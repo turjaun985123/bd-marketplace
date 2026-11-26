@@ -2906,3 +2906,145 @@ export function getRecommendations(
   const qs = search.toString();
   return call(`/v1/recommendations${qs ? `?${qs}` : ""}`, { token });
 }
+
+/**
+ * Seller analytics (Wave 27). Every figure is computed by the
+ * API from the ledger tables over the last `days` Asia/Dhaka
+ * calendar days (the API clamps the window to 7–90): goods
+ * exclude cancelled sub-orders, earnings are the DELIVERED
+ * sub-orders' payout snapshots, and `return_rate_bps` is
+ * returned / (delivered + returned) in basis points.
+ */
+export interface SellerAnalyticsTotals {
+  sub_orders: number;
+  goods_poisha: number;
+  earnings_poisha: number;
+  delivered: number;
+  returned: number;
+  cancelled: number;
+  return_rate_bps: number;
+}
+
+/** One day of the seller series (a Dhaka calendar day). */
+export interface SellerDailyRow {
+  date: string;
+  sub_orders: number;
+  goods_poisha: number;
+  earnings_poisha: number;
+}
+
+/** One top-selling product of the window (Wave 27). */
+export interface TopProduct {
+  product_id: string;
+  title: string;
+  units: number;
+  goods_poisha: number;
+}
+
+/** One status bucket of a breakdown (Wave 27). */
+export interface StatusCount {
+  status: string;
+  count: number;
+}
+
+/** One courier bucket of a breakdown (Wave 27). */
+export interface CourierCount {
+  courier: string;
+  count: number;
+}
+
+export interface SellerAnalytics {
+  days: number;
+  totals: SellerAnalyticsTotals;
+  daily: SellerDailyRow[];
+  top_products: TopProduct[];
+  status_breakdown: StatusCount[];
+  courier_breakdown: CourierCount[];
+}
+
+/** GET /v1/seller/analytics?days= — the caller's own stores only. */
+export function getSellerAnalytics(
+  token: string,
+  days?: number
+): Promise<SellerAnalytics> {
+  const qs = days ? `?days=${days}` : "";
+  return call(`/v1/seller/analytics${qs}`, { token });
+}
+
+/**
+ * GET /v1/seller/analytics/export.csv?days= — the daily series
+ * as a CSV file (the `orders` column counts sub-orders).
+ * Returns the raw Blob for a download click; unlike `call`
+ * this does not parse JSON.
+ */
+export async function downloadSellerAnalyticsCsv(
+  token: string,
+  days?: number
+): Promise<Blob> {
+  const qs = days ? `?days=${days}` : "";
+  const res = await fetch(`${apiBase()}/v1/seller/analytics/export.csv${qs}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    throw new Error(`CSV ডাউনলোড করা যায়নি (HTTP ${res.status})`);
+  }
+  return res.blob();
+}
+
+/**
+ * Platform analytics (Wave 27, admin). GMV is goods − discount
+ * + delivery over NON-cancelled sub-orders; commission is
+ * goods − discount − seller payout over DELIVERED sub-orders
+ * only; the window is the last `days` Asia/Dhaka days.
+ */
+export interface AdminAnalyticsTotals {
+  gmv_poisha: number;
+  orders: number;
+  sub_orders: number;
+  commission_poisha: number;
+  new_users: number;
+  new_stores: number;
+  payouts: {
+    requested_count: number;
+    requested_poisha: number;
+    paid_poisha: number;
+  };
+  charges_poisha: number;
+  coupons: {
+    redemptions: number;
+    discount_poisha: number;
+  };
+}
+
+/** One top store of the window, by GMV (Wave 27). */
+export interface TopStore {
+  store_id: string;
+  slug: string;
+  name: string;
+  gmv_poisha: number;
+  sub_orders: number;
+}
+
+/** One day of the platform series (a Dhaka calendar day). */
+export interface AdminDailyRow {
+  date: string;
+  orders: number;
+  gmv_poisha: number;
+}
+
+export interface AdminAnalytics {
+  days: number;
+  totals: AdminAnalyticsTotals;
+  top_stores: TopStore[];
+  courier_breakdown: CourierCount[];
+  daily: AdminDailyRow[];
+}
+
+/** GET /v1/admin/analytics?days= — admin only (the API answers 403 otherwise). */
+export function getAdminAnalytics(
+  token: string,
+  days?: number
+): Promise<AdminAnalytics> {
+  const qs = days ? `?days=${days}` : "";
+  return call(`/v1/admin/analytics${qs}`, { token });
+}

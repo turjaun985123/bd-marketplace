@@ -1392,6 +1392,80 @@ every promotion starts now). Sponsored ranking applies
 to the default/relevance/newest orderings only, by the
 documented rule above.
 
+Wave 27 (analytics for sellers and the platform):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| GET | `/v1/seller/analytics?days=` | Bearer, own stores only (no store: 404, like the dashboard). Totals, zero-filled daily series, top products, status and courier breakdowns for the window |
+| GET | `/v1/seller/analytics/export.csv?days=` | Bearer. The same daily series as a `text/csv` download (`seller-analytics-<days>d.csv`) |
+| GET | `/v1/admin/analytics?days=` | Admin (403 otherwise). Platform totals, top stores, courier breakdown and daily GMV series for the window |
+
+**The window:** the last N days INCLUDING today —
+`days` absent means 30, and any value clamps into
+7..=90 (the pure domain `analytics_days`; a caller is
+never errored for asking outside the range). Day
+boundaries are **Asia/Dhaka calendar days**, computed by
+Postgres (`created_at AT TIME ZONE 'Asia/Dhaka'`): a sale
+at 11pm in Dhaka counts on that Dhaka day, not the next
+UTC day. Sub-orders (seller slices) are the unit of
+almost every metric, because fulfilment and money move
+per slice.
+
+**Metric definitions — seller** (scope: the sub-orders
+of ALL stores the caller owns, created in the window):
+
+| Metric | Definition |
+| --- | --- |
+| `totals.sub_orders` | Sub-orders NOT in `cancelled` — the sales population the money figures share |
+| `totals.goods_poisha` | SUM(`goods_subtotal_poisha`) over that non-cancelled population (before coupon discounts) |
+| `totals.earnings_poisha` | SUM(`seller_payout_poisha`) over DELIVERED sub-orders only — the Wave 9 earnings rule; the snapshot already nets out borne discounts |
+| `totals.delivered` / `returned` / `cancelled` | Counts per current sub-order status |
+| `totals.return_rate_bps` | returned ÷ (delivered + returned) × 10,000, integer-truncated; 0 when the denominator is 0 |
+| `daily[]` | One row per Dhaka day, ZERO-FILLED via `generate_series` (quiet days appear with zeros, so the series length is always the window length): non-cancelled sub-order count, their goods, the delivered slices' earnings |
+| `top_products[]` | Order items of non-cancelled sub-orders grouped by product: units = SUM(quantity), goods = SUM(line_total_poisha); top 10 by goods |
+| `status_breakdown[]` | Counts per status over ALL sub-orders in the window (cancelled included — the operations view) |
+| `courier_breakdown[]` | Shipments of the window's sub-orders per courier; manual bookings count under their counter name, not the `manual` marker |
+
+**Metric definitions — admin** (platform-wide, same
+window):
+
+| Metric | Definition |
+| --- | --- |
+| `totals.gmv_poisha` | SUM(goods − discount + delivery) over sub-orders NOT cancelled — what buyers committed to pay for goods and carriage |
+| `totals.orders` | Parent orders CREATED in the window (the orders table, any state) |
+| `totals.sub_orders` | ALL sub-orders created in the window, cancelled included (operations volume) |
+| `totals.commission_poisha` | SUM(goods − discount − seller_payout) over DELIVERED sub-orders — equals their stored `commission_poisha` snapshots |
+| `totals.new_users` / `new_stores` | User / store rows created in the window |
+| `totals.payouts` | `requested_count` + `requested_poisha`: payouts still in `requested` created in the window; `paid_poisha`: payouts in `paid` created in the window |
+| `totals.charges_poisha` | SUM of `seller_charges` (Wave 26 promotion purchases) created in the window |
+| `totals.coupons` | `redemptions`: coupon_redemptions rows created in the window; `discount_poisha`: their summed discount |
+| `top_stores[]` | Per store over non-cancelled sub-orders: GMV by the platform formula + the non-cancelled sub-order count; top 10 |
+| `daily[]` | Per Dhaka day, zero-filled: `orders` = DISTINCT parent orders among that day's non-cancelled sub-orders; `gmv_poisha` by the GMV formula |
+
+**The CSV:** header `date,orders,goods_poisha,earnings_poisha`,
+then one line per day of the seller series, built by the
+domain CSV builder (RFC 4180 escaping). Note the
+`orders` column counts SUB-ORDERS — the same value as
+the JSON daily rows' `sub_orders` field; the file is a
+seller's own sales ledger, where a slice is the unit of
+work.
+
+**How it is computed:** every block is a single GROUP BY
+aggregate (or one scalar-subselect row) over the ledger
+tables — no N+1, no rows loaded into Rust to sum, no
+rollup tables and no cached counters, so the numbers can
+never drift from the money tables they describe.
+
+**Honest limits:** there is no cohort, funnel or
+retention analysis, and nothing is realtime — figures
+are computed per request from the ledger tables, so a
+window always reflects the current state of orders
+(a slice cancelled tomorrow leaves yesterday's goods
+when the window is re-read). At very large volumes the
+per-request aggregates would move to rollup tables
+behind these same definitions; the 90-day cap keeps a
+single request bounded until then.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -2449,6 +2523,33 @@ promote links on the seller products page, the dashboard
 nav link and charges line, and the admin settings price
 field.
 
+**Real (Wave 27):** analytics — no migration (the wave
+reads the existing ledger tables); the domain rules
+(`analytics_days` absent = 30, clamped 7..=90;
+`csv_escape` RFC 4180 quoting; `build_daily_csv` for the
+export); the `analytics` API module (seller totals /
+zero-filled daily series / top products / status +
+courier breakdowns over Asia/Dhaka day buckets, the CSV
+export of the same series, and the admin platform view
+behind `require_admin` — GMV = goods − discount +
+delivery over non-cancelled slices, commission over
+delivered slices only — every metric defined in the
+module doc and the Wave 27 section above); an
+integration test (`crates/api/tests/wave27.rs`, same
+`DATABASE_URL` gate) covering seller totals against
+known delivered/cancelled flows, the zero-filled series
+and its Dhaka-today bucket, top-product order, seller
+isolation, the window clamps, the CSV header + today's
+row against the JSON series, admin GMV / commission /
+top stores, and the non-admin 403; and the Next.js
+seller analytics page at /seller/analytics (days
+selector, totals cards, CSS daily bars, top products,
+breakdowns, CSV download) and admin analytics page at
+/admin/analytics (platform cards, daily GMV bars, top
+stores, courier breakdown), with nav links in the
+seller dashboard and the admin shell, and the shared
+DailyBars component (no chart library).
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters, and the four manual couriers run
@@ -2491,19 +2592,20 @@ the external service at the other end of it, configured by
   the product page's Q&A section, and the dashboard's
   unanswered-questions strip; Wave 26 adds
   /seller/promotions, the স্পন্সরড badge on the shared
-  ProductCard, and the admin settings promotion price).
+  ProductCard, and the admin settings promotion price;
+  Wave 27 adds /seller/analytics and /admin/analytics).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
-  (domain 98, courier 31, payments 8 unit tests; the `DATABASE_URL`-
+  (domain 101, courier 31, payments 8 unit tests; the `DATABASE_URL`-
   gated integration tests skip cleanly without a database). The API
   binary was also smoke-tested locally without a database: routes
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
   (including the Wave 13 messaging endpoints), and the SIDRA
   callback answers 503 without a database.
-- **Rust integration + clippy: CI-only** — the Wave 2–26 integration
+- **Rust integration + clippy: CI-only** — the Wave 2–27 integration
   tests against a real Postgres 16 service and clippy `-D warnings`
   are verified via **GitHub Actions CI** (`.github/workflows/ci.yml`)
-  on push. Waves 1–25 are green there; Wave 26 awaits its first CI run.
+  on push. Waves 1–26 are green there; Wave 27 awaits its first CI run.
 - **Docker images: CI-only** — Docker is not installed on the
   development machine, so `Dockerfile.api`, `Dockerfile.worker`
   and `apps/web/Dockerfile` are verified by the CI `docker` job

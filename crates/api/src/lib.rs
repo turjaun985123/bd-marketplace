@@ -166,6 +166,18 @@
 //! labelled স্পন্সরড, with explicit price/rating sorts kept
 //! pure — and cancelling stops placement immediately with
 //! NO refund: the charge stands.
+//! Wave 27: analytics (`analytics` module) — seller and
+//! platform numbers computed per request from the ledger
+//! tables by single GROUP BY aggregates, over a window of
+//! the last N days (domain-clamped to 7..=90) bucketed by
+//! ASIA/DHAKA calendar days. Every metric's population and
+//! money definition is written down in the module doc and
+//! the README: seller goods exclude cancelled slices,
+//! earnings are the delivered payout snapshots (the Wave 9
+//! rule), platform GMV is goods − discount + delivery over
+//! non-cancelled slices, and commission counts delivered
+//! slices only. The seller daily series also exports as
+//! CSV through the domain CSV builder.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -177,6 +189,7 @@
 //! endpoints; DB-backed endpoints return a clear 503 instead of panicking.
 
 pub mod admin;
+pub mod analytics;
 pub mod auth;
 pub mod cart;
 pub mod coupons;
@@ -1040,6 +1053,16 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/seller/payouts",
             post(payouts::request_payout_handler).get(payouts::list_payouts_handler),
         )
+        // Wave 27 — seller analytics (windowed aggregates over
+        // the caller's stores) and its CSV export.
+        .route(
+            "/v1/seller/analytics",
+            get(analytics::seller_analytics_handler),
+        )
+        .route(
+            "/v1/seller/analytics/export.csv",
+            get(analytics::seller_analytics_csv_handler),
+        )
         // Wave 12 — Facebook Page link + post import: link/unlink
         // the seller's Page, read the link + Graph API status,
         // preview parsed drafts from pasted posts, import the
@@ -1112,6 +1135,10 @@ pub fn build_app(state: AppState) -> Router {
         )
         // Wave 10 — platform admin: every route behind require_admin.
         .route("/v1/admin/overview", get(admin::overview_handler))
+        .route(
+            "/v1/admin/analytics",
+            get(analytics::admin_analytics_handler),
+        )
         .route("/v1/admin/stores", get(admin::list_stores_handler))
         .route(
             "/v1/admin/stores/:id/status",

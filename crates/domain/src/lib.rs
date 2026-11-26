@@ -2513,6 +2513,85 @@ pub fn recommendation_limit(limit: Option<i64>) -> i64 {
         .clamp(1, MAX_RECOMMENDATION_LIMIT)
 }
 
+// ---------------------------------------------------------------------------
+// Wave 27 — analytics windows and CSV export
+// ---------------------------------------------------------------------------
+
+/// How many days of history the analytics endpoints cover
+/// when the caller does not ask for a specific window
+/// (Wave 27).
+pub const DEFAULT_ANALYTICS_DAYS: i64 = 30;
+
+/// The shortest analytics window (Wave 27): a single day is
+/// a snapshot, not an analysis, so the floor is a week.
+pub const MIN_ANALYTICS_DAYS: i64 = 7;
+
+/// The longest analytics window (Wave 27): analytics are
+/// computed per request from the ledger tables (no rollups
+/// yet), so the cap keeps a single request bounded.
+pub const MAX_ANALYTICS_DAYS: i64 = 90;
+
+/// Normalise a caller-supplied analytics window (Wave 27):
+/// an absent window means [`DEFAULT_ANALYTICS_DAYS`]; a
+/// supplied one clamps into
+/// [`MIN_ANALYTICS_DAYS`]..=[`MAX_ANALYTICS_DAYS`] — the
+/// caller is never errored for asking for too little or too
+/// much history, they just get the nearest supported window.
+pub fn analytics_days(days: Option<i64>) -> i64 {
+    days.unwrap_or(DEFAULT_ANALYTICS_DAYS)
+        .clamp(MIN_ANALYTICS_DAYS, MAX_ANALYTICS_DAYS)
+}
+
+/// Escape one CSV field (Wave 27, RFC 4180): the field is
+/// wrapped in double quotes when it contains a comma, a
+/// double quote, or a line break, and every internal double
+/// quote is doubled. Anything else passes through untouched.
+pub fn csv_escape(field: &str) -> String {
+    if !field.contains([',', '"', '\n', '\r']) {
+        return field.to_string();
+    }
+    let mut out = String::with_capacity(field.len() + 2);
+    out.push('"');
+    for ch in field.chars() {
+        if ch == '"' {
+            out.push('"');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out
+}
+
+/// The header line of the daily analytics CSV (Wave 27).
+/// The `orders` column counts SUB-ORDERS (seller slices) —
+/// the seller export's day rows are sub-order rows; see
+/// [`build_daily_csv`].
+pub fn daily_csv_header() -> &'static str {
+    "date,orders,goods_poisha,earnings_poisha"
+}
+
+/// Build the seller analytics CSV (Wave 27) from daily rows
+/// of `(date, orders, goods_poisha, earnings_poisha)`: the
+/// shared header, then one line per row, every field run
+/// through [`csv_escape`] (dates and numbers never need it,
+/// but the escaper is the one rule for every field), lines
+/// joined by `\n` with a trailing newline at the end.
+pub fn build_daily_csv(rows: &[(String, i64, i64, i64)]) -> String {
+    let mut out = String::from(daily_csv_header());
+    out.push('\n');
+    for (date, orders, goods_poisha, earnings_poisha) in rows {
+        out.push_str(&csv_escape(date));
+        out.push(',');
+        out.push_str(&csv_escape(&orders.to_string()));
+        out.push(',');
+        out.push_str(&csv_escape(&goods_poisha.to_string()));
+        out.push(',');
+        out.push_str(&csv_escape(&earnings_poisha.to_string()));
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4467,5 +4546,57 @@ mod tests {
             MAX_RECOMMENDATION_LIMIT
         );
         assert_eq!(recommendation_limit(Some(10_000)), MAX_RECOMMENDATION_LIMIT);
+    }
+
+    #[test]
+    fn analytics_days_defaults_and_clamps() {
+        // Absent means the shared default.
+        assert_eq!(analytics_days(None), DEFAULT_ANALYTICS_DAYS);
+        assert_eq!(analytics_days(None), 30);
+        // In-range values pass through untouched.
+        assert_eq!(analytics_days(Some(7)), 7);
+        assert_eq!(analytics_days(Some(45)), 45);
+        assert_eq!(analytics_days(Some(90)), 90);
+        // Below the floor clamps up to a week, never errors.
+        assert_eq!(analytics_days(Some(3)), MIN_ANALYTICS_DAYS);
+        assert_eq!(analytics_days(Some(0)), MIN_ANALYTICS_DAYS);
+        assert_eq!(analytics_days(Some(-30)), MIN_ANALYTICS_DAYS);
+        // Above the cap clamps down to a quarter.
+        assert_eq!(analytics_days(Some(500)), MAX_ANALYTICS_DAYS);
+        assert_eq!(analytics_days(Some(10_000)), MAX_ANALYTICS_DAYS);
+    }
+
+    #[test]
+    fn csv_escape_quotes_only_when_needed() {
+        // Plain fields pass through untouched.
+        assert_eq!(csv_escape("2026-11-26"), "2026-11-26");
+        assert_eq!(csv_escape("184000"), "184000");
+        assert_eq!(csv_escape(""), "");
+        // A comma forces quoting.
+        assert_eq!(csv_escape("a,b"), "\"a,b\"");
+        // A double quote forces quoting and doubles itself.
+        assert_eq!(csv_escape("say \"hi\""), "\"say \"\"hi\"\"\"");
+        // Line breaks (LF and CR) force quoting.
+        assert_eq!(csv_escape("a\nb"), "\"a\nb\"");
+        assert_eq!(csv_escape("a\rb"), "\"a\rb\"");
+    }
+
+    #[test]
+    fn build_daily_csv_has_header_and_one_line_per_row() {
+        let rows = vec![
+            ("2026-11-25".to_string(), 0, 0, 0),
+            ("2026-11-26".to_string(), 2, 250_000, 230_000),
+        ];
+        assert_eq!(
+            build_daily_csv(&rows),
+            "date,orders,goods_poisha,earnings_poisha\n\
+             2026-11-25,0,0,0\n\
+             2026-11-26,2,250000,230000\n"
+        );
+        // No rows: just the header line.
+        assert_eq!(
+            build_daily_csv(&[]),
+            "date,orders,goods_poisha,earnings_poisha\n"
+        );
     }
 }

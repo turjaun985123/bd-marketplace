@@ -191,6 +191,8 @@ export default function SellerDashboardPage() {
         {" · "}
         <Link href="/seller/promotions">প্রমোশন — Promotions</Link>
         {" · "}
+        <Link href="/seller/analytics">অ্যানালিটিক্স — Analytics</Link>
+        {" · "}
         <Link href="/seller/returns">রিটার্ন — Returns</Link>
         {" · "}
         <Link href="/seller/branding">স্টোরের সাজসজ্জা — Branding</Link>
