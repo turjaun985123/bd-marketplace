@@ -67,6 +67,19 @@ jobs:
           dropdb -h localhost -U marketplace marketplace_restore_check
       - name: Clippy (warnings are errors)
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # User rule (2026-11-26): no local builds — the runnable
+      # server binaries are produced HERE and downloaded from the
+      # run's artifacts. Release profile, api + worker only.
+      - name: Build release server binaries
+        run: cargo build --release -p api -p worker
+      - name: Upload server binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-binaries
+          path: |
+            target/release/api
+            target/release/worker
+          retention-days: 14
 
   web:
     runs-on: ubuntu-24.04
@@ -79,9 +92,28 @@ jobs:
           cache-dependency-path: apps/web/package-lock.json
       - name: Install and build
         working-directory: apps/web
+        env:
+          # Empty = same-origin relative API calls, so the
+          # standalone bundle can sit behind any reverse proxy
+          # that routes /v1 to the API (the live-demo shape).
+          NEXT_PUBLIC_API_BASE_URL: ""
         run: |
           npm ci
           npm run build
+      # Package the standalone server the same way the web
+      # Dockerfile does (static + public copied in) and upload
+      # it as a downloadable artifact — no local builds.
+      - name: Upload web standalone bundle
+        working-directory: apps/web
+        run: |
+          cp -r .next/static .next/standalone/.next/static
+          cp -r public .next/standalone/public
+          tar -czf /tmp/web-standalone.tar.gz -C .next/standalone .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-standalone
+          path: /tmp/web-standalone.tar.gz
+          retention-days: 14
 
   # Wave 20: the deployment images must always build. Build only
   # — nothing is pushed to a registry from CI.
