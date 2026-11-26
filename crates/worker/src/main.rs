@@ -14,26 +14,52 @@
 //! `sms_not_configured` recorded, visible in the admin
 //! notifications view, never silently dropped.
 //!
+//! Wave 30 gives the worker its second real job: automatic
+//! courier status polling. Each cycle also runs
+//! `api::shipments::refresh_stale_shipments` — the worker
+//! depends on the api crate as a library and calls the same
+//! refresh service function the seller/buyer refresh endpoint
+//! calls, so a status learned by polling lands (shipment
+//! event, sub-order sync, buyer notification) exactly like a
+//! status learned by hand. Only API-courier shipments that
+//! are stale (`SHIPMENT_POLL_STALE_MINUTES`, default 15) and
+//! not in a terminal status are polled; manual shipments are
+//! never polled (they have no API — the seller-entered status
+//! is the truth). The service state is built with
+//! `AppState::from_env`, which reads the courier credentials
+//! and the DEV simulator flag from the same environment the
+//! API server uses; the Wave 28 JWT-secret startup gate lives
+//! in `api::run`, which the worker never calls, so it is not
+//! triggered here (the worker serves no HTTP and issues no
+//! tokens).
+//!
 //! The worker runs the same embedded migrations as the API
 //! at startup (idempotent — whichever process starts first
 //! applies them). Poll interval: `WORKER_POLL_SECONDS`
 //! (default 10). Shutdown is graceful on Ctrl-C / SIGTERM.
 //!
-//! Still planned (not implemented): courier status polling,
-//! payout jobs, COD reconciliation — those jobs will call
-//! the same service functions the API exposes when they land.
+//! Still planned (not implemented): payout jobs, COD
+//! reconciliation — those jobs will call the same service
+//! functions the API exposes when they land.
 
 use std::time::Duration;
 
 use sqlx::postgres::PgPoolOptions;
 
 /// Jobs this worker will own in later waves (the notification
-/// outbox below is implemented, Wave 29).
+/// outbox, Wave 29, and courier status polling, Wave 30, are
+/// implemented below).
 const PLANNED_JOBS: &[&str] = &[
-    "courier_status_polling (poll couriers, apply unified shipment statuses via the shipments refresh service)",
     "payout_jobs (compute_commission-based seller payouts on schedule)",
     "cod_reconciliation (match courier COD collections to orders)",
 ];
+
+/// How many stale shipments one poll cycle refreshes at
+/// most. The platform's courier accounts are shared across
+/// every seller, so a cycle's worth of tracking calls stays
+/// bounded; whatever does not fit is simply older next
+/// cycle and goes first (the service takes oldest-first).
+const SHIPMENT_POLL_BATCH: i64 = 50;
 
 /// The poll interval in seconds: `WORKER_POLL_SECONDS`,
 /// default 10; an unparsable or zero value keeps the
@@ -50,6 +76,27 @@ fn poll_seconds() -> u64 {
             }
         },
         Err(_) => 10,
+    }
+}
+
+/// How stale a shipment's stored status may get before the
+/// poller refreshes it, in minutes:
+/// `SHIPMENT_POLL_STALE_MINUTES`, default 15; an unparsable
+/// or negative value keeps the default. Zero is valid and
+/// means "every non-terminal API shipment is stale" —
+/// useful for a catch-up run, noisy as a steady state.
+fn shipment_poll_stale_minutes() -> i64 {
+    match std::env::var("SHIPMENT_POLL_STALE_MINUTES") {
+        Ok(raw) => match raw.parse::<i64>() {
+            Ok(minutes) if minutes >= 0 => minutes,
+            _ => {
+                eprintln!(
+                    "WARNING: SHIPMENT_POLL_STALE_MINUTES='{raw}' is invalid — using the default 15"
+                );
+                15
+            }
+        },
+        Err(_) => 15,
     }
 }
 
@@ -122,11 +169,23 @@ async fn main() {
     let dev_mode = sms_dev_mode();
     let sender = notify::sender_from_env(dev_mode);
     let seconds = poll_seconds();
+    let stale_minutes = shipment_poll_stale_minutes();
+    // Service state for the shipment poller, built from the
+    // environment exactly as the API server builds its own
+    // (courier credentials + DEV simulator flag), around a
+    // clone of the worker's pool. `from_env` performs no
+    // startup gate — the JWT-secret gate lives in `api::run`,
+    // which this process never calls.
+    let state = api::AppState::from_env(Some(pool.clone()));
     println!(
         "bd-marketplace worker starting: notification outbox every {seconds}s \
          (sms sender: {}, batch {})",
         notify::sender_kind(dev_mode),
         notify::DEFAULT_BATCH
+    );
+    println!(
+        "shipment polling every {seconds}s (stale after {stale_minutes} min, \
+         batch {SHIPMENT_POLL_BATCH})"
     );
     println!("planned jobs (still TODO, not yet implemented):");
     for job in PLANNED_JOBS {
@@ -144,6 +203,20 @@ async fn main() {
             Ok(_) => {}
             Err(error) => {
                 eprintln!("worker: notification batch failed: {error}");
+            }
+        }
+        match api::shipments::refresh_stale_shipments(&state, stale_minutes, SHIPMENT_POLL_BATCH)
+            .await
+        {
+            Ok(report) if report.checked > 0 => {
+                println!(
+                    "shipment poll: checked {} advanced {} unchanged {} failed {}",
+                    report.checked, report.advanced, report.unchanged, report.failed
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("worker: shipment poll failed: {}", error.message);
             }
         }
         tokio::select! {

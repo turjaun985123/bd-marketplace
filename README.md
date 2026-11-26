@@ -80,7 +80,7 @@ crates/api/             Axum API — thin handlers over service functions
   tests/wave4.rs        weight / cancel / receipt integration test
   tests/wave5.rs        online payments integration test (same gate)
   tests/wave9.rs        dashboard / earnings / payouts test (same gate)
-crates/worker/          Tokio worker binary (drains the Wave 29 notification outbox; further jobs listed)
+crates/worker/          Tokio worker binary (drains the Wave 29 notification outbox; polls courier statuses since Wave 30 via the api library)
 migrations/             SQLx migrations (users, stores, otp_codes, products,
                         carts, orders, sub_orders, order_items, payments,
                         payment_events, shipments, reviews, payout_accounts,
@@ -1632,9 +1632,70 @@ still 503 before anything is stored. The biggest launch
 blocker remains a real SMS gateway. A worker that dies
 mid-batch leaves its claimed rows in `sending` — counted
 in the admin view, but there is no automatic reaper yet.
-No email or push channels exist yet; courier polling,
-payout jobs and COD reconciliation remain planned worker
-jobs, printed at worker startup.
+No email or push channels exist yet; payout jobs and COD
+reconciliation remain planned worker jobs, printed at
+worker startup (courier polling landed in Wave 30).
+
+**Real (Wave 30):** automatic courier status polling. The
+single-shipment refresh core is factored out of the
+participant endpoint into ONE service function,
+`refresh_shipment_by_id` (returns the shipment plus an
+`Advanced` / `Unchanged` outcome), and the endpoint is now
+a participant check in front of it — its behaviour is
+unchanged. On top of it sits `refresh_stale_shipments`:
+candidates are shipments whose courier is not `manual`,
+whose status is not terminal, and whose `updated_at` is
+older than the staleness threshold, taken oldest-first up
+to a batch limit. The terminal set for polling is
+`delivered` / `returned` / `cancelled`
+(`POLL_TERMINAL_STATUSES`): the domain table does allow
+`delivered` → `return_in_transit`, but that journey is
+driven by an explicit refresh or a return flow, not by
+background polling — for the poller, delivery is final.
+`partial_delivered` and `return_in_transit` are NOT
+terminal (both still have somewhere to go) and keep being
+polled. There is deliberately NO HTTP endpoint for the
+batch poll: the worker binary now depends on the `api`
+crate as a library and calls the service in-process on
+every poll cycle, with a state built by
+`AppState::from_env` around the worker's own pool — the
+same courier credentials and DEV simulator flag the API
+server reads, and no JWT startup gate (that gate lives in
+`api::run`, which the worker never calls; the worker
+serves no HTTP and issues no tokens). Configuration:
+`SHIPMENT_POLL_STALE_MINUTES` (default 15, invalid or
+negative → default with a warning, zero allowed) and a
+fixed batch of 50 per cycle; the cycle logs one line only
+when it actually checked something. A shipment whose
+refresh errors (courier down, credentials revoked) is
+counted in the run's `PollReport` (`checked` /
+`advanced` / `unchanged` / `failed`) and logged — never
+fatal to the batch — and because a failed refresh writes
+nothing, its `updated_at` stays stale so the next cycle
+retries it. An integration test
+(`crates/api/tests/wave30.rs`, same `DATABASE_URL` gate)
+drives the poller in courier dev mode: a baseline poll
+first (shared-database discipline), then a booked shipment
+walks picked_up → in_transit → out_for_delivery →
+delivered one poll at a time with the sub-order sync and
+the delivered notification firing, the staleness window
+excludes a fresh shipment and includes a backdated one,
+and a final exact-count poll proves a backdated delivered
+shipment and a backdated manual shipment are both left
+alone. No web changes this wave.
+
+**Honest limits:** freshness is bounded by the poll
+cycle — a status can lag the courier by up to
+`WORKER_POLL_SECONDS` plus the staleness threshold, and
+every poll is a tracking call against the platform's
+SHARED courier merchant accounts, so the staleness
+threshold and the 50-per-cycle batch are also a rate
+budget: sellers who need an answer sooner still have the
+manual refresh endpoint. No courier offers this platform
+a webhook receiver yet, so polling is the mechanism, not
+a fallback. The Wave 29 caveat stands: notification rows
+a worker claims and then dies on stay in `sending` with
+no automatic reaper yet.
 
 Wave 8 (reviews, ratings and seller replies):
 
@@ -2751,6 +2812,22 @@ filter, pagination, detail summaries) with the
 AdminShell nav link, the api.ts client, and the web
 app's own header subset in `next.config.js`.
 
+**Real (Wave 30):** automatic courier status polling —
+the refresh core factored into `refresh_shipment_by_id`
+(shared by the participant endpoint and the new
+`refresh_stale_shipments` batch service), and the worker
+binary calling that service in-process through an `api`
+library dependency: stale, non-terminal, API-courier
+shipments are refreshed oldest-first, 50 per cycle, with
+per-shipment failures counted in a `PollReport` and
+never fatal. Manual and terminal (`delivered` /
+`returned` / `cancelled`) shipments are never polled.
+An integration test (`crates/api/tests/wave30.rs`, same
+`DATABASE_URL` gate) covers the dev-courier progression
+to delivered with its notification, the staleness
+window, and the terminal/manual exclusions at exact
+counts. No new endpoints and no web changes.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters, and the four manual couriers run
@@ -2769,10 +2846,11 @@ signature verification (need merchant credentials + each gateway's
 integration docs), gateway refund APIs (Wave 16 refunds are
 recorded off-platform obligations instead — see the Wave 16
 section), Redis, a real SMS gateway,
-the REMAINING worker jobs — automatic courier status
-polling (which will call the same refresh service function
-the API exposes), payout jobs and COD reconciliation; the
-notification outbox drain IS wired since Wave 29.
+the REMAINING worker jobs — payout jobs and COD
+reconciliation; the notification outbox drain IS wired
+since Wave 29 and automatic courier status polling
+since Wave 30 (both call the same service functions the
+API exposes).
 (The SIDRA bridge contract IS wired in Wave 13 — SIDRA itself is
 the external service at the other end of it, configured by
 `SIDRA_API_URL` / `SIDRA_WEBHOOK_SECRET`.)
@@ -2809,12 +2887,12 @@ the external service at the other end of it, configured by
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
   (including the Wave 13 messaging endpoints), and the SIDRA
   callback answers 503 without a database.
-- **Rust integration + clippy: CI-only** — the Wave 2–29 integration
+- **Rust integration + clippy: CI-only** — the Wave 2–30 integration
   tests (including the Wave 29 outbox test in the `notify`
   crate) against a real Postgres 16 service and clippy
   `-D warnings` are verified via **GitHub Actions CI**
   (`.github/workflows/ci.yml`)
-  on push. Waves 1–28 are green there; Wave 29 awaits its first CI run.
+  on push. Waves 1–29 are green there; Wave 30 awaits its first CI run.
 - **Docker images: CI-only** — Docker is not installed on the
   development machine, so `Dockerfile.api`, `Dockerfile.worker`
   and `apps/web/Dockerfile` are verified by the CI `docker` job

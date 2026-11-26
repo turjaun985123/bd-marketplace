@@ -207,6 +207,16 @@
 //! The `SmsSender` trait and its senders moved from
 //! `auth` into the `notify` crate, so OTP codes and
 //! notifications can never disagree about delivery.
+//! Wave 30: automatic courier status polling (`shipments`
+//! module) — the single-shipment refresh core is factored
+//! into `refresh_shipment_by_id`, shared by the participant
+//! refresh endpoint and by `refresh_stale_shipments`, which
+//! the worker process runs on its poll cycle against
+//! API-courier shipments that are stale and not in a
+//! terminal status (manual shipments are never polled).
+//! There is deliberately no HTTP endpoint for the batch
+//! poll: the worker depends on this crate as a library and
+//! calls the service in-process.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service

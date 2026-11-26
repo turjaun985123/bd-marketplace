@@ -24,6 +24,18 @@
 //! reference: it is what the buyer sees on the public tracking
 //! view and what support can check against the paper receipt.
 //!
+//! Wave 30 adds automatic courier status polling: the worker
+//! process periodically calls [`refresh_stale_shipments`],
+//! which finds API-courier shipments whose stored status has
+//! not been refreshed for a while and runs each one through
+//! [`refresh_shipment_by_id`] — the very same service function
+//! the seller/buyer refresh endpoint calls, so a status learned
+//! by polling lands (events, sub-order sync, notifications)
+//! exactly like a status learned by hand. Manual shipments are
+//! never polled (there is no API to poll — the seller-entered
+//! status is the truth), and neither are shipments in a
+//! terminal status ([`POLL_TERMINAL_STATUSES`]).
+//!
 //! Honesty rules for this module, mirroring the payments module: a
 //! shipment exists only when a courier adapter actually booked it —
 //! a real adapter with merchant credentials, or the DEV courier
@@ -881,49 +893,59 @@ async fn sync_sub_order_with_shipment_status(
 // Tracking refresh (seller or buyer)
 // ---------------------------------------------------------------------------
 
-/// Poll the courier for one shipment's current status and apply it.
-/// Only the sub-order's seller and the order's buyer may refresh —
-/// anyone else gets a 404, the same no-leak rule as the buyer order
-/// endpoints. An unchanged poll, a status the courier reported that
-/// maps to `unknown`, or a move the domain shipment table forbids
-/// (a courier reporting a backwards state) all leave the stored
-/// shipment untouched and write no event. A legal change updates the
-/// shipment, writes a `refresh` event with the courier's raw status,
-/// and syncs the sub-order where the two status sets overlap:
+/// What one shipment refresh did (Wave 30): `Advanced` when a
+/// new status was applied (shipment row, `refresh` event and
+/// sub-order sync committed), `Unchanged` when the stored
+/// shipment already told the truth — the courier reported the
+/// same status, a status that maps to `unknown`, a move the
+/// domain transition table forbids, or the shipment is a
+/// manual one with no API to poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    Advanced,
+    Unchanged,
+}
+
+/// Poll the courier for one shipment's current status and apply
+/// it. THE refresh service function: the seller/buyer endpoint
+/// (through [`refresh_shipment_for_participant`], which adds
+/// the participant check) and the Wave 30 worker poller
+/// (through [`refresh_stale_shipments`]) both call this and
+/// nothing else, so however a status is learned it lands
+/// identically. An unchanged poll, a status the courier
+/// reported that maps to `unknown`, or a move the domain
+/// shipment table forbids (a courier reporting a backwards
+/// state) all leave the stored shipment untouched and write
+/// no event. A legal change updates the shipment, writes a
+/// `refresh` event with the courier's raw status, and syncs
+/// the sub-order where the two status sets overlap:
 /// `delivered` and `returned` (each still checked against the
-/// sub-order transition table). A sync to `returned` also restocks
-/// the sub-order's items in the same transaction (Wave 16) — the
-/// goods physically came back — but it creates no return request
-/// and no refund (see the note at the sync site).
-pub async fn refresh_shipment_for_participant(
+/// sub-order transition table). A sync to `returned` also
+/// restocks the sub-order's items in the same transaction
+/// (Wave 16) — the goods physically came back — but it
+/// creates no return request and no refund (see the note at
+/// the sync site).
+pub async fn refresh_shipment_by_id(
     state: &AppState,
-    user: &AuthUser,
     shipment_id: Uuid,
-) -> Result<Shipment, ApiError> {
+) -> Result<(Shipment, RefreshOutcome), ApiError> {
     let pool = state.require_pool()?;
     let shipment = load_shipment(pool, shipment_id).await?;
 
-    let (owner_user_id, buyer_user_id, sub_status): (Uuid, Uuid, String) = sqlx::query_as(
-        "SELECT s.owner_user_id, o.buyer_user_id, so.status \
-         FROM sub_orders so \
-         JOIN stores s ON s.id = so.store_id \
-         JOIN orders o ON o.id = so.order_id \
-         WHERE so.id = $1",
+    let sub_status: String = sqlx::query_scalar(
+        "SELECT so.status FROM sub_orders so WHERE so.id = $1",
     )
     .bind(shipment.sub_order_id)
     .fetch_one(pool)
     .await
-    .map_err(|e| ApiError::internal("load shipment participants", e))?;
-    if user.user_id != owner_user_id && user.user_id != buyer_user_id {
-        return Err(ApiError::not_found("shipment not found"));
-    }
+    .map_err(|e| ApiError::internal("load sub-order status for refresh", e))?;
 
     // Wave 19: a manual shipment has no API to poll — its
     // seller-entered status IS the current truth — so a refresh
     // is an honest no-op returning the stored shipment, never
     // an "unknown courier" error and never an invented update.
     if shipment.courier == "manual" {
-        return Ok(shipment);
+        return Ok((shipment, RefreshOutcome::Unchanged));
     }
 
     let adapter =
@@ -937,7 +959,7 @@ pub async fn refresh_shipment_for_participant(
         || update.status == "unknown"
         || !can_transition_shipment(&shipment.status, &update.status)
     {
-        return Ok(shipment);
+        return Ok((shipment, RefreshOutcome::Unchanged));
     }
 
     let mut tx = pool
@@ -978,7 +1000,126 @@ pub async fn refresh_shipment_for_participant(
         .await
         .map_err(|e| ApiError::internal("commit refresh", e))?;
 
-    load_shipment(pool, shipment_id).await
+    Ok((
+        load_shipment(pool, shipment_id).await?,
+        RefreshOutcome::Advanced,
+    ))
+}
+
+/// Poll the courier for one shipment's current status and apply
+/// it, for a participant of the shipment's order. Only the
+/// sub-order's seller and the order's buyer may refresh —
+/// anyone else gets a 404, the same no-leak rule as the buyer
+/// order endpoints. The refresh itself is
+/// [`refresh_shipment_by_id`]; this wrapper only adds the
+/// participant check in front of it.
+pub async fn refresh_shipment_for_participant(
+    state: &AppState,
+    user: &AuthUser,
+    shipment_id: Uuid,
+) -> Result<Shipment, ApiError> {
+    let pool = state.require_pool()?;
+    let shipment = load_shipment(pool, shipment_id).await?;
+
+    let (owner_user_id, buyer_user_id): (Uuid, Uuid) = sqlx::query_as(
+        "SELECT s.owner_user_id, o.buyer_user_id \
+         FROM sub_orders so \
+         JOIN stores s ON s.id = so.store_id \
+         JOIN orders o ON o.id = so.order_id \
+         WHERE so.id = $1",
+    )
+    .bind(shipment.sub_order_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::internal("load shipment participants", e))?;
+    if user.user_id != owner_user_id && user.user_id != buyer_user_id {
+        return Err(ApiError::not_found("shipment not found"));
+    }
+
+    let (shipment, _outcome) = refresh_shipment_by_id(state, shipment_id).await?;
+    Ok(shipment)
+}
+
+/// Shipment statuses the automatic poller treats as terminal:
+/// once a shipment is `delivered`, `returned` or `cancelled`
+/// the poller never asks its courier about it again. The
+/// domain transition table does allow `delivered` →
+/// `return_in_transit` (a delivered parcel that comes back),
+/// but that journey is driven by an explicit refresh or a
+/// return flow, not by background polling — for polling,
+/// delivery is the end of the story. `partial_delivered` is
+/// deliberately NOT in this set: it can still complete
+/// (`→ delivered`) or come back (`→ returned`), so the
+/// poller keeps watching it, and so does `return_in_transit`,
+/// which must still reach `returned`.
+pub const POLL_TERMINAL_STATUSES: [&str; 3] = ["delivered", "returned", "cancelled"];
+
+/// The tallies of one [`refresh_stale_shipments`] run: how
+/// many stale shipments were picked up (`checked`), how many
+/// of those applied a new status (`advanced`), how many were
+/// already current (`unchanged`), and how many errored
+/// (`failed` — counted and logged, never fatal to the batch).
+/// `checked` always equals the other three summed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PollReport {
+    pub checked: usize,
+    pub advanced: usize,
+    pub unchanged: usize,
+    pub failed: usize,
+}
+
+/// Refresh every stale API-courier shipment (Wave 30). A
+/// shipment is a candidate when its courier is not `manual`
+/// (manual shipments have no API to poll), its status is not
+/// terminal ([`POLL_TERMINAL_STATUSES`]), and its `updated_at`
+/// is older than `stale_minutes` ago; candidates are taken
+/// oldest-first, at most `limit` of them. Each candidate goes
+/// through [`refresh_shipment_by_id`] — the same service
+/// function the refresh endpoint calls — so a polled status
+/// lands with the same event, sub-order sync and notification
+/// as a manual refresh. A shipment that errors (courier down,
+/// credentials revoked, row raced away) is counted `failed`
+/// and logged; it never stops the batch, and because a failed
+/// refresh writes nothing its `updated_at` stays stale, so
+/// the next run retries it.
+pub async fn refresh_stale_shipments(
+    state: &AppState,
+    stale_minutes: i64,
+    limit: i64,
+) -> Result<PollReport, ApiError> {
+    let pool = state.require_pool()?;
+    let candidate_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM shipments \
+         WHERE courier <> 'manual' \
+           AND status NOT IN ('delivered', 'returned', 'cancelled') \
+           AND updated_at < now() - make_interval(mins => $1::int) \
+         ORDER BY updated_at ASC \
+         LIMIT $2",
+    )
+    .bind(stale_minutes)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::internal("load stale shipments", e))?;
+
+    let mut report = PollReport {
+        checked: candidate_ids.len(),
+        ..PollReport::default()
+    };
+    for shipment_id in candidate_ids {
+        match refresh_shipment_by_id(state, shipment_id).await {
+            Ok((_shipment, RefreshOutcome::Advanced)) => report.advanced += 1,
+            Ok((_shipment, RefreshOutcome::Unchanged)) => report.unchanged += 1,
+            Err(error) => {
+                report.failed += 1;
+                eprintln!(
+                    "shipment poll: refreshing shipment {shipment_id} failed: {}",
+                    error.message
+                );
+            }
+        }
+    }
+    Ok(report)
 }
 
 // ---------------------------------------------------------------------------
