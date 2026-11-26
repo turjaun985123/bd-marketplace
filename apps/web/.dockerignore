@@ -1,0 +1,6 @@
+# Build context exclusions for apps/web/Dockerfile (its context
+# is this directory). The image installs dependencies itself via
+# npm ci and builds from source.
+node_modules
+.next
+.git

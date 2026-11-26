@@ -1275,6 +1275,164 @@ NEXT_PUBLIC_API_BASE_URL=http://localhost:8080 npm run dev   # http://localhost:
 # the home page and storefronts)
 ```
 
+## Deployment (Wave 20)
+
+The deployable stack lives at the repository root:
+
+```bash
+cp .env.example .env        # then work through the checklist below
+docker compose up --build   # Postgres 16 + API + worker + web
+```
+
+`docker-compose.yml` runs four services on the compose
+network: **postgres** (postgres:16, a named volume, a
+`pg_isready` healthcheck, and NO published port — only the
+app services reach it), **api** (built from `Dockerfile.api`,
+waits for a healthy database, publishes `${API_PORT:-8080}`),
+**worker** (built from `Dockerfile.worker`) and **web**
+(built from `apps/web/Dockerfile`, publishes 3000). The API
+and worker read the same `.env` the local flow uses;
+`DATABASE_URL` is the one deliberate override, rewritten by
+compose to reach the `postgres` service (the `POSTGRES_USER`
+/ `POSTGRES_PASSWORD` / `POSTGRES_DB` values, which can also
+be set in `.env`, default to the dev database in
+`.env.example`). Redis is present only as an opt-in
+`future`-profile service — nothing connects to it yet, and a
+plain `docker compose up` never starts it. The older
+`infra/docker-compose.yml` remains the lightweight local-dev
+services file (Postgres/Redis/MinIO for running cargo and
+next on the host); it is not the deployment stack.
+
+The images: `Dockerfile.api` and `Dockerfile.worker` are
+multi-stage Rust builds (builder `rust:1.100-bookworm`, the
+toolchain the workspace is developed with; runtime
+`debian:bookworm-slim`, non-root user; the API image adds
+`ca-certificates` for its outbound HTTPS calls). Migrations
+need no runtime copy — the API embeds them at compile time
+via `sqlx::migrate!` and applies them on startup.
+`apps/web/Dockerfile` builds Next.js with
+`output: "standalone"` (set in `next.config.js`) and runs the
+traced server as a non-root user on node:20-alpine.
+`NEXT_PUBLIC_API_BASE_URL` is a **build argument**: Next.js
+inlines `NEXT_PUBLIC_*` values into the browser bundle, so it
+must be the origin browsers use to reach the API, and
+changing it means rebuilding the web image. CI has a
+`docker` job that builds all three images on every push
+(build only — nothing is pushed to a registry).
+
+**API hardening in this wave:** `GET /health/ready` is a real
+readiness probe — it runs `SELECT 1` against the pool and
+answers 200 `{"status": "ready"}` only when the query
+succeeds, 503 otherwise (including "no database configured");
+`GET /health` stays the liveness check. Gate load balancers
+and compose healthchecks on readiness, not liveness. The
+Wave 1–19 permissive CORS layer is replaced by an explicit
+origin list: `CORS_ORIGINS` (comma-separated) names exactly
+the origins whose preflights are answered; unset, only
+`http://localhost:3000` is allowed. The server shuts down
+gracefully on SIGTERM/SIGINT (in-flight requests drain), and
+startup logs one `config summary:` line — dev-mode flags,
+how many of the 4 payment gateways and 5 couriers carry
+complete credentials, SIDRA/Facebook configuration, CORS
+origin count, money-policy fallbacks — with no secret values.
+
+### Environment variables
+
+Every variable from `.env.example`, plus the two deployment
+ones. "Required in production" means the deployment is
+broken or unsafe without it.
+
+| Variable | Purpose | Required in production |
+| --- | --- | --- |
+| `API_PORT` | Port the API listens on (default 8080) | No (default works) |
+| `CORS_ORIGINS` | Comma-separated browser origins allowed to call the API (Wave 20) | **Yes** — set to the deployed web origin; unset allows only `http://localhost:3000` |
+| `DATABASE_URL` | Postgres connection string; migrations auto-apply on startup | **Yes** (compose rewrites it to the `postgres` service) |
+| `REDIS_URL` | Placeholder for the worker's planned queue | No — nothing connects yet |
+| `JWT_SECRET` | HMAC secret for auth tokens | **Yes** — unset falls back to a public DEV-ONLY secret (loud warning) and anyone can forge tokens |
+| `APP_ENV` / `SMS_DEV_MODE` | Dev mode: log SMS sender + `dev_otp` in responses | **Must be off** — `APP_ENV` must not be `dev` and `SMS_DEV_MODE` must not be `true`, or OTP codes are public |
+| `COMMISSION_RATE_BPS` | Startup commission fallback (admin settings override it) | No |
+| `ADVANCE_PERCENT_BPS` / `ADVANCE_THRESHOLD_POISHA` | Startup COD-advance fallback (admin settings override) | No |
+| `NEXT_PUBLIC_API_BASE_URL` | API origin baked into the browser bundle at web build time | **Yes** for the web image — the public API origin |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Compose Postgres credentials (defaults match the dev database) | **Yes** — change the password from the dev default |
+| `S3_ENDPOINT` / `S3_BUCKET` / `S3_ACCESS_KEY` / `S3_SECRET_KEY` | Object storage placeholders | No — not wired to any code yet |
+| `SMS_API_KEY` / `SMS_SENDER_ID` | Real SMS gateway credentials | Not yet — no real gateway exists (see the checklist) |
+| `STEADFAST_API_KEY` / `STEADFAST_SECRET_KEY` / `STEADFAST_BASE_URL` | Steadfast merchant credentials + optional sandbox base URL | For live Steadfast bookings |
+| `DEFAULT_COURIER` | Courier sellers get by default | No |
+| `PATHAO_CLIENT_ID` / `PATHAO_CLIENT_SECRET` / `PATHAO_STORE_ID` / `PATHAO_BASE_URL` | Pathao merchant credentials + optional base URL | For live Pathao bookings |
+| `REDX_API_KEY` / `REDX_BASE_URL` | RedX access token + optional base URL | For live RedX bookings |
+| `ECOURIER_API_KEY` / `ECOURIER_USER_ID` / `ECOURIER_BASE_URL` | eCourier credentials + optional base URL | For live eCourier bookings |
+| `PAPERFLY_USERNAME` / `PAPERFLY_PASSWORD` / `PAPERFLY_KEY` / `PAPERFLY_PICKUP_NAME` / `PAPERFLY_PICKUP_PHONE` / `PAPERFLY_PICKUP_ADDRESS` / `PAPERFLY_BASE_URL` | Paperfly credentials, platform pickup point + optional base URL | For live Paperfly bookings |
+| `BKASH_APP_KEY` / `BKASH_APP_SECRET` | bKash merchant credentials | For bKash availability at checkout |
+| `NAGAD_MERCHANT_ID` / `NAGAD_API_KEY` | Nagad merchant credentials | For Nagad availability |
+| `SSLCOMMERZ_STORE_ID` / `SSLCOMMERZ_STORE_PASSWORD` | SSLCommerz store credentials | For SSLCommerz availability |
+| `SHURJOPAY_USERNAME` / `SHURJOPAY_PASSWORD` | ShurjoPay credentials | For ShurjoPay availability |
+| `PAYMENTS_DEV_MODE` / `PAYMENTS_DEV_SECRET` | DEV payment simulator (local/CI only) | **Must be off** — simulated payments are not real money |
+| `COURIER_DEV_MODE` | DEV courier simulator (local/CI only) | **Must be off** — simulated shipments are not real bookings |
+| `FACEBOOK_APP_ID` / `FACEBOOK_APP_SECRET` | Meta app credentials (presence only is read) | For the Graph API status to report configured |
+| `SIDRA_API_URL` / `SIDRA_WEBHOOK_SECRET` | SIDRA bridge endpoint + shared HMAC secret (both or neither) | For the AI salesperson bridge |
+
+### Production checklist
+
+- [ ] `JWT_SECRET` set to a long random value (never the
+  dev fallback).
+- [ ] Dev modes OFF: `APP_ENV` is not `dev`,
+  `SMS_DEV_MODE=false`, `PAYMENTS_DEV_MODE=false`,
+  `COURIER_DEV_MODE=false`. Verify from the startup
+  `config summary:` line, which prints all three flags.
+- [ ] `POSTGRES_PASSWORD` changed from the dev default.
+- [ ] `CORS_ORIGINS` set to the deployed web origin, and the
+  web image rebuilt with `NEXT_PUBLIC_API_BASE_URL` pointing
+  at the public API origin.
+- [ ] Merchant credentials filled for every courier and
+  payment gateway the launch actually offers (the config
+  summary counts them: x/4 gateways, x/5 couriers). Methods
+  without credentials stay honestly unavailable.
+- [ ] `SIDRA_API_URL` + `SIDRA_WEBHOOK_SECRET` set if the AI
+  salesperson is part of the launch.
+- [ ] **SMS is still dev-only — this is the biggest launch
+  blocker.** There is no real SMS gateway yet: outside dev
+  mode, request-otp returns a typed 503 instead of sending a
+  code, so phone login cannot work in production until a
+  Bangladeshi SMS gateway is wired into the `SmsSender`
+  trait. Do not "fix" this by enabling dev mode — that
+  publishes the OTP codes.
+- [ ] TLS termination is deployment-side: neither the API
+  nor the Next.js server terminates HTTPS. Put a reverse
+  proxy in front, e.g. Caddy on the host:
+
+  ```caddyfile
+  marketplace.example.com {
+      reverse_proxy localhost:3000
+  }
+  api.marketplace.example.com {
+      reverse_proxy localhost:8080
+  }
+  ```
+
+  (and then `CORS_ORIGINS=https://marketplace.example.com`
+  and the web image built with
+  `NEXT_PUBLIC_API_BASE_URL=https://api.marketplace.example.com`).
+
+### Honest limits
+
+- **Backups are on you.** The compose stack keeps data in a
+  named Docker volume; there is no managed backup, snapshot
+  schedule or restore drill in this repository.
+- **One host, one replica.** No horizontal-scaling story:
+  the API keeps no in-memory session state (JWT + Postgres),
+  so it *could* be replicated behind a load balancer, but
+  that topology is untested and the web/worker services are
+  single-instance here.
+- **The worker still does no jobs.** It logs its planned
+  jobs (courier status polling, payout jobs, notifications,
+  COD reconciliation) and exits cleanly; automatic courier
+  polling in particular does not exist yet — sellers refresh
+  tracking through the API.
+- **Live gateway calls are still not implemented** (see the
+  Scope section): configured payment adapters report
+  NotImplemented honestly, so "credentials set" does not yet
+  mean "can charge".
+
 ## Scope — what is real, stubbed and TODO
 
 **Real (Wave 1):** domain functions + unit tests (delivery charge, cart
@@ -1685,6 +1843,32 @@ consignment and its later replacement, public tracking, and
 page manual booking group, status buttons and receipt edit,
 and the public tracking view's manual courier line.
 
+**Real (Wave 20):** deployment readiness — `Dockerfile.api`
+and `Dockerfile.worker` (multi-stage Rust 1.100 builds, slim
+non-root runtimes; migrations are embedded at compile time
+by `sqlx::migrate!`, so no runtime copy exists or is
+needed), `apps/web/Dockerfile` (Next.js standalone output —
+`output: "standalone"` in `next.config.js` — with
+`NEXT_PUBLIC_API_BASE_URL` as a build argument), the root
+`docker-compose.yml` deployment stack (Postgres 16 with a
+healthcheck and no published port, API, worker, web, and a
+profile-gated unused Redis), `.dockerignore` files, and a CI
+`docker` job that builds all three images on every push;
+the API hardening — `GET /health/ready` (a real `SELECT 1`
+readiness probe next to the `/health` liveness check), the
+permissive CORS layer replaced by the `CORS_ORIGINS` origin
+list on `AppState` (default: the local Next.js dev origin),
+graceful shutdown on SIGTERM/SIGINT, and the non-secret
+startup `config summary:` line; an integration test
+(`crates/api/tests/wave20.rs`, same `DATABASE_URL` gate)
+covering readiness with and without a pool and the CORS
+default/replaced origin behaviour; and the Deployment
+section above (stack architecture, the full environment
+table, the production checklist, the Caddy TLS example, and
+the honest limits). Docker is not installed on the
+development machine, so the image builds are verified by
+the CI `docker` job, not locally.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters, and the four manual couriers run
@@ -1726,7 +1910,11 @@ the external service at the other end of it, configured by
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
   (including the Wave 13 messaging endpoints), and the SIDRA
   callback answers 503 without a database.
-- **Rust integration + clippy: CI-only** — the Wave 2–19 integration
+- **Rust integration + clippy: CI-only** — the Wave 2–20 integration
   tests against a real Postgres 16 service and clippy `-D warnings`
   are verified via **GitHub Actions CI** (`.github/workflows/ci.yml`)
-  on push. Waves 1–18 are green there; Wave 19 awaits its first CI run.
+  on push. Waves 1–19 are green there; Wave 20 awaits its first CI run.
+- **Docker images: CI-only** — Docker is not installed on the
+  development machine, so `Dockerfile.api`, `Dockerfile.worker`
+  and `apps/web/Dockerfile` are verified by the CI `docker` job
+  (build only, no registry push), never locally.

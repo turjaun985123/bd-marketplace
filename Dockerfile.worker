@@ -1,0 +1,24 @@
+# BD Marketplace worker (Rust) — Wave 20 deployment image.
+#
+# The worker is its own binary crate (crates/worker), so it gets
+# its own image rather than sharing the API's: the two scale and
+# restart independently, and this runtime needs no CA bundle
+# yet (the Wave 1 worker makes no network calls).
+#
+# Honest status: the worker currently logs its planned jobs and
+# exits cleanly — no queue is connected. The image exists so the
+# deployment shape is complete and CI-verified before the jobs
+# land; see the README Deployment section.
+
+FROM rust:1.100-bookworm AS builder
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY migrations ./migrations
+RUN cargo build --release -p worker
+
+FROM debian:bookworm-slim AS runtime
+RUN useradd --system --create-home --uid 10001 appuser
+COPY --from=builder /app/target/release/worker /usr/local/bin/bd-marketplace-worker
+USER appuser
+CMD ["bd-marketplace-worker"]

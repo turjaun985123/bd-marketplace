@@ -1,0 +1,3 @@
+# Placeholder so the directory exists: the web Dockerfile copies
+# public/ into the standalone runtime image. Real static assets
+# (favicons, images) land here in later waves.

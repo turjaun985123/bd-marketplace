@@ -101,6 +101,15 @@
 //! status move by hand, and the moves are checked against the
 //! same domain transition table and synced to the sub-order by
 //! the same shared sync function as courier-reported ones.
+//! Wave 20: deployment readiness — the permissive CORS layer
+//! is replaced by an explicit origin list (`CORS_ORIGINS`,
+//! defaulting to the local Next.js dev origin), `/health/ready`
+//! is a real readiness probe (it pings the database; `/health`
+//! stays the liveness check), the server shuts down gracefully
+//! on Ctrl-C / SIGTERM, and startup logs one non-secret config
+//! summary line. The deployable stack itself (Dockerfiles,
+//! root `docker-compose.yml`, the CI `docker` job) lives at
+//! the repository root — see the README Deployment section.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -130,7 +139,7 @@ pub mod stores;
 pub mod tracking;
 
 use axum::{
-    http::StatusCode,
+    http::{HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, patch, post, put},
     Json, Router,
@@ -142,10 +151,10 @@ use domain::{
     calculate_delivery_charge, compute_commission, split_cart_by_seller, CartItem,
     CommissionQuote, DeliveryZone, SellerSubOrder,
 };
-use ::payments::{GatewayConfig, PaymentsConfig};
+use ::payments::{GatewayConfig, PaymentMethod, PaymentsConfig};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 /// Shared application state. `pool` is `None` when the API was started
 /// without `DATABASE_URL` — DB endpoints must check via `require_pool`.
@@ -203,6 +212,13 @@ pub struct AppState {
     /// them messaging works as a plain human inbox and the SIDRA
     /// callback endpoint answers 503.
     pub sidra_config: SidraConfig,
+    /// Browser origins allowed to call the API (Wave 20). Read
+    /// from `CORS_ORIGINS` (comma-separated) in `from_env`; when
+    /// the variable is unset the list is just the local Next.js
+    /// dev origin ([`DEFAULT_CORS_ORIGIN`]). `build_app` turns
+    /// the list into the router's CORS layer — preflight answers
+    /// name exactly these origins, no wildcard.
+    pub cors_origins: Vec<String>,
 }
 
 /// SIDRA bridge configuration (Wave 13). See [`AppState::sidra_config`].
@@ -249,6 +265,11 @@ pub const DEFAULT_ADVANCE_PERCENT_BPS: u32 = 2_000;
 /// at or above this grand total collect an advance before shipping.
 pub const DEFAULT_ADVANCE_THRESHOLD_POISHA: i64 = 200_000;
 
+/// The one origin allowed by CORS when `CORS_ORIGINS` is not set
+/// (Wave 20): the local Next.js dev server. A real deployment
+/// sets `CORS_ORIGINS` to its deployed web origin(s).
+pub const DEFAULT_CORS_ORIGIN: &str = "http://localhost:3000";
+
 impl AppState {
     pub fn new(pool: Option<PgPool>, jwt_secret: String, sms_dev_mode: bool) -> Self {
         AppState {
@@ -262,6 +283,7 @@ impl AppState {
             couriers_config: CouriersConfig::default(),
             facebook_config: FacebookConfig::default(),
             sidra_config: SidraConfig::default(),
+            cors_origins: vec![DEFAULT_CORS_ORIGIN.to_string()],
         }
     }
 
@@ -291,6 +313,14 @@ impl AppState {
     /// secret, or deliberately unconfigured).
     pub fn with_sidra_config(mut self, sidra_config: SidraConfig) -> Self {
         self.sidra_config = sidra_config;
+        self
+    }
+
+    /// Replace the CORS origin list (used by `from_env` and by
+    /// tests that need a specific deployed origin). The list
+    /// REPLACES the default; it is never merged with it.
+    pub fn with_cors_origins(mut self, cors_origins: Vec<String>) -> Self {
+        self.cors_origins = cors_origins;
         self
     }
 
@@ -356,6 +386,7 @@ impl AppState {
         state.couriers_config = couriers_config_from_env();
         state.facebook_config = facebook_config_from_env();
         state.sidra_config = sidra_config_from_env();
+        state.cors_origins = cors_origins_from_env();
         state
     }
 
@@ -593,6 +624,63 @@ fn sidra_config_from_env() -> SidraConfig {
     config
 }
 
+/// Build the Wave 20 CORS origin list from the environment:
+/// `CORS_ORIGINS` is a comma-separated list of exact origins
+/// (scheme + host + port, e.g. `https://shop.example.com`).
+/// Unset, empty, or all-blank values fall back to the single
+/// local dev origin ([`DEFAULT_CORS_ORIGIN`]) — a deployment
+/// must name its real web origin here, because the browser
+/// blocks cross-origin calls from anywhere else.
+fn cors_origins_from_env() -> Vec<String> {
+    let origins: Vec<String> = match std::env::var("CORS_ORIGINS") {
+        Ok(raw) => raw
+            .split(',')
+            .map(|part| part.trim().to_string())
+            .filter(|part| !part.is_empty())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    if origins.is_empty() {
+        vec![DEFAULT_CORS_ORIGIN.to_string()]
+    } else {
+        origins
+    }
+}
+
+/// The router's CORS layer (Wave 20): preflight and response
+/// headers for exactly the configured origins — the Wave 1–19
+/// permissive layer is gone. Only the methods and headers the
+/// Next.js app actually uses are allowed. An entry that is not
+/// a valid header value is skipped with a warning rather than
+/// taking the whole API down over a typo.
+fn cors_layer(origins: &[String]) -> CorsLayer {
+    let parsed: Vec<HeaderValue> = origins
+        .iter()
+        .filter_map(|origin| match origin.parse::<HeaderValue>() {
+            Ok(value) => Some(value),
+            Err(_) => {
+                eprintln!(
+                    "WARNING: CORS origin '{origin}' is not a valid origin — ignoring it"
+                );
+                None
+            }
+        })
+        .collect();
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(parsed))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ])
+        .allow_headers([
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::CONTENT_TYPE,
+        ])
+}
+
 /// Run the embedded workspace migrations (SQLx migrate format, in
 /// `migrations/` at the workspace root) against a pool.
 pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
@@ -624,6 +712,33 @@ async fn health(
             "not configured"
         },
     })
+}
+
+/// Wave 20 readiness probe: unlike `/health` (liveness — the
+/// process is up), this answers whether the API can actually
+/// serve database-backed traffic right now. It runs a real
+/// `SELECT 1` against the pool: 200 `{"status": "ready"}` when
+/// the query succeeds, 503 when there is no pool or the query
+/// fails. Orchestrators (compose healthchecks, load balancers)
+/// should gate traffic on this, not on `/health`.
+async fn health_ready(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let db_ok = match state.pool.as_ref() {
+        Some(pool) => sqlx::query("SELECT 1").execute(pool).await.is_ok(),
+        None => false,
+    };
+    if db_ok {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "ready", "database": "ok" })),
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "status": "not ready", "database": "unavailable" })),
+        )
+    }
 }
 
 #[derive(Deserialize)]
@@ -675,8 +790,13 @@ async fn commission_quote(Json(req): Json<CommissionQuoteRequest>) -> Json<Commi
 /// Build the full router around a state. Used by `main` and by the
 /// integration tests (which drive it via tower oneshot, no TCP port).
 pub fn build_app(state: AppState) -> Router {
+    // Wave 20: the CORS layer is built from the state's origin
+    // list before the state moves into the router.
+    let cors = cors_layer(&state.cors_origins);
     Router::new()
         .route("/health", get(health))
+        // Wave 20 — readiness probe (pings the database).
+        .route("/health/ready", get(health_ready))
         // Wave 1 — stateless domain calls.
         .route("/v1/delivery-charge", post(delivery_charge))
         .route("/v1/cart/split", post(split_cart))
@@ -959,8 +1079,80 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/admin/return-requests/:id/refund-done",
             post(returns::refund_done_handler),
         )
-        .layer(CorsLayer::permissive())
+        .layer(cors)
         .with_state(state)
+}
+
+/// One startup log line (Wave 20) summarising the EFFECTIVE
+/// configuration without printing a single secret value: which
+/// dev modes are on, how many payment gateways and couriers
+/// carry complete merchant credentials, whether the SIDRA
+/// bridge and the Facebook app are configured, the CORS origin
+/// count, and the money policy fallbacks. Operators verify a
+/// deployment from this line instead of inspecting the process
+/// environment.
+fn log_config_summary(state: &AppState) {
+    let gateways_configured = [
+        PaymentMethod::Bkash,
+        PaymentMethod::Nagad,
+        PaymentMethod::SslCommerz,
+        PaymentMethod::ShurjoPay,
+    ]
+    .iter()
+    .filter(|method| state.payments_config.credentials_present(**method))
+    .count();
+    let couriers_live = ["steadfast", "pathao", "redx", "ecourier", "paperfly"]
+        .iter()
+        .filter(|name| {
+            shipments::courier_availability_entry(name, &state.couriers_config)
+                .mode
+                .as_deref()
+                == Some("live")
+        })
+        .count();
+    println!(
+        "config summary: sms_dev_mode={} payments_dev_mode={} couriers_dev_mode={} \
+         payment gateways configured={}/4 couriers live={}/5 sidra_configured={} \
+         facebook_app_configured={} cors_origins={} commission={}bps \
+         advance={}bps at/above {} poisha",
+        state.sms_dev_mode,
+        state.payments_config.dev_mode,
+        state.couriers_config.dev_mode,
+        gateways_configured,
+        couriers_live,
+        state.sidra_config.configured(),
+        state.facebook_config.graph_api_configured(),
+        state.cors_origins.len(),
+        state.commission_rate_bps,
+        state.advance_percent_bps,
+        state.advance_threshold_poisha,
+    );
+}
+
+/// Resolve when the process is asked to stop (Wave 20): Ctrl-C
+/// on any platform, plus SIGTERM on Unix — what Docker and
+/// systemd send. `axum::serve` then stops accepting new
+/// connections and drains the in-flight ones.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install the Ctrl-C handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install the SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    println!("shutdown signal received — draining in-flight requests");
 }
 
 /// Connect to Postgres (when configured), migrate, and serve. Called by
@@ -987,6 +1179,7 @@ pub async fn run() {
     };
 
     let state = AppState::from_env(pool);
+    log_config_summary(&state);
     let port: u16 = std::env::var("API_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -997,6 +1190,7 @@ pub async fn run() {
         .expect("failed to bind API listener");
     println!("bd-marketplace api listening on {addr}");
     axum::serve(listener, build_app(state))
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("API server error");
 }

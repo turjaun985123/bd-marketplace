@@ -1,0 +1,10 @@
+# Build context exclusions for the root-context images
+# (Dockerfile.api, Dockerfile.worker). Nothing here may exclude
+# crates/, migrations/, Cargo.toml or Cargo.lock — the builds
+# need all of them.
+.git
+target
+node_modules
+apps/web/node_modules
+apps/web/.next
+.env

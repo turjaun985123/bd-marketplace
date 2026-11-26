@@ -52,3 +52,19 @@ jobs:
         run: |
           npm ci
           npm run build
+
+  # Wave 20: the deployment images must always build. Build only
+  # — nothing is pushed to a registry from CI.
+  docker:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build API image
+        run: docker build -f Dockerfile.api -t bd-marketplace-api .
+      - name: Build worker image
+        run: docker build -f Dockerfile.worker -t bd-marketplace-worker .
+      - name: Build web image
+        run: >-
+          docker build -f apps/web/Dockerfile
+          --build-arg NEXT_PUBLIC_API_BASE_URL=http://localhost:8080
+          -t bd-marketplace-web apps/web

@@ -1,0 +1,101 @@
+# BD Marketplace — the deployable stack (Wave 20).
+#
+#   cp .env.example .env    # then replace EVERY dev default —
+#                            # see the production checklist in
+#                            # the README Deployment section
+#   docker compose up --build
+#
+# Services: Postgres 16, the Rust API, the Rust worker and the
+# Next.js web app, wired on the compose network. (The older
+# infra/docker-compose.yml is a different thing: a lightweight
+# local-dev services file — Postgres/Redis/MinIO only — for
+# running cargo and next directly on a developer machine.)
+#
+# Configuration: the API and worker read the SAME .env file the
+# local flow uses (env_file below). DATABASE_URL is the one
+# deliberate override — inside the api container "localhost" is
+# the container itself, so compose rewrites it to reach the
+# postgres service, using the POSTGRES_* values (set them in
+# .env for a real deployment; the defaults match .env.example's
+# dev database).
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-marketplace}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-marketplace_dev_only}
+      POSTGRES_DB: ${POSTGRES_DB:-marketplace}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-marketplace}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # Deliberately NOT published: only the api/worker services
+    # talk to the database, over the compose network. Uncomment
+    # for local debugging only.
+    # ports:
+    #   - "5432:5432"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-marketplace}:${POSTGRES_PASSWORD:-marketplace_dev_only}@postgres:5432/${POSTGRES_DB:-marketplace}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${API_PORT:-8080}:8080"
+    # Readiness is observable at GET /health/ready (Wave 20);
+    # gate real traffic on it, not on the /health liveness check.
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-marketplace}:${POSTGRES_PASSWORD:-marketplace_dev_only}@postgres:5432/${POSTGRES_DB:-marketplace}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Honest status: the Wave 1 worker logs its planned jobs and
+    # exits cleanly, so this container starts, logs and stops
+    # until real jobs land in a later wave. No restart policy is
+    # set on purpose — a crash-loop would only hide that.
+
+  web:
+    build:
+      context: apps/web
+      dockerfile: Dockerfile
+      args:
+        # Baked into the browser bundle at build time (Next.js
+        # inlines NEXT_PUBLIC_*): this is the origin BROWSERS
+        # use to reach the API, so on a single-host deployment
+        # it is the host's public API origin, not a container
+        # name. Changing it requires a rebuild of this service.
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8080}
+    depends_on:
+      - api
+    ports:
+      - "3000:3000"
+
+  # OPTIONAL and unused today: nothing in the codebase connects
+  # to Redis yet — REDIS_URL in .env.example is a placeholder
+  # for the worker's planned queue. Redis stays behind the
+  # "future" profile so a plain `docker compose up` never
+  # starts it; opt in explicitly when a wave actually wires it:
+  #   docker compose --profile future up
+  redis:
+    image: redis:7-alpine
+    profiles: ["future"]
+
+volumes:
+  postgres_data:
