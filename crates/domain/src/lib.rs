@@ -3163,18 +3163,18 @@ pub fn variant_final_price(base_poisha: i64, delta_poisha: i64) -> Option<i64> {
 // the rows, hashes the secrets and enforces everything)
 // ---------------------------------------------------------------------------
 
-/// API keys (Wave 37) are the long-lived bearer credentials
-/// external apps authenticate with — a future mobile app, a
-/// seller's own integration — in place of the 7-day JWT a
-/// human login issues. A key belongs to ONE user and acts as
-/// that user, narrowed by its scopes. Only the SHA-256 hash
-/// of a key is ever stored (the hashing itself lives in the
-/// API crate, beside the OTP hashing it mirrors); the full
-/// key is shown exactly once, at creation. The rules in this
-/// section are the pure vocabulary the API enforces: what a
-/// key may be named, which scope sets are legal, what a scope
-/// set permits, how long a key may live, and which part of a
-/// key is safe to display.
+// API keys (Wave 37) are the long-lived bearer credentials
+// external apps authenticate with — a future mobile app, a
+// seller's own integration — in place of the 7-day JWT a
+// human login issues. A key belongs to ONE user and acts as
+// that user, narrowed by its scopes. Only the SHA-256 hash
+// of a key is ever stored (the hashing itself lives in the
+// API crate, beside the OTP hashing it mirrors); the full
+// key is shown exactly once, at creation. The rules in this
+// section are the pure vocabulary the API enforces: what a
+// key may be named, which scope sets are legal, what a scope
+// set permits, how long a key may live, and which part of a
+// key is safe to display.
 
 /// The longest name an API key may carry (Wave 37): a label
 /// the owner picks to recognise the key later ("Mobile app",
