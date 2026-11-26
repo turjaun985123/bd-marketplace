@@ -880,6 +880,59 @@ buyer who burned other platforms starts here with a clean
 record. The shield never blocks an order outright; it only
 prices the risk into an advance.
 
+Wave 18 (storefront themes & store branding):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| PUT | `/v1/seller/store/branding` | Bearer, store owner (a user without a store gets the usual 404). Sets the caller's own store branding; returns the shared store view. The public `GET /v1/stores/{slug}` view carries the same fields, so the storefront renders from the one shape |
+
+**The branding fields (migration 0020):** `theme_key`
+(`classic` until the seller picks one), `brand_color`,
+`logo_url`, `banner_url` and `announcement` are new columns
+on `stores`; the store `description` from migration 0002 is
+reused, not re-added. Every value is written through the
+pure domain validators (`validate_theme_key`,
+`validate_hex_color`, `validate_branding_url`,
+`validate_announcement`, `validate_store_description`): a
+theme is one of the three keys exactly; a colour is `#RRGGBB`
+and is stored normalized to UPPERCASE (`#ff5722` comes back
+`#FF5722`); an image URL must be an absolute `http(s)` URL of
+at most 500 characters with no spaces; an announcement is at
+most 120 characters and a description at most 1,000, both
+counted in Unicode characters, not bytes, so Bangla text is
+measured by what a visitor reads. An invalid write is a 400
+and changes nothing.
+
+**The write convention** is the codebase's PATCH convention
+(the one product updates use): a field absent from the body —
+or sent as JSON `null` — keeps its stored value; a field
+sent as a string is validated and stored; for the nullable
+fields an empty string CLEARS the value back to null (the
+validators' blank-to-`None` normalization). `theme_key` is
+NOT NULL: it can be changed but never cleared.
+
+**The three themes** are layout variants of ONE shared
+storefront view (`StorefrontView`), not three pages:
+`classic` is the pre-Wave-18 look (banner image when set,
+logo beside the store name, the standard product grid);
+`minimal` drops the banner, shrinks and mutes the header,
+and lists products as compact rows; `bold` enlarges the
+banner and the store name and renders products as oversized
+cards in a two-column grid. The brand colour is an accent
+only — it paints the announcement bar and, through a
+`--store-accent` CSS variable scoped to the storefront, the
+button borders inside it.
+
+**Limits (stated, not hidden):** image URLs are HOTLINKED —
+there is no image upload or storage yet, so a logo or banner
+lives wherever the seller hosts it and disappears if that
+host drops it. The colour is a single accent, not a theme
+editor: no seller CSS, HTML or layout code is accepted
+anywhere, by design — branding values are data the platform
+renders, never markup a seller injects. The marketplace
+home has no public store listing (products only), so logos
+appear on the storefront itself, not on marketplace cards.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -1516,6 +1569,31 @@ lines, the seller orders risk badge + advance warnings, the
 seller dashboard buyer-risk lookup, and the two new admin
 settings fields.
 
+**Real (Wave 18):** storefront themes & store branding —
+migration 0020 (the `theme_key` / `brand_color` / `logo_url`
+/ `banner_url` / `announcement` columns on `stores`, the
+existing `description` reused); the pure domain branding
+validators (exact theme keys, `#RRGGBB` normalized to
+uppercase, absolute http(s) image URLs ≤ 500 chars,
+announcement ≤ 120 and description ≤ 1,000 Unicode
+characters); `PUT /v1/seller/store/branding` on the caller's
+own store under the codebase PATCH convention (absent keeps,
+blank clears a nullable field, invalid is a 400 that changes
+nothing), with the shared store view — public storefront
+included — carrying the branding fields; an integration
+test (`crates/api/tests/wave18.rs`, same `DATABASE_URL`
+gate) covering the defaults, the full write + public read,
+the uppercase normalization, every 400 shape, the
+partial-write and blank-clear semantics, cross-seller
+isolation, and the storeless 404 / anonymous 401; the
+Next.js shared `StorefrontView` rendering all three themes
+(classic / minimal / bold) from the one component with the
+brand colour as a scoped accent, the variant-aware shared
+`ProductGrid` / `ProductCard`, the seller `/seller/branding`
+page (theme cards, colour picker + hex, URL previews,
+char-counted announcement and description), and a branding
+link on the seller dashboard.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters. Manual Phase 2 couriers (Sundarban,
@@ -1547,16 +1625,16 @@ the external service at the other end of it, configured by
   /seller/import; Wave 13 adds /messages, /messages/[id] and
   /seller/inbox; Wave 14 adds /seller/coupons and /admin/coupons;
   Wave 15 adds /search; Wave 16 adds /track, /seller/returns and
-  /admin/returns).
+  /admin/returns; Wave 18 adds /seller/branding).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
-  (domain 68, courier 31, payments 8 unit tests; the `DATABASE_URL`-
+  (domain 75, courier 31, payments 8 unit tests; the `DATABASE_URL`-
   gated integration tests skip cleanly without a database). The API
   binary was also smoke-tested locally without a database: routes
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
   (including the Wave 13 messaging endpoints), and the SIDRA
   callback answers 503 without a database.
-- **Rust integration + clippy: CI-only** — the Wave 2–17 integration
+- **Rust integration + clippy: CI-only** — the Wave 2–18 integration
   tests against a real Postgres 16 service and clippy `-D warnings`
   are verified via **GitHub Actions CI** (`.github/workflows/ci.yml`)
-  on push. Waves 1–16 are green there; Wave 17 awaits its first CI run.
+  on push. Waves 1–17 are green there; Wave 18 awaits its first CI run.

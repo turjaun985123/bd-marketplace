@@ -9,7 +9,10 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use domain::is_valid_slug;
+use domain::{
+    is_valid_slug, validate_announcement, validate_branding_url, validate_hex_color,
+    validate_store_description, validate_theme_key,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
@@ -27,7 +30,11 @@ use crate::{ApiError, AppState};
 /// module). `sidra_auto_reply` (Wave 13) is the store's SIDRA
 /// mode: when true, SIDRA's AI replies enter the conversation
 /// directly; when false, they wait as suggestions for the seller
-/// (see the `messaging` module).
+/// (see the `messaging` module). The Wave 18 branding fields
+/// (`theme_key`, `brand_color`, `logo_url`, `banner_url`,
+/// `announcement`) are the storefront's look — validated values
+/// only, never seller-supplied markup (see
+/// [`update_store_branding_for_owner`]).
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct Store {
     pub id: Uuid,
@@ -39,23 +46,32 @@ pub struct Store {
     pub facebook_page_id: Option<String>,
     pub facebook_page_name: Option<String>,
     pub sidra_auto_reply: bool,
+    pub theme_key: String,
+    pub brand_color: Option<String>,
+    pub logo_url: Option<String>,
+    pub banner_url: Option<String>,
+    pub announcement: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
 const INSERT_STORE_SQL: &str = "INSERT INTO stores (owner_user_id, slug, name, description) \
     VALUES ($1, $2, $3, $4) \
     RETURNING id, owner_user_id, slug, name, description, status, \
-    facebook_page_id, facebook_page_name, sidra_auto_reply, created_at";
+    facebook_page_id, facebook_page_name, sidra_auto_reply, \
+    theme_key, brand_color, logo_url, banner_url, announcement, created_at";
 const SELECT_STORE_BY_SLUG_SQL: &str =
     "SELECT id, owner_user_id, slug, name, description, status, \
-     facebook_page_id, facebook_page_name, sidra_auto_reply, created_at \
+     facebook_page_id, facebook_page_name, sidra_auto_reply, \
+     theme_key, brand_color, logo_url, banner_url, announcement, created_at \
      FROM stores WHERE slug = $1";
 const SELECT_STORE_BY_ID_SQL: &str =
     "SELECT id, owner_user_id, slug, name, description, status, \
-     facebook_page_id, facebook_page_name, sidra_auto_reply, created_at \
+     facebook_page_id, facebook_page_name, sidra_auto_reply, \
+     theme_key, brand_color, logo_url, banner_url, announcement, created_at \
      FROM stores WHERE id = $1";
 const SELECT_STORE_BY_OWNER_SQL: &str = "SELECT id, owner_user_id, slug, name, description, \
-    status, facebook_page_id, facebook_page_name, sidra_auto_reply, created_at \
+    status, facebook_page_id, facebook_page_name, sidra_auto_reply, \
+    theme_key, brand_color, logo_url, banner_url, announcement, created_at \
     FROM stores WHERE owner_user_id = $1 ORDER BY created_at ASC LIMIT 1";
 
 /// Create a store for the authenticated user. Validates the slug with
@@ -141,6 +157,92 @@ pub async fn get_store_by_id(pool: &PgPool, id: Uuid) -> Result<Store, ApiError>
         .ok_or_else(|| ApiError::not_found("store not found"))
 }
 
+/// One branding write: every field is optional, following the
+/// codebase's PATCH convention (the same one product updates
+/// use). A field ABSENT from the JSON body — or sent as JSON
+/// `null`, which deserializes identically — leaves the stored
+/// value unchanged. A field sent as a string is validated by
+/// the pure domain validators and stored; for the nullable
+/// fields (`brand_color`, `logo_url`, `banner_url`,
+/// `announcement`, `description`) an empty or whitespace-only
+/// string CLEARS the field back to NULL — that is the domain
+/// validators' blank-to-`None` normalization doing the clearing,
+/// and it is the one supported way to remove a logo, a banner,
+/// a colour or a text. `theme_key` is NOT NULL, so it can be
+/// changed but never cleared (a blank theme is a 400).
+#[derive(Debug, Deserialize)]
+pub struct UpdateBrandingRequest {
+    pub theme_key: Option<String>,
+    pub brand_color: Option<String>,
+    pub logo_url: Option<String>,
+    pub banner_url: Option<String>,
+    pub announcement: Option<String>,
+    pub description: Option<String>,
+}
+
+/// Update the branding of the caller's own store (their
+/// earliest-created store, via [`get_store_by_owner`] — the same
+/// scoping the Facebook link and SIDRA toggle use). Every
+/// provided value passes its domain validator first, so an
+/// invalid write is a 400 and changes nothing; the merged row
+/// is then written in one UPDATE and returned as the shared
+/// store view.
+pub async fn update_store_branding_for_owner(
+    pool: &PgPool,
+    user: &AuthUser,
+    patch: UpdateBrandingRequest,
+) -> Result<Store, ApiError> {
+    let existing = get_store_by_owner(pool, user.user_id).await?;
+
+    let theme_key = match patch.theme_key.as_deref() {
+        Some(raw) => validate_theme_key(raw)
+            .map_err(ApiError::bad_request)?
+            .to_string(),
+        None => existing.theme_key.clone(),
+    };
+    // A provided blank colour clears the accent; a provided
+    // non-blank one must be a real #RRGGBB (the validator
+    // normalizes it to uppercase for storage).
+    let brand_color = match patch.brand_color.as_deref() {
+        Some(raw) if raw.trim().is_empty() => None,
+        Some(raw) => Some(validate_hex_color(raw).map_err(ApiError::bad_request)?),
+        None => existing.brand_color.clone(),
+    };
+    let logo_url = match patch.logo_url.as_deref() {
+        Some(raw) => validate_branding_url(Some(raw)).map_err(ApiError::bad_request)?,
+        None => existing.logo_url.clone(),
+    };
+    let banner_url = match patch.banner_url.as_deref() {
+        Some(raw) => validate_branding_url(Some(raw)).map_err(ApiError::bad_request)?,
+        None => existing.banner_url.clone(),
+    };
+    let announcement = match patch.announcement.as_deref() {
+        Some(raw) => validate_announcement(Some(raw)).map_err(ApiError::bad_request)?,
+        None => existing.announcement.clone(),
+    };
+    let description = match patch.description.as_deref() {
+        Some(raw) => validate_store_description(Some(raw)).map_err(ApiError::bad_request)?,
+        None => existing.description.clone(),
+    };
+
+    sqlx::query(
+        "UPDATE stores SET theme_key = $2, brand_color = $3, logo_url = $4, \
+         banner_url = $5, announcement = $6, description = $7 WHERE id = $1",
+    )
+    .bind(existing.id)
+    .bind(&theme_key)
+    .bind(&brand_color)
+    .bind(&logo_url)
+    .bind(&banner_url)
+    .bind(&announcement)
+    .bind(&description)
+    .execute(pool)
+    .await
+    .map_err(|e| ApiError::internal("update store branding", e))?;
+
+    get_store_by_id(pool, existing.id).await
+}
+
 // ---------------------------------------------------------------------------
 // Handlers (thin)
 // ---------------------------------------------------------------------------
@@ -175,4 +277,15 @@ pub async fn get_store(
 ) -> Result<Json<Store>, ApiError> {
     let pool = state.require_pool()?;
     Ok(Json(get_store_by_slug(pool, &slug).await?))
+}
+
+pub async fn update_store_branding(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(req): Json<UpdateBrandingRequest>,
+) -> Result<Json<Store>, ApiError> {
+    let pool = state.require_pool()?;
+    Ok(Json(
+        update_store_branding_for_owner(pool, &user, req).await?,
+    ))
 }

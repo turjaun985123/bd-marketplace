@@ -1,13 +1,13 @@
-import MessageStoreButton from "@/components/MessageStoreButton";
-import ProductGrid from "@/components/ProductGrid";
-import SearchBar from "@/components/SearchBar";
+import StorefrontView from "@/components/StorefrontView";
 
 /**
- * Per-seller storefront: the store's own page, rendering the SAME
+ * Per-seller storefront: the store's own page, rendered by the
+ * ONE shared StorefrontView — the store's theme (Wave 18)
+ * selects a layout variant of it, and the products are the same
  * shared ProductGrid as the central marketplace (scoped to this
- * store) — the same products, cards, ratings and cart behaviour,
- * never a forked copy. In production this route group is also served
- * via subdomain rewrite, e.g. `{store}.shop.example.bd`.
+ * store): same products, cards, ratings and cart behaviour,
+ * never a forked copy. In production this route group is also
+ * served via subdomain rewrite, e.g. `{store}.shop.example.bd`.
  */
 export default function StorefrontPage({
   params,
@@ -16,15 +16,7 @@ export default function StorefrontPage({
 }) {
   return (
     <main>
-      <h1>স্টোর: {params.store}</h1>
-      <p>
-        এটি <strong>{params.store}</strong>-এর নিজস্ব স্টোরফ্রন্ট — একই পণ্য
-        কেন্দ্রীয় মার্কেটপ্লেসেও পাওয়া যায়।
-      </p>
-      <MessageStoreButton slug={params.store} />
-      <SearchBar storeSlug={params.store} />
-      <h2>পণ্য — Products</h2>
-      <ProductGrid storeSlug={params.store} />
+      <StorefrontView slug={params.store} />
     </main>
   );
 }

@@ -10,6 +10,13 @@ export interface ProductCardProps {
   /** Wave 8 rating summary; the rating line shows only when count > 0. */
   ratingAvg?: number | null;
   ratingCount?: number;
+  /**
+   * Wave 18 storefront theme variant: "card" (default, the
+   * marketplace look), "row" (minimal theme's compact list row),
+   * "large" (bold theme's oversized card). Same content, three
+   * presentations — the variant only changes the CSS class.
+   */
+  variant?: "card" | "row" | "large";
 }
 
 /**
@@ -24,9 +31,10 @@ export default function ProductCard({
   href,
   ratingAvg,
   ratingCount,
+  variant = "card",
 }: ProductCardProps) {
   return (
-    <article className="card">
+    <article className={variant === "card" ? "card" : `card card--${variant}`}>
       <h3>{href ? <Link href={href}>{name}</Link> : name}</h3>
       <p>{storeName}</p>
       <PriceTag amountPoisha={pricePoisha} />

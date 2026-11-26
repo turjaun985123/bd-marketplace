@@ -784,6 +784,13 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/seller/store/facebook",
             put(facebook::link_facebook_page).delete(facebook::unlink_facebook_page),
         )
+        // Wave 18 — store branding: theme, brand colour, logo /
+        // banner URLs and announcement for the seller's own
+        // store (validated values only, never markup).
+        .route(
+            "/v1/seller/store/branding",
+            put(stores::update_store_branding),
+        )
         .route("/v1/seller/facebook/status", get(facebook::facebook_status))
         .route(
             "/v1/seller/products/import-preview",

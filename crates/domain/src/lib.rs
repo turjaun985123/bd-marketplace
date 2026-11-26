@@ -1895,6 +1895,129 @@ pub fn phones_match_for_tracking(stored_phone: &str, supplied_phone: &str) -> bo
     }
 }
 
+// ---------------------------------------------------------------------------
+// Store branding (Wave 18)
+// ---------------------------------------------------------------------------
+
+/// The storefront theme keys a seller may pick. A theme is a
+/// LAYOUT choice for the storefront page, never seller-supplied
+/// markup: the web app renders exactly these three variants of
+/// the one shared storefront view, so a theme key can never
+/// smuggle CSS or HTML into the page.
+pub const THEME_KEYS: [&str; 3] = ["classic", "minimal", "bold"];
+
+/// The theme a store renders with until its seller picks one —
+/// also the database default (migration 0020).
+pub const DEFAULT_THEME_KEY: &str = "classic";
+
+/// Validate a storefront theme key: an exact match against
+/// [`THEME_KEYS`] (case-sensitive — keys are machine values, not
+/// display text). Returns the key itself on success so callers
+/// can store the validated value.
+pub fn validate_theme_key(key: &str) -> Result<&str, &'static str> {
+    if THEME_KEYS.contains(&key) {
+        Ok(key)
+    } else {
+        Err("theme_key must be one of: classic, minimal, bold")
+    }
+}
+
+/// Validate a brand accent colour: exactly `#RRGGBB` (a `#` plus
+/// six hex digits). Returns the colour normalized to UPPERCASE,
+/// so the stored value has one canonical spelling however the
+/// seller typed it (`#ff5722` and `#FF5722` are the same brand).
+pub fn validate_hex_color(raw: &str) -> Result<String, &'static str> {
+    let hex = raw.strip_prefix('#').unwrap_or("");
+    if raw.len() == 7 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(raw.to_uppercase())
+    } else {
+        Err("brand_color must be a hex colour like #FF5722")
+    }
+}
+
+/// Maximum length of a branding image URL, in characters.
+pub const MAX_BRANDING_URL_CHARS: usize = 500;
+
+/// Validate an optional branding image URL (store logo /
+/// banner). `None` and blank input are valid and normalize to
+/// `None` (no image). A present URL must be an absolute
+/// `http://` or `https://` URL of at most
+/// [`MAX_BRANDING_URL_CHARS`] characters with no whitespace —
+/// the web app hotlinks it into an `<img>` tag, so relative
+/// paths, other schemes (`ftp:`, `data:`, `javascript:`) and
+/// embedded spaces are all rejected here, at the one gate every
+/// write passes through.
+pub fn validate_branding_url(url: Option<&str>) -> Result<Option<String>, &'static str> {
+    let Some(raw) = url else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().count() > MAX_BRANDING_URL_CHARS {
+        return Err("image URL must be at most 500 characters");
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err("image URL must not contain spaces");
+    }
+    if !trimmed.starts_with("https://") && !trimmed.starts_with("http://") {
+        return Err("image URL must start with https:// or http://");
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+/// Maximum length of a store announcement, in characters.
+pub const MAX_ANNOUNCEMENT_CHARS: usize = 120;
+
+/// Validate an optional store announcement (the one-line banner
+/// text at the top of a storefront, e.g. an Eid offer). `None`
+/// and blank input normalize to `None` (no announcement). A
+/// present announcement is trimmed and may be at most
+/// [`MAX_ANNOUNCEMENT_CHARS`] characters, counted in Unicode
+/// characters, not bytes — Bangla text is multi-byte, and the
+/// limit is about how much a visitor reads, not storage size.
+pub fn validate_announcement(text: Option<&str>) -> Result<Option<String>, &'static str> {
+    validate_optional_text(text, MAX_ANNOUNCEMENT_CHARS, "announcement")
+}
+
+/// Maximum length of a store description, in characters.
+pub const MAX_STORE_DESCRIPTION_CHARS: usize = 1_000;
+
+/// Validate an optional store description. Same contract as
+/// [`validate_announcement`] with the larger
+/// [`MAX_STORE_DESCRIPTION_CHARS`] limit: `None` and blank
+/// normalize to `None`, a present text is trimmed and
+/// char-counted.
+pub fn validate_store_description(text: Option<&str>) -> Result<Option<String>, &'static str> {
+    validate_optional_text(text, MAX_STORE_DESCRIPTION_CHARS, "description")
+}
+
+/// The shared shape behind the optional-text validators: `None`
+/// and blank become `None`; a present value is trimmed, must fit
+/// `max_chars` Unicode characters, and is returned owned. The
+/// `label` only names the field in the error message.
+fn validate_optional_text(
+    text: Option<&str>,
+    max_chars: usize,
+    label: &'static str,
+) -> Result<Option<String>, &'static str> {
+    let Some(raw) = text else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().count() > max_chars {
+        return Err(match label {
+            "announcement" => "announcement must be at most 120 characters",
+            _ => "description must be at most 1000 characters",
+        });
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3372,5 +3495,107 @@ mod tests {
         assert!(!phones_match_for_tracking("+8801712345678", "12345"));
         assert!(!phones_match_for_tracking("+8801712345678", ""));
         assert!(!phones_match_for_tracking("not-a-phone", "01712345678"));
+    }
+
+    #[test]
+    fn theme_keys_are_exact_matches() {
+        assert_eq!(THEME_KEYS, ["classic", "minimal", "bold"]);
+        assert_eq!(DEFAULT_THEME_KEY, "classic");
+        for key in THEME_KEYS {
+            assert_eq!(validate_theme_key(key), Ok(key));
+        }
+        // Case, padding and unknown keys are all rejected: the key
+        // selects a layout variant, it is not free text.
+        assert!(validate_theme_key("Classic").is_err());
+        assert!(validate_theme_key(" classic").is_err());
+        assert!(validate_theme_key("fancy").is_err());
+        assert!(validate_theme_key("").is_err());
+    }
+
+    #[test]
+    fn hex_color_normalizes_to_uppercase() {
+        assert_eq!(validate_hex_color("#ff5722").unwrap(), "#FF5722");
+        assert_eq!(validate_hex_color("#FF5722").unwrap(), "#FF5722");
+        assert_eq!(validate_hex_color("#a1B2c3").unwrap(), "#A1B2C3");
+        assert_eq!(validate_hex_color("#000000").unwrap(), "#000000");
+    }
+
+    #[test]
+    fn hex_color_rejects_non_rrggbb_shapes() {
+        assert!(validate_hex_color("red").is_err());
+        assert!(validate_hex_color("FF5722").is_err()); // missing '#'
+        assert!(validate_hex_color("#12345").is_err()); // too short
+        assert!(validate_hex_color("#1234567").is_err()); // too long
+        assert!(validate_hex_color("#GGGGGG").is_err()); // not hex
+        assert!(validate_hex_color("#ff 722").is_err()); // space inside
+        assert!(validate_hex_color("").is_err());
+    }
+
+    #[test]
+    fn branding_url_accepts_absolute_http_urls() {
+        assert_eq!(validate_branding_url(None).unwrap(), None);
+        assert_eq!(validate_branding_url(Some("")).unwrap(), None);
+        assert_eq!(validate_branding_url(Some("   ")).unwrap(), None);
+        assert_eq!(
+            validate_branding_url(Some("https://example.com/logo.png")).unwrap(),
+            Some("https://example.com/logo.png".to_string())
+        );
+        assert_eq!(
+            validate_branding_url(Some("http://cdn.example.com/b.jpg")).unwrap(),
+            Some("http://cdn.example.com/b.jpg".to_string())
+        );
+        // Surrounding whitespace is trimmed before storing.
+        assert_eq!(
+            validate_branding_url(Some("  https://example.com/a.png  ")).unwrap(),
+            Some("https://example.com/a.png".to_string())
+        );
+        // Exactly at the cap is fine.
+        let at_cap = format!("https://e.co/{}", "a".repeat(MAX_BRANDING_URL_CHARS - 13));
+        assert_eq!(at_cap.chars().count(), MAX_BRANDING_URL_CHARS);
+        assert!(validate_branding_url(Some(&at_cap)).is_ok());
+    }
+
+    #[test]
+    fn branding_url_rejects_bad_shapes() {
+        assert!(validate_branding_url(Some("ftp://example.com/x.png")).is_err());
+        assert!(validate_branding_url(Some("example.com/x.png")).is_err());
+        assert!(validate_branding_url(Some("/images/x.png")).is_err());
+        assert!(validate_branding_url(Some("data:image/png;base64,AAAA")).is_err());
+        assert!(validate_branding_url(Some("https://exa mple.com/x.png")).is_err());
+        let over_cap = format!("https://e.co/{}", "a".repeat(MAX_BRANDING_URL_CHARS));
+        assert!(validate_branding_url(Some(&over_cap)).is_err());
+    }
+
+    #[test]
+    fn announcement_is_optional_trimmed_and_char_counted() {
+        assert_eq!(validate_announcement(None).unwrap(), None);
+        assert_eq!(validate_announcement(Some("")).unwrap(), None);
+        assert_eq!(validate_announcement(Some("   ")).unwrap(), None);
+        assert_eq!(
+            validate_announcement(Some("  ঈদের অফার চলছে!  ")).unwrap(),
+            Some("ঈদের অফার চলছে!".to_string())
+        );
+        // Bangla characters count as characters, not bytes: 120
+        // copies of a 3-byte character fit, 121 do not.
+        assert!(validate_announcement(Some(&"ক".repeat(MAX_ANNOUNCEMENT_CHARS))).is_ok());
+        assert!(validate_announcement(Some(&"ক".repeat(MAX_ANNOUNCEMENT_CHARS + 1))).is_err());
+        assert!(validate_announcement(Some(&"x".repeat(MAX_ANNOUNCEMENT_CHARS + 1))).is_err());
+    }
+
+    #[test]
+    fn store_description_shares_the_announcement_contract() {
+        assert_eq!(validate_store_description(None).unwrap(), None);
+        assert_eq!(validate_store_description(Some("")).unwrap(), None);
+        assert_eq!(
+            validate_store_description(Some("  সেরা পণ্যের দোকান  ")).unwrap(),
+            Some("সেরা পণ্যের দোকান".to_string())
+        );
+        assert!(
+            validate_store_description(Some(&"ক".repeat(MAX_STORE_DESCRIPTION_CHARS))).is_ok()
+        );
+        assert!(
+            validate_store_description(Some(&"ক".repeat(MAX_STORE_DESCRIPTION_CHARS + 1)))
+                .is_err()
+        );
     }
 }

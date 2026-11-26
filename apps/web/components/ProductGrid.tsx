@@ -17,8 +17,20 @@ import { useCart } from "@/hooks/useCart";
  *
  * ProductCard stays presentational: the add-to-cart button is wired
  * here, in the grid, through the shared useCart hook.
+ *
+ * Wave 18: `layout` picks the storefront theme's presentation —
+ * "grid" (default; the exact markup every existing page renders),
+ * "list" (minimal theme: compact rows) or "large" (bold theme:
+ * two-column oversized cards). Data, cart wiring and states are
+ * identical in all three; only wrapper/card classes change.
  */
-export default function ProductGrid({ storeSlug }: { storeSlug?: string }) {
+export default function ProductGrid({
+  storeSlug,
+  layout = "grid",
+}: {
+  storeSlug?: string;
+  layout?: "grid" | "list" | "large";
+}) {
   const { token } = useAuth();
   const { add, error: cartError } = useCart();
   const [products, setProducts] = useState<Product[] | null>(null);
@@ -68,7 +80,15 @@ export default function ProductGrid({ storeSlug }: { storeSlug?: string }) {
     );
   }
   return (
-    <div>
+    <div
+      className={
+        layout === "list"
+          ? "product-list"
+          : layout === "large"
+            ? "product-grid-large"
+            : undefined
+      }
+    >
       {cartError && <p role="alert">{cartError}</p>}
       {products.map((p) => (
         <div key={p.id}>
@@ -79,6 +99,9 @@ export default function ProductGrid({ storeSlug }: { storeSlug?: string }) {
             href={`/products/${p.id}`}
             ratingAvg={p.rating_avg}
             ratingCount={p.rating_count}
+            variant={
+              layout === "list" ? "row" : layout === "large" ? "large" : "card"
+            }
           />
           {token ? (
             <p>

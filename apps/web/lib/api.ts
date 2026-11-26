@@ -32,8 +32,24 @@ export interface Store {
    * conversation; false = they wait as seller-approved suggestions.
    */
   sidra_auto_reply: boolean;
+  /**
+   * Storefront theme (Wave 18): one of the StoreTheme keys —
+   * a layout variant of the shared storefront view, never markup.
+   */
+  theme_key: StoreTheme;
+  /** Brand accent colour, `#RRGGBB` uppercase, or null (Wave 18). */
+  brand_color: string | null;
+  /** Hotlinked logo image URL, or null (Wave 18). */
+  logo_url: string | null;
+  /** Hotlinked banner image URL, or null (Wave 18). */
+  banner_url: string | null;
+  /** One-line announcement shown atop the storefront, or null. */
+  announcement: string | null;
   created_at: string;
 }
+
+/** The three storefront layout variants (Wave 18). */
+export type StoreTheme = "classic" | "minimal" | "bold";
 
 export interface Product {
   id: string;
@@ -439,6 +455,35 @@ export function getMe(token: string): Promise<User> {
 /** GET /v1/stores/{slug} — public store profile (also resolves the id). */
 export function getStore(slug: string): Promise<Store> {
   return call(`/v1/stores/${encodeURIComponent(slug)}`);
+}
+
+/**
+ * Branding write body (Wave 18). Every field is optional and the
+ * API applies the codebase's PATCH convention: a field left out
+ * (or null) keeps its stored value; a field sent as a string is
+ * validated and stored; an empty string CLEARS a nullable field
+ * (brand_color, logo_url, banner_url, announcement, description)
+ * back to null. theme_key can be changed but never cleared.
+ */
+export interface UpdateBrandingInput {
+  theme_key?: StoreTheme;
+  brand_color?: string;
+  logo_url?: string;
+  banner_url?: string;
+  announcement?: string;
+  description?: string;
+}
+
+/** PUT /v1/seller/store/branding — update the caller's own store branding. */
+export function updateStoreBranding(
+  token: string,
+  input: UpdateBrandingInput
+): Promise<Store> {
+  return call("/v1/seller/store/branding", {
+    method: "PUT",
+    token,
+    body: input,
+  });
 }
 
 /** GET /v1/products — central marketplace listing (active products). */
