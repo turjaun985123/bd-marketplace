@@ -859,6 +859,7 @@ pub fn can_transition_payout(from: &str, to: &str) -> bool {
 ///   needs the account holder's name) and the account number must
 ///   be 6 to 24 ASCII letters or digits (bank account numbers carry
 ///   no checksum we can verify; shape is all we can check).
+///
 /// Any other method is rejected. Error strings are user-facing.
 pub fn validate_payout_account(
     method: &str,
