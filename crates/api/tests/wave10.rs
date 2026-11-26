@@ -687,4 +687,13 @@ async fn wave10_admin_panel_flow() {
     assert_eq!(list["total"], 1);
     assert_eq!(list["items"][0]["store_count"], 1);
     assert_eq!(list["items"][0]["role"], "seller");
+
+    // Cleanup: platform_settings is global state shared with the other
+    // wave test binaries (they run sequentially against one database).
+    // Leaving commission_bps=1000 behind would change every later
+    // checkout's commission, so remove the rows this test wrote.
+    sqlx::query("DELETE FROM platform_settings")
+        .execute(&pool)
+        .await
+        .expect("clean platform_settings");
 }
