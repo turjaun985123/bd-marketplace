@@ -335,6 +335,16 @@ async fn wave7_smart_routing_flow() {
     let estimates = body["estimates"].as_array().expect("estimates array");
     assert_eq!(estimates.len(), 9, "five API couriers + four manual (Wave 19): {body}");
     for estimate in estimates {
+        if estimate["mode"] == "manual" {
+            // Wave 19: manual couriers are always bookable at the
+            // counter; they are never price-estimated or recommended.
+            assert_eq!(estimate["available"], true, "manual estimate: {estimate}");
+            assert!(
+                estimate["price_poisha"].is_null(),
+                "manual couriers are not price-estimated: {estimate}"
+            );
+            continue;
+        }
         assert_eq!(estimate["available"], false, "prod estimate: {estimate}");
         assert_eq!(estimate["reason"], "not_configured", "prod estimate: {estimate}");
         assert!(
@@ -344,7 +354,7 @@ async fn wave7_smart_routing_flow() {
     }
     assert!(
         body["recommended"].is_null(),
-        "no recommendation when nothing is available: {body}"
+        "no API recommendation when no API courier is available: {body}"
     );
 
     let prod_sub_order_id = confirmed_sub_order(&prod_app, &seller, &buyer, &product).await;

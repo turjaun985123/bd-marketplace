@@ -303,6 +303,14 @@ async fn wave11_ecourier_paperfly_flow() {
                 estimate["price_poisha"], 6_000,
                 "local tariff price (inside Dhaka, 1 kg): {estimate}"
             );
+        } else if estimate["mode"] == "manual" {
+            // Wave 19: manual couriers are always bookable at the
+            // counter, but carry no estimated price.
+            assert_eq!(estimate["available"], true, "manual estimate: {estimate}");
+            assert!(
+                estimate["price_poisha"].is_null(),
+                "manual couriers are not price-estimated: {estimate}"
+            );
         } else {
             assert_eq!(estimate["available"], false, "other estimate: {estimate}");
             assert!(
