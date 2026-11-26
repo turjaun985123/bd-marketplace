@@ -270,7 +270,7 @@ async fn wave7_smart_routing_flow() {
     assert_eq!(body["zone"], "inside_dhaka");
     assert_eq!(body["weight_grams"], 1_000);
     let estimates = body["estimates"].as_array().expect("estimates array");
-    assert_eq!(estimates.len(), 5, "five known couriers: {body}");
+    assert_eq!(estimates.len(), 9, "five API couriers + four manual (Wave 19): {body}");
     for estimate in estimates {
         assert_eq!(estimate["available"], true, "dev estimate: {estimate}");
         assert_eq!(estimate["mode"], "dev", "dev estimate: {estimate}");
@@ -333,7 +333,7 @@ async fn wave7_smart_routing_flow() {
     .await;
     assert_eq!(status, StatusCode::OK, "prod estimates: {body}");
     let estimates = body["estimates"].as_array().expect("estimates array");
-    assert_eq!(estimates.len(), 5, "five known couriers: {body}");
+    assert_eq!(estimates.len(), 9, "five API couriers + four manual (Wave 19): {body}");
     for estimate in estimates {
         assert_eq!(estimate["available"], false, "prod estimate: {estimate}");
         assert_eq!(estimate["reason"], "not_configured", "prod estimate: {estimate}");

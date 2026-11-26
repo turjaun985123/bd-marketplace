@@ -294,7 +294,7 @@ async fn wave11_ecourier_paperfly_flow() {
     .await;
     assert_eq!(status, StatusCode::OK, "ecourier-only estimates: {body}");
     let estimates = body["estimates"].as_array().expect("estimates array");
-    assert_eq!(estimates.len(), 5, "five known couriers: {body}");
+    assert_eq!(estimates.len(), 9, "five API couriers + four manual (Wave 19): {body}");
     for estimate in estimates {
         if estimate["courier"] == "ecourier" {
             assert_eq!(estimate["available"], true, "ecourier estimate: {estimate}");

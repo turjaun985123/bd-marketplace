@@ -262,7 +262,7 @@ async fn wave6_courier_shipments_flow() {
     let (status, couriers) = call(&app, Method::GET, "/v1/couriers", None, None).await;
     assert_eq!(status, StatusCode::OK, "couriers: {couriers}");
     let courier_list = couriers.as_array().expect("couriers array");
-    assert_eq!(courier_list.len(), 5, "five known couriers: {couriers}");
+    assert_eq!(courier_list.len(), 9, "five API couriers + four manual (Wave 19): {couriers}");
     let steadfast = courier_list
         .iter()
         .find(|c| c["courier"] == "steadfast")
