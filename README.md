@@ -1283,6 +1283,44 @@ category signals: a catalogue with sparse categories
 gives sparse personalisation, and the fallback carries
 new users until they buy or save something.
 
+Wave 25 (product Q&A):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| POST | `/v1/products/{id}/questions` | Bearer. Ask a question on a product (3–500 chars). The product must be publicly visible (else 404); asking about your OWN store's product is a 400. 201 with the question |
+| GET | `/v1/products/{id}/questions?page=&limit=` | Public question list, newest first, paginated like every other list; hidden questions excluded; 404 when the product is not publicly visible |
+| POST | `/v1/seller/questions/{id}/answer` | Bearer, owner of the product's store only (anyone else: 404). Answer (1–1000 chars); answering again CORRECTS the answer on the same row |
+| POST | `/v1/seller/questions/{id}/hide` · `/unhide` | Bearer, same ownership rule. Set/clear the question's hidden flag |
+| POST | `/v1/admin/questions/{id}/hide` · `/unhide` | Admin. The same moderation write, behind the admin guard |
+| GET | `/v1/seller/questions?answered=false\|true\|all` | Bearer. The seller inbox across all their stores, newest first; default `false` (the work queue). Hidden questions are included and marked `is_hidden` |
+
+**The rules:** anyone signed in may ask — except about
+their own store's products, because sellers answer
+questions rather than seed them. Only the owner of the
+product's store may answer, and re-answering is a
+correction, not a second answer: there is exactly one
+answer per question, always the seller's latest word.
+Seller hide/unhide and admin hide/unhide are the same
+single write (`set_question_hidden`) behind two guards.
+A hidden question disappears from the public list AND
+from the dashboard's unanswered count (hiding is how a
+seller deals with spam — a dealt-with question must not
+keep nagging), but it stays in the seller inbox so the
+hide can be undone. The dashboard's
+`unanswered_questions` counter therefore counts questions
+that are unanswered AND not hidden. Asker identity is
+public only as a masked phone — the full number never
+leaves the API.
+
+**Honest limits:** there are no notifications in this
+wave. Sellers discover questions by opening the Q&A
+inbox or glancing at the dashboard counter; buyers get
+no ping when their question is answered — they see the
+answer by revisiting the product page. And there are no
+AI answers here by design: SIDRA answers store chat
+(Wave 13), but Q&A answers are public, permanent and
+signed by the store, so they stay human-written.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -2274,6 +2312,32 @@ product page, and the home page's personalised and
 device-local recently-viewed strips (localStorage only,
 never sent to the server).
 
+**Real (Wave 25):** product Q&A — migration 0026
+(`product_questions`: asker FK, answer fields on the same
+row, `is_hidden` moderation flag, product index); the
+domain body rules (`validate_question_body` — 3..=500
+chars returning the trimmed body; `validate_answer_body`
+— 1..=1000 chars); the `qna` API module (ask gated on the
+shared public-visibility rule plus the not-your-own-store
+400, the public list with masked asker display, owner-only
+answering where re-answering corrects, the ONE
+`set_question_hidden` write behind the seller-ownership
+and admin guards, the seller inbox with its
+answered/unanswered/all queues, and the
+`count_unanswered_questions` aggregate — unanswered AND
+not hidden — feeding the dashboard's new
+`unanswered_questions` field); an integration test
+(`crates/api/tests/wave25.rs`, same `DATABASE_URL` gate)
+covering the 400/404 ask rules, the masked-asker
+no-full-phone assertion, stranger-answer 404, answer +
+correction, inbox splits, seller and admin hide/unhide,
+and the dashboard count at every step; and the Next.js
+Q&A section on the product page (ask form for signed-in
+non-owners, an inbox pointer for the owner), the seller
+Q&A inbox at /seller/questions (filter queues, answer /
+correct forms, hide/unhide), and the dashboard's
+unanswered-questions strip and nav link.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters, and the four manual couriers run
@@ -2312,19 +2376,21 @@ the external service at the other end of it, configured by
   /seller/inventory and the dashboard low-stock strip;
   Wave 24 adds /wishlist, the product page's related +
   also-bought rails, and the home page's personalised +
-  recently-viewed strips).
+  recently-viewed strips; Wave 25 adds /seller/questions,
+  the product page's Q&A section, and the dashboard's
+  unanswered-questions strip).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
-  (domain 92, courier 31, payments 8 unit tests; the `DATABASE_URL`-
+  (domain 94, courier 31, payments 8 unit tests; the `DATABASE_URL`-
   gated integration tests skip cleanly without a database). The API
   binary was also smoke-tested locally without a database: routes
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
   (including the Wave 13 messaging endpoints), and the SIDRA
   callback answers 503 without a database.
-- **Rust integration + clippy: CI-only** — the Wave 2–24 integration
+- **Rust integration + clippy: CI-only** — the Wave 2–25 integration
   tests against a real Postgres 16 service and clippy `-D warnings`
   are verified via **GitHub Actions CI** (`.github/workflows/ci.yml`)
-  on push. Waves 1–23 are green there; Wave 24 awaits its first CI run.
+  on push. Waves 1–24 are green there; Wave 25 awaits its first CI run.
 - **Docker images: CI-only** — Docker is not installed on the
   development machine, so `Dockerfile.api`, `Dockerfile.worker`
   and `apps/web/Dockerfile` are verified by the CI `docker` job

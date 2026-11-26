@@ -9,11 +9,13 @@ import Stars from "@/components/Stars";
 import VerificationBadge from "@/components/VerificationBadge";
 import WishlistButton from "@/components/WishlistButton";
 import {
+  askQuestion,
   createConversation,
   createReview,
   deleteReview,
   getAlsoBought,
   getProduct,
+  getProductQuestions,
   getProductReviews,
   getRelatedProducts,
   getStore,
@@ -22,6 +24,7 @@ import {
   updateReview,
   type AlsoBoughtItem,
   type Product,
+  type ProductQuestion,
   type Review,
   type Store,
 } from "@/lib/api";
@@ -44,6 +47,11 @@ import { recordRecentlyViewed } from "@/hooks/useRecentlyViewed";
  * rail renders nothing while the product has no
  * co-purchases), and the device-local recently-viewed
  * recording.
+ *
+ * Wave 25: the Q&A section below the reviews — public
+ * questions with the seller's public answers. Signed-in
+ * non-owners ask here; the owner is pointed at the seller
+ * Q&A inbox instead (the API refuses own-store questions).
  */
 export default function ProductDetailPage({
   params,
@@ -67,6 +75,11 @@ export default function ProductDetailPage({
   const [formError, setFormError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
+  const [questions, setQuestions] = useState<ProductQuestion[] | null>(null);
+  const [questionBody, setQuestionBody] = useState("");
+  const [questionError, setQuestionError] = useState<string | null>(null);
+  const [questionSubmitting, setQuestionSubmitting] = useState(false);
+
   const reload = useCallback(async () => {
     const [p, list] = await Promise.all([
       getProduct(params.id, token),
@@ -74,6 +87,11 @@ export default function ProductDetailPage({
     ]);
     setProduct(p);
     setReviews(list.items);
+    // Wave 25: the public Q&A list — best-effort like the
+    // discovery rails, a failed read hides the section's list
+    // instead of breaking the page.
+    const qs = await getProductQuestions(params.id).catch(() => null);
+    if (qs) setQuestions(qs.items);
     // The store is public data: it carries the owner check AND
     // the Wave 21 verification tier for the trust badge, which
     // every visitor should see — not only signed-in users.
@@ -133,6 +151,24 @@ export default function ProductDetailPage({
       setMessageError(
         err instanceof Error ? err.message : "মেসেজ শুরু করা যায়নি।"
       );
+    }
+  }
+
+  async function onAskQuestion(e: React.FormEvent) {
+    e.preventDefault();
+    if (!token) return;
+    setQuestionError(null);
+    setQuestionSubmitting(true);
+    try {
+      await askQuestion(token, params.id, questionBody.trim());
+      setQuestionBody("");
+      await reload();
+    } catch (err) {
+      setQuestionError(
+        err instanceof Error ? err.message : "প্রশ্ন পাঠানো যায়নি।"
+      );
+    } finally {
+      setQuestionSubmitting(false);
     }
   }
 
@@ -312,6 +348,72 @@ export default function ProductDetailPage({
             ownStoreId={store?.id ?? null}
             onChanged={() => void reload()}
           />
+        ))
+      )}
+
+      <h2>প্রশ্নোত্তর — Questions &amp; answers</h2>
+
+      {isStoreOwner ? (
+        <p>
+          এটি আপনার স্টোরের পণ্য — ক্রেতাদের প্রশ্নের উত্তর দিন{" "}
+          <Link href="/seller/questions">প্রশ্নোত্তর ইনবক্সে</Link>।
+        </p>
+      ) : token ? (
+        <form onSubmit={(e) => void onAskQuestion(e)}>
+          <label htmlFor="question-body">বিক্রেতাকে প্রশ্ন করুন</label>
+          <textarea
+            id="question-body"
+            value={questionBody}
+            onChange={(e) => setQuestionBody(e.target.value)}
+            rows={2}
+            cols={50}
+            minLength={3}
+            maxLength={500}
+            required
+          />
+          <p>
+            <button
+              type="submit"
+              disabled={questionSubmitting || questionBody.trim().length < 3}
+            >
+              প্রশ্ন করুন — Ask question
+            </button>
+          </p>
+          {questionError && <p role="alert">{questionError}</p>}
+        </form>
+      ) : (
+        <p>
+          প্রশ্ন করতে <Link href="/login">লগইন করুন</Link>।
+        </p>
+      )}
+
+      {questions === null ? (
+        <p>প্রশ্ন লোড হচ্ছে…</p>
+      ) : questions.length === 0 ? (
+        <p>এখনো কোনো প্রশ্ন নেই — প্রথম প্রশ্নটি করুন।</p>
+      ) : (
+        questions.map((question) => (
+          <article className="card" key={question.id}>
+            <p>
+              <strong>প্রশ্ন:</strong> {question.body}
+            </p>
+            <p>
+              <small>
+                {question.asker_display} ·{" "}
+                {new Date(question.created_at).toLocaleDateString("en-GB")}
+              </small>
+            </p>
+            {question.answer_body ? (
+              <div className="card">
+                <p>
+                  <strong>বিক্রেতার উত্তর</strong>
+                </p>
+                <p>{question.answer_body}</p>
+              </div>
+            ) : (
+              <p>উত্তরের অপেক্ষায় — Awaiting the seller&apos;s answer</p>
+            )}
+          </article>
         ))
       )}
     </main>

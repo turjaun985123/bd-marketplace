@@ -736,6 +736,118 @@ export function updateReply(
   });
 }
 
+/** One product question (Wave 25). The asker is shown only by
+ * masked phone — never the full number. */
+export interface ProductQuestion {
+  id: string;
+  product_id: string;
+  body: string;
+  asker_display: string;
+  answer_body: string | null;
+  answered_at: string | null;
+  created_at: string;
+  is_answered: boolean;
+}
+
+export interface QuestionList {
+  items: ProductQuestion[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+/** A question as the seller inbox sees it: the public view plus
+ * its product and the hidden (moderation) flag. */
+export interface SellerQuestion extends ProductQuestion {
+  product: { id: string; title: string; store_slug: string };
+  is_hidden: boolean;
+}
+
+export interface SellerQuestionList {
+  items: SellerQuestion[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+/** GET /v1/products/{id}/questions — public question list, newest
+ * first, hidden questions excluded. */
+export function getProductQuestions(
+  productId: string,
+  params?: { page?: number; limit?: number }
+): Promise<QuestionList> {
+  const search = new URLSearchParams();
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/products/${encodeURIComponent(productId)}/questions${qs ? `?${qs}` : ""}`);
+}
+
+/**
+ * POST /v1/products/{id}/questions — ask the seller a question.
+ * The API rejects asking about your own store's product (400)
+ * and questions on non-visible products (404).
+ */
+export function askQuestion(
+  token: string,
+  productId: string,
+  body: string
+): Promise<ProductQuestion> {
+  return call(`/v1/products/${encodeURIComponent(productId)}/questions`, {
+    method: "POST",
+    token,
+    body: { body },
+  });
+}
+
+/** GET /v1/seller/questions?answered= — the seller Q&A inbox
+ * across all their stores; hidden questions included, marked. */
+export function listSellerQuestions(
+  token: string,
+  answered: "false" | "true" | "all"
+): Promise<SellerQuestionList> {
+  return call(`/v1/seller/questions?answered=${answered}`, { token });
+}
+
+/**
+ * POST /v1/seller/questions/{id}/answer — answer a question on
+ * your store's product. Answering again CORRECTS the answer.
+ */
+export function answerQuestion(
+  token: string,
+  questionId: string,
+  body: string
+): Promise<ProductQuestion> {
+  return call(`/v1/seller/questions/${encodeURIComponent(questionId)}/answer`, {
+    method: "POST",
+    token,
+    body: { body },
+  });
+}
+
+/** POST /v1/seller/questions/{id}/hide — hide a question from
+ * the public list (it stays in the inbox, marked hidden). */
+export function hideQuestion(
+  token: string,
+  questionId: string
+): Promise<SellerQuestion> {
+  return call(`/v1/seller/questions/${encodeURIComponent(questionId)}/hide`, {
+    method: "POST",
+    token,
+  });
+}
+
+/** POST /v1/seller/questions/{id}/unhide — undo a hide. */
+export function unhideQuestion(
+  token: string,
+  questionId: string
+): Promise<SellerQuestion> {
+  return call(`/v1/seller/questions/${encodeURIComponent(questionId)}/unhide`, {
+    method: "POST",
+    token,
+  });
+}
+
 /** GET /v1/cart — the signed-in buyer's cart. */
 export function getCart(token: string): Promise<Cart> {
   return call("/v1/cart", { token });
@@ -1142,6 +1254,9 @@ export interface SellerDashboard {
   recent_sub_orders: SellerSubOrder[];
   /** Low-stock alerts (Wave 23), worst first, at most ten. */
   low_stock_items: LowStockItem[];
+  /** Product questions still awaiting an answer (Wave 25);
+   * hidden questions are excluded. */
+  unanswered_questions: number;
 }
 
 /** Where a store's payout money goes (Wave 9). */

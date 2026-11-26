@@ -144,6 +144,14 @@
 //! the categories of the caller's delivered purchases and
 //! wishlist items — with a labelled top-rated fallback
 //! (`personalized: false`) for callers without signals.
+//! Wave 25: product Q&A (`qna` module) — any signed-in user
+//! may ask a question on a publicly visible product (never
+//! their own store's), the store owner answers publicly
+//! (re-answering corrects the answer), and both the owner
+//! and admins can hide a question: hidden questions vanish
+//! from the public list and from the dashboard's unanswered
+//! count, but stay visible in the seller inbox so the hide
+//! can be undone. The asker is shown only as a masked phone.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -166,6 +174,7 @@ pub mod orders;
 pub mod payments;
 pub mod payouts;
 pub mod products;
+pub mod qna;
 pub mod recommend;
 pub mod returns;
 pub mod reviews;
@@ -942,6 +951,37 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/v1/seller/reviews/:id/reply",
             post(reviews::create_reply_handler).patch(reviews::update_reply_handler),
+        )
+        // Wave 25 — product Q&A: signed-in users ask on a
+        // product page, the store owner answers (re-answering
+        // corrects), owners and admins hide spam.
+        .route(
+            "/v1/products/:id/questions",
+            post(qna::ask_question_handler).get(qna::list_questions_handler),
+        )
+        .route(
+            "/v1/seller/questions",
+            get(qna::list_seller_questions_handler),
+        )
+        .route(
+            "/v1/seller/questions/:id/answer",
+            post(qna::answer_question_handler),
+        )
+        .route(
+            "/v1/seller/questions/:id/hide",
+            post(qna::hide_question_handler),
+        )
+        .route(
+            "/v1/seller/questions/:id/unhide",
+            post(qna::unhide_question_handler),
+        )
+        .route(
+            "/v1/admin/questions/:id/hide",
+            post(qna::admin_hide_question_handler),
+        )
+        .route(
+            "/v1/admin/questions/:id/unhide",
+            post(qna::admin_unhide_question_handler),
         )
         // Wave 9 — seller dashboard, balance, payout account and
         // payout requests (approval/payment land with the admin wave).

@@ -997,6 +997,46 @@ pub fn validate_reply_body(body: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Minimum length of a product question body, in characters.
+pub const MIN_QUESTION_BODY_CHARS: usize = 3;
+/// Maximum length of a product question body, in characters.
+pub const MAX_QUESTION_BODY_CHARS: usize = 500;
+/// Maximum length of a seller answer body, in characters.
+pub const MAX_ANSWER_BODY_CHARS: usize = 1_000;
+
+/// Validate a product question body (Wave 25). A question must say
+/// something: after trimming it is [`MIN_QUESTION_BODY_CHARS`] to
+/// [`MAX_QUESTION_BODY_CHARS`] characters (Unicode characters, not
+/// bytes, so Bangla text counts fairly). Returns the trimmed body
+/// — the value callers store.
+pub fn validate_question_body(body: &str) -> Result<String, &'static str> {
+    let trimmed = body.trim();
+    let len = trimmed.chars().count();
+    if len < MIN_QUESTION_BODY_CHARS {
+        return Err("question body must be at least 3 characters");
+    }
+    if len > MAX_QUESTION_BODY_CHARS {
+        return Err("question body must be at most 500 characters");
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Validate a seller's answer to a product question (Wave 25). An
+/// answer is meaningless when empty: after trimming it is 1 to
+/// [`MAX_ANSWER_BODY_CHARS`] characters. Returns the trimmed body
+/// — the value callers store.
+pub fn validate_answer_body(body: &str) -> Result<String, &'static str> {
+    let trimmed = body.trim();
+    let len = trimmed.chars().count();
+    if len == 0 {
+        return Err("answer body must not be empty");
+    }
+    if len > MAX_ANSWER_BODY_CHARS {
+        return Err("answer body must be at most 1000 characters");
+    }
+    Ok(trimmed.to_string())
+}
+
 /// Mask a phone number for public display: keep the first three and
 /// last three digits of the local form, hide the middle. Canonical
 /// numbers are converted to local form first (`+8801712345678`
@@ -2554,6 +2594,43 @@ mod tests {
         assert!(validate_reply_body("").is_err());
         assert!(validate_reply_body("   ").is_err());
         assert!(validate_reply_body(&"a".repeat(501)).is_err());
+    }
+
+    #[test]
+    fn question_body_rules() {
+        // Too short: empty, whitespace-only and under 3 characters.
+        assert!(validate_question_body("").is_err());
+        assert!(validate_question_body("   ").is_err());
+        assert!(validate_question_body("ab").is_err());
+        assert!(validate_question_body("  ab  ").is_err());
+        // Boundaries: exactly 3 and exactly 500 are fine, 501 is not.
+        assert_eq!(validate_question_body("abc").as_deref(), Ok("abc"));
+        assert!(validate_question_body(&"a".repeat(500)).is_ok());
+        assert!(validate_question_body(&"a".repeat(501)).is_err());
+        // Bangla text counts in characters, not bytes, and the
+        // stored value is the trimmed body.
+        assert_eq!(
+            validate_question_body("  ডেলিভারি কতদিনে পাবো?  ").as_deref(),
+            Ok("ডেলিভারি কতদিনে পাবো?")
+        );
+        assert!(validate_question_body(&"ক".repeat(500)).is_ok());
+        assert!(validate_question_body(&"ক".repeat(501)).is_err());
+    }
+
+    #[test]
+    fn answer_body_rules() {
+        // Empty answers are meaningless; 1 char is enough.
+        assert!(validate_answer_body("").is_err());
+        assert!(validate_answer_body("   ").is_err());
+        assert_eq!(validate_answer_body("হ্যাঁ").as_deref(), Ok("হ্যাঁ"));
+        // Boundaries: exactly 1000 is fine, 1001 is not, and the
+        // stored value is trimmed.
+        assert!(validate_answer_body(&"a".repeat(1_000)).is_ok());
+        assert!(validate_answer_body(&"a".repeat(1_001)).is_err());
+        assert_eq!(
+            validate_answer_body("  ২-৩ দিন লাগবে  ").as_deref(),
+            Ok("২-৩ দিন লাগবে")
+        );
     }
 
     #[test]

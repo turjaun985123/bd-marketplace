@@ -185,6 +185,8 @@ export default function SellerDashboardPage() {
         {" · "}
         <Link href="/seller/inbox">ইনবক্স — Inbox</Link>
         {" · "}
+        <Link href="/seller/questions">প্রশ্নোত্তর — Q&amp;A</Link>
+        {" · "}
         <Link href="/seller/coupons">কুপন — Coupons</Link>
         {" · "}
         <Link href="/seller/returns">রিটার্ন — Returns</Link>
@@ -194,6 +196,23 @@ export default function SellerDashboardPage() {
         <Link href="/seller/verification">স্টোর যাচাইকরণ — Verification</Link>
       </p>
       {message && <p role="status">{message}</p>}
+      {dashboard !== null && dashboard.unanswered_questions > 0 && (
+        <section>
+          <div className="card">
+            <h2>ক্রেতাদের প্রশ্ন — Buyer questions</h2>
+            <p>
+              {dashboard.unanswered_questions}টি প্রশ্ন উত্তরের অপেক্ষায়
+              আছে।
+            </p>
+            <p>
+              <Link href="/seller/questions">
+                প্রশ্নোত্তর ইনবক্সে গিয়ে উত্তর দিন — Answer in the Q&amp;A
+                inbox
+              </Link>
+            </p>
+          </div>
+        </section>
+      )}
       {dashboard !== null && dashboard.low_stock_items.length > 0 && (
         <section>
           <div className="card">

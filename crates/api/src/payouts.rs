@@ -110,6 +110,11 @@ pub struct SellerDashboard {
     /// (Wave 23), worst first, at most ten — the dashboard's
     /// alert strip. Empty when nothing needs attention.
     pub low_stock_items: Vec<crate::inventory::LowStockItem>,
+    /// Product questions across the seller's stores that
+    /// still need an answer (Wave 25). Hidden questions are
+    /// excluded — hiding is how a seller deals with spam, so
+    /// a hidden question must not keep counting as work.
+    pub unanswered_questions: i64,
 }
 
 /// Where a store's payout money goes; also a `payout_accounts` row.
@@ -253,6 +258,8 @@ pub async fn get_dashboard(pool: &PgPool, user: &AuthUser) -> Result<SellerDashb
     let recent = list_seller_sub_orders(pool, user, Some(1), Some(5)).await?;
     let low_stock_items =
         crate::inventory::low_stock_items_for_seller(pool, user.user_id).await?;
+    let unanswered_questions =
+        crate::qna::count_unanswered_questions(pool, user.user_id).await?;
 
     Ok(SellerDashboard {
         store,
@@ -263,6 +270,7 @@ pub async fn get_dashboard(pool: &PgPool, user: &AuthUser) -> Result<SellerDashb
         earnings,
         recent_sub_orders: recent.items,
         low_stock_items,
+        unanswered_questions,
     })
 }
 
