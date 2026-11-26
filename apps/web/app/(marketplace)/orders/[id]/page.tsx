@@ -3,7 +3,11 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import PriceTag from "@/components/PriceTag";
-import { getOrderReceipt, type Receipt } from "@/lib/api";
+import {
+  getOrderReceipt,
+  paymentStatusLabel,
+  type Receipt,
+} from "@/lib/api";
 import { useAuth } from "@/hooks/useAuth";
 
 /** Zone values with their Bangla labels (display only). */
@@ -102,7 +106,8 @@ export default function OrderReceiptPage({
           অবস্থা: {receipt.status} · পেমেন্ট:{" "}
           {receipt.payment_method === "cod"
             ? "ক্যাশ অন ডেলিভারি (COD)"
-            : receipt.payment_method}
+            : receipt.payment_method}{" "}
+          — {paymentStatusLabel(receipt.payment_status)}
         </p>
 
         <h2>ডেলিভারির তথ্য</h2>

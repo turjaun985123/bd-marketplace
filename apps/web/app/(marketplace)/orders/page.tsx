@@ -3,7 +3,13 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import PriceTag from "@/components/PriceTag";
-import { cancelOrder, listOrders, type Order } from "@/lib/api";
+import {
+  cancelOrder,
+  listOrders,
+  paymentStatusLabel,
+  retryPayment,
+  type Order,
+} from "@/lib/api";
 import { useAuth } from "@/hooks/useAuth";
 
 /**
@@ -18,6 +24,29 @@ export default function BuyerOrdersPage() {
   const [orders, setOrders] = useState<Order[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [cancellingId, setCancellingId] = useState<string | null>(null);
+  const [retryingId, setRetryingId] = useState<string | null>(null);
+
+  // Retry a failed online payment (Wave 5): the API moves it back to
+  // pending; the list is then reloaded so the status shown is the
+  // server's, not an optimistic guess.
+  async function onRetryPayment(order: Order) {
+    if (!token || !order.payment) return;
+    setRetryingId(order.id);
+    setError(null);
+    try {
+      await retryPayment(token, order.payment.id);
+      const list = await listOrders(token, { limit: 50 });
+      setOrders(list.items);
+    } catch (err) {
+      setError(
+        `পেমেন্ট আবার চেষ্টা করা যায়নি। ${
+          err instanceof Error ? err.message : ""
+        }`.trim()
+      );
+    } finally {
+      setRetryingId(null);
+    }
+  }
 
   async function onCancel(orderId: string) {
     if (!token) return;
@@ -117,8 +146,23 @@ export default function BuyerOrdersPage() {
               <strong>
                 <PriceTag amountPoisha={order.grand_total_poisha} />
               </strong>{" "}
-              (ক্যাশ অন ডেলিভারি)
+              · পেমেন্ট: {paymentStatusLabel(order.payment_status)}
+              {order.payment_method !== "cod" &&
+                ` (${order.payment_method})`}
             </p>
+            {order.payment_status === "failed" && order.payment && (
+              <p>
+                <button
+                  type="button"
+                  disabled={retryingId === order.id}
+                  onClick={() => void onRetryPayment(order)}
+                >
+                  {retryingId === order.id
+                    ? "চেষ্টা হচ্ছে…"
+                    : "পেমেন্ট আবার চেষ্টা করুন — Retry payment"}
+                </button>
+              </p>
+            )}
             <p>
               <Link href={`/orders/${order.id}`}>
                 রসিদ / বিবরণ দেখুন — Receipt & details

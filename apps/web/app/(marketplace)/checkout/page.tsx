@@ -3,13 +3,31 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import PriceTag from "@/components/PriceTag";
-import { placeOrder, type CartItem, type Order } from "@/lib/api";
+import {
+  devSimulateSuccess,
+  getOrder,
+  getPaymentMethods,
+  paymentStatusLabel,
+  placeOrder,
+  type CartItem,
+  type Order,
+  type PaymentMethodInfo,
+} from "@/lib/api";
 import { useAuth } from "@/hooks/useAuth";
 import { useCart } from "@/hooks/useCart";
 import {
   useDeliveryCharge,
   type DeliveryZone,
 } from "@/hooks/useDeliveryCharge";
+
+/** Bangla labels for payment methods (availability comes from the API). */
+const METHOD_LABELS: Record<string, string> = {
+  cod: "ক্যাশ অন ডেলিভারি (COD) — পণ্য হাতে পেয়ে টাকা দিন",
+  bkash: "বিকাশ (bKash)",
+  nagad: "নগদ (Nagad)",
+  sslcommerz: "SSLCommerz — কার্ড / ব্যাংক / মোবাইল ব্যাংকিং",
+  shurjopay: "ShurjoPay",
+};
 
 /** Zone values the API expects, with their Bangla labels. */
 const ZONES: { value: string; apiZone: DeliveryZone; label: string }[] = [
@@ -57,7 +75,8 @@ function groupByStore(items: CartItem[]): SellerGroup[] {
 }
 
 /**
- * Checkout (COD only). The per-seller delivery preview is display-only,
+ * Checkout (COD + online methods from GET /v1/payments/methods,
+ * Wave 5). The per-seller delivery preview is display-only,
  * quoted through the shared useDeliveryCharge hook (one quote per
  * seller group, billed on the group's real weight in grams — the
  * server's Wave 4 rule). The server's totals in the place-order
@@ -76,6 +95,12 @@ export default function CheckoutPage() {
   const [placing, setPlacing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [placed, setPlaced] = useState<Order | null>(null);
+  // Payment methods come from GET /v1/payments/methods — the API is
+  // the single source of truth for what is available; this page only
+  // renders that answer and tracks the buyer's selection.
+  const [methods, setMethods] = useState<PaymentMethodInfo[] | null>(null);
+  const [method, setMethod] = useState("cod");
+  const [simulating, setSimulating] = useState(false);
 
   const groups = useMemo(() => groupByStore(items), [items]);
 
@@ -103,6 +128,23 @@ export default function CheckoutPage() {
     };
   }, [groups, zone, quoteAmount]);
 
+  // Load the payment method availability once.
+  useEffect(() => {
+    let cancelled = false;
+    getPaymentMethods()
+      .then((list) => {
+        if (!cancelled) setMethods(list);
+      })
+      .catch(() => {
+        // API offline: COD stays selectable; the server decides at
+        // order time anyway and its error is shown to the buyer.
+        if (!cancelled) setMethods([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const previewDelivery = groups.reduce(
     (sum, g) => sum + (charges[g.storeSlug] ?? 0),
     0
@@ -120,7 +162,7 @@ export default function CheckoutPage() {
         delivery_phone: phone.trim(),
         delivery_address: address.trim(),
         delivery_zone: zone.value,
-        payment_method: "cod",
+        payment_method: method,
       });
       setPlaced(order);
       await refresh(); // the server cleared the cart
@@ -128,6 +170,26 @@ export default function CheckoutPage() {
       setError(err instanceof Error ? err.message : "অর্ডার করা যায়নি।");
     } finally {
       setPlacing(false);
+    }
+  }
+
+  // DEV ONLY: settle the placed order's dev payment through the
+  // API's simulate helper (the API signs and applies the callback
+  // itself, through the same path as a real webhook), then reload
+  // the order so the paid state shown here is the server's.
+  async function onSimulateSuccess() {
+    if (!token || !placed?.payment) return;
+    setSimulating(true);
+    setError(null);
+    try {
+      await devSimulateSuccess(token, placed.payment.id);
+      setPlaced(await getOrder(token, placed.id));
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "সিমুলেশন করা যায়নি।"
+      );
+    } finally {
+      setSimulating(false);
     }
   }
 
@@ -161,11 +223,40 @@ export default function CheckoutPage() {
         <p>
           পণ্যের দাম: <PriceTag amountPoisha={placed.goods_total_poisha} /> ·
           ডেলিভারি: <PriceTag amountPoisha={placed.delivery_total_poisha} /> ·
-          সর্বমোট (ডেলিভারির সময় পরিশোধ):{" "}
+          সর্বমোট:{" "}
           <strong>
             <PriceTag amountPoisha={placed.grand_total_poisha} />
           </strong>
         </p>
+        <p>
+          পেমেন্ট: {METHOD_LABELS[placed.payment_method] ?? placed.payment_method}{" "}
+          — অবস্থা:{" "}
+          <strong>{paymentStatusLabel(placed.payment_status)}</strong>
+          {placed.payment_status === "pay_on_delivery" &&
+            " (ডেলিভারির সময় পরিশোধ করতে হবে)"}
+        </p>
+        {error && <p role="alert">{error}</p>}
+        {placed.payment_status === "pending" &&
+          placed.payment?.dev_redirect_url && (
+            <article className="card">
+              <h3>ডেভ মোড (পরীক্ষামূলক) — DEV payment simulator</h3>
+              <p>
+                এটি একটি সিমুলেটেড পেমেন্ট — আসল টাকা লেনদেন হয়নি।
+                (This is a simulated payment; no real money moved.)
+              </p>
+              <p>
+                <button
+                  type="button"
+                  disabled={simulating}
+                  onClick={() => void onSimulateSuccess()}
+                >
+                  {simulating
+                    ? "সিমুলেশন হচ্ছে…"
+                    : "Simulate payment success — পেমেন্ট সফল সিমুলেট করুন"}
+                </button>
+              </p>
+            </article>
+          )}
         {placed.sub_orders.map((sub) => (
           <article key={sub.id} className="card">
             <h3>{sub.store_slug}</h3>
@@ -286,14 +377,27 @@ export default function CheckoutPage() {
             </label>
 
             <h2>পেমেন্ট — Payment</h2>
-            <label>
-              <input type="radio" checked readOnly /> ক্যাশ অন ডেলিভারি (COD) —
-              পণ্য হাতে পেয়ে টাকা দিন
-            </label>
-            <label>
-              <input type="radio" disabled /> বিকাশ / নগদ / SSLCommerz — শীঘ্রই
-              আসছে
-            </label>
+            {methods === null ? (
+              <p>পেমেন্ট পদ্ধতি লোড হচ্ছে…</p>
+            ) : (
+              methods.map((info) => (
+                <label key={info.method}>
+                  <input
+                    type="radio"
+                    name="payment-method"
+                    value={info.method}
+                    disabled={!info.available}
+                    checked={method === info.method}
+                    onChange={() => setMethod(info.method)}
+                  />{" "}
+                  {METHOD_LABELS[info.method] ?? info.method}
+                  {!info.available && " — এখনো চালু হয়নি"}
+                  {info.available &&
+                    info.mode === "dev" &&
+                    " — ডেভ মোড (পরীক্ষামূলক)"}
+                </label>
+              ))
+            )}
 
             <p>
               <button type="submit" disabled={placing}>

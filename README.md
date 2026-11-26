@@ -50,20 +50,30 @@ apps/web/               Next.js (App Router, TypeScript)
                         formatBdt and shared helpers
 crates/domain/          pure, unit-tested domain functions (no DB, no network)
 crates/courier/         CourierAdapter trait + Tier 1 stubs (Steadfast, Pathao, RedX)
-crates/payments/        PaymentAdapter trait + COD (records intent) + stubs
-                        (Bkash, Nagad, SslCommerz, ShurjoPay)
+crates/payments/        PaymentAdapter trait + COD (records intent),
+                        credential-configured gateway adapters (Bkash,
+                        Nagad, SslCommerz, ShurjoPay), the DEV gateway
+                        simulator + HMAC callback signing, and the
+                        payment_adapter_for factory
 crates/api/             Axum API — thin handlers over service functions
   src/auth.rs           phone + OTP + JWT service functions + SmsSender trait
   src/stores.rs         store create/get service functions
   src/products.rs       product CRUD + the ONE shared listing function
   src/cart.rs           one cart per buyer: add/set/remove/clear + cart view
-  src/orders.rs         COD checkout (one transaction), buyer orders,
-                        seller sub-orders + status transitions
+  src/orders.rs         checkout (one transaction, COD + online
+                        methods), buyer orders, seller sub-orders +
+                        status transitions, receipts
+  src/payments.rs       method availability, webhook callback
+                        application (the one apply path), retry,
+                        dev-simulate helper
   tests/wave2.rs        end-to-end integration test (needs DATABASE_URL)
   tests/wave3.rs        cart + split checkout integration test (same gate)
+  tests/wave4.rs        weight / cancel / receipt integration test
+  tests/wave5.rs        online payments integration test (same gate)
 crates/worker/          Tokio worker binary (jobs listed, implementation TODO)
 migrations/             SQLx migrations (users, stores, otp_codes, products,
-                        carts, orders, sub_orders, order_items)
+                        carts, orders, sub_orders, order_items, payments,
+                        payment_events)
 infra/docker-compose.yml  Postgres + Redis + MinIO
 .env.example            every environment variable, no real values
 .github/workflows/ci.yml  Rust tests/clippy (with a Postgres service) + Next.js build
@@ -150,6 +160,72 @@ items in the same transaction — previously the status changed but the
 stock stayed decremented. Both paths share one restock helper inside
 their transaction, so a cancel and its restock commit or roll back
 together.
+
+Wave 5 (online payments foundation):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| GET | `/v1/payments/methods` | Per-method availability (public): COD always available; bkash / nagad / sslcommerz / shurjopay available only with merchant credentials present (mode `live`) or the DEV simulator on (mode `dev`); otherwise `available: false, reason: "not_configured"`. The checkout page renders exactly this answer |
+| POST | `/v1/orders` (extended) | `payment_method` may now be `cod`, `bkash`, `nagad`, `sslcommerz` or `shurjopay`. Online methods are initiated via the payments factory inside the checkout transaction: success creates a `pending` payment row and the order's `payment_status` is `pending`; an unconfigured gateway fails the whole checkout with 503 and the transaction rolls back (cart and stock untouched) |
+| POST | `/v1/payments/webhook/{method}` | Gateway callback (public, signature-verified — contract below). Applies the result to the payment and the order's `payment_status` |
+| POST | `/v1/payments/{id}/retry` | Buyer retries their own failed payment: `failed` → `pending`, reusing the same gateway reference |
+| POST | `/v1/payments/{id}/dev-simulate-success` | DEV ONLY: signs and applies a success callback for one of the caller's dev payments, through the SAME apply function as the webhook. Returns 404 whenever dev mode is off |
+
+**Payment state machine** (pure domain function `can_transition_payment`,
+unit-tested): `pending → paid`, `pending → failed`, `paid → refunded`,
+`failed → pending` (retry). The order carries the same lifecycle in
+`orders.payment_status`, plus `pay_on_delivery` for COD. **COD
+semantics are unchanged and explicit:** a COD order has
+`payment_status = 'pay_on_delivery'` and NO row in `payments` — there
+is no gateway attempt to record; cash is collected by the courier.
+
+**Method availability rule:** a gateway method is usable only when
+its merchant credentials are all present in the environment (bKash:
+`BKASH_APP_KEY` + `BKASH_APP_SECRET`; Nagad: `NAGAD_MERCHANT_ID` +
+`NAGAD_API_KEY`; SSLCommerz: `SSLCOMMERZ_STORE_ID` +
+`SSLCOMMERZ_STORE_PASSWORD`; ShurjoPay: `SHURJOPAY_USERNAME` +
+`SHURJOPAY_PASSWORD`) or when the DEV simulator is on. Adapters are
+structured and credential-configured, but live gateway calls are NOT
+implemented yet: with credentials present an adapter honestly reports
+`NotImplemented`, and without them `NotConfigured` — nothing ever
+fakes a successful payment.
+
+**DEV gateway simulator** (`PAYMENTS_DEV_MODE=true`, local/CI only —
+NEVER in production): checkout with an online method mints a
+`DEV-<method>-<order_id>` gateway reference and a `/dev-pay/<ref>`
+redirect path, and creates the pending payment. The checkout success
+screen labels it as a dev simulation and offers a "Simulate payment
+success" button, which calls the dev-simulate endpoint above; the API
+signs a success callback and applies it through the same
+`apply_payment_callback` service function the webhook uses — one code
+path, no browser-side signing, no second apply implementation.
+
+**Webhook contract** (`POST /v1/payments/webhook/{method}`), JSON body:
+
+```json
+{
+  "payment_ref": "DEV-bkash-<order-uuid>",
+  "amount_poisha": 106000,
+  "status": "success",
+  "signature": "<hex hmac-sha256>"
+}
+```
+
+`status` is `success` or `failed`. For DEV payments the signature is
+HMAC-SHA256 (hex) over `"<payment_ref>:<amount_poisha>:<status>"`
+keyed with `PAYMENTS_DEV_SECRET`, computed by the single
+`sign_dev_callback` / `verify_dev_callback` implementation in the
+payments crate. Every callback received is written to
+`payment_events` with its raw body and signature verdict BEFORE any
+rejection, so rejected callbacks are auditable too. A bad signature
+is a 401 with no state change; an amount that differs from the
+payment amount (exact poisha equality, domain function
+`validate_callback_amount`) is a 400 with no state change; a
+duplicate delivery of an already-applied result returns 200 without
+double effects. Real-gateway signature verification is a deliberate
+TODO: it cannot be implemented without each gateway's credentials
+and documented signature scheme, so callbacks for non-dev payments
+are logged and rejected (401) rather than trusted.
 
 Auth rules that matter: only a SHA-256 hash of an OTP is ever stored;
 ownership is checked on every seller mutation (403 for non-owners);
@@ -282,24 +358,48 @@ end-to-end integration test (`crates/api/tests/wave4.rs`, same
 commission field, buyer-cancel restock, the cancel-after-confirm 409,
 and seller-cancel restocking only that sub-order's items.
 
-**Stubbed (typed `NotConfigured` errors — never fake success, no network
-calls, no credentials):** Steadfast / Pathao / RedX courier adapters;
-bKash / Nagad / SSLCommerz / ShurjoPay payment adapters. Tier 1b couriers
+**Real (Wave 5):** the online payments foundation — migration 0009
+(`orders.payment_status`, `payments`, `payment_events`); the pure
+domain payment transition table and exact callback-amount validation;
+credential-configured gateway adapters behind the
+`payment_adapter_for` factory (complete credentials →
+`NotImplemented` for live calls, incomplete → `NotConfigured`); the
+DEV gateway simulator with HMAC-signed callbacks (dev flag only,
+`DEV-` references, labelled in API responses, UI and this README);
+checkout with online methods (pending payment row inside the checkout
+transaction, 503 with full rollback when a gateway is unavailable);
+the signed webhook with its auditable event log, idempotent
+duplicates and the one shared `apply_payment_callback` path also used
+by dev-simulate; payment retry (`failed` → `pending`); order and
+receipt views carrying `payment_status` and the latest payment
+summary; an end-to-end integration test (`crates/api/tests/wave5.rs`,
+same `DATABASE_URL` gate) covering method availability on and off,
+dev bKash checkout, wrong-signature 401 with the audit row,
+amount-mismatch 400, success + duplicate webhooks, failure + retry,
+dev-simulate, COD staying row-free, and the production-mode 503 with
+the cart left intact; the checkout page rendering the methods
+endpoint (unavailable methods disabled, dev methods labelled) and
+the orders/receipt pages showing payment status in Bangla.
+
+**Stubbed (typed errors — never fake success, no network calls):**
+Steadfast / Pathao / RedX courier adapters. Tier 1b couriers
 (eCourier, Paperfly) and manual Phase 2 couriers (Sundarban, SA Paribahan,
 Karatoa, Carrybee) join behind the same traits later. SMS sending has
 only the dev-mode log implementation (see the dev OTP flow above).
 
-**TODO / not wired:** Redis, online payments (bKash/Nagad/SSLCommerz —
-Wave 5), courier booking, payouts, a real SMS gateway, SIDRA calls,
-worker jobs (the worker logs its planned jobs and exits cleanly).
+**TODO / not wired:** live gateway calls and real-gateway webhook
+signature verification (need merchant credentials + each gateway's
+integration docs), refunds and payouts, Redis, courier booking, a
+real SMS gateway, SIDRA calls, worker jobs (the worker logs its
+planned jobs and exits cleanly).
 
 ## Verification status
 
 - **Next.js: verified on this machine** — `npm ci && npm run build`
-  passes (Wave 4 route `/orders/[id]` included).
+  passes (Wave 5 checkout / orders / receipt changes included).
 - **Rust: NOT compiled locally** — this development VM has no `cargo`
   installed, by design. Rust compilation, `cargo test --workspace`
-  (including the Wave 2 + Wave 3 + Wave 4 integration tests against
-  CI's Postgres service) and clippy `-D warnings` are verified via
-  **GitHub Actions CI** (`.github/workflows/ci.yml`) on push. Waves 1–3
-  are green there; Wave 4 awaits its first CI run.
+  (including the Wave 2 + Wave 3 + Wave 4 + Wave 5 integration tests
+  against CI's Postgres service) and clippy `-D warnings` are
+  verified via **GitHub Actions CI** (`.github/workflows/ci.yml`) on
+  push. Waves 1–4 are green there; Wave 5 awaits its first CI run.

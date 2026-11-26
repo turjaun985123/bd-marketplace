@@ -13,6 +13,16 @@
 //! Wave 3 payment rule: COD only. Other methods are rejected with a
 //! clear 400 (online payments land in Wave 5).
 //!
+//! Wave 5: checkout accepts every known payment method. COD orders
+//! are stored with `payment_status = 'pay_on_delivery'` and no
+//! payment row. An online method is initiated through the payments
+//! factory inside the same transaction: a configured or
+//! dev-simulated gateway creates a `pending` payment row and the
+//! order is stored with `payment_status = 'pending'`, while an
+//! unconfigured gateway fails the whole checkout with a 503 and the
+//! transaction rolls back (cart and stock untouched). Settlement
+//! happens later, only via the signed webhook in the payments module.
+//!
 //! Wave 4: delivery charges are weight-based (each product carries
 //! `weight_grams`; a sub-order's parcel weight is the sum of unit
 //! weight times quantity, billed per started kilogram by the domain
@@ -32,12 +42,14 @@ use domain::{
     normalize_bd_phone, parse_delivery_zone, split_cart_by_seller, CartItem as DomainCartItem,
     OrderGroupInput,
 };
+use payments::{payment_adapter_for, parse_payment_method};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
+use crate::payments::{insert_pending_payment, load_latest_payment_summary, PaymentSummary};
 use crate::products::clamp_pagination;
 use crate::{ApiError, AppState};
 
@@ -80,6 +92,12 @@ pub struct Order {
     pub buyer_user_id: Uuid,
     pub status: String,
     pub payment_method: String,
+    /// `pay_on_delivery` for COD; otherwise the latest payment
+    /// attempt's lifecycle (`pending`, `paid`, `failed`, `refunded`).
+    pub payment_status: String,
+    /// The latest payment attempt, or `None` for COD orders (which
+    /// deliberately have no payment row).
+    pub payment: Option<PaymentSummary>,
     pub delivery_name: String,
     pub delivery_phone: String,
     pub delivery_address: String,
@@ -140,6 +158,7 @@ struct OrderRow {
     buyer_user_id: Uuid,
     status: String,
     payment_method: String,
+    payment_status: String,
     delivery_name: String,
     delivery_phone: String,
     delivery_address: String,
@@ -164,8 +183,8 @@ struct SubOrderRow {
     created_at: DateTime<Utc>,
 }
 
-const ORDER_COLUMNS: &str = "id, buyer_user_id, status, payment_method, delivery_name, \
-    delivery_phone, delivery_address, delivery_zone, goods_total_poisha, \
+const ORDER_COLUMNS: &str = "id, buyer_user_id, status, payment_method, payment_status, \
+    delivery_name, delivery_phone, delivery_address, delivery_zone, goods_total_poisha, \
     delivery_total_poisha, grand_total_poisha, created_at";
 
 const SUB_ORDER_COLUMNS: &str = "so.id, so.order_id, so.store_id, s.slug AS store_slug, \
@@ -241,11 +260,15 @@ pub async fn load_order(pool: &PgPool, order_id: Uuid) -> Result<Order, ApiError
         sub_orders.push(sub_order_from_row(pool, sub_row).await?);
     }
 
+    let payment = load_latest_payment_summary(pool, row.id).await?;
+
     Ok(Order {
         id: row.id,
         buyer_user_id: row.buyer_user_id,
         status: row.status,
         payment_method: row.payment_method,
+        payment_status: row.payment_status,
+        payment,
         delivery_name: row.delivery_name,
         delivery_phone: row.delivery_phone,
         delivery_address: row.delivery_address,
@@ -269,7 +292,9 @@ pub struct PlaceOrderInput {
     pub delivery_address: String,
     /// One of: inside_dhaka, dhaka_suburb, outside_dhaka.
     pub delivery_zone: String,
-    /// Wave 3: only "cod" is accepted.
+    /// One of: cod, bkash, nagad, sslcommerz, shurjopay. Online
+    /// methods need a configured gateway or the DEV simulator,
+    /// otherwise checkout fails with a 503 (see module docs).
     #[serde(default = "default_payment_method")]
     pub payment_method: String,
 }
@@ -302,11 +327,11 @@ pub async fn place_order(
     user: &AuthUser,
     input: PlaceOrderInput,
 ) -> Result<Order, ApiError> {
-    if input.payment_method != "cod" {
-        return Err(ApiError::bad_request(
-            "payment method not yet available — only 'cod' (cash on delivery) is accepted for now",
-        ));
-    }
+    let method = parse_payment_method(&input.payment_method).ok_or_else(|| {
+        ApiError::bad_request(
+            "payment_method must be one of: cod, bkash, nagad, sslcommerz, shurjopay",
+        )
+    })?;
     if input.delivery_name.trim().is_empty() {
         return Err(ApiError::bad_request("delivery_name must not be empty"));
     }
@@ -385,13 +410,20 @@ pub async fn place_order(
         .collect();
     let totals = build_order_totals(&groups, zone, state.commission_rate_bps);
 
+    let order_payment_status = if method.is_online() {
+        "pending"
+    } else {
+        "pay_on_delivery"
+    };
     let order_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO orders (buyer_user_id, payment_method, delivery_name, \
-         delivery_phone, delivery_address, delivery_zone, goods_total_poisha, \
-         delivery_total_poisha, grand_total_poisha) \
-         VALUES ($1, 'cod', $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+        "INSERT INTO orders (buyer_user_id, payment_method, payment_status, \
+         delivery_name, delivery_phone, delivery_address, delivery_zone, \
+         goods_total_poisha, delivery_total_poisha, grand_total_poisha) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id",
     )
     .bind(user.user_id)
+    .bind(method.as_str())
+    .bind(order_payment_status)
     .bind(input.delivery_name.trim())
     .bind(&delivery_phone)
     .bind(input.delivery_address.trim())
@@ -402,6 +434,37 @@ pub async fn place_order(
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| ApiError::internal("insert order", e))?;
+
+    // Online payment: initiate through the payments factory, still
+    // inside the checkout transaction. An unconfigured gateway errors
+    // here, the transaction is dropped uncommitted, and the buyer
+    // keeps their cart and stock — a 503, never a half-placed order
+    // with a payment that cannot be taken. The DEV simulator's
+    // initiate is pure (it only mints a reference); real adapters
+    // make no network calls yet either.
+    if method.is_online() {
+        let adapter = payment_adapter_for(method, &state.payments_config);
+        let intent = payments::PaymentAdapter::initiate(
+            &*adapter,
+            &order_id.to_string(),
+            totals.grand_total_poisha,
+        )
+        .await
+        .map_err(|e| {
+            ApiError::service_unavailable(format!(
+                "payment method '{}' is not available yet ({e})",
+                method.as_str()
+            ))
+        })?;
+        insert_pending_payment(
+            &mut tx,
+            order_id,
+            method.as_str(),
+            totals.grand_total_poisha,
+            &intent.reference,
+        )
+        .await?;
+    }
 
     // Snapshots for order_items, keyed by product id.
     let locked_by_product: std::collections::HashMap<Uuid, &LockedCartItem> =
@@ -662,8 +725,12 @@ pub struct Receipt {
     pub created_at: DateTime<Utc>,
     pub status: String,
     pub payment_method: String,
+    /// The order's payment lifecycle: `pay_on_delivery` for COD,
+    /// otherwise `pending`, `paid`, `failed` or `refunded` (Wave 5).
+    pub payment_status: String,
     /// Amount the buyer hands over on delivery: the grand total for
-    /// COD orders, zero for anything already paid (no such method yet).
+    /// COD orders, zero for online orders (a paid online order has
+    /// nothing due; a pending one is settled online, not in cash).
     pub cod_amount_due_poisha: i64,
     pub delivery: ReceiptDelivery,
     pub sub_orders: Vec<ReceiptSubOrder>,
@@ -698,6 +765,7 @@ pub fn build_receipt(order: &Order, store_names: &HashMap<Uuid, String>) -> Rece
         created_at: order.created_at,
         status: order.status.clone(),
         payment_method: order.payment_method.clone(),
+        payment_status: order.payment_status.clone(),
         cod_amount_due_poisha: if order.payment_method == "cod" {
             order.grand_total_poisha
         } else {

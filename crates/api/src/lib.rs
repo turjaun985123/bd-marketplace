@@ -6,6 +6,9 @@
 //! auth, stores and products. Wave 3: carts, split orders and COD
 //! checkout (`cart` and `orders` modules). Wave 4: weight-based
 //! delivery, buyer order cancellation with restock, and receipts.
+//! Wave 5: the online payments foundation (`payments` module) —
+//! method availability, dev-simulated gateway checkout, signed
+//! webhook callbacks and payment retry.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -19,6 +22,7 @@
 pub mod auth;
 pub mod cart;
 pub mod orders;
+pub mod payments;
 pub mod products;
 pub mod stores;
 
@@ -32,6 +36,7 @@ use domain::{
     calculate_delivery_charge, compute_commission, split_cart_by_seller, CartItem,
     CommissionQuote, DeliveryZone, SellerSubOrder,
 };
+use payments::{GatewayConfig, PaymentsConfig};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tower_http::cors::CorsLayer;
@@ -50,6 +55,11 @@ pub struct AppState {
     /// startup from `COMMISSION_RATE_BPS` (see `from_env`); checkout
     /// passes it to the domain `build_order_totals` function.
     pub commission_rate_bps: u32,
+    /// Payment configuration (Wave 5): the DEV simulator switch and
+    /// secret, plus one merchant credential set per gateway. Built
+    /// from the environment in `from_env`; tests set it explicitly
+    /// via `with_payments_config`.
+    pub payments_config: PaymentsConfig,
 }
 
 /// Default commission rate: 8% (matches the MVP plan's worked example).
@@ -62,7 +72,15 @@ impl AppState {
             jwt_secret,
             sms_dev_mode,
             commission_rate_bps: DEFAULT_COMMISSION_RATE_BPS,
+            payments_config: PaymentsConfig::default(),
         }
+    }
+
+    /// Replace the payments configuration (used by `from_env` and by
+    /// tests that need the DEV payment simulator on or off).
+    pub fn with_payments_config(mut self, payments_config: PaymentsConfig) -> Self {
+        self.payments_config = payments_config;
+        self
     }
 
     /// Build state from environment variables around an optional pool.
@@ -96,6 +114,7 @@ impl AppState {
                 ),
             }
         }
+        state.payments_config = payments_config_from_env();
         state
     }
 
@@ -162,6 +181,71 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let body = Json(serde_json::json!({ "error": self.message }));
         (self.status, body).into_response()
+    }
+}
+
+/// A non-empty environment variable, or `None`. Credential values
+/// are only ever held in memory inside `PaymentsConfig` — never
+/// logged, never returned by any endpoint.
+fn env_value(name: &str) -> Option<String> {
+    match std::env::var(name) {
+        Ok(value) if !value.trim().is_empty() => Some(value),
+        _ => None,
+    }
+}
+
+/// Build the Wave 5 payments configuration from the environment:
+/// `PAYMENTS_DEV_MODE` gates the DEV simulator (with a loud startup
+/// warning — it must never be on in production), `PAYMENTS_DEV_SECRET`
+/// is its HMAC secret (defaulting to a public dev value, with a
+/// warning, only when dev mode is on), and each gateway's merchant
+/// credentials come from its `*_APP_KEY` / `*_MERCHANT_ID` style
+/// variables (see `.env.example` for the full list per gateway).
+fn payments_config_from_env() -> PaymentsConfig {
+    let dev_mode = std::env::var("PAYMENTS_DEV_MODE")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    let dev_secret = match env_value("PAYMENTS_DEV_SECRET") {
+        Some(secret) => secret,
+        None if dev_mode => {
+            eprintln!(
+                "WARNING: PAYMENTS_DEV_SECRET is not set — using the public \
+                 default 'dev-secret' for DEV callback signatures."
+            );
+            "dev-secret".to_string()
+        }
+        None => String::new(),
+    };
+    if dev_mode {
+        eprintln!(
+            "WARNING: PAYMENTS_DEV_MODE is ON — the DEV payment simulator is \
+             enabled. Simulated payments are not real money. NEVER enable \
+             this in production."
+        );
+    }
+    PaymentsConfig {
+        dev_mode,
+        dev_secret,
+        bkash: GatewayConfig {
+            merchant_id: None,
+            api_key: env_value("BKASH_APP_KEY"),
+            secret: env_value("BKASH_APP_SECRET"),
+        },
+        nagad: GatewayConfig {
+            merchant_id: env_value("NAGAD_MERCHANT_ID"),
+            api_key: env_value("NAGAD_API_KEY"),
+            secret: None,
+        },
+        sslcommerz: GatewayConfig {
+            merchant_id: env_value("SSLCOMMERZ_STORE_ID"),
+            api_key: None,
+            secret: env_value("SSLCOMMERZ_STORE_PASSWORD"),
+        },
+        shurjopay: GatewayConfig {
+            merchant_id: env_value("SHURJOPAY_USERNAME"),
+            api_key: None,
+            secret: env_value("SHURJOPAY_PASSWORD"),
+        },
     }
 }
 
@@ -288,6 +372,15 @@ pub fn build_app(state: AppState) -> Router {
         // Wave 4 — buyer cancel (with restock) + receipt view.
         .route("/v1/orders/:id/cancel", post(orders::cancel_order))
         .route("/v1/orders/:id/receipt", get(orders::get_receipt))
+        // Wave 5 — payments: availability, gateway webhook, retry,
+        // and the dev simulator helper (404s when dev mode is off).
+        .route("/v1/payments/methods", get(payments::list_methods))
+        .route("/v1/payments/webhook/:method", post(payments::webhook))
+        .route("/v1/payments/:id/retry", post(payments::retry))
+        .route(
+            "/v1/payments/:id/dev-simulate-success",
+            post(payments::dev_simulate),
+        )
         // Wave 3 — seller sub-orders.
         .route(
             "/v1/seller/sub-orders",

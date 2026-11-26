@@ -114,11 +114,64 @@ export interface SubOrder {
   items: OrderItem[];
 }
 
+/** The latest payment attempt on an order (Wave 5). */
+export interface PaymentSummary {
+  id: string;
+  method: string;
+  status: string;
+  gateway_ref: string | null;
+  /** Local DEV simulator path; present only for dev payments. */
+  dev_redirect_url: string | null;
+}
+
+/** One payment attempt (webhook / retry / dev-simulate responses). */
+export interface Payment {
+  id: string;
+  order_id: string;
+  method: string;
+  amount_poisha: number;
+  status: string;
+  gateway_ref: string | null;
+  created_at: string;
+  updated_at: string;
+  paid_at: string | null;
+}
+
+/** Availability of one payment method (GET /v1/payments/methods). */
+export interface PaymentMethodInfo {
+  method: string;
+  available: boolean;
+  /** "cod" | "live" | "dev" | null — "dev" means the DEV simulator. */
+  mode: string | null;
+  /** Machine-readable reason when unavailable, e.g. "not_configured". */
+  reason: string | null;
+}
+
+/** Bangla label for an order-level payment status (display only). */
+export function paymentStatusLabel(paymentStatus: string): string {
+  switch (paymentStatus) {
+    case "paid":
+      return "পরিশোধিত";
+    case "pending":
+      return "পেমেন্ট বাকি";
+    case "failed":
+      return "পেমেন্ট ব্যর্থ হয়েছে";
+    case "refunded":
+      return "ফেরত দেওয়া হয়েছে";
+    default:
+      return "ডেলিভারিতে পেমেন্ট";
+  }
+}
+
 export interface Order {
   id: string;
   buyer_user_id: string;
   status: string;
   payment_method: string;
+  /** pay_on_delivery | pending | paid | failed | refunded (Wave 5). */
+  payment_status: string;
+  /** Latest payment attempt; null for COD orders. */
+  payment: PaymentSummary | null;
   delivery_name: string;
   delivery_phone: string;
   delivery_address: string;
@@ -163,7 +216,7 @@ export interface SellerSubOrderList {
   limit: number;
 }
 
-/** Checkout payload. Wave 3: payment_method is "cod" only. */
+/** Checkout payload. Wave 5: cod | bkash | nagad | sslcommerz | shurjopay. */
 export interface PlaceOrderInput {
   delivery_name: string;
   delivery_phone: string;
@@ -288,9 +341,38 @@ export function clearCart(token: string): Promise<Cart> {
   return call("/v1/cart", { method: "DELETE", token });
 }
 
-/** POST /v1/orders — checkout (COD in Wave 3). Returns the placed order. */
+/** POST /v1/orders — checkout. Returns the placed order. */
 export function placeOrder(token: string, input: PlaceOrderInput): Promise<Order> {
   return call("/v1/orders", { method: "POST", token, body: input });
+}
+
+/** GET /v1/payments/methods — which payment methods are usable now. */
+export function getPaymentMethods(): Promise<PaymentMethodInfo[]> {
+  return call("/v1/payments/methods");
+}
+
+/** POST /v1/payments/{id}/retry — a failed payment goes back to pending. */
+export function retryPayment(token: string, paymentId: string): Promise<Payment> {
+  return call(`/v1/payments/${encodeURIComponent(paymentId)}/retry`, {
+    method: "POST",
+    token,
+  });
+}
+
+/**
+ * POST /v1/payments/{id}/dev-simulate-success — DEV ONLY helper: the
+ * API signs and applies a success callback for a dev payment through
+ * the same path as a real webhook. Exists only when the API runs
+ * with PAYMENTS_DEV_MODE on; otherwise the API returns 404.
+ */
+export function devSimulateSuccess(
+  token: string,
+  paymentId: string
+): Promise<Payment> {
+  return call(
+    `/v1/payments/${encodeURIComponent(paymentId)}/dev-simulate-success`,
+    { method: "POST", token }
+  );
 }
 
 /** GET /v1/orders — the buyer's own orders, newest first. */
@@ -339,6 +421,8 @@ export interface Receipt {
   created_at: string;
   status: string;
   payment_method: string;
+  /** pay_on_delivery | pending | paid | failed | refunded (Wave 5). */
+  payment_status: string;
   /** Grand total for COD orders; 0 when nothing is due on delivery. */
   cod_amount_due_poisha: number;
   delivery: {

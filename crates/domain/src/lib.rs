@@ -342,6 +342,35 @@ pub fn can_buyer_cancel(sub_statuses: &[&str]) -> bool {
     !sub_statuses.is_empty() && sub_statuses.iter().all(|status| *status == "placed")
 }
 
+/// Payment lifecycle statuses for one online payment attempt (mirrors
+/// the DB CHECK constraint on `payments.status`). The order-level
+/// `orders.payment_status` additionally allows `pay_on_delivery` for
+/// COD orders, which have no payment row at all.
+pub fn is_valid_payment_status(status: &str) -> bool {
+    matches!(status, "pending" | "paid" | "failed" | "refunded")
+}
+
+/// May a payment move from `from` to `to`? The single payment
+/// transition table (Wave 5): a pending payment settles as paid or
+/// fails; a paid payment can be refunded; a failed payment can be
+/// retried back to pending. Same-state moves, backwards moves and
+/// moves out of `refunded` are all rejected — duplicate webhook
+/// deliveries are handled by callers as idempotent no-ops BEFORE
+/// consulting this table.
+pub fn can_transition_payment(from: &str, to: &str) -> bool {
+    matches!(
+        (from, to),
+        ("pending", "paid") | ("pending", "failed") | ("paid", "refunded") | ("failed", "pending")
+    )
+}
+
+/// Does a gateway callback report the amount we actually expected?
+/// Exact integer-poisha equality — a callback for any other amount
+/// (even one poisha more or less) must never settle a payment.
+pub fn validate_callback_amount(expected_poisha: i64, reported_poisha: i64) -> bool {
+    expected_poisha == reported_poisha
+}
+
 /// Validate a Bangladeshi mobile number in local form: exactly 11 ASCII
 /// digits, starting with `01`, third digit in 3..=9 (operator prefixes
 /// 013–019). Pure helper — the single source of truth for phone rules.
@@ -777,6 +806,52 @@ mod tests {
         assert_eq!(totals.goods_total_poisha, 0);
         assert_eq!(totals.delivery_total_poisha, 0);
         assert_eq!(totals.grand_total_poisha, 0);
+    }
+
+    #[test]
+    fn payment_transition_table() {
+        // The allowed moves.
+        for (from, to) in [
+            ("pending", "paid"),
+            ("pending", "failed"),
+            ("paid", "refunded"),
+            ("failed", "pending"),
+        ] {
+            assert!(can_transition_payment(from, to), "{from} -> {to}");
+        }
+        // Everything else is rejected: same-state, backwards, skipping,
+        // moves out of refunded, the COD order-level status, unknowns.
+        for (from, to) in [
+            ("pending", "pending"),
+            ("pending", "refunded"),
+            ("paid", "pending"),
+            ("paid", "failed"),
+            ("paid", "paid"),
+            ("failed", "paid"),
+            ("failed", "refunded"),
+            ("failed", "failed"),
+            ("refunded", "pending"),
+            ("refunded", "paid"),
+            ("pay_on_delivery", "paid"),
+            ("bogus", "paid"),
+            ("pending", "bogus"),
+        ] {
+            assert!(!can_transition_payment(from, to), "{from} -> {to}");
+        }
+        assert!(is_valid_payment_status("pending"));
+        assert!(is_valid_payment_status("refunded"));
+        assert!(!is_valid_payment_status("pay_on_delivery"));
+        assert!(!is_valid_payment_status("bogus"));
+    }
+
+    #[test]
+    fn callback_amount_must_match_exactly() {
+        assert!(validate_callback_amount(469_000, 469_000));
+        assert!(validate_callback_amount(0, 0));
+        assert!(!validate_callback_amount(469_000, 469_001));
+        assert!(!validate_callback_amount(469_000, 468_999));
+        assert!(!validate_callback_amount(469_000, 0));
+        assert!(!validate_callback_amount(0, 100));
     }
 
     #[test]
