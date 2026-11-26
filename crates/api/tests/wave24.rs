@@ -146,6 +146,7 @@ async fn create_product(
 /// Create a product with a category and an explicit status
 /// (the Wave 15 create payload carries `category`); returns
 /// the product id.
+#[allow(clippy::too_many_arguments)]
 async fn create_categorised_product(
     app: &Router,
     token: &str,
