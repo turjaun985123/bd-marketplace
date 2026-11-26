@@ -50,6 +50,21 @@
 //! `advance_pending` order stays a plain buyer cancel — its
 //! payment row is still `pending` (no money ever moved) and is
 //! left as the audit record of the abandoned advance.
+//!
+//! Wave 33: checkout understands variant lines. A line's
+//! identity is (product, variant); variant rows are locked
+//! alongside the product rows, the line enters the totals at
+//! its FINAL price (base + delta, the domain rule), the
+//! order item snapshots the variant id and name, and the
+//! stock decrement lands on the VARIANT row with a
+//! variant-labelled audit row — the product's own stock is
+//! never touched by a variant line. The shared restock
+//! helper mirrors this: variant lines restock their variant.
+//! A variant-less line for a product that has since gained
+//! active variants is refused (the buyer must re-pick), so a
+//! stale cart can never draw on stock the seller moved into
+//! variants. Delivery weight stays the product's — variants
+//! carry no weight of their own.
 
 use axum::{
     extract::{Path, Query, State},
@@ -61,7 +76,7 @@ use domain::{
     allocate_discount, build_order_totals, can_buyer_cancel, can_transition_sub_order,
     compute_advance_poisha, compute_coupon_discount, is_valid_sub_order_status,
     normalize_bd_phone, normalize_coupon_code, parse_delivery_zone, split_cart_by_seller,
-    CartItem as DomainCartItem, OrderGroupInput,
+    variant_final_price, CartItem as DomainCartItem, OrderGroupInput,
 };
 use payments::{payment_adapter_for, parse_payment_method, PaymentMethod};
 use serde::{Deserialize, Serialize};
@@ -91,6 +106,14 @@ pub struct OrderItem {
     pub id: Uuid,
     pub sub_order_id: Uuid,
     pub product_id: Uuid,
+    /// The variant bought (Wave 33), or null for a
+    /// variant-less line. The restock paths restore stock to
+    /// this variant when it is set.
+    pub variant_id: Option<Uuid>,
+    /// The variant's name as it was at checkout (Wave 33) —
+    /// a snapshot like `title_snapshot`, so a later rename
+    /// never rewrites the order.
+    pub variant_name: Option<String>,
     pub title_snapshot: String,
     pub unit_price_poisha: i64,
     pub quantity: i32,
@@ -278,8 +301,9 @@ const SUB_ORDER_COLUMNS: &str = "so.id, so.order_id, so.store_id, s.slug AS stor
 
 async fn load_order_items(pool: &PgPool, sub_order_id: Uuid) -> Result<Vec<OrderItem>, ApiError> {
     sqlx::query_as(
-        "SELECT id, sub_order_id, product_id, title_snapshot, unit_price_poisha, \
-         quantity, line_total_poisha FROM order_items WHERE sub_order_id = $1 ORDER BY id",
+        "SELECT id, sub_order_id, product_id, variant_id, variant_name, title_snapshot, \
+         unit_price_poisha, quantity, line_total_poisha \
+         FROM order_items WHERE sub_order_id = $1 ORDER BY id",
     )
     .bind(sub_order_id)
     .fetch_all(pool)
@@ -423,6 +447,11 @@ fn default_payment_method() -> String {
 #[derive(FromRow)]
 struct LockedCartItem {
     product_id: Uuid,
+    /// The variant this line buys (Wave 33); null for a
+    /// variant-less line. The line's identity at checkout is
+    /// (product_id, variant_id) — two variants of one product
+    /// are two lines with two stock pools and two prices.
+    variant_id: Option<Uuid>,
     store_id: Uuid,
     title: String,
     unit_price_poisha: i64,
@@ -433,6 +462,27 @@ struct LockedCartItem {
     store_status: String,
     quantity: i32,
     weight_grams: i32,
+    /// Whether the product currently has at least one ACTIVE
+    /// variant (Wave 33). A variant-less line for such a
+    /// product is a stale cart entry (the variants arrived
+    /// after the add): checkout refuses it and asks the buyer
+    /// to pick a variant, rather than drawing on the product
+    /// stock the seller has since moved into variants.
+    has_active_variants: bool,
+}
+
+/// A variant row locked for checkout (`FOR UPDATE` on the
+/// variant row) — the variant half of a variant cart line:
+/// its current name, price delta and stock, read under the
+/// lock so the validation and the decrement below agree.
+#[derive(FromRow)]
+struct LockedVariant {
+    id: Uuid,
+    product_id: Uuid,
+    name: String,
+    price_delta_poisha: i64,
+    stock: i32,
+    is_active: bool,
 }
 
 /// Apply the checkout's coupon (if any) to the order groups, in
@@ -562,10 +612,12 @@ pub async fn place_order(
 
     // Lock the product rows so stock cannot change under this checkout.
     let locked: Vec<LockedCartItem> = sqlx::query_as(
-        "SELECT ci.product_id, p.store_id, p.title, \
+        "SELECT ci.product_id, ci.variant_id, p.store_id, p.title, \
          p.price_poisha AS unit_price_poisha, p.stock, p.status, \
          s.status AS store_status, ci.quantity, \
-         p.weight_grams \
+         p.weight_grams, \
+         EXISTS (SELECT 1 FROM product_variants pv \
+                 WHERE pv.product_id = p.id AND pv.is_active) AS has_active_variants \
          FROM cart_items ci JOIN products p ON p.id = ci.product_id \
          JOIN stores s ON s.id = p.store_id \
          WHERE ci.cart_id = $1 FOR UPDATE OF p",
@@ -578,6 +630,31 @@ pub async fn place_order(
     if locked.is_empty() {
         return Err(ApiError::bad_request("cart is empty"));
     }
+
+    // Wave 33: lock the referenced variant rows too, and read
+    // their current name / delta / stock under the lock. The
+    // cart's foreign key guarantees every referenced variant
+    // still exists (variants are never hard-deleted).
+    let variant_ids: Vec<Uuid> = locked.iter().filter_map(|item| item.variant_id).collect();
+    let locked_variants: Vec<LockedVariant> = if variant_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as(
+            "SELECT id, product_id, name, price_delta_poisha, stock, is_active \
+             FROM product_variants WHERE id = ANY($1) FOR UPDATE",
+        )
+        .bind(&variant_ids)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| ApiError::internal("lock cart variants", e))?
+    };
+    let variant_by_id: HashMap<Uuid, &LockedVariant> =
+        locked_variants.iter().map(|v| (v.id, v)).collect();
+
+    // The FINAL price of every line, computed once here (base
+    // + delta through the domain rule for variant lines) and
+    // reused by the totals and the snapshots below.
+    let mut final_price_by_line: HashMap<(Uuid, Option<Uuid>), i64> = HashMap::new();
     for item in &locked {
         if item.store_status == "suspended" {
             return Err(ApiError::conflict(format!(
@@ -591,23 +668,73 @@ pub async fn place_order(
                 item.title
             )));
         }
-        if item.stock < item.quantity {
-            return Err(ApiError::conflict(format!(
-                "insufficient stock for '{}': requested {}, available {}",
-                item.title, item.quantity, item.stock
-            )));
-        }
+        let final_price = match item.variant_id {
+            Some(variant_id) => {
+                let variant = variant_by_id.get(&variant_id).ok_or_else(|| {
+                    ApiError::internal("find locked variant", sqlx::Error::RowNotFound)
+                })?;
+                if variant.product_id != item.product_id {
+                    return Err(ApiError::internal(
+                        "variant/product mismatch",
+                        sqlx::Error::RowNotFound,
+                    ));
+                }
+                if !variant.is_active {
+                    return Err(ApiError::bad_request(format!(
+                        "variant '{}' of product '{}' is no longer available",
+                        variant.name, item.title
+                    )));
+                }
+                let price = variant_final_price(item.unit_price_poisha, variant.price_delta_poisha)
+                    .ok_or_else(|| {
+                        ApiError::bad_request(format!(
+                            "variant '{}' of product '{}' no longer has a valid price",
+                            variant.name, item.title
+                        ))
+                    })?;
+                if variant.stock < item.quantity {
+                    return Err(ApiError::conflict(format!(
+                        "insufficient stock for '{} ({})': requested {}, available {}",
+                        item.title, variant.name, item.quantity, variant.stock
+                    )));
+                }
+                price
+            }
+            None => {
+                if item.has_active_variants {
+                    return Err(ApiError::bad_request(format!(
+                        "আকার/রং বেছে নিন — product '{}' now has variants; \
+                         remove it from the cart and add it again with a variant chosen",
+                        item.title
+                    )));
+                }
+                if item.stock < item.quantity {
+                    return Err(ApiError::conflict(format!(
+                        "insufficient stock for '{}': requested {}, available {}",
+                        item.title, item.quantity, item.stock
+                    )));
+                }
+                item.unit_price_poisha
+            }
+        };
+        final_price_by_line.insert((item.product_id, item.variant_id), final_price);
     }
 
     // Split per seller and compute ALL money via the domain functions.
+    // Wave 33: variant lines enter the totals at their FINAL
+    // price and carry their variant id through the split, so
+    // the snapshot loop below can find each line's locked row
+    // by (product, variant). Delivery weight stays the
+    // PRODUCT's weight — variants carry no weight of their own.
     let domain_items: Vec<DomainCartItem> = locked
         .iter()
         .map(|item| DomainCartItem {
             product_id: item.product_id.to_string(),
             store_id: item.store_id.to_string(),
             quantity: item.quantity as u32,
-            unit_price_poisha: item.unit_price_poisha,
+            unit_price_poisha: final_price_by_line[&(item.product_id, item.variant_id)],
             unit_weight_grams: i64::from(item.weight_grams),
+            variant_id: item.variant_id.map(|id| id.to_string()),
         })
         .collect();
     // The split items carry their real unit weights, so each group's
@@ -794,9 +921,14 @@ pub async fn place_order(
         .await?;
     }
 
-    // Snapshots for order_items, keyed by product id.
-    let locked_by_product: std::collections::HashMap<Uuid, &LockedCartItem> =
-        locked.iter().map(|item| (item.product_id, item)).collect();
+    // Snapshots for order_items, keyed by (product, variant):
+    // Wave 33 makes the variant part of a line's identity, so
+    // two variant lines of one product resolve to their own
+    // locked rows (and their own stock pools) here.
+    let locked_by_line: std::collections::HashMap<(Uuid, Option<Uuid>), &LockedCartItem> = locked
+        .iter()
+        .map(|item| ((item.product_id, item.variant_id), item))
+        .collect();
 
     for (group, sub_totals) in groups.iter().zip(totals.sub_orders.iter()) {
         let store_id = Uuid::parse_str(&group.store_id)
@@ -820,16 +952,42 @@ pub async fn place_order(
         for item in &group.items {
             let product_id = Uuid::parse_str(&item.product_id)
                 .map_err(|_| ApiError::internal("parse product id", sqlx::Error::RowNotFound))?;
-            let locked_item = locked_by_product
-                .get(&product_id)
+            let variant_id: Option<Uuid> = item
+                .variant_id
+                .as_deref()
+                .map(|raw| {
+                    Uuid::parse_str(raw).map_err(|_| {
+                        ApiError::internal("parse variant id", sqlx::Error::RowNotFound)
+                    })
+                })
+                .transpose()?;
+            let locked_item = locked_by_line
+                .get(&(product_id, variant_id))
                 .ok_or_else(|| ApiError::internal("find locked item", sqlx::Error::RowNotFound))?;
+            // The variant name snapshot (Wave 33): the name as
+            // it stands under the checkout lock, frozen onto
+            // the order line like the title and price.
+            let variant_name: Option<String> = match variant_id {
+                Some(id) => Some(
+                    variant_by_id
+                        .get(&id)
+                        .ok_or_else(|| {
+                            ApiError::internal("find locked variant", sqlx::Error::RowNotFound)
+                        })?
+                        .name
+                        .clone(),
+                ),
+                None => None,
+            };
             sqlx::query(
-                "INSERT INTO order_items (sub_order_id, product_id, title_snapshot, \
-                 unit_price_poisha, quantity, line_total_poisha) \
-                 VALUES ($1, $2, $3, $4, $5, $6)",
+                "INSERT INTO order_items (sub_order_id, product_id, variant_id, variant_name, \
+                 title_snapshot, unit_price_poisha, quantity, line_total_poisha) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             )
             .bind(sub_order_id)
             .bind(product_id)
+            .bind(variant_id)
+            .bind(&variant_name)
             .bind(&locked_item.title)
             .bind(item.unit_price_poisha)
             .bind(item.quantity as i32)
@@ -841,23 +999,48 @@ pub async fn place_order(
             // Wave 23: the decrement and its audit row commit
             // together — `RETURNING stock` gives the exact
             // post-move count for the trail's snapshot.
-            let new_stock: i32 = sqlx::query_scalar(
-                "UPDATE products SET stock = stock - $2, updated_at = now() \
-                 WHERE id = $1 RETURNING stock",
-            )
-            .bind(product_id)
-            .bind(item.quantity as i32)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| ApiError::internal("decrement stock", e))?;
+            //
+            // Wave 33: a variant line decrements the VARIANT
+            // row (the product's own stock is not touched) and
+            // its audit row carries the variant id with the
+            // variant's post-move count; a variant-less line
+            // takes the product path exactly as before.
+            let quantity = item.quantity as i32;
+            let (new_stock, movement_variant_id) = match variant_id {
+                Some(variant_id) => {
+                    let variant_stock: i32 = sqlx::query_scalar(
+                        "UPDATE product_variants SET stock = stock - $2, updated_at = now() \
+                         WHERE id = $1 RETURNING stock",
+                    )
+                    .bind(variant_id)
+                    .bind(quantity)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| ApiError::internal("decrement variant stock", e))?;
+                    (variant_stock, Some(variant_id))
+                }
+                None => {
+                    let product_stock: i32 = sqlx::query_scalar(
+                        "UPDATE products SET stock = stock - $2, updated_at = now() \
+                         WHERE id = $1 RETURNING stock",
+                    )
+                    .bind(product_id)
+                    .bind(quantity)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| ApiError::internal("decrement stock", e))?;
+                    (product_stock, None)
+                }
+            };
             crate::inventory::record_stock_adjustment(
                 &mut tx,
                 &crate::inventory::StockMovement {
                     product_id,
+                    variant_id: movement_variant_id,
                     store_id,
                     actor: "system",
                     actor_user_id: None,
-                    delta: -(item.quantity as i32),
+                    delta: -quantity,
                     new_stock,
                     reason: "order",
                     note: None,
@@ -982,6 +1165,16 @@ pub async fn get_order_for_buyer(
 // Cancellation + restock (Wave 4)
 // ---------------------------------------------------------------------------
 
+/// One order line read back for restocking: the product, the
+/// variant the line bought (Wave 33; null for variant-less
+/// lines) and the quantity to put back.
+#[derive(FromRow)]
+struct RestockItem {
+    product_id: Uuid,
+    variant_id: Option<Uuid>,
+    quantity: i32,
+}
+
 /// Put one sub-order's items back into stock: for every order item,
 /// `products.stock` grows by the ordered quantity. Shared by the buyer
 /// whole-order cancel and the seller sub-order cancel — both run it
@@ -999,6 +1192,13 @@ pub async fn get_order_for_buyer(
 /// `return_restock` (a received buyer return) or `rto_restock`
 /// (a courier-driven return). The reason is a caller-supplied
 /// constant, never request data.
+///
+/// Wave 33: a line that bought a variant restocks THE VARIANT
+/// (its audit row carries the variant id and the variant's
+/// post-move count) — even if the variant has since been
+/// deactivated, because the physical goods came back and the
+/// seller can reactivate it; a variant-less line restocks the
+/// product exactly as before.
 pub(crate) async fn restock_sub_order_items(
     conn: &mut sqlx::PgConnection,
     sub_order_id: Uuid,
@@ -1009,30 +1209,49 @@ pub(crate) async fn restock_sub_order_items(
         .fetch_one(&mut *conn)
         .await
         .map_err(|e| ApiError::internal("load sub-order store for restock", e))?;
-    let items: Vec<(Uuid, i32)> =
-        sqlx::query_as("SELECT product_id, quantity FROM order_items WHERE sub_order_id = $1")
-            .bind(sub_order_id)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(|e| ApiError::internal("load items for restock", e))?;
-    for (product_id, quantity) in items {
-        let new_stock: i32 = sqlx::query_scalar(
-            "UPDATE products SET stock = stock + $2, updated_at = now() \
-             WHERE id = $1 RETURNING stock",
-        )
-        .bind(product_id)
-        .bind(quantity)
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(|e| ApiError::internal("restock product", e))?;
+    let items: Vec<RestockItem> = sqlx::query_as(
+        "SELECT product_id, variant_id, quantity FROM order_items WHERE sub_order_id = $1",
+    )
+    .bind(sub_order_id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| ApiError::internal("load items for restock", e))?;
+    for item in items {
+        let (new_stock, movement_variant_id) = match item.variant_id {
+            Some(variant_id) => {
+                let variant_stock: i32 = sqlx::query_scalar(
+                    "UPDATE product_variants SET stock = stock + $2, updated_at = now() \
+                     WHERE id = $1 RETURNING stock",
+                )
+                .bind(variant_id)
+                .bind(item.quantity)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| ApiError::internal("restock variant", e))?;
+                (variant_stock, Some(variant_id))
+            }
+            None => {
+                let product_stock: i32 = sqlx::query_scalar(
+                    "UPDATE products SET stock = stock + $2, updated_at = now() \
+                     WHERE id = $1 RETURNING stock",
+                )
+                .bind(item.product_id)
+                .bind(item.quantity)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| ApiError::internal("restock product", e))?;
+                (product_stock, None)
+            }
+        };
         crate::inventory::record_stock_adjustment(
             conn,
             &crate::inventory::StockMovement {
-                product_id,
+                product_id: item.product_id,
+                variant_id: movement_variant_id,
                 store_id,
                 actor: "system",
                 actor_user_id: None,
-                delta: quantity,
+                delta: item.quantity,
                 new_stock,
                 reason,
                 note: None,

@@ -24,6 +24,7 @@ import {
   updateReview,
   type AlsoBoughtItem,
   type Product,
+  type ProductDetail,
   type ProductQuestion,
   type Review,
   type Store,
@@ -52,6 +53,13 @@ import { recordRecentlyViewed } from "@/hooks/useRecentlyViewed";
  * questions with the seller's public answers. Signed-in
  * non-owners ask here; the owner is pointed at the seller
  * Q&A inbox instead (the API refuses own-store questions).
+ *
+ * Wave 33: the variant picker — when the detail carries
+ * variants, the buyer picks one (the first is preselected);
+ * the shown price and stock become the variant's FINAL
+ * price and its own stock, and add-to-cart sends the
+ * variant id (the API refuses a variant-less add for a
+ * variant product).
  */
 export default function ProductDetailPage({
   params,
@@ -62,7 +70,10 @@ export default function ProductDetailPage({
   const { add, error: cartError } = useCart();
   const router = useRouter();
   const [messageError, setMessageError] = useState<string | null>(null);
-  const [product, setProduct] = useState<Product | null>(null);
+  const [product, setProduct] = useState<ProductDetail | null>(null);
+  const [selectedVariantId, setSelectedVariantId] = useState<string | null>(
+    null
+  );
   const [reviews, setReviews] = useState<Review[] | null>(null);
   const [related, setRelated] = useState<Product[]>([]);
   const [alsoBought, setAlsoBought] = useState<AlsoBoughtItem[]>([]);
@@ -86,6 +97,13 @@ export default function ProductDetailPage({
       getProductReviews(params.id),
     ]);
     setProduct(p);
+    // Wave 33: preselect the first variant (picker order),
+    // keeping a still-valid earlier pick across reloads.
+    setSelectedVariantId((current) =>
+      current && p.variants.some((v) => v.id === current)
+        ? current
+        : (p.variants[0]?.id ?? null)
+    );
     setReviews(list.items);
     // Wave 25: the public Q&A list — best-effort like the
     // discovery rails, a failed read hides the section's list
@@ -131,7 +149,7 @@ export default function ProductDetailPage({
 
   async function onAdd() {
     setAdded(false);
-    await add(params.id, 1);
+    await add(params.id, 1, selectedVariantId);
     setAdded(true);
   }
 
@@ -210,6 +228,15 @@ export default function ProductDetailPage({
     );
   }
 
+  // Wave 33: with a variant picked, the page speaks for the
+  // variant — its final price and its own stock.
+  const selectedVariant =
+    product.variants.find((v) => v.id === selectedVariantId) ?? null;
+  const displayPrice = selectedVariant
+    ? selectedVariant.final_price_poisha
+    : product.price_poisha;
+  const displayStock = selectedVariant ? selectedVariant.stock : product.stock;
+
   return (
     <main>
       <p>
@@ -225,8 +252,33 @@ export default function ProductDetailPage({
       </p>
       <h1>{product.title_bn ?? product.title}</h1>
       {product.title_bn && <p>{product.title}</p>}
+      {product.variants.length > 0 && (
+        <div>
+          <p>আকার/রং বেছে নিন — Choose a variant:</p>
+          <p>
+            {product.variants.map((variant) => (
+              <button
+                key={variant.id}
+                type="button"
+                aria-pressed={variant.id === selectedVariantId}
+                onClick={() => setSelectedVariantId(variant.id)}
+              >
+                {variant.id === selectedVariantId ? "✓ " : ""}
+                {variant.name} —{" "}
+                <PriceTag amountPoisha={variant.final_price_poisha} />
+                {variant.stock <= 0 ? " (স্টক শেষ)" : ""}
+              </button>
+            ))}
+          </p>
+        </div>
+      )}
       <p>
-        <PriceTag amountPoisha={product.price_poisha} />{" "}
+        <PriceTag amountPoisha={displayPrice} />{" "}
+        {selectedVariant && selectedVariant.price_delta_poisha !== 0 && (
+          <span>
+            (মূল দাম <PriceTag amountPoisha={product.price_poisha} />)
+          </span>
+        )}{" "}
         {product.compare_at_poisha !== null && (
           <s>
             <PriceTag amountPoisha={product.compare_at_poisha} />
@@ -244,8 +296,8 @@ export default function ProductDetailPage({
         )}
       </p>
       <p>
-        {product.stock > 0
-          ? `স্টকে আছে (${product.stock}টি)`
+        {displayStock > 0
+          ? `স্টকে আছে (${displayStock}টি)`
           : "স্টকে নেই"}
         {" · "}
         ওজন: {product.weight_grams} গ্রাম
@@ -258,7 +310,11 @@ export default function ProductDetailPage({
 
       {token ? (
         <p>
-          <button type="button" onClick={() => void onAdd()}>
+          <button
+            type="button"
+            disabled={product.variants.length > 0 && displayStock <= 0}
+            onClick={() => void onAdd()}
+          >
             কার্টে যোগ করুন — Add to cart
           </button>{" "}
           {added && !cartError && (

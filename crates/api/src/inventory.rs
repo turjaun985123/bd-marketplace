@@ -17,6 +17,17 @@
 //!   vocabulary (`restock`, `correction`, `damage`,
 //!   `count_fix`, `other`).
 //!
+//! Wave 33 adds the variant dimension: movements that touch
+//! a VARIANT's stock (variant checkout lines, their restocks,
+//! and the per-variant adjust-stock endpoint in the
+//! `variants` module) write through the same single writer
+//! with `variant_id` set and `new_stock` snapshotting the
+//! VARIANT's count. A product with active variants refuses
+//! product-level adjust-stock — its stock lives on the
+//! variants, and the overview reads the effective (summed)
+//! stock so health and alerts follow the same pool buyers
+//! draw from.
+//!
 //! Product creation writes NO row: the history starts at the
 //! creation stock. The product PATCH endpoint no longer accepts
 //! a `stock` field at all (Wave 23 removed it from
@@ -61,6 +72,11 @@ use crate::{ApiError, AppState};
 pub struct StockAdjustment {
     pub id: Uuid,
     pub product_id: Uuid,
+    /// The variant whose stock moved (Wave 33), or null for
+    /// a product-level movement. A variant movement still
+    /// carries its product id, so the per-product history
+    /// shows it in place, labelled by this id.
+    pub variant_id: Option<Uuid>,
     pub store_id: Uuid,
     /// `seller` (a manual adjustment) or `system` (checkout,
     /// cancel, return and RTO movements).
@@ -149,6 +165,11 @@ pub struct LowStockItem {
 /// or roll back together.
 pub(crate) struct StockMovement<'a> {
     pub product_id: Uuid,
+    /// The variant whose stock moved (Wave 33); `None` for a
+    /// product-level movement. When set, `new_stock` is the
+    /// VARIANT's on-hand count after the move — the trail
+    /// replays whichever pool the movement touched.
+    pub variant_id: Option<Uuid>,
     pub store_id: Uuid,
     /// `seller` or `system`.
     pub actor: &'a str,
@@ -170,13 +191,14 @@ pub(crate) async fn record_stock_adjustment(
     movement: &StockMovement<'_>,
 ) -> Result<StockAdjustment, ApiError> {
     sqlx::query_as(
-        "INSERT INTO stock_adjustments (product_id, store_id, actor, actor_user_id, \
-         delta, new_stock, reason, note) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-         RETURNING id, product_id, store_id, actor, actor_user_id, delta, \
+        "INSERT INTO stock_adjustments (product_id, variant_id, store_id, actor, \
+         actor_user_id, delta, new_stock, reason, note) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+         RETURNING id, product_id, variant_id, store_id, actor, actor_user_id, delta, \
          new_stock, reason, note, created_at",
     )
     .bind(movement.product_id)
+    .bind(movement.variant_id)
     .bind(movement.store_id)
     .bind(movement.actor)
     .bind(movement.actor_user_id)
@@ -271,6 +293,25 @@ pub async fn adjust_stock_for_seller(
         return Err(ApiError::not_found("product not found"));
     }
 
+    // Wave 33: while a product has ACTIVE variants, its stock
+    // lives on the variants — a product-level adjustment would
+    // write a pool nothing reads. Refuse and point at the
+    // per-variant endpoint instead of silently no-oping.
+    let has_active_variants: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM product_variants \
+         WHERE product_id = $1 AND is_active)",
+    )
+    .bind(product_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| ApiError::internal("check variants for adjust-stock", e))?;
+    if has_active_variants {
+        return Err(ApiError::bad_request(
+            "এই পণ্যের স্টক ভ্যারিয়েন্ট অনুযায়ী পরিচালিত হয় — প্রতিটি ভ্যারিয়েন্টের স্টক আলাদা করে ঠিক করুন \
+             (this product's stock is managed per variant — adjust each variant's stock instead)",
+        ));
+    }
+
     let new_stock = i64::from(row.stock) + delta;
     if new_stock < 0 {
         return Err(ApiError::bad_request(format!(
@@ -292,6 +333,7 @@ pub async fn adjust_stock_for_seller(
         &mut tx,
         &StockMovement {
             product_id,
+            variant_id: None,
             store_id: row.store_id,
             actor: "seller",
             actor_user_id: Some(user.user_id),
@@ -335,7 +377,7 @@ pub async fn list_stock_history(
             .map_err(|e| ApiError::internal("count stock history", e))?;
 
     let items: Vec<StockAdjustment> = sqlx::query_as(
-        "SELECT id, product_id, store_id, actor, actor_user_id, delta, \
+        "SELECT id, product_id, variant_id, store_id, actor, actor_user_id, delta, \
          new_stock, reason, note, created_at \
          FROM stock_adjustments WHERE product_id = $1 \
          ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3",
@@ -395,13 +437,18 @@ struct InventoryRow {
 /// computed by the domain rule in Rust so the API and the
 /// dashboard alerts can never disagree.
 pub async fn get_inventory(pool: &PgPool, user: &AuthUser) -> Result<Inventory, ApiError> {
-    let rows: Vec<InventoryRow> = sqlx::query_as(
-        "SELECT p.id AS product_id, p.title, s.slug AS store_slug, p.stock, \
-         p.low_stock_threshold \
+    // Wave 33: the overview shows the EFFECTIVE stock (the
+    // shared expression from the products module) — for a
+    // variant product that is the sum of its variants'
+    // stocks, which is the availability a buyer can draw on.
+    let rows: Vec<InventoryRow> = sqlx::query_as(&format!(
+        "SELECT p.id AS product_id, p.title, s.slug AS store_slug, \
+         {EFFECTIVE_STOCK} AS stock, p.low_stock_threshold \
          FROM products p JOIN stores s ON s.id = p.store_id \
          WHERE s.owner_user_id = $1 \
-         ORDER BY p.stock ASC, p.title ASC",
-    )
+         ORDER BY stock ASC, p.title ASC",
+        EFFECTIVE_STOCK = crate::products::EFFECTIVE_STOCK_SQL
+    ))
     .bind(user.user_id)
     .fetch_all(pool)
     .await
@@ -449,15 +496,20 @@ pub async fn low_stock_items_for_seller(
     pool: &PgPool,
     owner_user_id: Uuid,
 ) -> Result<Vec<LowStockItem>, ApiError> {
-    let rows: Vec<InventoryRow> = sqlx::query_as(
-        "SELECT p.id AS product_id, p.title, s.slug AS store_slug, p.stock, \
-         p.low_stock_threshold \
+    // Wave 33: the alert filter runs on the EFFECTIVE stock
+    // (see `get_inventory`) — a variant product whose variants
+    // are nearly gone must alert on their sum, not on the
+    // untouched product column.
+    let rows: Vec<InventoryRow> = sqlx::query_as(&format!(
+        "SELECT p.id AS product_id, p.title, s.slug AS store_slug, \
+         {EFFECTIVE_STOCK} AS stock, p.low_stock_threshold \
          FROM products p JOIN stores s ON s.id = p.store_id \
          WHERE s.owner_user_id = $1 \
-         AND p.stock <= COALESCE(p.low_stock_threshold, $2) \
-         ORDER BY (p.stock <= 0) DESC, p.stock ASC, p.created_at ASC \
+         AND ({EFFECTIVE_STOCK}) <= COALESCE(p.low_stock_threshold, $2) \
+         ORDER BY (stock <= 0) DESC, stock ASC, p.created_at ASC \
          LIMIT 10",
-    )
+        EFFECTIVE_STOCK = crate::products::EFFECTIVE_STOCK_SQL
+    ))
     .bind(owner_user_id)
     .bind(LOW_STOCK_DEFAULT as i32)
     .fetch_all(pool)

@@ -270,7 +270,9 @@ export default function BuyerOrdersPage() {
                 </h4>
                 {sub.items.map((item) => (
                   <p key={item.id}>
-                    {item.title_snapshot} × {item.quantity} —{" "}
+                    {item.title_snapshot}
+                    {item.variant_name && <> ({item.variant_name})</>} ×{" "}
+                    {item.quantity} —{" "}
                     <PriceTag amountPoisha={item.line_total_poisha} />
                   </p>
                 ))}

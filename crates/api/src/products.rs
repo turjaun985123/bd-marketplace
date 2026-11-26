@@ -12,6 +12,17 @@
 //! Wave 8: the product view also carries the review rating summary
 //! (`rating_avg` / `rating_count`), produced by the single aggregate
 //! join `PRODUCT_RATING_JOIN` shared by every product query here.
+//!
+//! Wave 33: products gain variants (the `variants` module). The
+//! view's `stock` becomes the EFFECTIVE stock, computed in
+//! `PRODUCT_COLUMNS` itself: while a product has at least one
+//! ACTIVE variant, availability lives on the variants and the
+//! field is the SUM of the active variants' stocks (and
+//! `stock_status` derives from that sum, through the same
+//! `with_stock_status`); with no active variants it is the
+//! stored `products.stock`, exactly as before. The stored
+//! column is never overwritten with the sum — write paths that
+//! need the raw column read it themselves.
 
 use axum::{
     extract::{Path, Query, State},
@@ -26,6 +37,7 @@ use uuid::Uuid;
 
 use crate::auth::{authenticate_optional, AuthUser};
 use crate::stores::get_store_by_id;
+use crate::variants::{load_public_variants, PublicVariant};
 use crate::{ApiError, AppState};
 
 /// Wave 32: the cache policy for public catalogue reads. Thirty
@@ -71,7 +83,16 @@ pub struct Product {
     pub category: Option<String>,
     pub price_poisha: i64,
     pub compare_at_poisha: Option<i64>,
+    /// The EFFECTIVE stock (Wave 33): the sum of the active
+    /// variants' stocks while the product has active variants,
+    /// otherwise the stored `products.stock`. Computed by
+    /// `PRODUCT_COLUMNS` — see the module doc.
     pub stock: i32,
+    /// Whether the product has at least one ACTIVE variant
+    /// (Wave 33). List views carry only this flag (never the
+    /// variant rows — payload size); the detail view adds the
+    /// variants themselves (see `ProductDetail`).
+    pub has_variants: bool,
     /// The seller's per-product low-stock warning level
     /// (Wave 23); null means the platform default applies.
     pub low_stock_threshold: Option<i32>,
@@ -109,14 +130,47 @@ pub struct Product {
     pub updated_at: DateTime<Utc>,
 }
 
+/// The effective-stock expression (Wave 33), aliased `stock`
+/// in `PRODUCT_COLUMNS`: the SUM of the active variants'
+/// stocks (cast to int — the variants' own column is int)
+/// while the product has at least one active variant, else
+/// the stored `products.stock`. The inventory overview in
+/// the `inventory` module runs the same expression over its
+/// own `p` alias; this string is the canonical text.
+pub(crate) const EFFECTIVE_STOCK_SQL: &str = "CASE WHEN EXISTS (\
+    SELECT 1 FROM product_variants pv \
+    WHERE pv.product_id = p.id AND pv.is_active) \
+    THEN (SELECT COALESCE(SUM(pv2.stock), 0)::int FROM product_variants pv2 \
+          WHERE pv2.product_id = p.id AND pv2.is_active) \
+    ELSE p.stock END";
+
 pub(crate) const PRODUCT_COLUMNS: &str = "p.id, p.store_id, s.slug AS store_slug, p.title, p.title_bn, \
-    p.description, p.category, p.price_poisha, p.compare_at_poisha, p.stock, \
+    p.description, p.category, p.price_poisha, p.compare_at_poisha, \
+    CASE WHEN EXISTS (SELECT 1 FROM product_variants pv \
+                      WHERE pv.product_id = p.id AND pv.is_active) \
+         THEN (SELECT COALESCE(SUM(pv2.stock), 0)::int FROM product_variants pv2 \
+               WHERE pv2.product_id = p.id AND pv2.is_active) \
+         ELSE p.stock END AS stock, \
+    EXISTS (SELECT 1 FROM product_variants pv \
+            WHERE pv.product_id = p.id AND pv.is_active) AS has_variants, \
     p.low_stock_threshold, p.status, \
     p.weight_grams, p.source, p.source_ref, rv.rating_avg, rv.rating_count, \
     p.created_at, p.updated_at, \
     EXISTS (SELECT 1 FROM promotions pr \
             WHERE pr.product_id = p.id AND pr.status = 'active' \
               AND pr.starts_at <= now() AND pr.ends_at > now()) AS is_promoted";
+
+/// The product DETAIL shape (Wave 33): the shared product
+/// view flattened, plus the ACTIVE variants a buyer can pick
+/// (ordered by sort, then name — see the `variants` module).
+/// Only the detail endpoint builds this; list views carry
+/// `has_variants` and never the variant rows.
+#[derive(Debug, Serialize)]
+pub struct ProductDetail {
+    #[serde(flatten)]
+    pub product: Product,
+    pub variants: Vec<PublicVariant>,
+}
 
 /// Fill a loaded product's computed `stock_status` from the
 /// domain rule (Wave 23). Every query site that materialises
@@ -434,10 +488,41 @@ pub async fn update_product_for_owner(
     // category but not clear it back to NULL.
     let merged_category = normalize_category(patch.category.as_deref()).or(existing.category);
 
+    // Wave 33: a price change must not strand a variant at a
+    // zero or negative final price (base + delta). The variant
+    // write paths validate their own delta against the current
+    // base; this is the mirror guard for the base moving under
+    // existing deltas.
+    if merged.price_poisha != existing.price_poisha {
+        let stranded: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM product_variants \
+             WHERE product_id = $1 AND is_active AND $2 + price_delta_poisha <= 0",
+        )
+        .bind(id)
+        .bind(merged.price_poisha)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| ApiError::internal("check variant prices for product update", e))?;
+        if stranded > 0 {
+            return Err(ApiError::bad_request(format!(
+                "the new price would leave {stranded} variant price(s) at zero or below — \
+                 adjust the variant price differences first"
+            )));
+        }
+    }
+
+    // Wave 33: the UPDATE no longer writes `stock` at all.
+    // Since Wave 23 the merged value was the stored stock
+    // passed through unchanged (PATCH cannot move stock), but
+    // the loaded view's stock is now the EFFECTIVE stock (the
+    // variant sum for variant products) — writing it back
+    // would corrupt the stored fallback. Stock moves only
+    // through the audited paths, so the column is simply not
+    // this statement's business.
     sqlx::query(
         "UPDATE products SET title = $2, title_bn = $3, description = $4, \
-         price_poisha = $5, compare_at_poisha = $6, stock = $7, status = $8, \
-         weight_grams = $9, category = $10, updated_at = now() WHERE id = $1",
+         price_poisha = $5, compare_at_poisha = $6, status = $7, \
+         weight_grams = $8, category = $9, updated_at = now() WHERE id = $1",
     )
     .bind(id)
     .bind(merged.title.trim())
@@ -445,7 +530,6 @@ pub async fn update_product_for_owner(
     .bind(patch.description.or(existing.description))
     .bind(merged.price_poisha)
     .bind(patch.compare_at_poisha.or(existing.compare_at_poisha))
-    .bind(merged.stock)
     .bind(&merged.status)
     .bind(merged_weight_grams)
     .bind(&merged_category)
@@ -569,7 +653,7 @@ pub async fn get_product(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
-) -> Result<(HeaderMap, Json<Product>), ApiError> {
+) -> Result<(HeaderMap, Json<ProductDetail>), ApiError> {
     let pool = state.require_pool()?;
     let product = get_product_by_id(pool, id).await?;
     // Two visibility gates, both answered "404" so nothing leaks:
@@ -585,11 +669,15 @@ pub async fn get_product(
     if !is_owner && (product.status != "active" || store.status == "suspended") {
         return Err(ApiError::not_found("product not found"));
     }
+    // Wave 33: the detail view carries the ACTIVE variants
+    // (the list views never do — see `ProductDetail`).
+    let variants = load_public_variants(pool, &product).await?;
+    let detail = ProductDetail { product, variants };
     // Wave 32: an anonymous read that passed the gates is by
     // definition the public view, so it may be cached publicly;
     // a signed-in read (above all the owner's view of a draft)
     // gets no cache header (see `public_cache_headers`).
-    Ok((public_cache_headers(viewer.is_none()), Json(product)))
+    Ok((public_cache_headers(viewer.is_none()), Json(detail)))
 }
 
 pub async fn update_product(

@@ -3,6 +3,7 @@
 import { useCallback, useState } from "react";
 import Link from "next/link";
 import ProductCard from "@/components/ProductCard";
+import VariantManager from "@/components/VariantManager";
 import {
   createProduct,
   getStore,
@@ -18,6 +19,10 @@ import { useAuth } from "@/hooks/useAuth";
  * non-active products), and add a new product with a simple form.
  * Prices are entered in taka and converted to poisha here; all money
  * maths still lives in the Rust API.
+ *
+ * Wave 33: each product expands into its variant manager
+ * (the VariantManager component) — variants with their own
+ * price differences and stock, managed per product.
  */
 export default function SellerProductsPage() {
   const { ready, token } = useAuth();
@@ -25,6 +30,8 @@ export default function SellerProductsPage() {
   const [store, setStore] = useState<Store | null>(null);
   const [products, setProducts] = useState<Product[]>([]);
   const [message, setMessage] = useState<string | null>(null);
+  // Wave 33: which products have their variant manager open.
+  const [variantOpen, setVariantOpen] = useState<Record<string, boolean>>({});
 
   // Create-product form state (price typed in taka for humans).
   const [title, setTitle] = useState("");
@@ -155,6 +162,25 @@ export default function SellerProductsPage() {
                       প্রমোট করুন — Promote this product
                     </Link>
                   </p>
+                )}
+                <p>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setVariantOpen((prev) => ({
+                        ...prev,
+                        [p.id]: !prev[p.id],
+                      }))
+                    }
+                  >
+                    {variantOpen[p.id]
+                      ? "ভ্যারিয়েন্ট লুকান"
+                      : "ভ্যারিয়েন্ট পরিচালনা — Manage variants"}
+                    {p.has_variants ? " (আছে)" : ""}
+                  </button>
+                </p>
+                {variantOpen[p.id] && token && (
+                  <VariantManager token={token} productId={p.id} />
                 )}
               </div>
             ))

@@ -142,7 +142,8 @@ async fn load_items_for(
         return Ok(Vec::new());
     }
     sqlx::query_as(
-        "SELECT id, sub_order_id, product_id, title_snapshot, unit_price_poisha, \
+        "SELECT id, sub_order_id, product_id, variant_id, variant_name, \
+         title_snapshot, unit_price_poisha, \
          quantity, line_total_poisha FROM order_items \
          WHERE sub_order_id = ANY($1) ORDER BY id",
     )

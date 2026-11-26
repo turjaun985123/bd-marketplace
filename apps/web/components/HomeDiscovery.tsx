@@ -2,7 +2,12 @@
 
 import { useEffect, useState } from "react";
 import ProductRail from "./ProductRail";
-import { getProduct, getRecommendations, type Product } from "@/lib/api";
+import {
+  getProduct,
+  getRecommendations,
+  type Product,
+  type ProductDetail,
+} from "@/lib/api";
 import { useAuth } from "@/hooks/useAuth";
 import { useRecentlyViewed } from "@/hooks/useRecentlyViewed";
 
@@ -54,7 +59,9 @@ export default function HomeDiscovery() {
     ).then((products) => {
       if (!cancelled) {
         setRecent(
-          products.filter((p): p is Product => p !== null)
+          // The detail shape extends Product (Wave 33) — the
+          // rail renders the shared fields only.
+          products.filter((p): p is ProductDetail => p !== null)
         );
       }
     });

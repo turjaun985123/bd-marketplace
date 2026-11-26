@@ -49,8 +49,14 @@ export default function CartPage() {
       ) : (
         <>
           {items.map((item) => (
-            <article key={item.product_id} className="card">
-              <h3>{item.title_bn ?? item.title}</h3>
+            <article
+              key={`${item.product_id}:${item.variant_id ?? ""}`}
+              className="card"
+            >
+              <h3>
+                {item.title_bn ?? item.title}
+                {item.variant_name && <> — {item.variant_name}</>}
+              </h3>
               <p>
                 {item.store_slug} · একক দাম{" "}
                 <PriceTag amountPoisha={item.unit_price_poisha} />
@@ -60,7 +66,13 @@ export default function CartPage() {
                 <button
                   type="button"
                   aria-label="পরিমাণ কমান"
-                  onClick={() => void setQuantity(item.product_id, item.quantity - 1)}
+                  onClick={() =>
+                    void setQuantity(
+                      item.product_id,
+                      item.quantity - 1,
+                      item.variant_id
+                    )
+                  }
                 >
                   −
                 </button>{" "}
@@ -68,13 +80,19 @@ export default function CartPage() {
                 <button
                   type="button"
                   aria-label="পরিমাণ বাড়ান"
-                  onClick={() => void setQuantity(item.product_id, item.quantity + 1)}
+                  onClick={() =>
+                    void setQuantity(
+                      item.product_id,
+                      item.quantity + 1,
+                      item.variant_id
+                    )
+                  }
                 >
                   +
                 </button>{" "}
                 <button
                   type="button"
-                  onClick={() => void remove(item.product_id)}
+                  onClick={() => void remove(item.product_id, item.variant_id)}
                 >
                   মুছে ফেলুন — Remove
                 </button>

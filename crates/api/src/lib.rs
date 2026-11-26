@@ -229,6 +229,17 @@
 //! changed; authenticated responses never carry the public
 //! cache header, because the catalogue payload itself is
 //! viewer-dependent (owners see their own drafts).
+//! Wave 33: product variants (`variants` module, migration
+//! 0031) — a product gains purchasable variants (size,
+//! colour, …), each priced as base + delta through the pure
+//! domain rule (the final price must stay positive at every
+//! write that could break it) and stocked independently:
+//! while a product has an active variant, availability
+//! lives on the variants — the product view's stock is
+//! their sum, cart lines name the variant they buy, and
+//! checkout decrements (and restocks restore) the variant
+//! row, with the stock audit trail carrying the variant id.
+//! Variant-less products behave exactly as before.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -266,6 +277,7 @@ pub mod search;
 pub mod shipments;
 pub mod stores;
 pub mod tracking;
+pub mod variants;
 pub mod verification;
 pub mod wishlist;
 
@@ -1450,6 +1462,26 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/v1/seller/products/:id/low-stock-threshold",
             put(inventory::set_low_stock_threshold_handler),
+        )
+        // Wave 33 — product variants: seller CRUD over a
+        // product's variants (create, list incl. inactive,
+        // patch, soft-deactivate via DELETE) and per-variant
+        // audited stock adjustments. Owner-only; a stranger's
+        // product or variant is a 404. The public side rides
+        // the product detail (its `variants` array); list
+        // views carry only `has_variants`.
+        .route(
+            "/v1/seller/products/:id/variants",
+            post(variants::create_variant_handler).get(variants::list_variants_handler),
+        )
+        .route(
+            "/v1/seller/products/:id/variants/:variant_id",
+            patch(variants::update_variant_handler)
+                .delete(variants::deactivate_variant_handler),
+        )
+        .route(
+            "/v1/seller/products/:id/variants/:variant_id/adjust-stock",
+            post(variants::adjust_variant_stock_handler),
         )
         // Wave 26 — sponsored promotions: the public policy
         // (effective per-day price + the 30-day cap), buying a

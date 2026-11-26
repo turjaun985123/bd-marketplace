@@ -71,7 +71,14 @@ export interface Product {
   category: string | null;
   price_poisha: number;
   compare_at_poisha: number | null;
+  /**
+   * Effective stock (Wave 33): the sum of the active
+   * variants' stocks while the product has active variants,
+   * otherwise the product's own stock.
+   */
   stock: number;
+  /** Whether the product has at least one active variant (Wave 33). */
+  has_variants: boolean;
   /** Per-product low-stock warning level (Wave 23); null = platform default. */
   low_stock_threshold: number | null;
   /** in_stock | low | out_of_stock — computed by the API (Wave 23). */
@@ -105,6 +112,51 @@ export interface ProductList {
   limit: number;
 }
 
+/**
+ * One purchasable variant of a product (Wave 33), as the
+ * product detail shows it: active variants only, priced at
+ * the FINAL price (base + delta), with its own stock.
+ */
+export interface ProductVariant {
+  id: string;
+  name: string;
+  sku: string | null;
+  /** Difference against the base price, in poisha (may be negative). */
+  price_delta_poisha: number;
+  /** Base price + delta — what one unit of this variant costs. */
+  final_price_poisha: number;
+  stock: number;
+}
+
+/** The product detail shape (Wave 33): the product plus its variants. */
+export interface ProductDetail extends Product {
+  variants: ProductVariant[];
+}
+
+/**
+ * One variant in the seller's management view (Wave 33):
+ * inactive variants included — managing them is the point.
+ */
+export interface SellerVariant {
+  id: string;
+  product_id: string;
+  name: string;
+  sku: string | null;
+  price_delta_poisha: number;
+  final_price_poisha: number;
+  stock: number;
+  is_active: boolean;
+  sort: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** The variant adjust-stock answer: the variant + its audit row. */
+export interface VariantAdjustStockResult {
+  variant: SellerVariant;
+  adjustment: StockAdjustment;
+}
+
 export interface RequestOtpResult {
   phone: string;
   /** Present only when the API runs in dev mode — for local testing. */
@@ -134,10 +186,15 @@ export interface CreateProductInput {
 /** One cart line (flattened API shape: row fields + line_total_poisha). */
 export interface CartItem {
   product_id: string;
+  /** The variant this line buys (Wave 33); null for variant-less products. */
+  variant_id: string | null;
+  /** The variant's name (Wave 33); null for variant-less lines. */
+  variant_name: string | null;
   store_id: string;
   store_slug: string;
   title: string;
   title_bn: string | null;
+  /** The variant's FINAL price for variant lines (Wave 33). */
   unit_price_poisha: number;
   quantity: number;
   stock: number;
@@ -155,6 +212,10 @@ export interface OrderItem {
   id: string;
   sub_order_id: string;
   product_id: string;
+  /** The variant bought (Wave 33); null for variant-less lines. */
+  variant_id: string | null;
+  /** The variant's name at checkout (Wave 33 snapshot). */
+  variant_name: string | null;
   title_snapshot: string;
   unit_price_poisha: number;
   quantity: number;
@@ -625,8 +686,14 @@ export function createProduct(
   return call("/v1/products", { method: "POST", token, body: input });
 }
 
-/** GET /v1/products/{id} — one product, with its rating summary. */
-export function getProduct(id: string, token?: string | null): Promise<Product> {
+/**
+ * GET /v1/products/{id} — one product, with its rating
+ * summary and (Wave 33) its active variants.
+ */
+export function getProduct(
+  id: string,
+  token?: string | null
+): Promise<ProductDetail> {
   return call(`/v1/products/${encodeURIComponent(id)}`, { token });
 }
 
@@ -860,35 +927,52 @@ export function getCart(token: string): Promise<Cart> {
   return call("/v1/cart", { token });
 }
 
-/** POST /v1/cart/items — add (or accumulate) a product in the cart. */
+/**
+ * POST /v1/cart/items — add (or accumulate) a product in the
+ * cart. `variantId` (Wave 33) picks the variant the line
+ * buys; a product with active variants requires one.
+ */
 export function addCartItem(
   token: string,
   productId: string,
-  quantity: number
+  quantity: number,
+  variantId?: string | null
 ): Promise<Cart> {
   return call("/v1/cart/items", {
     method: "POST",
     token,
-    body: { product_id: productId, quantity },
+    body: { product_id: productId, quantity, variant_id: variantId ?? null },
   });
 }
 
-/** PATCH /v1/cart/items/{productId} — set a line's quantity (0 removes). */
+/**
+ * PATCH /v1/cart/items/{productId} — set a line's quantity
+ * (0 removes). The line is (product, variant) since Wave 33;
+ * omitting `variantId` addresses the variant-less line.
+ */
 export function updateCartItem(
   token: string,
   productId: string,
-  quantity: number
+  quantity: number,
+  variantId?: string | null
 ): Promise<Cart> {
   return call(`/v1/cart/items/${encodeURIComponent(productId)}`, {
     method: "PATCH",
     token,
-    body: { quantity },
+    body: { quantity, variant_id: variantId ?? null },
   });
 }
 
-/** DELETE /v1/cart/items/{productId} — remove one line. */
-export function removeCartItem(token: string, productId: string): Promise<Cart> {
-  return call(`/v1/cart/items/${encodeURIComponent(productId)}`, {
+/** DELETE /v1/cart/items/{productId} — remove one (product, variant) line. */
+export function removeCartItem(
+  token: string,
+  productId: string,
+  variantId?: string | null
+): Promise<Cart> {
+  const qs = variantId
+    ? `?variant_id=${encodeURIComponent(variantId)}`
+    : "";
+  return call(`/v1/cart/items/${encodeURIComponent(productId)}${qs}`, {
     method: "DELETE",
     token,
   });
@@ -1379,6 +1463,8 @@ export function listPayouts(
 export interface StockAdjustment {
   id: string;
   product_id: string;
+  /** The variant whose stock moved (Wave 33); null for product-level moves. */
+  variant_id: string | null;
   store_id: string;
   /** seller | system */
   actor: string;
@@ -1531,6 +1617,99 @@ export function setLowStockThreshold(
   return call(
     `/v1/seller/products/${encodeURIComponent(productId)}/low-stock-threshold`,
     { method: "PUT", token, body: { threshold } }
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Wave 33 — product variants. A variant is priced as base +
+// delta (the API refuses any combination whose final price
+// would not be positive) and stocked independently: while a
+// product has active variants, its stock lives on them.
+// Deactivation is the only delete — the row (and the order
+// history pointing at it) stays.
+// ---------------------------------------------------------------------------
+
+/** GET /v1/seller/products/{id}/variants — all variants, inactive included. */
+export function listSellerVariants(
+  token: string,
+  productId: string
+): Promise<SellerVariant[]> {
+  return call(
+    `/v1/seller/products/${encodeURIComponent(productId)}/variants`,
+    { token }
+  );
+}
+
+/** POST /v1/seller/products/{id}/variants — create one variant. */
+export function createVariant(
+  token: string,
+  productId: string,
+  input: {
+    name: string;
+    sku?: string;
+    /** Difference against the base price, in poisha (may be negative). */
+    price_delta_poisha?: number;
+    /** Starting stock; writes no audit row, like product creation. */
+    stock?: number;
+    sort?: number;
+  }
+): Promise<SellerVariant> {
+  return call(`/v1/seller/products/${encodeURIComponent(productId)}/variants`, {
+    method: "POST",
+    token,
+    body: input,
+  });
+}
+
+/** PATCH /v1/seller/products/{id}/variants/{variantId} — edit a variant. */
+export function updateVariant(
+  token: string,
+  productId: string,
+  variantId: string,
+  patch: {
+    name?: string;
+    sku?: string;
+    price_delta_poisha?: number;
+    is_active?: boolean;
+    sort?: number;
+  }
+): Promise<SellerVariant> {
+  return call(
+    `/v1/seller/products/${encodeURIComponent(productId)}/variants/${encodeURIComponent(variantId)}`,
+    { method: "PATCH", token, body: patch }
+  );
+}
+
+/**
+ * DELETE /v1/seller/products/{id}/variants/{variantId} —
+ * deactivate a variant (soft delete; the row stays for order
+ * history, and a PATCH with is_active reactivates it).
+ */
+export function deactivateVariant(
+  token: string,
+  productId: string,
+  variantId: string
+): Promise<SellerVariant> {
+  return call(
+    `/v1/seller/products/${encodeURIComponent(productId)}/variants/${encodeURIComponent(variantId)}`,
+    { method: "DELETE", token }
+  );
+}
+
+/**
+ * POST /v1/seller/products/{id}/variants/{variantId}/adjust-stock —
+ * one manual, audited stock move on the VARIANT (same reason
+ * vocabulary and below-zero refusal as product adjust-stock).
+ */
+export function adjustVariantStock(
+  token: string,
+  productId: string,
+  variantId: string,
+  input: { delta: number; reason: string; note?: string }
+): Promise<VariantAdjustStockResult> {
+  return call(
+    `/v1/seller/products/${encodeURIComponent(productId)}/variants/${encodeURIComponent(variantId)}/adjust-stock`,
+    { method: "POST", token, body: input }
   );
 }
 

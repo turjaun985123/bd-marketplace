@@ -1842,6 +1842,95 @@ indexes, compression and cache policy are shaped from
 the queries and payloads in the code, and a load test
 remains future work.
 
+Wave 33 (product variants — size / colour, own price delta, own stock):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| POST | `/v1/seller/products/{id}/variants` | Bearer, owner only (anyone else: 404). Create a variant `{name, sku?, price_delta_poisha?, stock?, sort?}`. 201 with the variant (incl. computed `final_price_poisha`); 400 on a bad name/delta or a non-positive final price |
+| GET | `/v1/seller/products/{id}/variants` | Bearer, owner only. All variants, inactive included, in sort/name order |
+| PATCH | `/v1/seller/products/{id}/variants/{variant_id}` | Bearer, owner only. Edit name / sku / delta / is_active / sort; the merged delta is re-validated against the current base price |
+| DELETE | `/v1/seller/products/{id}/variants/{variant_id}` | Bearer, owner only. SOFT delete: flips `is_active` to false and returns the row; reactivation is a PATCH. The row is never destroyed — order history references it |
+| POST | `/v1/seller/products/{id}/variants/{variant_id}/adjust-stock` | Bearer, owner only. One manual, audited stock move on the VARIANT (same reason vocabulary and below-zero refusal as product adjust-stock) |
+
+**The model.** A variant's price is never stored: it is
+the product's base price plus the variant's
+`price_delta_poisha`, computed by the pure domain rule
+`variant_final_price`. The final price must stay positive
+at EVERY write that could break it — variant create,
+variant reprice, checkout itself, and a base-price PATCH
+that would strand an existing delta (refused with a 400
+naming how many variant prices it would break). The
+delta itself is sanity-bounded (±100_000_000 poisha) by
+the domain, and names are trimmed 1..=80 characters.
+
+**The stock semantics switch.** While a product has at
+least one ACTIVE variant, availability lives on the
+variants: the shared product view's `stock` is the SUM
+of the active variants' stocks (computed inside
+`PRODUCT_COLUMNS`, so listing, search, detail, wishlist
+and recommendations all agree, and `stock_status`
+derives from the sum), checkout locks and decrements the
+VARIANT rows, and `products.stock` is touched by no
+write path for that product. The seller inventory
+overview and low-stock alerts read the same effective
+stock. With no active variants, `products.stock` rules
+exactly as before — the Wave 9 two-store money flow is
+asserted unchanged in the integration test.
+
+**Cart and checkout.** A cart line's identity is now
+(product, variant): `cart_items` gains `variant_id`, and
+its uniqueness becomes a `NULLS NOT DISTINCT` unique
+index over (cart_id, product_id, variant_id) (migration
+0031) so two variant lines of one product coexist while
+variant-less lines still merge. Adding a product that
+has active variants without choosing one is a 400
+("আকার/রং বেছে নিন"); choosing a variant that is not an
+active variant of the product is a 400. Cart lines show
+the variant name and price at the FINAL price. Checkout
+locks the variant rows alongside the product rows,
+re-validates activity and stock per line (insufficient
+variant stock is the same 409, naming product AND
+variant), enters the totals at the final price, and
+snapshots `variant_id` + `variant_name` onto the order
+item. A variant-less line for a product that has since
+gained active variants is refused at checkout — a stale
+cart can never draw on stock the seller moved into
+variants. Set-quantity and remove address a line by
+(product, variant) too.
+
+**Audit fidelity.** `stock_adjustments` gains
+`variant_id`: every movement that touches a variant's
+stock — checkout, cancel/return/RTO restocks (the shared
+restock helper restores to the variant the line bought,
+even if it was deactivated since), and per-variant
+adjust-stock — writes its row through the one Wave 23
+writer with the variant id set and `new_stock`
+snapshotting the VARIANT's count; the per-product
+history shows the movements in place. A variant's
+creation stock writes no row (the product-creation
+rule), and product-level adjust-stock REFUSES a product
+with active variants (400) rather than writing a pool
+nothing reads. The product detail gains `variants`
+(active only, final prices, own stock); list views gain
+only `has_variants` — variant rows never ride the list
+payload. The web app gains the product page's variant
+picker (price and stock follow the pick), variant names
+on cart and order lines, and the seller variant manager
+on the products page.
+
+**Honest limits:** variants carry no weight of their own
+(delivery still bills the product's `weight_grams` per
+unit, variant or not) and no images (products have no
+image field yet — see Wave 32). Promotions, coupons and
+search ranking treat the product as one unit — there is
+no variant-level promotion or per-variant coupon.
+Deactivating every variant returns the product to
+product-stock semantics with whatever `products.stock`
+still holds; sellers moving stock into variants should
+set each variant's stock explicitly (creation stock or
+adjust-stock), because the product's old count is NOT
+auto-distributed across variants.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -3040,6 +3129,31 @@ its absence on authenticated ones, and gzip negotiation
 with the gzip magic bytes on the body. Nothing was
 benchmarked — no load-test numbers are claimed.
 
+**Real (Wave 33):** product variants — migration 0031
+(`product_variants`, `cart_items.variant_id` with the
+NULLS NOT DISTINCT line-uniqueness index,
+`order_items.variant_id` + `variant_name` snapshots,
+`stock_adjustments.variant_id`); the domain price rule
+(base + delta, final price must stay positive at create,
+reprice, base-price PATCH and checkout) and the stock
+semantics switch (a product with active variants reads,
+sells and restocks from variant stock; the product
+view's stock is the active-variant sum computed in
+`PRODUCT_COLUMNS`); seller variant CRUD + per-variant
+audited adjust-stock (soft delete only); cart lines
+identified by (product, variant) and priced at the
+final price; checkout decrementing variant rows with
+variant-labelled audit rows, and the shared restock
+helper restoring to the bought variant. Web: the
+product page variant picker, variant names on cart and
+order lines, and the seller variant manager. An
+integration test (`crates/api/tests/wave33.rs`, same
+`DATABASE_URL` gate) covers the validation refusals,
+the detail/list shapes, the cart rules, the checkout
+stock split, the 409, cancel restock, adjust-stock
+fidelity, and the variant-less Wave 9 totals
+(445_000 + 12_000 = 457_000) unchanged.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters, and the four manual couriers run
@@ -3092,22 +3206,25 @@ the external service at the other end of it, configured by
   /admin/notifications; Wave 31 adds no page — it adds the
   ডেটা এক্সপোর্ট download buttons on the seller dashboard
   and the buyer orders page; Wave 32 adds no page — it
-  adds the next/image remote allowlist in next.config.js).
+  adds the next/image remote allowlist in next.config.js;
+  Wave 33 adds the product page's variant picker, variant
+  names on the cart and buyer-order lines, and the seller
+  variant manager on /seller/products).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
-  (domain 106, courier 31, payments 8 unit tests, plus the API
+  (domain 109, courier 31, payments 8 unit tests, plus the API
   crate's JWT-secret unit tests; the `DATABASE_URL`-
   gated integration tests skip cleanly without a database). The API
   binary was also smoke-tested locally without a database: routes
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
   (including the Wave 13 messaging endpoints), and the SIDRA
   callback answers 503 without a database.
-- **Rust integration + clippy: CI-only** — the Wave 2–32 integration
+- **Rust integration + clippy: CI-only** — the Wave 2–33 integration
   tests (including the Wave 29 outbox test in the `notify`
   crate) against a real Postgres 16 service and clippy
   `-D warnings` are verified via **GitHub Actions CI**
   (`.github/workflows/ci.yml`)
-  on push. Waves 1–31 are green there; Wave 32 awaits its first CI run.
+  on push. Waves 1–32 are green there; Wave 33 awaits its first CI run.
 - **Docker images: CI-only** — Docker is not installed on the
   development machine, so `Dockerfile.api`, `Dockerfile.worker`
   and `apps/web/Dockerfile` are verified by the CI `docker` job

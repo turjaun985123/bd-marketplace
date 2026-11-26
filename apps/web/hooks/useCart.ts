@@ -21,9 +21,19 @@ export interface CartState {
   /** Last cart error, in the API's message (Bangla UI shows it as-is). */
   error: string | null;
   refresh: () => Promise<void>;
-  add: (productId: string, quantity?: number) => Promise<void>;
-  setQuantity: (productId: string, quantity: number) => Promise<void>;
-  remove: (productId: string) => Promise<void>;
+  /** `variantId` (Wave 33) picks the variant the new line buys. */
+  add: (
+    productId: string,
+    quantity?: number,
+    variantId?: string | null
+  ) => Promise<void>;
+  /** Lines are (product, variant) since Wave 33 — pass the line's variant. */
+  setQuantity: (
+    productId: string,
+    quantity: number,
+    variantId?: string | null
+  ) => Promise<void>;
+  remove: (productId: string, variantId?: string | null) => Promise<void>;
   clear: () => Promise<void>;
 }
 
@@ -84,17 +94,18 @@ export function useCart(): CartState {
   );
 
   const add = useCallback(
-    (productId: string, quantity = 1) =>
-      mutate((t) => addCartItem(t, productId, quantity)),
+    (productId: string, quantity = 1, variantId?: string | null) =>
+      mutate((t) => addCartItem(t, productId, quantity, variantId)),
     [mutate]
   );
   const setQuantity = useCallback(
-    (productId: string, quantity: number) =>
-      mutate((t) => updateCartItem(t, productId, quantity)),
+    (productId: string, quantity: number, variantId?: string | null) =>
+      mutate((t) => updateCartItem(t, productId, quantity, variantId)),
     [mutate]
   );
   const remove = useCallback(
-    (productId: string) => mutate((t) => removeCartItem(t, productId)),
+    (productId: string, variantId?: string | null) =>
+      mutate((t) => removeCartItem(t, productId, variantId)),
     [mutate]
   );
   const clear = useCallback(() => mutate((t) => clearCartApi(t)), [mutate]);

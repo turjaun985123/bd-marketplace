@@ -38,6 +38,15 @@ pub struct CartItem {
     /// weight here and order totals sum it per seller group.
     #[serde(default = "default_unit_weight_grams")]
     pub unit_weight_grams: i64,
+    /// The product variant this line buys (Wave 33), as the
+    /// variant's id string; `None` for a variant-less line.
+    /// Defaults to `None` when a payload omits it, so older
+    /// clients keep working. The variant is part of the line's
+    /// identity: two lines for the same product with different
+    /// variants (or different final prices) stay separate lines
+    /// through the split and the totals.
+    #[serde(default)]
+    pub variant_id: Option<String>,
 }
 
 fn default_unit_weight_grams() -> i64 {
@@ -2783,6 +2792,72 @@ pub fn export_filename(kind: &str, slug_or_phone: &str, yyyymmdd: &str) -> Strin
     format!("bd-marketplace-{kind}-{sanitized}-{yyyymmdd}.json")
 }
 
+// ---------------------------------------------------------------------------
+// Product variants (Wave 33)
+// ---------------------------------------------------------------------------
+
+/// The longest name a product variant may carry (Wave 33):
+/// a size, a colour, or a size-plus-colour label ("XL",
+/// "লাল", "XL — লাল") — eighty characters is generous for
+/// a label a buyer picks from a row of buttons.
+pub const MAX_VARIANT_NAME_CHARS: usize = 80;
+
+/// Validate a product variant's name (Wave 33): after
+/// trimming it must hold 1..=[`MAX_VARIANT_NAME_CHARS`]
+/// characters (counted as characters, not bytes, so Bangla
+/// labels measure fairly). On success the trimmed name is
+/// returned for storage.
+pub fn validate_variant_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    let count = trimmed.chars().count();
+    if count == 0 {
+        return Err("variant name must not be empty".to_string());
+    }
+    if count > MAX_VARIANT_NAME_CHARS {
+        return Err(format!(
+            "variant name must be at most {MAX_VARIANT_NAME_CHARS} characters"
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// The largest price delta a variant may carry in either
+/// direction (Wave 33): 100_000_000 poisha is 1,000,000
+/// taka — far above any real size/colour price difference.
+/// A bigger delta is a typo (an extra zero or two), and
+/// refusing it here keeps a fat-fingered delta from
+/// silently repricing a variant by lakhs.
+pub const MAX_VARIANT_PRICE_DELTA_POISHA: i64 = 100_000_000;
+
+/// Validate a variant's price delta (Wave 33): its
+/// absolute value must not exceed
+/// [`MAX_VARIANT_PRICE_DELTA_POISHA`]. Zero is a valid
+/// delta (a variant that differs only by size or colour,
+/// not price).
+pub fn validate_variant_delta(delta_poisha: i64) -> Result<i64, String> {
+    if delta_poisha.checked_abs().is_none_or(|abs| abs > MAX_VARIANT_PRICE_DELTA_POISHA) {
+        return Err(
+            "variant price delta is too large (at most 1000000 taka in either direction)"
+                .to_string(),
+        );
+    }
+    Ok(delta_poisha)
+}
+
+/// The price a buyer actually pays for one unit of a
+/// variant (Wave 33): the product's base price plus the
+/// variant's delta. `None` when the sum overflows or is
+/// not positive — a variant must always cost something,
+/// so the API refuses to create or reprice a variant
+/// whose final price would be zero or negative, and
+/// checkout refuses a line whose stored delta no longer
+/// clears the (possibly since-lowered) base price.
+pub fn variant_final_price(base_poisha: i64, delta_poisha: i64) -> Option<i64> {
+    base_poisha
+        .checked_add(delta_poisha)
+        .filter(|price| *price > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2804,7 +2879,55 @@ mod tests {
             quantity: qty,
             unit_price_poisha: price_bdt * 100,
             unit_weight_grams,
+            variant_id: None,
         }
+    }
+
+    #[test]
+    fn variant_name_validation_trims_and_bounds() {
+        assert_eq!(validate_variant_name("  XL  ").unwrap(), "XL");
+        assert_eq!(validate_variant_name("লাল").unwrap(), "লাল");
+        assert!(validate_variant_name("").is_err());
+        assert!(validate_variant_name("   ").is_err());
+        let longest_ok = "x".repeat(MAX_VARIANT_NAME_CHARS);
+        assert!(validate_variant_name(&longest_ok).is_ok());
+        let too_long = "x".repeat(MAX_VARIANT_NAME_CHARS + 1);
+        assert!(validate_variant_name(&too_long).is_err());
+        // Bangla characters count as characters, not bytes.
+        let bangla_ok = "ক".repeat(MAX_VARIANT_NAME_CHARS);
+        assert!(validate_variant_name(&bangla_ok).is_ok());
+    }
+
+    #[test]
+    fn variant_delta_validation_bounds_both_directions() {
+        assert_eq!(validate_variant_delta(0).unwrap(), 0);
+        assert_eq!(validate_variant_delta(5_000).unwrap(), 5_000);
+        assert_eq!(validate_variant_delta(-5_000).unwrap(), -5_000);
+        assert_eq!(
+            validate_variant_delta(MAX_VARIANT_PRICE_DELTA_POISHA).unwrap(),
+            MAX_VARIANT_PRICE_DELTA_POISHA
+        );
+        assert_eq!(
+            validate_variant_delta(-MAX_VARIANT_PRICE_DELTA_POISHA).unwrap(),
+            -MAX_VARIANT_PRICE_DELTA_POISHA
+        );
+        assert!(validate_variant_delta(MAX_VARIANT_PRICE_DELTA_POISHA + 1).is_err());
+        assert!(validate_variant_delta(-MAX_VARIANT_PRICE_DELTA_POISHA - 1).is_err());
+        assert!(validate_variant_delta(i64::MIN).is_err());
+        assert!(validate_variant_delta(i64::MAX).is_err());
+    }
+
+    #[test]
+    fn variant_final_price_must_stay_positive() {
+        assert_eq!(variant_final_price(10_000, 0), Some(10_000));
+        assert_eq!(variant_final_price(10_000, 2_500), Some(12_500));
+        assert_eq!(variant_final_price(10_000, -2_500), Some(7_500));
+        assert_eq!(variant_final_price(10_000, -9_999), Some(1));
+        // Zero and negative final prices are refused.
+        assert_eq!(variant_final_price(10_000, -10_000), None);
+        assert_eq!(variant_final_price(10_000, -10_001), None);
+        // Overflow is refused, never wrapped.
+        assert_eq!(variant_final_price(i64::MAX, 1), None);
     }
 
     #[test]
