@@ -1917,6 +1917,79 @@ pub fn allocate_discount(subtotals: &[i64], discount: i64) -> Vec<i64> {
 }
 
 // ---------------------------------------------------------------------------
+// Loyalty points (Wave 35)
+// ---------------------------------------------------------------------------
+
+/// Net goods (goods minus the coupon discount, in poisha) that
+/// earn ONE loyalty point: a buyer earns 1 point per 100 taka
+/// (10_000 poisha) of net goods on each DELIVERED sub-order.
+pub const LOYALTY_POISHA_PER_POINT: i64 = 10_000;
+
+/// What one loyalty point is worth when redeemed at checkout,
+/// in poisha: 1 point = 1 taka (100 poisha).
+pub const LOYALTY_POINT_VALUE_POISHA: i64 = 100;
+
+/// Days an earned point stays spendable. Expiry is computed at
+/// read time from the earn row's `expires_at` — no sweeper job
+/// deletes or rewrites expired rows.
+pub const LOYALTY_EXPIRY_DAYS: i64 = 365;
+
+/// Points earned by one delivered sub-order whose net goods
+/// (goods subtotal minus its coupon discount share) are
+/// `net_goods_poisha`: one point per full
+/// [`LOYALTY_POISHA_PER_POINT`] poisha, floored — a sub-order
+/// below 100 taka of net goods earns nothing, and a negative
+/// net (never produced by checkout; the clamp only keeps this
+/// function total) earns nothing either.
+pub fn loyalty_points_for_goods(net_goods_poisha: i64) -> i64 {
+    if net_goods_poisha <= 0 {
+        return 0;
+    }
+    net_goods_poisha / LOYALTY_POISHA_PER_POINT
+}
+
+/// The checkout discount a redemption of `points` buys, in
+/// poisha: points times [`LOYALTY_POINT_VALUE_POISHA`]. `None`
+/// on a negative point count or on overflow — the caller
+/// treats both as "no redemption" rather than wrapping into a
+/// bogus discount.
+pub fn loyalty_discount_poisha(points: i64) -> Option<i64> {
+    if points < 0 {
+        return None;
+    }
+    points.checked_mul(LOYALTY_POINT_VALUE_POISHA)
+}
+
+/// The most points a buyer may redeem on one order: their
+/// balance, capped so the redemption discount never exceeds
+/// HALF the order's post-coupon goods total (delivery is never
+/// discounted by points, and at least half the goods are
+/// always paid with money). The cap is floored at each step —
+/// half the goods, floored, then whole points only — so the
+/// resulting discount can never cross the half-goods line.
+pub fn loyalty_max_redeemable_points(balance_points: i64, post_coupon_goods_poisha: i64) -> i64 {
+    if balance_points <= 0 || post_coupon_goods_poisha <= 0 {
+        return 0;
+    }
+    let cap_points = (post_coupon_goods_poisha / 2) / LOYALTY_POINT_VALUE_POISHA;
+    balance_points.min(cap_points)
+}
+
+/// Validate a checkout loyalty request. Zero is a valid
+/// request (it redeems nothing, exactly like omitting the
+/// field); a negative count is a client error. There is no
+/// upper-bound error: an over-large request is CLAMPED to the
+/// redeemable maximum by [`loyalty_max_redeemable_points`],
+/// never rejected — the checkout response reports the points
+/// actually used.
+pub fn validate_loyalty_request(requested_points: i64) -> Result<(), &'static str> {
+    if requested_points < 0 {
+        return Err("loyalty_points must not be negative");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Search (Wave 15)
 // ---------------------------------------------------------------------------
 
@@ -3601,6 +3674,55 @@ mod tests {
         );
         // A discount above the total is clamped to it.
         assert_eq!(allocate_discount(&[100, 50], 1_000), vec![100, 50]);
+    }
+
+    #[test]
+    fn loyalty_points_earned_per_full_hundred_taka() {
+        // The standard flow: 200_000 poisha of net goods earns 20.
+        assert_eq!(loyalty_points_for_goods(200_000), 20);
+        // Floored: a partial 100 taka earns nothing extra.
+        assert_eq!(loyalty_points_for_goods(199_999), 19);
+        assert_eq!(loyalty_points_for_goods(10_000), 1);
+        assert_eq!(loyalty_points_for_goods(9_999), 0);
+        // Zero and negative nets earn nothing.
+        assert_eq!(loyalty_points_for_goods(0), 0);
+        assert_eq!(loyalty_points_for_goods(-50_000), 0);
+    }
+
+    #[test]
+    fn loyalty_discount_is_points_times_one_taka() {
+        assert_eq!(loyalty_discount_poisha(0), Some(0));
+        assert_eq!(loyalty_discount_poisha(15), Some(1_500));
+        assert_eq!(loyalty_discount_poisha(1_000), Some(100_000));
+        // Negative counts and overflow buy nothing.
+        assert_eq!(loyalty_discount_poisha(-1), None);
+        assert_eq!(loyalty_discount_poisha(i64::MAX), None);
+    }
+
+    #[test]
+    fn loyalty_redemption_is_capped_at_half_the_goods() {
+        // Balance binds when it is the smaller side.
+        assert_eq!(loyalty_max_redeemable_points(15, 200_000), 15);
+        // The cap binds: half of 200_000 goods is 100_000 poisha
+        // = 1_000 points, however large the balance or request.
+        assert_eq!(loyalty_max_redeemable_points(10_000, 200_000), 1_000);
+        // The cap floors twice: half of 199 poisha is 99, which
+        // buys no whole point.
+        assert_eq!(loyalty_max_redeemable_points(10, 199), 0);
+        // Half of 300 is 150 poisha = exactly 1 point.
+        assert_eq!(loyalty_max_redeemable_points(10, 300), 1);
+        // No balance or no goods: nothing redeemable.
+        assert_eq!(loyalty_max_redeemable_points(0, 200_000), 0);
+        assert_eq!(loyalty_max_redeemable_points(-5, 200_000), 0);
+        assert_eq!(loyalty_max_redeemable_points(100, 0), 0);
+        assert_eq!(loyalty_max_redeemable_points(100, -1), 0);
+    }
+
+    #[test]
+    fn loyalty_request_validation() {
+        assert!(validate_loyalty_request(0).is_ok());
+        assert!(validate_loyalty_request(250).is_ok());
+        assert!(validate_loyalty_request(-1).is_err());
     }
 
     #[test]

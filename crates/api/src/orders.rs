@@ -65,6 +65,24 @@
 //! stale cart can never draw on stock the seller moved into
 //! variants. Delivery weight stays the product's — variants
 //! carry no weight of their own.
+//!
+//! Wave 35: checkout also redeems loyalty points. After the
+//! coupon is applied, the buyer's requested points are clamped
+//! to the redeemable maximum (their balance, capped at half
+//! the post-coupon goods — the pure domain rule) and the
+//! discount is allocated across the seller groups by the same
+//! `allocate_discount` the coupon uses, snapshotted per
+//! sub-order. The stored grand total is the REDUCED payable:
+//! the advance decision, the online payment amount and the
+//! receipt's cash-due all read it, so every figure the buyer
+//! sees already nets the points out. The platform funds the
+//! redemption — `seller_payout_poisha` and the commission
+//! basis are computed from the pre-loyalty totals and never
+//! change. The ledger side (balance, earn, refunds, clawback)
+//! lives in the `loyalty` module; checkout writes only the
+//! `redeem` row, inside this transaction, under a lock on the
+//! buyer's user row so concurrent checkouts cannot spend the
+//! same points twice.
 
 use axum::{
     extract::{Path, Query, State},
@@ -75,7 +93,8 @@ use chrono::{DateTime, Utc};
 use domain::{
     allocate_discount, build_order_totals, can_buyer_cancel, can_transition_sub_order,
     compute_advance_poisha, compute_coupon_discount, is_valid_sub_order_status,
-    normalize_bd_phone, normalize_coupon_code, parse_delivery_zone, split_cart_by_seller,
+    loyalty_discount_poisha, loyalty_max_redeemable_points, normalize_bd_phone,
+    normalize_coupon_code, parse_delivery_zone, split_cart_by_seller, validate_loyalty_request,
     variant_final_price, CartItem as DomainCartItem, OrderGroupInput,
 };
 use payments::{payment_adapter_for, parse_payment_method, PaymentMethod};
@@ -132,6 +151,11 @@ pub struct SubOrder {
     pub goods_subtotal_poisha: i64,
     /// Coupon discount allocated to this sub-order (Wave 14).
     pub discount_poisha: i64,
+    /// Loyalty discount allocated to this sub-order (Wave 35):
+    /// the buyer's redeemed points, spread over the groups by
+    /// post-coupon goods. Platform-funded — it never reduces
+    /// the seller payout below.
+    pub loyalty_discount_poisha: i64,
     pub delivery_charge_poisha: i64,
     pub commission_poisha: i64,
     pub seller_payout_poisha: i64,
@@ -185,6 +209,12 @@ pub struct Order {
     pub coupon_code: Option<String>,
     /// Total coupon discount across the sub-orders (Wave 14).
     pub discount_total_poisha: i64,
+    /// Loyalty points the buyer redeemed on this order
+    /// (Wave 35); 0 when none were used.
+    pub loyalty_points_used: i64,
+    /// The discount those points bought (Wave 35). The grand
+    /// total below is already net of it.
+    pub loyalty_discount_poisha: i64,
     pub delivery_total_poisha: i64,
     pub grand_total_poisha: i64,
     pub created_at: DateTime<Utc>,
@@ -270,6 +300,8 @@ struct OrderRow {
     goods_total_poisha: i64,
     coupon_code: Option<String>,
     discount_total_poisha: i64,
+    loyalty_points_used: i32,
+    loyalty_discount_poisha: i64,
     delivery_total_poisha: i64,
     grand_total_poisha: i64,
     created_at: DateTime<Utc>,
@@ -284,6 +316,7 @@ struct SubOrderRow {
     status: String,
     goods_subtotal_poisha: i64,
     discount_poisha: i64,
+    loyalty_discount_poisha: i64,
     delivery_charge_poisha: i64,
     commission_poisha: i64,
     seller_payout_poisha: i64,
@@ -293,11 +326,12 @@ struct SubOrderRow {
 const ORDER_COLUMNS: &str = "id, buyer_user_id, status, payment_method, payment_status, \
     advance_required_poisha, advance_paid_poisha, \
     delivery_name, delivery_phone, delivery_address, delivery_zone, goods_total_poisha, \
-    coupon_code, discount_total_poisha, \
+    coupon_code, discount_total_poisha, loyalty_points_used, loyalty_discount_poisha, \
     delivery_total_poisha, grand_total_poisha, created_at";
 
 const SUB_ORDER_COLUMNS: &str = "so.id, so.order_id, so.store_id, s.slug AS store_slug, \
-    so.status, so.goods_subtotal_poisha, so.discount_poisha, so.delivery_charge_poisha, so.commission_poisha, \
+    so.status, so.goods_subtotal_poisha, so.discount_poisha, so.loyalty_discount_poisha, \
+    so.delivery_charge_poisha, so.commission_poisha, \
     so.seller_payout_poisha, so.created_at";
 
 async fn load_order_items(pool: &PgPool, sub_order_id: Uuid) -> Result<Vec<OrderItem>, ApiError> {
@@ -329,6 +363,7 @@ async fn sub_order_from_row(pool: &PgPool, row: SubOrderRow) -> Result<SubOrder,
         status: row.status,
         goods_subtotal_poisha: row.goods_subtotal_poisha,
         discount_poisha: row.discount_poisha,
+        loyalty_discount_poisha: row.loyalty_discount_poisha,
         delivery_charge_poisha: row.delivery_charge_poisha,
         commission_poisha: row.commission_poisha,
         seller_payout_poisha: row.seller_payout_poisha,
@@ -398,6 +433,8 @@ pub async fn load_order(pool: &PgPool, order_id: Uuid) -> Result<Order, ApiError
         goods_total_poisha: row.goods_total_poisha,
         coupon_code: row.coupon_code,
         discount_total_poisha: row.discount_total_poisha,
+        loyalty_points_used: i64::from(row.loyalty_points_used),
+        loyalty_discount_poisha: row.loyalty_discount_poisha,
         delivery_total_poisha: row.delivery_total_poisha,
         grand_total_poisha: row.grand_total_poisha,
         created_at: row.created_at,
@@ -438,6 +475,14 @@ pub struct PlaceOrderInput {
     /// Ignored for online checkouts and advance-free COD orders.
     #[serde(default)]
     pub advance_method: Option<String>,
+    /// Loyalty points the buyer wants to redeem on this order
+    /// (Wave 35). Optional; the server CLAMPS the request to
+    /// the redeemable maximum (the buyer's balance, capped at
+    /// half the post-coupon goods) instead of rejecting an
+    /// over-large request — the placed order reports the points
+    /// actually used. A negative count is a 400.
+    #[serde(default)]
+    pub loyalty_points: Option<i64>,
 }
 
 fn default_payment_method() -> String {
@@ -592,6 +637,9 @@ pub async fn place_order(
     }
     if input.delivery_address.trim().is_empty() {
         return Err(ApiError::bad_request("delivery_address must not be empty"));
+    }
+    if let Some(points) = input.loyalty_points {
+        validate_loyalty_request(points).map_err(ApiError::bad_request)?;
     }
     let delivery_phone = normalize_bd_phone(&input.delivery_phone)
         .ok_or_else(|| ApiError::bad_request("invalid Bangladeshi phone number"))?;
@@ -764,6 +812,52 @@ pub async fn place_order(
     let commission_rate_bps = crate::admin::effective_commission_bps(state).await;
     let totals = build_order_totals(&groups, zone, commission_rate_bps);
 
+    // Wave 35: redeem loyalty points, AFTER the coupon (the
+    // brief's order: points price against post-coupon goods).
+    // The buyer's user row is locked FOR UPDATE first, so two
+    // concurrent checkouts by the same buyer serialize here and
+    // can never both read the same balance and spend it twice.
+    // The request is clamped to the domain maximum — balance
+    // and the half-of-goods cap — never rejected for being too
+    // large; the placed order reports what was actually used.
+    // The discount is allocated across the groups by
+    // post-coupon goods (the coupon's own allocator), so the
+    // per-sub-order shares sum exactly to the discount.
+    let requested_loyalty = input.loyalty_points.unwrap_or(0);
+    let mut loyalty_points_used: i64 = 0;
+    let mut loyalty_discount_total: i64 = 0;
+    let mut loyalty_shares: Vec<i64> = vec![0; groups.len()];
+    if requested_loyalty > 0 {
+        sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+            .bind(user.user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ApiError::internal("lock buyer for loyalty", e))?;
+        let balance = crate::loyalty::loyalty_balance_on(&mut *tx, user.user_id).await?;
+        // Each group's post-coupon goods: its subtotal minus
+        // its (clamped) coupon share — the same figures
+        // `build_order_totals` just used.
+        let post_coupon_goods: Vec<i64> = totals
+            .sub_orders
+            .iter()
+            .map(|sub| sub.goods_subtotal_poisha - sub.discount_poisha)
+            .collect();
+        let post_coupon_total: i64 = post_coupon_goods.iter().sum();
+        let allowed = loyalty_max_redeemable_points(balance.available_points, post_coupon_total);
+        loyalty_points_used = requested_loyalty.min(allowed);
+        if loyalty_points_used > 0 {
+            loyalty_discount_total = loyalty_discount_poisha(loyalty_points_used).ok_or_else(|| {
+                ApiError::internal("loyalty discount overflow", sqlx::Error::RowNotFound)
+            })?;
+            loyalty_shares = allocate_discount(&post_coupon_goods, loyalty_discount_total);
+        }
+    }
+    // What the buyer actually pays: every downstream figure —
+    // the advance decision, the online payment amount, the
+    // stored grand total, the receipt's cash-due — reads this
+    // reduced payable, never the pre-loyalty total.
+    let payable_grand_total = totals.grand_total_poisha - loyalty_discount_total;
+
     // Wave 17: the COD advance decision. COD orders only — an
     // online order prepays in full by construction. The buyer's
     // risk verdict (the ONE shared aggregate in the `risk`
@@ -798,8 +892,11 @@ pub async fn place_order(
     };
     if !method.is_online() {
         let report = buyer_risk_for_user(pool, user.user_id).await?;
+        // Wave 35: the advance is measured against the
+        // loyalty-reduced payable — points the buyer spent are
+        // money the platform already holds for this order.
         let advance = compute_advance_poisha(
-            totals.grand_total_poisha,
+            payable_grand_total,
             crate::admin::effective_advance_bps(state).await,
             crate::admin::effective_advance_threshold(state).await,
             report.risk.requires_advance,
@@ -835,8 +932,9 @@ pub async fn place_order(
         "INSERT INTO orders (buyer_user_id, payment_method, payment_status, \
          delivery_name, delivery_phone, delivery_address, delivery_zone, \
          goods_total_poisha, delivery_total_poisha, grand_total_poisha, \
-         coupon_code, discount_total_poisha, advance_required_poisha) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id",
+         coupon_code, discount_total_poisha, advance_required_poisha, \
+         loyalty_points_used, loyalty_discount_poisha) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING id",
     )
     .bind(user.user_id)
     .bind(method.as_str())
@@ -847,10 +945,12 @@ pub async fn place_order(
     .bind(zone.as_str())
     .bind(totals.goods_total_poisha)
     .bind(totals.delivery_total_poisha)
-    .bind(totals.grand_total_poisha)
+    .bind(payable_grand_total)
     .bind(applied_coupon.as_ref().map(|coupon| coupon.code.clone()))
     .bind(totals.discount_total_poisha)
     .bind(advance_required_poisha)
+    .bind(i32::try_from(loyalty_points_used).unwrap_or(i32::MAX))
+    .bind(loyalty_discount_total)
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| ApiError::internal("insert order", e))?;
@@ -864,10 +964,13 @@ pub async fn place_order(
     // make no network calls yet either.
     if method.is_online() {
         let adapter = payment_adapter_for(method, &state.payments_config);
+        // Wave 35: the gateway charges the loyalty-reduced
+        // payable — the points are the platform's money, already
+        // settled in the ledger row written below.
         let intent = payments::PaymentAdapter::initiate(
             &*adapter,
             &order_id.to_string(),
-            totals.grand_total_poisha,
+            payable_grand_total,
         )
         .await
         .map_err(|e| {
@@ -880,7 +983,7 @@ pub async fn place_order(
             &mut tx,
             order_id,
             method.as_str(),
-            totals.grand_total_poisha,
+            payable_grand_total,
             &intent.reference,
         )
         .await?;
@@ -931,13 +1034,20 @@ pub async fn place_order(
         .map(|item| ((item.product_id, item.variant_id), item))
         .collect();
 
-    for (group, sub_totals) in groups.iter().zip(totals.sub_orders.iter()) {
+    for (group_idx, (group, sub_totals)) in
+        groups.iter().zip(totals.sub_orders.iter()).enumerate()
+    {
         let store_id = Uuid::parse_str(&group.store_id)
             .map_err(|_| ApiError::internal("parse store id", sqlx::Error::RowNotFound))?;
+        // Wave 35: the sub-order snapshots its allocated share
+        // of the loyalty discount (the audit + cancel-refund
+        // basis). The seller payout bind below is the
+        // pre-loyalty figure — the platform funds the points.
         let sub_order_id: Uuid = sqlx::query_scalar(
             "INSERT INTO sub_orders (order_id, store_id, goods_subtotal_poisha, \
-             discount_poisha, delivery_charge_poisha, commission_poisha, seller_payout_poisha) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
+             discount_poisha, delivery_charge_poisha, commission_poisha, seller_payout_poisha, \
+             loyalty_discount_poisha) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
         )
         .bind(order_id)
         .bind(store_id)
@@ -946,6 +1056,7 @@ pub async fn place_order(
         .bind(sub_totals.delivery_charge_poisha)
         .bind(sub_totals.commission_poisha)
         .bind(sub_totals.seller_payout_poisha)
+        .bind(loyalty_shares[group_idx])
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| ApiError::internal("insert sub-order", e))?;
@@ -1074,6 +1185,24 @@ pub async fn place_order(
             .map_err(|e| ApiError::internal("count coupon use", e))?;
     }
 
+    // Wave 35: the redemption's ledger row, in the same
+    // transaction — a rolled-back checkout never spends points,
+    // and a committed one always does. Written through the
+    // loyalty module's balance conventions: negative delta,
+    // reason `redeem`, ref = the order.
+    if loyalty_points_used > 0 {
+        sqlx::query(
+            "INSERT INTO loyalty_points (user_id, delta, reason, ref_id) \
+             VALUES ($1, $2, 'redeem', $3)",
+        )
+        .bind(user.user_id)
+        .bind(i32::try_from(-loyalty_points_used).unwrap_or(i32::MIN))
+        .bind(order_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::internal("record loyalty redemption", e))?;
+    }
+
     sqlx::query("DELETE FROM cart_items WHERE cart_id = $1")
         .bind(cart_id)
         .execute(&mut *tx)
@@ -1086,7 +1215,9 @@ pub async fn place_order(
     // the grand total. A rolled-back checkout queues nothing.
     let notice_payload = serde_json::json!({
         "order_id": order_id.to_string(),
-        "amount_poisha": totals.grand_total_poisha,
+        // Wave 35: the amount the buyer actually pays (the
+        // loyalty-reduced payable), not the pre-points total.
+        "amount_poisha": payable_grand_total,
     });
     notify::enqueue(
         &mut *tx,
@@ -1320,6 +1451,12 @@ pub async fn cancel_order_for_buyer(
 
     for (sub_order_id, _) in &sub_orders {
         restock_sub_order_items(&mut tx, *sub_order_id, "cancel_restock").await?;
+        // Wave 35: each cancelled sub-order also gives back the
+        // points its share of the checkout redemption bought
+        // (the `loyalty` module's cancel hook), in this
+        // transaction — a whole-order cancel therefore refunds
+        // the order's full redemption, share by share.
+        crate::loyalty::refund_for_cancelled_sub_order(&mut tx, *sub_order_id).await?;
     }
 
     tx.commit()
@@ -1393,6 +1530,12 @@ pub struct Receipt {
     /// when it is positive.
     pub coupon_code: Option<String>,
     pub discount_total_poisha: i64,
+    /// Loyalty points redeemed at checkout (Wave 35) and the
+    /// discount they bought; the grand total (and so the
+    /// cash-due above) is already net of it. The receipt
+    /// renders the discount as its own line when positive.
+    pub loyalty_points_used: i64,
+    pub loyalty_discount_poisha: i64,
     pub delivery_total_poisha: i64,
     pub grand_total_poisha: i64,
 }
@@ -1445,6 +1588,8 @@ pub fn build_receipt(order: &Order, store_names: &HashMap<Uuid, String>) -> Rece
         goods_total_poisha: order.goods_total_poisha,
         coupon_code: order.coupon_code.clone(),
         discount_total_poisha: order.discount_total_poisha,
+        loyalty_points_used: order.loyalty_points_used,
+        loyalty_discount_poisha: order.loyalty_discount_poisha,
         delivery_total_poisha: order.delivery_total_poisha,
         grand_total_poisha: order.grand_total_poisha,
     }
@@ -1682,6 +1827,19 @@ pub async fn update_sub_order_status(
     };
     if let Some(kind) = notice_kind {
         crate::notices::enqueue_sub_order_notice(&mut tx, sub_order_id, kind).await?;
+    }
+
+    // Wave 35: the loyalty hooks ride this same funnel, in
+    // this transaction — a delivery credits the buyer's earn
+    // (the `loyalty` module's earn-once rule makes a repeat
+    // impossible, and this transition itself is one-way), and
+    // a seller cancellation refunds the points the sub-order's
+    // redemption share bought.
+    if new_status == "delivered" {
+        crate::loyalty::earn_for_sub_order(&mut tx, sub_order_id).await?;
+    }
+    if new_status == "cancelled" {
+        crate::loyalty::refund_for_cancelled_sub_order(&mut tx, sub_order_id).await?;
     }
 
     tx.commit()

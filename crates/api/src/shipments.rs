@@ -486,6 +486,11 @@ struct SubOrderBookingRow {
     order_id: Uuid,
     goods_subtotal_poisha: i64,
     delivery_charge_poisha: i64,
+    /// Wave 35: this sub-order's allocated share of the
+    /// order's loyalty discount — the collection netting
+    /// subtracts it (the buyer already paid that slice in
+    /// points).
+    loyalty_discount_poisha: i64,
     payment_status: String,
     /// Wave 17: the parent order's advance snapshot — the
     /// booking guard and the collection netting read these.
@@ -512,7 +517,7 @@ async fn load_booking_row(
 ) -> Result<SubOrderBookingRow, ApiError> {
     let row: Option<SubOrderBookingRow> = sqlx::query_as(
         "SELECT so.status, so.store_id, s.owner_user_id, o.id AS order_id, \
-         so.goods_subtotal_poisha, so.delivery_charge_poisha, \
+         so.goods_subtotal_poisha, so.delivery_charge_poisha, so.loyalty_discount_poisha, \
          o.payment_status, o.advance_required_poisha, o.advance_paid_poisha, \
          o.delivery_name, o.delivery_phone, \
          o.delivery_address, o.delivery_zone \
@@ -579,17 +584,25 @@ async fn load_booking_row(
 /// the advance the buyer already paid online — the advance is
 /// allocated across the order's sub-orders in proportion to
 /// their goods + delivery shares (integer division; a
-/// sub-order never collects below zero).
+/// sub-order never collects below zero). Wave 35: every share
+/// is likewise NET of the sub-order's loyalty discount share —
+/// that slice was already paid in points at checkout, so the
+/// courier must not collect it again in cash.
 async fn compute_booking_cod_amount(
     pool: &PgPool,
     row: &SubOrderBookingRow,
 ) -> Result<i64, ApiError> {
+    // This sub-order's cash share before the advance netting:
+    // goods + delivery, minus the slice the buyer paid in
+    // loyalty points.
+    let sub_share =
+        row.goods_subtotal_poisha + row.delivery_charge_poisha - row.loyalty_discount_poisha;
     if row.payment_status == "pay_on_delivery" {
-        Ok(row.goods_subtotal_poisha + row.delivery_charge_poisha)
+        Ok(sub_share.max(0))
     } else if row.payment_status == "advance_paid" {
-        let sub_share = row.goods_subtotal_poisha + row.delivery_charge_poisha;
         let order_collect_total: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(goods_subtotal_poisha + delivery_charge_poisha), 0)::bigint \
+            "SELECT COALESCE(SUM(goods_subtotal_poisha + delivery_charge_poisha \
+             - loyalty_discount_poisha), 0)::bigint \
              FROM sub_orders WHERE order_id = $1",
         )
         .bind(row.order_id)
@@ -858,7 +871,9 @@ pub async fn create_manual_shipment_for_seller(
 /// effect of a shipment status. Wave 29: an applied sync also
 /// queues the buyer's `sub_order_delivered` /
 /// `sub_order_returned` notification in the same transaction
-/// (see the `notices` module).
+/// (see the `notices` module). Wave 35: an applied sync to
+/// `delivered` also credits the buyer's loyalty earn in the
+/// same transaction (see the `loyalty` module).
 async fn sync_sub_order_with_shipment_status(
     conn: &mut sqlx::PgConnection,
     sub_order_id: Uuid,
@@ -895,6 +910,13 @@ async fn sync_sub_order_with_shipment_status(
         domain::NOTIFICATION_SUB_ORDER_RETURNED
     };
     crate::notices::enqueue_sub_order_notice(conn, sub_order_id, kind).await?;
+    // Wave 35: a courier-driven delivery is the second earn
+    // funnel (the seller PATCH in `orders` is the first) — the
+    // buyer's loyalty earn is credited here, in the caller's
+    // transaction, under the same exactly-once rule.
+    if target == "delivered" {
+        crate::loyalty::earn_for_sub_order(conn, sub_order_id).await?;
+    }
     Ok(())
 }
 

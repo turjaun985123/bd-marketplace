@@ -250,6 +250,17 @@
 //! to `owner` and pass every gate, so owner behaviour is
 //! unchanged everywhere; the payout store stays owner-based
 //! by design (money settles to the owner alone).
+//! Wave 35: buyer loyalty points (`loyalty` module,
+//! migration 0033) — an append-only points ledger: a
+//! delivered sub-order earns the buyer 1 point per 100 taka
+//! of net goods (through the same two delivery funnels as
+//! the Wave 29 notices), checkout redeems points at 1 point
+//! = 100 poisha capped at half the post-coupon goods, and
+//! cancels and received returns reverse their slice. The
+//! platform funds redemptions: seller payout snapshots and
+//! the commission basis never see the discount, and the
+//! stored grand total is the reduced payable every money
+//! surface reads.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -271,6 +282,7 @@ pub mod exports;
 pub mod facebook;
 pub mod inventory;
 pub mod invoices;
+pub mod loyalty;
 pub mod messaging;
 pub mod notices;
 pub mod notifications;
@@ -1129,6 +1141,9 @@ pub fn build_app(state: AppState) -> Router {
         // Wave 4 — buyer cancel (with restock) + receipt view.
         .route("/v1/orders/:id/cancel", post(orders::cancel_order))
         .route("/v1/orders/:id/receipt", get(orders::get_receipt))
+        // Wave 35 — loyalty: the caller's points balance,
+        // the programme rules and their recent ledger.
+        .route("/v1/loyalty", get(loyalty::get_loyalty_handler))
         // Wave 5 — payments: availability, gateway webhook, retry,
         // and the dev simulator helper (404s when dev mode is off).
         .route("/v1/payments/methods", get(payments::list_methods))

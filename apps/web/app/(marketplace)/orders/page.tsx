@@ -7,6 +7,7 @@ import {
   cancelOrder,
   createReturnRequest,
   downloadBuyerExport,
+  getLoyalty,
   listBuyerReturnRequests,
   listOrders,
   paymentStatusLabel,
@@ -15,6 +16,7 @@ import {
   retryPayment,
   returnStatusLabel,
   shipmentStatusLabel,
+  type LoyaltyView,
   type Order,
   type ReturnRequest,
   type SubOrder,
@@ -43,6 +45,12 @@ import { useAuth } from "@/hooks/useAuth";
  * Wave 31: the header button downloads the buyer's own record
  * (GET /v1/buyer/export — profile, orders, reviews, wishlist,
  * questions) as one JSON file, the portability export.
+ *
+ * Wave 35: the header also carries the buyer's loyalty card —
+ * the spendable balance and the recent points ledger (earns
+ * from delivered orders, redemptions, and the adjustments a
+ * cancel or a received return writes) — and an order that was
+ * paid partly in points shows its loyalty discount line.
  */
 export default function BuyerOrdersPage() {
   const { ready, token } = useAuth();
@@ -60,6 +68,7 @@ export default function BuyerOrdersPage() {
   const [returningId, setReturningId] = useState<string | null>(null);
   const [exportBusy, setExportBusy] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
+  const [loyalty, setLoyalty] = useState<LoyaltyView | null>(null);
 
   // Wave 31: download the buyer's own record as one JSON file.
   async function onDownloadExport() {
@@ -191,6 +200,15 @@ export default function BuyerOrdersPage() {
   useEffect(() => {
     if (!token) return;
     let cancelled = false;
+    // The loyalty card loads alongside; a failure there must
+    // not take the orders list down with it.
+    getLoyalty(token)
+      .then((loaded) => {
+        if (!cancelled) setLoyalty(loaded);
+      })
+      .catch(() => {
+        if (!cancelled) setLoyalty(null);
+      });
     Promise.all([
       listOrders(token, { limit: 50 }),
       listBuyerReturnRequests(token, { limit: 50 }),
@@ -249,6 +267,41 @@ export default function BuyerOrdersPage() {
         ফাইলে।
       </p>
       {exportError && <p role="alert">{exportError}</p>}
+      {loyalty && (
+        <section className="card">
+          <h2>লয়্যালটি পয়েন্ট — Loyalty points</h2>
+          <p>
+            ব্যবহারযোগ্য পয়েন্ট: <strong>{loyalty.available_points}</strong>{" "}
+            (১ পয়েন্ট = <PriceTag amountPoisha={loyalty.point_value_poisha} />
+            ) · মোট অর্জিত: {loyalty.lifetime_earned} · মোট ব্যবহৃত:{" "}
+            {loyalty.lifetime_redeemed}
+          </p>
+          <p>
+            ডেলিভারি সম্পন্ন অর্ডারে প্রতি{" "}
+            <PriceTag amountPoisha={loyalty.earn_poisha_per_point} /> পণ্যে ১
+            পয়েন্ট পাওয়া যায়; পয়েন্টের মেয়াদ {loyalty.expiry_days} দিন।
+            (Delivered orders earn 1 point per{" "}
+            <PriceTag amountPoisha={loyalty.earn_poisha_per_point} /> of goods;
+            points expire after {loyalty.expiry_days} days.)
+          </p>
+          {loyalty.history.length > 0 && (
+            <ul>
+              {loyalty.history.slice(0, 10).map((entry, idx) => (
+                <li key={`${entry.created_at}-${idx}`}>
+                  {new Date(entry.created_at).toLocaleString("bn-BD")} —{" "}
+                  {entry.reason === "earn"
+                    ? "অর্জন"
+                    : entry.reason === "redeem"
+                      ? "ব্যবহার"
+                      : "সমন্বয়"}
+                  : {entry.delta > 0 ? "+" : ""}
+                  {entry.delta} পয়েন্ট
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
       {error && <p role="alert">{error}</p>}
       {orders === null ? (
         <p>অর্ডার লোড হচ্ছে…</p>
@@ -368,6 +421,12 @@ export default function BuyerOrdersPage() {
               {order.payment_method !== "cod" &&
                 ` (${order.payment_method})`}
             </p>
+            {order.loyalty_discount_poisha > 0 && (
+              <p>
+                লয়্যালটি ছাড়: −<PriceTag amountPoisha={order.loyalty_discount_poisha} />{" "}
+                ({order.loyalty_points_used} পয়েন্ট ব্যবহৃত হয়েছে)
+              </p>
+            )}
             {order.payment_status === "failed" && order.payment && (
               <p>
                 <button

@@ -343,6 +343,8 @@ export interface SubOrder {
   goods_subtotal_poisha: number;
   /** Coupon discount allocated to this sub-order (Wave 14). */
   discount_poisha: number;
+  /** Loyalty discount allocated to this sub-order (Wave 35). */
+  loyalty_discount_poisha: number;
   delivery_charge_poisha: number;
   commission_poisha: number;
   seller_payout_poisha: number;
@@ -442,6 +444,14 @@ export interface Order {
   coupon_code: string | null;
   /** Total coupon discount across the sub-orders (Wave 14). */
   discount_total_poisha: number;
+  /** Loyalty points redeemed on this order (Wave 35); 0 when none. */
+  loyalty_points_used: number;
+  /**
+   * The discount those points bought (Wave 35). The grand total
+   * is already net of it; the platform funds it, so seller
+   * payouts never see it.
+   */
+  loyalty_discount_poisha: number;
   delivery_total_poisha: number;
   grand_total_poisha: number;
   created_at: string;
@@ -513,6 +523,46 @@ export interface PlaceOrderInput {
    * checkout page asks for one and retries.
    */
   advance_method?: string;
+  /**
+   * Loyalty points to redeem (Wave 35). The server clamps the
+   * request to the redeemable maximum (balance, capped at half
+   * the post-coupon goods) — the placed order reports the
+   * points actually used.
+   */
+  loyalty_points?: number;
+}
+
+/** One loyalty ledger movement (GET /v1/loyalty history, Wave 35). */
+export interface LoyaltyEntry {
+  /** Signed: positive for earn/refund, negative for redeem/clawback. */
+  delta: number;
+  /** earn | redeem | adjust */
+  reason: string;
+  ref_id: string | null;
+  /** When an earned point stops being spendable; null on non-earn rows. */
+  expires_at: string | null;
+  created_at: string;
+}
+
+/** GET /v1/loyalty — the buyer's points balance, rules and history. */
+export interface LoyaltyView {
+  available_points: number;
+  lifetime_earned: number;
+  lifetime_redeemed: number;
+  /** Net goods poisha that earn one point (100 taka = 10_000). */
+  earn_poisha_per_point: number;
+  /** Poisha one redeemed point buys (1 taka = 100). */
+  point_value_poisha: number;
+  /** Redemption cap, as a percent of post-coupon goods (50). */
+  max_redeem_percent_of_goods: number;
+  /** Days an earned point stays spendable (365). */
+  expiry_days: number;
+  history: LoyaltyEntry[];
+}
+
+/** GET /v1/loyalty — my loyalty points (Wave 35). */
+export function getLoyalty(token: string): Promise<LoyaltyView> {
+  return call("/v1/loyalty", { token });
 }
 
 function apiBase(): string {
@@ -1089,6 +1139,10 @@ export interface Receipt {
   coupon_code: string | null;
   /** Total coupon discount (Wave 14); shown as its own line. */
   discount_total_poisha: number;
+  /** Loyalty points redeemed at checkout (Wave 35). */
+  loyalty_points_used: number;
+  /** The discount those points bought (Wave 35); shown as its own line. */
+  loyalty_discount_poisha: number;
   delivery_total_poisha: number;
   grand_total_poisha: number;
 }

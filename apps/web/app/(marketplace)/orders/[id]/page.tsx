@@ -148,6 +148,13 @@ export default function OrderReceiptPage({
               <PriceTag amountPoisha={receipt.discount_total_poisha} />
             </>
           )}
+          {receipt.loyalty_discount_poisha > 0 && (
+            <>
+              <br />
+              লয়্যালটি ছাড় ({receipt.loyalty_points_used} পয়েন্ট): −
+              <PriceTag amountPoisha={receipt.loyalty_discount_poisha} />
+            </>
+          )}
           <br />
           ডেলিভারি মোট:{" "}
           <PriceTag amountPoisha={receipt.delivery_total_poisha} />

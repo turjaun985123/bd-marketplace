@@ -26,6 +26,13 @@
 //! Courier-driven returns (RTO) are NOT return requests: they
 //! restock through the shipment refresh path (see `shipments`)
 //! and never create rows here or refunds anywhere.
+//!
+//! Wave 35: marking a return received also claws back the
+//! loyalty points the sub-order earned when it was delivered
+//! (the `loyalty` module's return hook), inside the same
+//! transaction — goods that came back un-earn their points.
+//! (An RTO parcel was never delivered, so it never earned
+//! anything and needs no clawback.)
 
 use axum::{
     extract::{Path, Query, State},
@@ -550,6 +557,17 @@ pub async fn mark_return_received(
         .map_err(|e| ApiError::internal("mark sub-order returned", e))?;
 
     restock_sub_order_items(&mut tx, sub_order_id, "return_restock").await?;
+
+    // Wave 35: goods that came back un-earn their loyalty
+    // points — the clawback mirrors the sub-order's earn row,
+    // in this transaction (the `loyalty` module's return hook).
+    let buyer_id: Uuid =
+        sqlx::query_scalar("SELECT buyer_id FROM return_requests WHERE id = $1")
+            .bind(return_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| ApiError::internal("load return buyer for loyalty clawback", e))?;
+    crate::loyalty::clawback_for_returned_sub_order(&mut tx, buyer_id, sub_order_id).await?;
 
     // Wave 29: the buyer's return_update notification
     // (received — with the refund snapshot the helper reads

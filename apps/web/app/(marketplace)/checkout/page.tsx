@@ -6,6 +6,7 @@ import PriceTag from "@/components/PriceTag";
 import {
   devSimulateSuccess,
   getAdvancePolicy,
+  getLoyalty,
   getOrder,
   getPaymentMethods,
   paymentStatusLabel,
@@ -14,6 +15,7 @@ import {
   type AdvancePolicy,
   type CartItem,
   type CouponPreview,
+  type LoyaltyView,
   type Order,
   type PaymentMethodInfo,
 } from "@/lib/api";
@@ -101,6 +103,13 @@ function groupByStore(items: CartItem[]): SellerGroup[] {
  * The success screen then walks the buyer through paying the
  * advance (the Wave 5 simulate block, reused) before anything
  * ships.
+ *
+ * Wave 35: a buyer with loyalty points sees a points block —
+ * their balance, the most this cart may redeem (balance capped
+ * at half the post-coupon goods, the server's rule previewed
+ * with the same arithmetic), and an opt-in amount. The request
+ * rides along with the order; the server clamps it and the
+ * placed order reports the points actually used.
  */
 export default function CheckoutPage() {
   const { ready, token } = useAuth();
@@ -132,6 +141,15 @@ export default function CheckoutPage() {
   const [policy, setPolicy] = useState<AdvancePolicy | null>(null);
   const [advanceMethod, setAdvanceMethod] = useState("bkash");
   const [advanceRequired, setAdvanceRequired] = useState(false);
+  // Loyalty (Wave 35): the buyer's points view, whether they
+  // want to spend points on this order, and how many. The
+  // server clamps the request to the redeemable maximum; the
+  // figures previewed here use the same rule (balance, capped
+  // at half the post-coupon goods) so the preview should match
+  // — the placed order remains the authority.
+  const [loyalty, setLoyalty] = useState<LoyaltyView | null>(null);
+  const [useLoyalty, setUseLoyalty] = useState(false);
+  const [loyaltyPointsInput, setLoyaltyPointsInput] = useState("");
 
   const groups = useMemo(() => groupByStore(items), [items]);
 
@@ -193,16 +211,66 @@ export default function CheckoutPage() {
     };
   }, []);
 
+  // Load the buyer's loyalty balance once (Wave 35). A buyer
+  // with no points simply never sees the loyalty block.
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    getLoyalty(token)
+      .then((loaded) => {
+        if (!cancelled) setLoyalty(loaded);
+      })
+      .catch(() => {
+        if (!cancelled) setLoyalty(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token]);
+
   const previewDelivery = groups.reduce(
     (sum, g) => sum + (charges[g.storeSlug] ?? 0),
     0
   );
   const previewKnown = groups.every((g) => charges[g.storeSlug] != null);
 
+  // Loyalty preview (Wave 35): the most points this cart could
+  // redeem — the balance, capped at half the post-coupon goods
+  // (the server's rule, previewed with the same arithmetic) —
+  // and the buyer's requested amount clamped to it. An empty
+  // input means "use as many as possible".
+  const postCouponGoodsPreview =
+    goodsTotalPoisha - (coupon?.valid ? coupon.discount_poisha : 0);
+  const loyaltyMaxUsable = loyalty
+    ? Math.min(
+        loyalty.available_points,
+        Math.floor(
+          Math.floor(postCouponGoodsPreview / 2) / loyalty.point_value_poisha
+        )
+      )
+    : 0;
+  const loyaltyRequestedParsed = Number.parseInt(loyaltyPointsInput, 10);
+  const loyaltyPointsPreview =
+    useLoyalty && loyalty
+      ? Math.min(
+          Number.isNaN(loyaltyRequestedParsed)
+            ? loyaltyMaxUsable
+            : Math.max(0, loyaltyRequestedParsed),
+          loyaltyMaxUsable
+        )
+      : 0;
+  const loyaltyDiscountPreview = loyalty
+    ? loyaltyPointsPreview * loyalty.point_value_poisha
+    : 0;
+
   // The grand total the advance threshold is measured against:
-  // goods minus a valid coupon's discount, plus delivery.
+  // goods minus a valid coupon's discount and the loyalty
+  // discount, plus delivery.
   const previewGrand =
-    goodsTotalPoisha - (coupon?.valid ? coupon.discount_poisha : 0) + previewDelivery;
+    goodsTotalPoisha -
+    (coupon?.valid ? coupon.discount_poisha : 0) -
+    loyaltyDiscountPreview +
+    previewDelivery;
   // Show the advance picker when the preview says an advance is
   // likely (COD + threshold reached) or checkout already asked
   // for a method (a risk-forced advance below the threshold).
@@ -267,6 +335,13 @@ export default function CheckoutPage() {
         // Only a preview-valid code is sent; checkout re-checks it
         // and its response is the final authority either way.
         coupon_code: coupon?.valid ? coupon.code : undefined,
+        // Loyalty points (Wave 35): sent only when the buyer
+        // opted in; the server clamps to the redeemable maximum
+        // and the placed order reports what was actually used.
+        loyalty_points:
+          useLoyalty && loyaltyPointsPreview > 0
+            ? loyaltyPointsPreview
+            : undefined,
         // The advance method rides along whenever the picker is
         // shown for a COD order; the server ignores it when no
         // advance is required.
@@ -343,6 +418,13 @@ export default function CheckoutPage() {
               {" "}
               · কুপন ছাড় ({placed.coupon_code}): −
               <PriceTag amountPoisha={placed.discount_total_poisha} />
+            </>
+          )}
+          {placed.loyalty_discount_poisha > 0 && (
+            <>
+              {" "}
+              · লয়্যালটি ছাড় ({placed.loyalty_points_used} পয়েন্ট): −
+              <PriceTag amountPoisha={placed.loyalty_discount_poisha} />
             </>
           )}{" "}
           · ডেলিভারি: <PriceTag amountPoisha={placed.delivery_total_poisha} /> ·
@@ -542,6 +624,49 @@ export default function CheckoutPage() {
                 {coupon.reason ? `: ${coupon.reason}` : ""}
               </p>
             ))}
+
+          {loyalty && loyalty.available_points > 0 && (
+            <>
+              <h2>লয়্যালটি পয়েন্ট — Loyalty points</h2>
+              <p>
+                আপনার কাছে {loyalty.available_points} পয়েন্ট আছে (১
+                পয়েন্ট ={" "}
+                <PriceTag amountPoisha={loyalty.point_value_poisha} />
+                )। এই অর্ডারে সর্বোচ্চ {loyaltyMaxUsable} পয়েন্ট
+                ব্যবহার করা যাবে — ছাড় পণ্যের মোট দামের (কুপনের পর)
+                অর্ধেকের বেশি হয় না। (You have {loyalty.available_points}{" "}
+                points; at most {loyaltyMaxUsable} can be used on this
+                order.)
+              </p>
+              <p>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={useLoyalty}
+                    onChange={(e) => setUseLoyalty(e.target.checked)}
+                  />{" "}
+                  পয়েন্ট ব্যবহার করুন — Use points
+                </label>
+              </p>
+              {useLoyalty && (
+                <p>
+                  <label>
+                    কত পয়েন্ট ব্যবহার করবেন (খালি রাখলে সর্বোচ্চটাই
+                    ব্যবহৃত হবে)
+                    <input
+                      value={loyaltyPointsInput}
+                      onChange={(e) => setLoyaltyPointsInput(e.target.value)}
+                      placeholder={String(loyaltyMaxUsable)}
+                      inputMode="numeric"
+                    />
+                  </label>{" "}
+                  ছাড়: −
+                  <PriceTag amountPoisha={loyaltyDiscountPreview} /> (
+                  {loyaltyPointsPreview} পয়েন্ট)
+                </p>
+              )}
+            </>
+          )}
 
           <h2>ডেলিভারির তথ্য — Delivery details</h2>
           <form onSubmit={onPlaceOrder}>

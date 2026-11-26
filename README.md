@@ -2047,6 +2047,104 @@ is not modelled. Roles are per store and there are
 exactly two of them; finer-grained or custom roles are
 not modelled.
 
+Wave 35 (buyer loyalty points — earn on delivery, spend at checkout):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| GET | `/v1/loyalty` | Bearer. The caller's points position: `available_points`, `lifetime_earned`, `lifetime_redeemed`, the programme rules (`earn_poisha_per_point`, `point_value_poisha`, `max_redeem_percent_of_goods`, `expiry_days`) and the last 20 ledger movements, newest first |
+
+**The rates** are pure domain constants and functions:
+earn **1 point per ৳100** (10_000 poisha) of NET goods —
+goods subtotal minus the sub-order's coupon discount
+share, floored per sub-order (`loyalty_points_for_goods`);
+redeem at **1 point = ৳1** (100 poisha,
+`loyalty_discount_poisha`); a redemption may not exceed
+**half the order's post-coupon goods total**
+(`loyalty_max_redeemable_points`); earned points **expire
+365 days** after they are earned.
+
+**The ledger** (migration 0033, `loyalty_points`) is
+append-only and IS the balance — there is no stored
+counter to drift. Rows are `earn` (positive, per delivered
+sub-order, carrying `expires_at`), `redeem` (negative,
+one per checkout that spent points, ref = the order) and
+`adjust` (refunds and clawbacks, ref = the sub-order).
+The one balance query (`loyalty_balance_on`) computes
+available points as the UNEXPIRED earn sum plus every
+redeem/adjust movement, floored at zero. Deliberate
+simplification: movements net against the unexpired earn
+pool as a whole — there is no per-point FIFO tracking of
+which earn lot a redemption consumed.
+
+**Earn funnels.** Points land exactly where the Wave 29
+delivered notification lands — the two transactions that
+move a sub-order to `delivered`: the seller status PATCH
+(`orders::update_sub_order_status`) and the shared
+shipment sync (`shipments::sync_sub_order_with_shipment_status`,
+courier refresh and manual statuses alike) — via the one
+hook `loyalty::earn_for_sub_order`, inside the same
+transaction. A partial UNIQUE index (one earn row per
+sub-order) plus `ON CONFLICT DO NOTHING` makes the credit
+exactly-once even if a funnel were ever reached twice.
+Checkout is authenticated, so every order's buyer is an
+account the earn can credit.
+
+**Redeem at checkout.** `POST /v1/orders` accepts
+`loyalty_points`. Inside the checkout transaction, after
+the coupon is applied: the buyer's user row is locked
+`FOR UPDATE` (concurrent checkouts serialize; the same
+points cannot be spent twice), the balance is read, and
+the request is CLAMPED to the redeemable maximum — never
+rejected for being too large; a negative request is a
+400. The discount is allocated across the seller groups
+proportional to post-coupon goods by the same
+`allocate_discount` the coupon uses, and each sub-order
+snapshots its share (`sub_orders.loyalty_discount_poisha`).
+The stored `grand_total_poisha` is the REDUCED payable:
+the Wave 17 advance decision, the online payment amount,
+the receipt's cash-due and the courier's collection
+amount (`compute_booking_cod_amount` nets each parcel's
+share) all read reduced figures. **The platform funds
+the redemption**: `seller_payout_poisha` and the
+commission basis are computed from the pre-loyalty totals
+and never change — a seller is paid exactly as if the
+buyer had paid cash. The order and receipt views carry
+`loyalty_points_used` + `loyalty_discount_poisha`.
+
+**Reversals** ride the one-way transitions, which is
+their once-only guard (no unique index — see migration
+0033's note). A cancelled sub-order (buyer whole-order
+cancel or seller single cancel) refunds the points its
+allocated share bought — share / 100, floored; the
+redemption total was a multiple of 100 poisha but its
+per-sub-order shares need not be, and the remainder
+poisha stay with the platform. A return marked RECEIVED
+claws back the sub-order's earn (the mirror `adjust`
+row); if the buyer already spent those points, the
+balance floors at zero and the clawback consumes future
+earns first. An RTO parcel was never delivered, so it
+never earned and needs no clawback.
+
+**Web.** Checkout shows a লয়্যালটি পয়েন্ট block when
+the buyer has points: the balance, the most this cart may
+redeem (the server's rule previewed with the same
+arithmetic), an opt-in and an amount; the placed order
+shows the loyalty discount line. The buyer orders page
+header carries the loyalty card (balance, lifetime
+totals, recent ledger with বাংলা movement labels) and
+each order shows its loyalty discount line; the receipt
+page shows it too.
+
+**Honest limits:** points cannot be transferred or
+gifted, there are no tier levels, and expiry is computed
+at read time — no sweeper job deletes or rewrites
+expired rows, and an expired lot's points simply stop
+counting toward the balance. A partial (single-sub-order)
+cancel refunds by that sub-order's allocated share, not
+by re-running the order's redemption; the allocation
+remainder stays with the platform (above). Points are
+worth money only inside checkout — there is no cash-out.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -3292,6 +3390,29 @@ booking against coupon + balance refusals (403), stranger
 invisibility, role change and removal ending access, and
 the Wave 9 owner money flow (184_000 earned) unchanged.
 
+**Real (Wave 35):** buyer loyalty points — migration
+0033 (the append-only `loyalty_points` ledger with its
+earn-once partial unique index; loyalty snapshots on
+orders and sub_orders); the pure domain rules (earn 1
+point per 100 taka of net goods, redeem 1 point = 100
+poisha capped at half the post-coupon goods, 365-day
+expiry computed at read); the one balance aggregate and
+the earn / cancel-refund / return-clawback hooks in
+`crates/api/src/loyalty.rs`, wired into the two delivery
+funnels, both cancel paths and the return-received path;
+checkout redemption clamped under the buyer's user-row
+lock with the stored grand total as the reduced payable
+(advance, online amount, receipt and courier collection
+all read it) and seller payouts untouched (platform
+funded). Web: the checkout points block, the orders-page
+loyalty card, and loyalty lines on the order and receipt
+views. An integration test (`crates/api/tests/wave35.rs`,
+same `DATABASE_URL` gate) covers both earn funnels,
+no-double-earn, the redemption maths + cap, the
+platform-funded payout proof, the advance reading the
+reduced payable, the cancel refund, the return clawback,
+the courier collection netting and the full ledger order.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters, and the four manual couriers run
@@ -3349,25 +3470,28 @@ the external service at the other end of it, configured by
   names on the cart and buyer-order lines, and the seller
   variant manager on /seller/products; Wave 34 adds
   /seller/members, the dashboard store switcher and the
-  role badge next to the store name).
+  role badge next to the store name; Wave 35 adds no page —
+  it adds the checkout loyalty block, the orders-page
+  loyalty card, and loyalty discount lines on the order
+  and receipt views).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
-  (domain 114, courier 31, payments 8 unit tests, plus the API
+  (domain 118, courier 31, payments 8 unit tests, plus the API
   crate's JWT-secret unit tests; the `DATABASE_URL`-
   gated integration tests skip cleanly without a database). The API
   binary was also smoke-tested locally without a database: routes
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
   (including the Wave 13 messaging endpoints), and the SIDRA
   callback answers 503 without a database.
-- **Rust integration + clippy: CI-only** — the Wave 2–34 integration
+- **Rust integration + clippy: CI-only** — the Wave 2–35 integration
   tests (including the Wave 29 outbox test in the `notify`
   crate) against a real Postgres 16 service and clippy
   `-D warnings` are verified via **GitHub Actions CI**
   (`.github/workflows/ci.yml`)
-  on push. Waves 1–33 are green there; Wave 34 awaits its first CI run.
-  Waves 33 and 34 were additionally verified locally against a
+  on push. Waves 1–34 are green there; Wave 35 awaits its first CI run.
+  Waves 33–35 were additionally verified locally against a
   scratch Postgres 16 cluster on this machine: the full workspace
-  suite (191 tests) passes with `DATABASE_URL` set, twice in a row.
+  suite (202 tests) passes with `DATABASE_URL` set.
 - **Docker images: CI-only** — Docker is not installed on the
   development machine, so `Dockerfile.api`, `Dockerfile.worker`
   and `apps/web/Dockerfile` are verified by the CI `docker` job
