@@ -206,7 +206,7 @@ async fn buy_and_deliver(app: &axum::Router, seller_token: &str, sub_order_id: &
         "POST",
         &format!("/v1/seller/sub-orders/{sub_order_id}/shipment"),
         Some(seller_token),
-        Some(json!({ "courier": "dev" })),
+        Some(json!({})),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "book shipment: {shipment}");
