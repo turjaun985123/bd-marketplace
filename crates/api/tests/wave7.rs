@@ -273,6 +273,15 @@ async fn wave7_smart_routing_flow() {
     assert_eq!(estimates.len(), 9, "five API couriers + four manual (Wave 19): {body}");
     for estimate in estimates {
         assert_eq!(estimate["available"], true, "dev estimate: {estimate}");
+        if estimate["mode"] == "manual" {
+            // Wave 19: manual couriers stay manual + unpriced even
+            // when the API couriers run in dev mode.
+            assert!(
+                estimate["price_poisha"].is_null(),
+                "manual couriers are not price-estimated: {estimate}"
+            );
+            continue;
+        }
         assert_eq!(estimate["mode"], "dev", "dev estimate: {estimate}");
         assert_eq!(
             estimate["price_poisha"], 6_000,
