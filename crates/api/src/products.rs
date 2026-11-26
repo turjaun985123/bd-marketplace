@@ -28,6 +28,34 @@ use crate::auth::{authenticate_optional, AuthUser};
 use crate::stores::get_store_by_id;
 use crate::{ApiError, AppState};
 
+/// Wave 32: the cache policy for public catalogue reads. Thirty
+/// seconds is deliberately short — prices and stock change
+/// without invalidating anything, so a shared cache may serve a
+/// price that is at most half a minute stale; that tradeoff is
+/// accepted for the catalogue (never for carts, orders or
+/// balances) because it takes the hottest read traffic off
+/// Postgres.
+pub const PUBLIC_CACHE_CONTROL: &str = "public, max-age=30";
+
+/// The response headers for a catalogue read: the public cache
+/// header when the read is ANONYMOUS, and no cache header at
+/// all when a viewer is signed in. The catalogue payload is
+/// viewer-dependent (a signed-in owner also sees their own
+/// non-active products), so an authenticated response must
+/// never land in a shared cache — the rule is "no token, no
+/// public cache entry", enforced here at the handler, not by
+/// path-matching middleware.
+pub fn public_cache_headers(anonymous: bool) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if anonymous {
+        headers.insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static(PUBLIC_CACHE_CONTROL),
+        );
+    }
+    headers
+}
+
 /// A product row joined with its store's slug; the public product shape.
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct Product {
@@ -500,7 +528,7 @@ pub async fn list_products_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<ListProductsQuery>,
-) -> Result<Json<ProductList>, ApiError> {
+) -> Result<(HeaderMap, Json<ProductList>), ApiError> {
     let pool = state.require_pool()?;
     let viewer = authenticate_optional(&state, &headers).map(|u| u.user_id);
     let list = list_products(
@@ -512,7 +540,9 @@ pub async fn list_products_handler(
         viewer,
     )
     .await?;
-    Ok(Json(list))
+    // Wave 32: publicly cacheable only for anonymous reads
+    // (see `public_cache_headers`).
+    Ok((public_cache_headers(viewer.is_none()), Json(list)))
 }
 
 pub async fn list_store_products(
@@ -539,7 +569,7 @@ pub async fn get_product(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
-) -> Result<Json<Product>, ApiError> {
+) -> Result<(HeaderMap, Json<Product>), ApiError> {
     let pool = state.require_pool()?;
     let product = get_product_by_id(pool, id).await?;
     // Two visibility gates, both answered "404" so nothing leaks:
@@ -549,12 +579,17 @@ pub async fn get_product(
     let store = get_store_by_id(pool, product.store_id).await?;
     let viewer = authenticate_optional(&state, &headers);
     let is_owner = viewer
+        .as_ref()
         .map(|user| store.owner_user_id == user.user_id)
         .unwrap_or(false);
     if !is_owner && (product.status != "active" || store.status == "suspended") {
         return Err(ApiError::not_found("product not found"));
     }
-    Ok(Json(product))
+    // Wave 32: an anonymous read that passed the gates is by
+    // definition the public view, so it may be cached publicly;
+    // a signed-in read (above all the owner's view of a draft)
+    // gets no cache header (see `public_cache_headers`).
+    Ok((public_cache_headers(viewer.is_none()), Json(product)))
 }
 
 pub async fn update_product(

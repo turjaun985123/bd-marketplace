@@ -1763,6 +1763,85 @@ export is a JSON snapshot for the owner's records — not
 a migration tool: nothing imports it back, here or on
 another platform.
 
+Wave 32 (performance pass — indexes, gzip, cache headers):
+
+No endpoint changed shape in this wave; three costs were
+attacked instead. **Indexes (migration 0030).** The full
+0001–0029 history was inventoried first — the hot paths
+that already had indexes (orders by buyer, sub_orders by
+order and by store+created, order_items by sub_order,
+reviews by product, messages by conversation, wishlist
+by product, stock_adjustments by product, notifications
+by status) are NOT duplicated. Four gaps were filled,
+one per query shape that lacked one:
+
+| Index | Query it serves |
+| --- | --- |
+| `idx_order_items_product` on `order_items (product_id)` | Seller top-products analytics (Wave 27) groups order items by product; the also-bought rail (Wave 24) probes them by product inside an EXISTS |
+| `idx_shipments_status_updated` on `shipments (status, updated_at)` | The Wave 30 poller sweeps non-terminal shipments oldest-first by staleness, every worker cycle |
+| `idx_sub_orders_store_status` on `sub_orders (store_id, status)` | Seller earnings and dashboard counts filter one store's sub-orders by status (earned = store + `delivered`) |
+| `idx_product_questions_product_hidden` on `product_questions (product_id, is_hidden, created_at DESC)` | The public Q&A list reads one product's visible questions newest first |
+
+The migration uses plain `CREATE INDEX` inside the
+migration transaction — a sub-second lock at the current
+catalogue size. On a large production table these would
+be built with `CREATE INDEX CONCURRENTLY` as an ops step
+instead (it cannot run inside a transaction); the
+migration header says so.
+
+**Gzip.** tower-http's `CompressionLayer` (the pinned
+tower-http 0.5.2, `compression-gzip` feature) is the
+OUTERMOST middleware layer: the response flows out
+through CORS and the Wave 28 security headers first, and
+compression applies to the finished body only when the
+client sends `Accept-Encoding: gzip`. Clients that do
+not ask get byte-identical responses, which is why every
+earlier test suite is unaffected. Enabling the feature
+added only new transitive crates (async-compression,
+flate2 and friends) to the lockfile — no existing crate
+changed version.
+
+**Cache headers.** The anonymous public catalogue reads
+— `GET /v1/products`, `GET /v1/products/{id}`,
+`GET /v1/search` — now answer `Cache-Control: public,
+max-age=30`, set at the handler (never by path-matching
+middleware). Thirty seconds is the whole policy: prices
+and stock change without invalidation, so a shared cache
+may serve a price at most half a minute stale — accepted
+for the catalogue, never for carts, orders or balances.
+The subtlety: the catalogue payload is viewer-dependent
+(a signed-in owner also sees their own drafts), so the
+header is attached ONLY when the request carries no
+token. An authenticated catalogue read gets no cache
+header at all, and no authenticated endpoint anywhere
+gets a public one — both rules are asserted in the
+integration test.
+
+**Web images.** `next.config.js` now allows the
+next/image optimiser to fetch any http/https host
+(`images.remotePatterns`), matching the Wave 18 hotlink
+model for seller imagery. Nothing was converted this
+wave, honestly: products carry no image field yet, so
+the card and the product page render no product image
+to convert, and the only hotlinked images in the app —
+store logos and banners — size themselves from CSS with
+unknown intrinsic dimensions, so swapping them to
+next/image is a layout change, not a one-line swap; it
+waits until product imagery lands and gives the
+optimiser real call sites.
+
+**Honest limits:** there is still no Redis and no CDN —
+the cache header only pays off once a cache (browser,
+proxy, CDN) sits in front, and the worker/Redis compose
+profile remains future work. The indexes serve the
+current query shapes only; a new access pattern earns
+its own index when it exists, not before. And nothing
+in this wave was benchmarked: no load test was run, so
+no throughput or latency numbers are claimed — the
+indexes, compression and cache policy are shaped from
+the queries and payloads in the code, and a load test
+remains future work.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -2937,6 +3016,30 @@ test (`crates/api/tests/wave31.rs`, same `DATABASE_URL`
 gate) covers both documents' contents, cross-seller
 isolation, the storeless 404 and the anonymous 401s.
 
+**Real (Wave 32):** the performance pass — migration
+0030 adds the four indexes the query inventory lacked
+(order_items by product, shipments by status +
+updated_at, sub_orders by store + status, product
+questions by product + hidden; the full pre-existing
+inventory is in the Wave 32 section and the gaps only
+were filled), gzip response compression via
+tower-http's `CompressionLayer` on the pinned 0.5.2
+(new transitive crates only, no version changes),
+`Cache-Control: public, max-age=30` on the anonymous
+catalogue reads (product list, product detail, search)
+set at the handler — never on authenticated responses,
+whose catalogue payload is viewer-dependent — and the
+next/image remote allowlist for seller hotlinks in
+`next.config.js` (no component converted: products have
+no image field yet). No payload changed. An integration
+test (`crates/api/tests/wave32.rs`; the gzip half needs
+no database, the index/cache half keeps the
+`DATABASE_URL` gate) asserts the four indexes in
+`pg_indexes`, the cache header on anonymous reads and
+its absence on authenticated ones, and gzip negotiation
+with the gzip magic bytes on the body. Nothing was
+benchmarked — no load-test numbers are claimed.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters, and the four manual couriers run
@@ -2988,7 +3091,8 @@ the external service at the other end of it, configured by
   Wave 28 adds /admin/audit; Wave 29 adds
   /admin/notifications; Wave 31 adds no page — it adds the
   ডেটা এক্সপোর্ট download buttons on the seller dashboard
-  and the buyer orders page).
+  and the buyer orders page; Wave 32 adds no page — it
+  adds the next/image remote allowlist in next.config.js).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
   (domain 106, courier 31, payments 8 unit tests, plus the API
@@ -2998,12 +3102,12 @@ the external service at the other end of it, configured by
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
   (including the Wave 13 messaging endpoints), and the SIDRA
   callback answers 503 without a database.
-- **Rust integration + clippy: CI-only** — the Wave 2–31 integration
+- **Rust integration + clippy: CI-only** — the Wave 2–32 integration
   tests (including the Wave 29 outbox test in the `notify`
   crate) against a real Postgres 16 service and clippy
   `-D warnings` are verified via **GitHub Actions CI**
   (`.github/workflows/ci.yml`)
-  on push. Waves 1–30 are green there; Wave 31 awaits its first CI run.
+  on push. Waves 1–31 are green there; Wave 32 awaits its first CI run.
 - **Docker images: CI-only** — Docker is not installed on the
   development machine, so `Dockerfile.api`, `Dockerfile.worker`
   and `apps/web/Dockerfile` are verified by the CI `docker` job

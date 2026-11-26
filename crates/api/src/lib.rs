@@ -217,6 +217,18 @@
 //! There is deliberately no HTTP endpoint for the batch
 //! poll: the worker depends on this crate as a library and
 //! calls the service in-process.
+//! Wave 32: the performance pass (migration 0030, the
+//! `CompressionLayer` in `build_app`, handler-level cache
+//! headers) — four indexes for the query shapes that lacked
+//! one (order_items by product, shipments by status +
+//! updated_at, sub_orders by store + status, product
+//! questions by product + hidden), gzip response compression
+//! as the outermost layer, and `Cache-Control: public,
+//! max-age=30` on the anonymous public catalogue reads
+//! (product list, product detail, search). No payload
+//! changed; authenticated responses never carry the public
+//! cache header, because the catalogue payload itself is
+//! viewer-dependent (owners see their own drafts).
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -275,6 +287,7 @@ use domain::{
 use ::payments::{GatewayConfig, PaymentMethod, PaymentsConfig};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 /// Shared application state. `pool` is `None` when the API was started
@@ -1489,6 +1502,15 @@ pub fn build_app(state: AppState) -> Router {
         // hard cap on request bodies for the body extractors.
         .layer(middleware::from_fn(security_headers))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        // Wave 32: gzip response compression, added LAST so it
+        // is the OUTERMOST layer — the response flows back out
+        // through the security-headers and CORS layers first
+        // (their headers are set on the plain body), and this
+        // layer compresses the finished body only when the
+        // client sent `Accept-Encoding: gzip`. Requests without
+        // that header are untouched, so the existing test suites
+        // (which never send it) see byte-identical responses.
+        .layer(CompressionLayer::new())
         .with_state(state)
 }
 

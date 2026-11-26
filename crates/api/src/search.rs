@@ -26,7 +26,7 @@
 //! exactly by price or rating, promoted or not — a buyer who
 //! asks for the cheapest first gets the cheapest first.
 
-use axum::{extract::Query, extract::State, Json};
+use axum::{extract::Query, extract::State, http::HeaderMap, Json};
 use domain::{
     search_like_pattern, search_prefix_pattern, validate_search_params, SearchParams, SearchSort,
 };
@@ -34,7 +34,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
-use crate::products::{with_stock_status, Product, PRODUCT_COLUMNS, PRODUCT_RATING_JOIN};
+use crate::products::{
+    public_cache_headers, with_stock_status, Product, PRODUCT_COLUMNS, PRODUCT_RATING_JOIN,
+};
 use crate::{ApiError, AppState};
 
 /// One page of search results plus the total match count. The
@@ -257,7 +259,7 @@ pub struct SuggestQuery {
 pub async fn search_handler(
     State(state): State<AppState>,
     Query(query): Query<SearchQuery>,
-) -> Result<Json<SearchResults>, ApiError> {
+) -> Result<(HeaderMap, Json<SearchResults>), ApiError> {
     let pool = state.require_pool()?;
     let params = validate_search_params(
         query.q.as_deref(),
@@ -275,7 +277,10 @@ pub async fn search_handler(
         query.category.as_deref(),
     )
     .await?;
-    Ok(Json(results))
+    // Wave 32: search has no authenticated variant at all (see
+    // the module doc), so every response is the public view and
+    // carries the public cache header.
+    Ok((public_cache_headers(true), Json(results)))
 }
 
 pub async fn suggest_handler(
