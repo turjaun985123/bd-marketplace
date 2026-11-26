@@ -593,6 +593,108 @@ pub fn map_redx_status(raw: &str) -> &'static str {
     }
 }
 
+/// Map one eCourier tracking status onto the unified shipment
+/// status set. This is the single eCourier mapping: the courier
+/// crate's adapter calls it, so the mapping exists in exactly one
+/// place.
+///
+/// eCourier reports title-case status strings (`Processing`,
+/// `Picked`, `Shipped`, `Delivered`, …), so the table is
+/// deliberately conservative, like RedX's — only confidently known
+/// strings are mapped, and everything else is `unknown` (which the
+/// transition table treats as no change) rather than a guess. The
+/// choices: `Processing` (order accepted, being prepared for
+/// pickup) and `pending` / `created` map to `created`; `picked` /
+/// `picked_up` map to `picked_up`; `shipped` and `in_transit` map
+/// to `in_transit`, and so do `hold` / `on_hold` — the same
+/// paused-in-the-pipeline choice as the other couriers;
+/// `out_for_delivery` maps to `out_for_delivery`, and so does
+/// `failed_delivery` (a failed attempt on a delivery run, which is
+/// retried — the same choice as Pathao and RedX); `delivered` maps
+/// to `delivered`; `partial_delivered` / `partially_delivered` keep
+/// their own unified status; on the return path, `return_in_transit`
+/// and `returning` map to `return_in_transit`, while `returned` and
+/// `delivered_returned` map to `returned`; `cancelled` (and the US
+/// spelling `canceled`) maps to `cancelled`. Matching is on the
+/// normalized form, so case, spaces and hyphens never change the
+/// answer.
+pub fn map_ecourier_status(raw: &str) -> &'static str {
+    match normalize_courier_status(raw).as_str() {
+        "processing" => "created",
+        "pending" => "created",
+        "created" => "created",
+        "picked" => "picked_up",
+        "picked_up" => "picked_up",
+        "shipped" => "in_transit",
+        "in_transit" => "in_transit",
+        "hold" => "in_transit",
+        "on_hold" => "in_transit",
+        "out_for_delivery" => "out_for_delivery",
+        "failed_delivery" => "out_for_delivery",
+        "delivered" => "delivered",
+        "partial_delivered" => "partial_delivered",
+        "partially_delivered" => "partial_delivered",
+        "return_in_transit" => "return_in_transit",
+        "returning" => "return_in_transit",
+        "returned" => "returned",
+        "delivered_returned" => "returned",
+        "cancelled" => "cancelled",
+        "canceled" => "cancelled",
+        _ => "unknown",
+    }
+}
+
+/// Map one Paperfly tracking status onto the unified shipment
+/// status set. This is the single Paperfly mapping: the courier
+/// crate's adapter calls it, so the mapping exists in exactly one
+/// place.
+///
+/// Paperfly reports sentence-style status strings (`Order
+/// Received`, `Pickup Requested`, `Out for Delivery`, …), so the
+/// table is deliberately conservative, like RedX's and eCourier's —
+/// only confidently known strings are mapped, and everything else
+/// is `unknown`. The choices: `Order Received` and `Pickup
+/// Requested` (the order exists; the parcel has not moved yet) and
+/// `pending` / `created` map to `created`; `picked` / `picked_up`
+/// map to `picked_up`; `in_transit` maps to `in_transit`, and so do
+/// `hold` / `on_hold` — the same paused-in-the-pipeline choice as
+/// the other couriers; `out_for_delivery` maps to
+/// `out_for_delivery`, and so does `failed_delivery` (a failed
+/// attempt on a delivery run, which is retried — the same choice
+/// as the other couriers); `delivered` maps to `delivered`;
+/// `partially_delivered` / `partial_delivered` keep their own
+/// unified status; on the return path, `return_in_transit` and
+/// `returning` map to `return_in_transit`, while `returned` and
+/// `delivered_returned` map to `returned`; `cancelled` (and the US
+/// spelling `canceled`) maps to `cancelled`. Matching is on the
+/// normalized form, so `Partially Delivered` and
+/// `partial_delivered` are the same value.
+pub fn map_paperfly_status(raw: &str) -> &'static str {
+    match normalize_courier_status(raw).as_str() {
+        "order_received" => "created",
+        "pickup_requested" => "created",
+        "pending" => "created",
+        "created" => "created",
+        "picked" => "picked_up",
+        "picked_up" => "picked_up",
+        "in_transit" => "in_transit",
+        "hold" => "in_transit",
+        "on_hold" => "in_transit",
+        "out_for_delivery" => "out_for_delivery",
+        "failed_delivery" => "out_for_delivery",
+        "delivered" => "delivered",
+        "partial_delivered" => "partial_delivered",
+        "partially_delivered" => "partial_delivered",
+        "return_in_transit" => "return_in_transit",
+        "returning" => "return_in_transit",
+        "returned" => "returned",
+        "delivered_returned" => "returned",
+        "cancelled" => "cancelled",
+        "canceled" => "cancelled",
+        _ => "unknown",
+    }
+}
+
 /// One courier's candidacy for smart routing: its name, whether it
 /// can actually book right now (credentials configured, or the DEV
 /// simulator is on — the API layer decides this from config), and
@@ -1606,6 +1708,60 @@ mod tests {
         assert_eq!(map_redx_status("agent is nearby"), "unknown");
         for raw in ["picked-up", "delivered", "returned", "whatever"] {
             assert!(is_valid_shipment_status(map_redx_status(raw)), "{raw}");
+        }
+    }
+
+    #[test]
+    fn ecourier_status_mapping() {
+        // The eCourier title-case tracking strings.
+        assert_eq!(map_ecourier_status("Processing"), "created");
+        assert_eq!(map_ecourier_status("pending"), "created");
+        assert_eq!(map_ecourier_status("Picked"), "picked_up");
+        assert_eq!(map_ecourier_status("picked-up"), "picked_up");
+        assert_eq!(map_ecourier_status("Shipped"), "in_transit");
+        assert_eq!(map_ecourier_status("In Transit"), "in_transit");
+        assert_eq!(map_ecourier_status("On Hold"), "in_transit");
+        assert_eq!(map_ecourier_status("Out for Delivery"), "out_for_delivery");
+        assert_eq!(map_ecourier_status("Delivered"), "delivered");
+        assert_eq!(map_ecourier_status("Partial Delivered"), "partial_delivered");
+        assert_eq!(map_ecourier_status("Partially Delivered"), "partial_delivered");
+        assert_eq!(map_ecourier_status("Return in Transit"), "return_in_transit");
+        assert_eq!(map_ecourier_status("Returned"), "returned");
+        assert_eq!(map_ecourier_status("Cancelled"), "cancelled");
+        // Normalization covers the spelling variants too.
+        assert_eq!(map_ecourier_status(" DELIVERED "), "delivered");
+        assert_eq!(map_ecourier_status("canceled"), "cancelled");
+        // Unrecognised strings are honestly unknown, never guessed.
+        assert_eq!(map_ecourier_status(""), "unknown");
+        assert_eq!(map_ecourier_status("agent is nearby"), "unknown");
+        for raw in ["Processing", "Picked", "Delivered", "Returned", "whatever"] {
+            assert!(is_valid_shipment_status(map_ecourier_status(raw)), "{raw}");
+        }
+    }
+
+    #[test]
+    fn paperfly_status_mapping() {
+        // The Paperfly sentence-style tracking strings.
+        assert_eq!(map_paperfly_status("Order Received"), "created");
+        assert_eq!(map_paperfly_status("Pickup Requested"), "created");
+        assert_eq!(map_paperfly_status("Picked"), "picked_up");
+        assert_eq!(map_paperfly_status("In Transit"), "in_transit");
+        assert_eq!(map_paperfly_status("On Hold"), "in_transit");
+        assert_eq!(map_paperfly_status("Out for Delivery"), "out_for_delivery");
+        assert_eq!(map_paperfly_status("Delivered"), "delivered");
+        assert_eq!(map_paperfly_status("Partially Delivered"), "partial_delivered");
+        assert_eq!(map_paperfly_status("Partial Delivered"), "partial_delivered");
+        assert_eq!(map_paperfly_status("Return in Transit"), "return_in_transit");
+        assert_eq!(map_paperfly_status("Returned"), "returned");
+        assert_eq!(map_paperfly_status("Cancelled"), "cancelled");
+        // Normalization covers the spelling variants too.
+        assert_eq!(map_paperfly_status(" DELIVERED "), "delivered");
+        assert_eq!(map_paperfly_status("order_received"), "created");
+        // Unrecognised strings are honestly unknown, never guessed.
+        assert_eq!(map_paperfly_status(""), "unknown");
+        assert_eq!(map_paperfly_status("rider assigned"), "unknown");
+        for raw in ["Order Received", "Picked", "Delivered", "Returned", "whatever"] {
+            assert!(is_valid_shipment_status(map_paperfly_status(raw)), "{raw}");
         }
     }
 

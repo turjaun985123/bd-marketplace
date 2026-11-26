@@ -49,7 +49,11 @@ apps/web/               Next.js (App Router, TypeScript)
   lib/                  api.ts typed client (one function per endpoint),
                         formatBdt and shared helpers
 crates/domain/          pure, unit-tested domain functions (no DB, no network)
-crates/courier/         CourierAdapter trait + Tier 1 stubs (Steadfast, Pathao, RedX)
+crates/courier/         CourierAdapter trait + real credential-gated
+                        adapters for all five API couriers (Steadfast,
+                        Pathao, RedX, eCourier, Paperfly), the DEV
+                        courier simulator, and the courier_adapter_for
+                        factory
 crates/payments/        PaymentAdapter trait + COD (records intent),
                         credential-configured gateway adapters (Bkash,
                         Nagad, SslCommerz, ShurjoPay), the DEV gateway
@@ -266,9 +270,8 @@ endpoint** for a created consignment, so the adapter's `cancel`
 returns `Unsupported` rather than pretending; and `price_estimate`
 is a purely local estimate from the domain delivery-charge function
 under our own tariff — no network call, and not a quote from
-Steadfast. Pathao and RedX became real adapters in Wave 7 (below);
-eCourier and Paperfly remain `NotConfigured` stubs behind the same
-trait.
+Steadfast. Pathao and RedX became real adapters in Wave 7 (below),
+and eCourier and Paperfly in Wave 11 (further below).
 
 **DEV courier simulator** (`COURIER_DEV_MODE=true`, local/CI only —
 NEVER in production): booking mints a
@@ -373,6 +376,82 @@ be verified against the live services until platform merchant
 accounts exist. Without complete credentials every network
 operation returns `NotConfigured` and nothing is sent — the same
 rule as Steadfast and the payment gateways.
+
+Wave 11 (eCourier + Paperfly adapters — all five API couriers complete):
+
+No new endpoints: eCourier and Paperfly appear in
+`GET /v1/couriers`, `GET /v1/couriers/estimate` and smart routing
+automatically, because availability and estimates iterate the known
+couriers and read each one's credential rule from the courier crate
+— the Wave 7 generalization needed only the two new match arms in
+the one availability helper. Bookings name them exactly like the
+other couriers (`{ "courier": "ecourier" }` /
+`{ "courier": "paperfly" }`, or let `auto` pick them).
+
+**eCourier adapter** (real, credential-gated): authentication is
+two headers — the API auth token (`ECOURIER_API_KEY`) and the
+merchant user id (`ECOURIER_USER_ID`); both must be set before
+eCourier reports `live`. Booking is `POST /order` — recipient name,
+the mobile converted to the 11-digit local form (the platform
+stores `+880` canonical), the address, the collection amount as
+`product_price` in WHOLE taka (poisha rounded half-up at that
+boundary only), the weight in kg, our invoice as
+`merchant_order_id`, the note as `comments`, and a numeric
+`area_id`. eCourier area ids are eCourier's own and there is no
+honest default: a booking without the recipient's `area_id` (the
+same booking-body field RedX uses) fails loudly with a gateway
+error before any network call. Tracking is
+`GET /track?tracking={consignment_id}`; the raw status is mapped by
+the single domain function `map_ecourier_status`. eCourier's basic
+API documents **no cancel call**, so `cancel` returns
+`Unsupported`. `price_estimate` is the local domain estimate, not
+an eCourier quote.
+
+**Paperfly adapter** (real, credential-gated): authentication is
+HTTP Basic (`PAPERFLY_USERNAME` + `PAPERFLY_PASSWORD`) PLUS the
+merchant key (`PAPERFLY_KEY`) in a header; all three must be set
+before Paperfly reports `live`. Booking is
+`POST /OrderPlacement` — our invoice as `merInvoiceNo`, the
+customer name/phone (local form)/address, the collection amount in
+WHOLE taka, a generic `productName` naming the order (a sub-order
+can hold several products, so there is no single honest title),
+quantity 1, the weight as a kg string, and the pickup point from
+platform config: `PAPERFLY_PICKUP_NAME` / `PAPERFLY_PICKUP_PHONE` /
+`PAPERFLY_PICKUP_ADDRESS`. A master account collects from one
+place, so the pickup point is config, never invented per order: a
+booking with any pickup field missing fails loudly BEFORE any
+network call, naming every missing variable. Tracking POSTs the
+tracking id as JSON to `/API-Order-Tracking`; the raw status is
+mapped by the single domain function `map_paperfly_status`.
+Paperfly's API documents **no cancel call**, so `cancel` returns
+`Unsupported`. `price_estimate` is the local domain estimate, not
+a Paperfly quote.
+
+**Onboarding-confirm items (flagged, not assumed):** eCourier's
+exact auth header NAMES — the adapter sends the token as
+`API-AUTH-TOKEN` and the user id as `USER-ID`, and eCourier doc
+versions differ on the names; Paperfly's merchant-key header name
+— the adapter sends `paperflykey` — and its tracking call's verb
+and path (the adapter POSTs JSON to `/API-Order-Tracking`). The
+create-response parsers are defensive for the same reason:
+eCourier's booked-order id is accepted as `order_id`, `tracking`,
+`consignment_id` or `e_id` (top level or under `data`, string or
+number), Paperfly's tracking id as `trackingId`, `tracking_id` or
+`refNo`, and both tracking parsers accept the status under
+`status`, `order_status` or `current_status`. Each uncertainty is
+isolated to one header line / one URL line / one field list when
+the answer is known at onboarding.
+
+**Adapter verification status (honesty):** with Wave 11, all five
+API couriers — Tier 1 Steadfast, Pathao, RedX and Tier 1b eCourier,
+Paperfly — have real adapters behind the one trait, coded to their
+documented API shapes with fixture-tested parsers. NONE of the five
+can be verified against its live service until platform merchant
+accounts exist; without complete credentials every network
+operation returns `NotConfigured` and nothing is sent. What remains
+unadapted is only the manual couriers — Sundarban, SA Paribahan,
+Karatoa, Carrybee — which have no merchant APIs and are Phase 2
+manual workflow by design, not a gap.
 
 Wave 8 (reviews, ratings and seller replies):
 
@@ -844,11 +923,29 @@ and flag promotion/demotion; the Next.js admin area
 the shared `AdminShell` guard, plus an admins-only Admin link
 in the marketplace nav.
 
+**Real (Wave 11):** the eCourier and Paperfly adapters behind the
+same `courier_adapter_for` factory, completing all five API
+couriers (eCourier: two-header auth, order create/track with
+fixture-tested defensive parsers, a required numeric `area_id`
+with no invented default; Paperfly: HTTP Basic plus merchant-key
+header, order placement/track with fixture-tested defensive
+parsers, a required platform pickup point in config that bookings
+refuse to invent); the pure domain eCourier/Paperfly raw-status
+mappings on the one shared status normalization; availability,
+estimates and smart routing covering both new couriers with no new
+handler logic (the Wave 7 generalization — only the credential-rule
+match gained two arms); an integration test
+(`crates/api/tests/wave11.rs`, same `DATABASE_URL` gate) covering
+an eCourier-only config reporting eCourier `live` and Paperfly
+`not_configured`, the estimate endpoint pricing and recommending
+the only available courier, and DEV bookings under both new names.
+
 **Stubbed (typed errors — never fake success, no network calls):**
-eCourier / Paperfly courier adapters. Manual Phase 2 couriers
-(Sundarban, SA Paribahan, Karatoa, Carrybee) join behind the same
-trait later. SMS sending has only the dev-mode log implementation
-(see the dev OTP flow above).
+none among the couriers — all five API couriers have real
+credential-gated adapters. Manual Phase 2 couriers (Sundarban,
+SA Paribahan, Karatoa, Carrybee) have no APIs and join later as a
+manual workflow behind the same trait. SMS sending has only the
+dev-mode log implementation (see the dev OTP flow above).
 
 **TODO / not wired:** live gateway calls and real-gateway webhook
 signature verification (need merchant credentials + each gateway's
@@ -864,12 +961,12 @@ exposes (the worker still logs its planned jobs and exits cleanly).
   /admin/payouts, /admin/users, /admin/settings).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
-  (domain 44, courier 21, payments 8 unit tests; the `DATABASE_URL`-
+  (domain 46, courier 31, payments 8 unit tests; the `DATABASE_URL`-
   gated integration tests skip cleanly without a database). The API
   binary was also smoke-tested locally without a database: routes
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
   (including the Wave 10 admin endpoints).
-- **Rust integration + clippy: CI-only** — the Wave 2–10 integration
+- **Rust integration + clippy: CI-only** — the Wave 2–11 integration
   tests against a real Postgres 16 service and clippy `-D warnings`
   are verified via **GitHub Actions CI** (`.github/workflows/ci.yml`)
-  on push. Waves 1–9 are green there; Wave 10 awaits its first CI run.
+  on push. Waves 1–10 are green there; Wave 11 awaits its first CI run.

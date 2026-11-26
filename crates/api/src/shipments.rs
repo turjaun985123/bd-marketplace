@@ -5,6 +5,11 @@
 //! smart routing: booking with courier `auto` resolves to the
 //! cheapest available courier through the domain `choose_courier`
 //! function, and the shipment stores the CHOSEN courier's name.
+//! Wave 11 adds the eCourier and Paperfly adapters behind the same
+//! factory; availability and estimates needed no new logic here —
+//! they iterate the known couriers and read each one's credential
+//! rule from the courier crate, so the new couriers appear in both
+//! endpoints (and in smart routing) by construction.
 //!
 //! Honesty rules for this module, mirroring the payments module: a
 //! shipment exists only when a courier adapter actually booked it —
@@ -29,9 +34,9 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use courier::{
-    courier_adapter_for, courier_credentials_complete, pathao_credentials_complete,
-    redx_credentials_complete, CourierError, CouriersConfig, Parcel, ShipmentRequest,
-    KNOWN_COURIERS,
+    courier_adapter_for, courier_credentials_complete, ecourier_credentials_complete,
+    paperfly_credentials_complete, pathao_credentials_complete, redx_credentials_complete,
+    CourierError, CouriersConfig, Parcel, ShipmentRequest, KNOWN_COURIERS,
 };
 use domain::{
     can_transition_shipment, can_transition_sub_order, choose_courier, parse_delivery_zone,
@@ -147,14 +152,17 @@ pub async fn load_shipment_summary_for_sub_order(
 }
 
 /// Does this courier have complete merchant credentials in the
-/// config? Steadfast, Pathao and RedX have real adapters with their
-/// own completeness rules (Wave 6/7); eCourier and Paperfly are
-/// still stubs, so they never report live.
+/// config? Every known courier now has a real adapter with its own
+/// completeness rule in the courier crate (Steadfast Wave 6, Pathao
+/// and RedX Wave 7, eCourier and Paperfly Wave 11) — this match is
+/// the one place the API maps a courier name onto its rule.
 fn courier_has_live_credentials(name: &str, config: &CouriersConfig) -> bool {
     match name {
         "steadfast" => courier_credentials_complete(&config.steadfast),
         "pathao" => pathao_credentials_complete(&config.pathao),
         "redx" => redx_credentials_complete(&config.redx),
+        "ecourier" => ecourier_credentials_complete(&config.ecourier),
+        "paperfly" => paperfly_credentials_complete(&config.paperfly),
         _ => false,
     }
 }

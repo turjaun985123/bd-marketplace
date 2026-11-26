@@ -37,6 +37,10 @@
 //! the shared product queries and at checkout), user admin flags
 //! (never their own), and platform settings whose rows override
 //! the startup commission rate and minimum payout at read time.
+//! Wave 11: the eCourier and Paperfly adapters (same credential-
+//! gated pattern) complete all five API couriers; availability,
+//! estimates and smart routing cover them through the one shared
+//! per-courier credential rule, with no new endpoints.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -64,7 +68,9 @@ use axum::{
     routing::{get, patch, post},
     Json, Router,
 };
-use ::courier::{CourierConfig, CouriersConfig, PathaoConfig, RedxConfig};
+use ::courier::{
+    CourierConfig, CouriersConfig, EcourierConfig, PaperflyConfig, PathaoConfig, RedxConfig,
+};
 use domain::{
     calculate_delivery_charge, compute_commission, split_cart_by_seller, CartItem,
     CommissionQuote, DeliveryZone, SellerSubOrder,
@@ -96,10 +102,12 @@ pub struct AppState {
     /// from the environment in `from_env`; tests set it explicitly
     /// via `with_payments_config`.
     pub payments_config: PaymentsConfig,
-    /// Courier configuration (Wave 6): the DEV simulator switch,
-    /// Steadfast's merchant credentials, and the default courier.
-    /// Built from the environment in `from_env`; tests set it
-    /// explicitly via `with_couriers_config`.
+    /// Courier configuration (Wave 6, extended Waves 7 and 11):
+    /// the DEV simulator switch, one merchant credential set per
+    /// courier (Steadfast, Pathao, RedX, eCourier, Paperfly), and
+    /// the default courier. Built from the environment in
+    /// `from_env`; tests set it explicitly via
+    /// `with_couriers_config`.
     pub couriers_config: CouriersConfig,
 }
 
@@ -309,7 +317,13 @@ fn payments_config_from_env() -> PaymentsConfig {
 /// Wave 7 adds Pathao (`PATHAO_CLIENT_ID` / `PATHAO_CLIENT_SECRET`
 /// / `PATHAO_STORE_ID`, `PATHAO_BASE_URL` overrides the Hermes API
 /// base URL) and RedX (`REDX_API_KEY`, `REDX_BASE_URL` overrides
-/// the open-API base URL).
+/// the open-API base URL). Wave 11 adds eCourier
+/// (`ECOURIER_API_KEY` / `ECOURIER_USER_ID`, `ECOURIER_BASE_URL`
+/// overrides the backoffice API base URL) and Paperfly
+/// (`PAPERFLY_USERNAME` / `PAPERFLY_PASSWORD` / `PAPERFLY_KEY`,
+/// plus the platform pickup point `PAPERFLY_PICKUP_NAME` /
+/// `PAPERFLY_PICKUP_PHONE` / `PAPERFLY_PICKUP_ADDRESS`;
+/// `PAPERFLY_BASE_URL` overrides the production API base URL).
 fn couriers_config_from_env() -> CouriersConfig {
     let dev_mode = std::env::var("COURIER_DEV_MODE")
         .map(|v| v == "true")
@@ -340,6 +354,22 @@ fn couriers_config_from_env() -> CouriersConfig {
             api_key: env_value("REDX_API_KEY"),
             base_url: env_value("REDX_BASE_URL")
                 .unwrap_or_else(|| ::courier::DEFAULT_REDX_BASE_URL.to_string()),
+        },
+        ecourier: EcourierConfig {
+            api_key: env_value("ECOURIER_API_KEY"),
+            user_id: env_value("ECOURIER_USER_ID"),
+            base_url: env_value("ECOURIER_BASE_URL")
+                .unwrap_or_else(|| ::courier::DEFAULT_ECOURIER_BASE_URL.to_string()),
+        },
+        paperfly: PaperflyConfig {
+            username: env_value("PAPERFLY_USERNAME"),
+            password: env_value("PAPERFLY_PASSWORD"),
+            merchant_id: env_value("PAPERFLY_KEY"),
+            pickup_name: env_value("PAPERFLY_PICKUP_NAME"),
+            pickup_phone: env_value("PAPERFLY_PICKUP_PHONE"),
+            pickup_address: env_value("PAPERFLY_PICKUP_ADDRESS"),
+            base_url: env_value("PAPERFLY_BASE_URL")
+                .unwrap_or_else(|| ::courier::DEFAULT_PAPERFLY_BASE_URL.to_string()),
         },
         default_courier: env_value("DEFAULT_COURIER")
             .unwrap_or_else(|| "steadfast".to_string()),

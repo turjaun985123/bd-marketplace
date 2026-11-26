@@ -17,9 +17,16 @@
 //! parsers. They CANNOT be verified against the live services until
 //! platform merchant credentials exist: without complete credentials
 //! every network operation returns `NotConfigured`, exactly like
-//! Steadfast, and nothing fakes success. eCourier and Paperfly
-//! remain typed `NotConfigured` stubs (the manual Phase 2 couriers
-//! Sundarban, SA Paribahan, Karatoa and Carrybee join later).
+//! Steadfast, and nothing fakes success.
+//!
+//! Wave 11 state: eCourier ([`EcourierAdapter`]) and Paperfly
+//! ([`PaperflyAdapter`]) are real adapters too, behind the same
+//! credential gate and with the same fixture-tested defensive
+//! parsers — all five API couriers (Tier 1 Steadfast / Pathao /
+//! RedX, Tier 1b eCourier / Paperfly) now have adapters. The manual
+//! Phase 2 couriers (Sundarban, SA Paribahan, Karatoa, Carrybee)
+//! have no APIs to adapt to and join later as a manual workflow,
+//! by design.
 //! [`DevCourierAdapter`] is a clearly-labelled SIMULATOR for local
 //! and CI use only, reachable only through [`courier_adapter_for`]
 //! when `CouriersConfig::dev_mode` is true. Platform master accounts
@@ -210,6 +217,94 @@ pub fn redx_credentials_complete(config: &RedxConfig) -> bool {
     present(&config.api_key)
 }
 
+/// eCourier merchant credentials and API base URL, as plain config
+/// values (the API crate fills them from environment variables; this
+/// crate never reads the environment itself). eCourier's documented
+/// auth is TWO headers: an API auth token and the merchant's user
+/// id. The exact header NAMES vary between eCourier doc versions —
+/// the adapter sends `API-AUTH-TOKEN` and `USER-ID`, and both names
+/// are flagged in the README as merchant-onboarding confirm items,
+/// the same honesty treatment as RedX's auth header.
+#[derive(Debug, Clone)]
+pub struct EcourierConfig {
+    pub api_key: Option<String>,
+    pub user_id: Option<String>,
+    pub base_url: String,
+}
+
+/// eCourier's production API base URL (their backoffice API).
+pub const DEFAULT_ECOURIER_BASE_URL: &str = "https://backoffice.ecourier.com.bd/api";
+
+impl Default for EcourierConfig {
+    fn default() -> Self {
+        EcourierConfig {
+            api_key: None,
+            user_id: None,
+            base_url: DEFAULT_ECOURIER_BASE_URL.to_string(),
+        }
+    }
+}
+
+/// Are eCourier's credentials all present? The API auth token AND
+/// the merchant user id — eCourier identifies the caller by the
+/// pair, so one without the other cannot book or track.
+pub fn ecourier_credentials_complete(config: &EcourierConfig) -> bool {
+    present(&config.api_key) && present(&config.user_id)
+}
+
+/// Paperfly merchant credentials, pickup details and API base URL,
+/// as plain config values (the API crate fills them from environment
+/// variables; this crate never reads the environment itself).
+/// Paperfly's documented auth is HTTP Basic (merchant username +
+/// password) PLUS a merchant key sent in a `paperflykey` header —
+/// the header name is flagged in the README as a merchant-
+/// onboarding confirm item. The pickup fields are the platform's
+/// own pickup point (a platform master account collects from one
+/// place): Paperfly requires them on every order placement, so they
+/// live in config rather than in each shipment request.
+#[derive(Debug, Clone)]
+pub struct PaperflyConfig {
+    pub username: Option<String>,
+    pub password: Option<String>,
+    /// The merchant key sent in the `paperflykey` header.
+    pub merchant_id: Option<String>,
+    /// Pickup contact name at the platform's pickup point.
+    pub pickup_name: Option<String>,
+    /// Pickup contact phone at the platform's pickup point.
+    pub pickup_phone: Option<String>,
+    /// Pickup address of the platform's pickup point.
+    pub pickup_address: Option<String>,
+    pub base_url: String,
+}
+
+/// Paperfly's production API base URL.
+pub const DEFAULT_PAPERFLY_BASE_URL: &str = "https://api.paperfly.com.bd";
+
+impl Default for PaperflyConfig {
+    fn default() -> Self {
+        PaperflyConfig {
+            username: None,
+            password: None,
+            merchant_id: None,
+            pickup_name: None,
+            pickup_phone: None,
+            pickup_address: None,
+            base_url: DEFAULT_PAPERFLY_BASE_URL.to_string(),
+        }
+    }
+}
+
+/// Are Paperfly's credentials all present? Username, password AND
+/// the merchant key — Basic auth alone cannot place an order,
+/// because every call also carries the key header. The pickup
+/// fields are NOT credentials: they gate order placement (with a
+/// gateway error naming what is missing), not this completeness
+/// check, because a merchant can be fully credentialed before its
+/// pickup point is agreed.
+pub fn paperfly_credentials_complete(config: &PaperflyConfig) -> bool {
+    present(&config.username) && present(&config.password) && present(&config.merchant_id)
+}
+
 /// Courier configuration for the whole platform: the dev simulator
 /// switch, each real courier's credentials, and the default courier
 /// sellers get when they do not pick one.
@@ -221,6 +316,8 @@ pub struct CouriersConfig {
     pub steadfast: CourierConfig,
     pub pathao: PathaoConfig,
     pub redx: RedxConfig,
+    pub ecourier: EcourierConfig,
+    pub paperfly: PaperflyConfig,
     /// Courier name used when a booking does not name one.
     pub default_courier: String,
 }
@@ -232,6 +329,8 @@ impl Default for CouriersConfig {
             steadfast: CourierConfig::default(),
             pathao: PathaoConfig::default(),
             redx: RedxConfig::default(),
+            ecourier: EcourierConfig::default(),
+            paperfly: PaperflyConfig::default(),
             default_courier: "steadfast".to_string(),
         }
     }
@@ -355,6 +454,51 @@ fn gateway_message(
 /// wrong — we never invent a number.
 fn local_phone_or_raw(phone: &str) -> String {
     domain::to_local_phone(phone).unwrap_or_else(|| phone.to_string())
+}
+
+/// Find a courier-side id in a response payload: each field name is
+/// tried at the top level first, then under a `data` object, and a
+/// value counts whether the courier sends it as a string or as a
+/// number. Shared by the eCourier and Paperfly create parsers —
+/// their exact id field names are among the least certain parts of
+/// their documented shapes, so the parsers accept every known name
+/// rather than betting on one.
+fn find_response_id(payload: &Value, fields: &[&str]) -> Option<String> {
+    let data = payload.get("data");
+    for field in fields {
+        for scope in [Some(payload), data].into_iter().flatten() {
+            match scope.get(field) {
+                Some(Value::String(s)) if !s.trim().is_empty() => {
+                    return Some(s.clone());
+                }
+                Some(Value::Number(n)) => return Some(n.to_string()),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Find a raw status string in a tracking response payload: the
+/// known field names are tried at the top level first, then under a
+/// `data` object. Shared by the RedX, eCourier and Paperfly track
+/// parsers — all three couriers' tracking payloads are `message`-
+/// plus-status shaped in their docs, but none of the three names
+/// its status field consistently across doc versions.
+fn find_response_status(payload: &Value, fields: &[&str]) -> Option<String> {
+    let data = payload.get("data");
+    for scope in [Some(payload), data].into_iter().flatten() {
+        for field in fields {
+            if let Some(raw) = scope
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
+                return Some(raw.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Parse a Steadfast `create_order` response body into a [`Shipment`].
@@ -1015,29 +1159,11 @@ const REDX_STATUS_FIELDS: [&str; 3] = ["status", "parcel_status", "current_statu
 /// value onto the unified set is NOT done here — callers use
 /// `domain::map_redx_status`, the single mapping implementation.
 pub fn parse_redx_track_response(payload: &Value) -> Result<String, CourierError> {
-    for field in REDX_STATUS_FIELDS {
-        if let Some(raw) = payload
-            .get(field)
-            .and_then(Value::as_str)
-            .filter(|s| !s.trim().is_empty())
-        {
-            return Ok(raw.to_string());
-        }
-    }
-    if let Some(data) = payload.get("data") {
-        for field in REDX_STATUS_FIELDS {
-            if let Some(raw) = data
-                .get(field)
-                .and_then(Value::as_str)
-                .filter(|s| !s.trim().is_empty())
-            {
-                return Ok(raw.to_string());
-            }
-        }
-    }
-    Err(CourierError::Gateway(
-        "redx tracking response had no recognisable status field".to_string(),
-    ))
+    find_response_status(payload, &REDX_STATUS_FIELDS).ok_or_else(|| {
+        CourierError::Gateway(
+            "redx tracking response had no recognisable status field".to_string(),
+        )
+    })
 }
 
 #[async_trait]
@@ -1174,7 +1300,568 @@ impl CourierAdapter for RedxAdapter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// eCourier (real adapter, credential-gated)
+// ---------------------------------------------------------------------------
 
+/// eCourier (backoffice.ecourier.com.bd) adapter. Coded to
+/// eCourier's documented API shapes with defensive, fixture-tested
+/// parsers. It CANNOT be verified against the live service until
+/// platform merchant credentials exist: without complete credentials
+/// every network operation returns `NotConfigured` and nothing is
+/// sent anywhere. Documented uncertainties to confirm at merchant
+/// onboarding (see the README's Wave 11 section): the exact auth
+/// header NAMES (this adapter sends the API key as `API-AUTH-TOKEN`
+/// and the merchant user id as `USER-ID`; eCourier doc versions
+/// differ on the names), the exact create-response id field (the
+/// parser accepts `order_id`, `tracking`, `consignment_id` and
+/// `e_id`, top level or under `data`), and the tracking status
+/// field name (the parser accepts `status`, `order_status` and
+/// `current_status`). `price_estimate` is a purely local domain
+/// estimate, like the other adapters — labelled an estimate, never
+/// an eCourier quote.
+#[derive(Debug)]
+pub struct EcourierAdapter {
+    config: EcourierConfig,
+    base_url: String,
+    client: reqwest::Client,
+}
+
+impl EcourierAdapter {
+    pub fn new(config: EcourierConfig) -> Self {
+        let base_url = config.base_url.trim_end_matches('/').to_string();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .expect("reqwest client builds with the rustls TLS backend");
+        EcourierAdapter {
+            config,
+            base_url,
+            client,
+        }
+    }
+
+    fn check_configured(&self) -> Result<(), CourierError> {
+        if ecourier_credentials_complete(&self.config) {
+            Ok(())
+        } else {
+            Err(CourierError::NotConfigured("ecourier".to_string()))
+        }
+    }
+
+    fn api_key(&self) -> &str {
+        self.config.api_key.as_deref().unwrap_or_default()
+    }
+
+    fn user_id(&self) -> &str {
+        self.config.user_id.as_deref().unwrap_or_default()
+    }
+}
+
+/// The id field names an eCourier create-order response might use,
+/// in the order they are tried. eCourier doc versions name the
+/// booked order differently (`order_id`, a `tracking` code, a
+/// `consignment_id`, or their short `e_id`), so the parser accepts
+/// every known name rather than betting on one.
+const ECOURIER_ID_FIELDS: [&str; 4] = ["order_id", "tracking", "consignment_id", "e_id"];
+
+/// The status field names an eCourier tracking response might use,
+/// in the order they are tried.
+const ECOURIER_STATUS_FIELDS: [&str; 3] = ["status", "order_status", "current_status"];
+
+/// Parse an eCourier create-order response body into a [`Shipment`].
+/// Pure, so it is unit-testable without a network. Success is a
+/// recognisable order id (see [`ECOURIER_ID_FIELDS`], top level or
+/// nested under `data`, string or number). The `tracking` field,
+/// when the response carries one distinct from the id, is kept as
+/// the customer-facing tracking code. Anything else is a gateway
+/// error carrying eCourier's `message` when it sent one.
+pub fn parse_ecourier_create_response(
+    courier: &str,
+    payload: &Value,
+) -> Result<Shipment, CourierError> {
+    let consignment_id = find_response_id(payload, &ECOURIER_ID_FIELDS);
+    match consignment_id {
+        Some(id) => {
+            let tracking_code = find_response_id(payload, &["tracking"])
+                .filter(|tracking| *tracking != id);
+            Ok(Shipment {
+                courier: courier.to_string(),
+                consignment_id: id,
+                tracking_code,
+                status: "created".to_string(),
+            })
+        }
+        None => {
+            let message = payload
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|m| !m.trim().is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    "ecourier create order response had no recognisable order id".to_string()
+                });
+            Err(CourierError::Gateway(message))
+        }
+    }
+}
+
+/// Parse an eCourier tracking response body into the RAW status
+/// string. Pure, so it is unit-testable without a network. Mapping
+/// the raw value onto the unified set is NOT done here — callers use
+/// `domain::map_ecourier_status`, the single mapping implementation.
+pub fn parse_ecourier_track_response(payload: &Value) -> Result<String, CourierError> {
+    find_response_status(payload, &ECOURIER_STATUS_FIELDS).ok_or_else(|| {
+        CourierError::Gateway(
+            "ecourier tracking response had no recognisable status field".to_string(),
+        )
+    })
+}
+
+#[async_trait]
+impl CourierAdapter for EcourierAdapter {
+    fn name(&self) -> &str {
+        "ecourier"
+    }
+
+    async fn create_shipment(&self, req: &ShipmentRequest) -> Result<Shipment, CourierError> {
+        self.check_configured()?;
+        // eCourier books orders against numeric AREA ids — theirs,
+        // not ours — and there is no honest default: without the
+        // recipient's eCourier area id the booking cannot be made,
+        // so it fails loudly instead of guessing an area (the same
+        // rule as RedX).
+        let area_id = req.area_id.ok_or_else(|| {
+            CourierError::Gateway(
+                "ecourier booking requires the recipient area_id (eCourier area ids are numeric and courier-specific)"
+                    .to_string(),
+            )
+        })?;
+        let mut body = serde_json::Map::new();
+        body.insert("recipient_name".to_string(), json!(req.recipient_name));
+        // eCourier requires the recipient mobile in the 11-digit
+        // local form (01XXXXXXXXX); the platform stores +880
+        // canonical.
+        body.insert(
+            "recipient_mobile".to_string(),
+            json!(local_phone_or_raw(&req.recipient_phone)),
+        );
+        body.insert(
+            "recipient_address".to_string(),
+            json!(req.recipient_address),
+        );
+        body.insert("area_id".to_string(), json!(area_id));
+        // eCourier's `product_price` is the amount to collect, in
+        // WHOLE taka; poisha are rounded half-up at this boundary
+        // only (poisha_to_whole_taka).
+        body.insert(
+            "product_price".to_string(),
+            json!(poisha_to_whole_taka(req.parcel.cod_amount_poisha)),
+        );
+        body.insert("number_of_item".to_string(), json!(1));
+        body.insert(
+            "weight".to_string(),
+            json!(f64::from(req.parcel.weight_kg)),
+        );
+        body.insert("merchant_order_id".to_string(), json!(req.invoice));
+        if let Some(note) = &req.note {
+            body.insert("comments".to_string(), json!(note));
+        }
+        let url = format!("{}/order", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            // UNCERTAINTY: eCourier doc versions differ on the auth
+            // header names. This adapter sends the API key as
+            // `API-AUTH-TOKEN` and the merchant user id as
+            // `USER-ID`; both names must be confirmed at merchant
+            // onboarding (see README, Wave 11).
+            .header("API-AUTH-TOKEN", self.api_key())
+            .header("USER-ID", self.user_id())
+            .header("Content-Type", "application/json")
+            .json(&Value::Object(body))
+            .send()
+            .await
+            .map_err(|e| {
+                CourierError::Gateway(format!("ecourier create order request failed: {e}"))
+            })?;
+        let http_status = response.status();
+        let payload: Value = response.json().await.map_err(|e| {
+            CourierError::Gateway(format!(
+                "ecourier create order returned an unreadable response: {e}"
+            ))
+        })?;
+        if !http_status.is_success() {
+            return Err(CourierError::Gateway(gateway_message(
+                self.name(),
+                &payload,
+                http_status,
+            )));
+        }
+        parse_ecourier_create_response(self.name(), &payload)
+    }
+
+    async fn track(&self, consignment_id: &str) -> Result<TrackingUpdate, CourierError> {
+        self.check_configured()?;
+        let url = format!("{}/track", self.base_url);
+        let response = self
+            .client
+            .get(&url)
+            .header("API-AUTH-TOKEN", self.api_key())
+            .header("USER-ID", self.user_id())
+            .query(&[("tracking", consignment_id)])
+            .send()
+            .await
+            .map_err(|e| {
+                CourierError::Gateway(format!("ecourier tracking request failed: {e}"))
+            })?;
+        let http_status = response.status();
+        let payload: Value = response.json().await.map_err(|e| {
+            CourierError::Gateway(format!(
+                "ecourier tracking returned an unreadable response: {e}"
+            ))
+        })?;
+        if !http_status.is_success() {
+            return Err(CourierError::Gateway(gateway_message(
+                self.name(),
+                &payload,
+                http_status,
+            )));
+        }
+        let raw_status = parse_ecourier_track_response(&payload)?;
+        Ok(TrackingUpdate {
+            status: domain::map_ecourier_status(&raw_status).to_string(),
+            raw_status: Some(raw_status),
+        })
+    }
+
+    async fn cancel(&self, _consignment_id: &str) -> Result<(), CourierError> {
+        self.check_configured()?;
+        // Honest limit: eCourier's basic API documents no cancel
+        // call for a created order — cancellations go through
+        // eCourier support / the merchant panel. We report that
+        // instead of pretending a cancel happened.
+        Err(CourierError::Unsupported {
+            courier: "ecourier".to_string(),
+            operation: "cancel".to_string(),
+        })
+    }
+
+    async fn price_estimate(&self, parcel: &Parcel) -> Result<i64, CourierError> {
+        // A purely local estimate from the domain delivery-charge
+        // function, exactly like the other adapters — no network
+        // call, and an estimate under OUR tariff, not an eCourier
+        // quote.
+        Ok(domain::calculate_delivery_charge(
+            parcel.zone,
+            parcel.weight_kg,
+            parcel.cod_amount_poisha,
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Paperfly (real adapter, credential-gated)
+// ---------------------------------------------------------------------------
+
+/// Paperfly (api.paperfly.com.bd) adapter. Coded to Paperfly's
+/// documented API shapes with defensive, fixture-tested parsers. It
+/// CANNOT be verified against the live service until platform
+/// merchant credentials exist: without complete credentials every
+/// network operation returns `NotConfigured` and nothing is sent
+/// anywhere. Documented uncertainties to confirm at merchant
+/// onboarding (see the README's Wave 11 section): the merchant-key
+/// header name (this adapter sends the key as `paperflykey`
+/// alongside HTTP Basic auth), the exact create-response tracking
+/// field (the parser accepts `trackingId`, `tracking_id` and
+/// `refNo`, top level or under `data`), and the tracking call's
+/// verb and path (this adapter POSTs JSON to
+/// `/API-Order-Tracking`). `price_estimate` is a purely local
+/// domain estimate, like the other adapters — labelled an estimate,
+/// never a Paperfly quote.
+#[derive(Debug)]
+pub struct PaperflyAdapter {
+    config: PaperflyConfig,
+    base_url: String,
+    client: reqwest::Client,
+}
+
+impl PaperflyAdapter {
+    pub fn new(config: PaperflyConfig) -> Self {
+        let base_url = config.base_url.trim_end_matches('/').to_string();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .expect("reqwest client builds with the rustls TLS backend");
+        PaperflyAdapter {
+            config,
+            base_url,
+            client,
+        }
+    }
+
+    fn check_configured(&self) -> Result<(), CourierError> {
+        if paperfly_credentials_complete(&self.config) {
+            Ok(())
+        } else {
+            Err(CourierError::NotConfigured("paperfly".to_string()))
+        }
+    }
+
+    /// The pickup config fields that are missing, by their
+    /// environment-variable names. Paperfly requires pickup details
+    /// on every order placement; they are platform config, not
+    /// credentials, so a fully credentialed merchant can still be
+    /// missing them — and the booking must say exactly what is
+    /// missing instead of sending a half-empty order.
+    fn missing_pickup_fields(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if !present(&self.config.pickup_name) {
+            missing.push("PAPERFLY_PICKUP_NAME");
+        }
+        if !present(&self.config.pickup_phone) {
+            missing.push("PAPERFLY_PICKUP_PHONE");
+        }
+        if !present(&self.config.pickup_address) {
+            missing.push("PAPERFLY_PICKUP_ADDRESS");
+        }
+        missing
+    }
+}
+
+/// The tracking-id field names a Paperfly order-placement response
+/// might use, in the order they are tried.
+const PAPERFLY_ID_FIELDS: [&str; 3] = ["trackingId", "tracking_id", "refNo"];
+
+/// The status field names a Paperfly tracking response might use,
+/// in the order they are tried.
+const PAPERFLY_STATUS_FIELDS: [&str; 3] = ["status", "order_status", "current_status"];
+
+/// Parse a Paperfly order-placement response body into a
+/// [`Shipment`]. Pure, so it is unit-testable without a network.
+/// Success is a recognisable tracking id (see
+/// [`PAPERFLY_ID_FIELDS`], top level or nested under `data`, string
+/// or number) — that id is both the consignment id and the
+/// customer-facing tracking code for Paperfly. Anything else is a
+/// gateway error carrying Paperfly's `message` when it sent one.
+pub fn parse_paperfly_create_response(
+    courier: &str,
+    payload: &Value,
+) -> Result<Shipment, CourierError> {
+    let tracking_id = find_response_id(payload, &PAPERFLY_ID_FIELDS);
+    match tracking_id {
+        Some(id) => Ok(Shipment {
+            courier: courier.to_string(),
+            consignment_id: id.clone(),
+            tracking_code: Some(id),
+            status: "created".to_string(),
+        }),
+        None => {
+            let message = payload
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|m| !m.trim().is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    "paperfly order placement response had no recognisable tracking id"
+                        .to_string()
+                });
+            Err(CourierError::Gateway(message))
+        }
+    }
+}
+
+/// Parse a Paperfly tracking response body into the RAW status
+/// string. Pure, so it is unit-testable without a network. Mapping
+/// the raw value onto the unified set is NOT done here — callers use
+/// `domain::map_paperfly_status`, the single mapping implementation.
+pub fn parse_paperfly_track_response(payload: &Value) -> Result<String, CourierError> {
+    find_response_status(payload, &PAPERFLY_STATUS_FIELDS).ok_or_else(|| {
+        CourierError::Gateway(
+            "paperfly tracking response had no recognisable status field".to_string(),
+        )
+    })
+}
+
+#[async_trait]
+impl CourierAdapter for PaperflyAdapter {
+    fn name(&self) -> &str {
+        "paperfly"
+    }
+
+    async fn create_shipment(&self, req: &ShipmentRequest) -> Result<Shipment, CourierError> {
+        self.check_configured()?;
+        // Paperfly requires the pickup point on every placement —
+        // and it is platform config (a master account collects from
+        // one place), never something to invent per order. Missing
+        // pickup config fails loudly, naming what is missing,
+        // before any network call.
+        let missing = self.missing_pickup_fields();
+        if !missing.is_empty() {
+            return Err(CourierError::Gateway(format!(
+                "paperfly booking requires pickup configuration: missing {}",
+                missing.join(", ")
+            )));
+        }
+        let mut body = serde_json::Map::new();
+        body.insert("merInvoiceNo".to_string(), json!(req.invoice));
+        body.insert(
+            "pickMerchantName".to_string(),
+            json!(self.config.pickup_name.as_deref().unwrap_or_default()),
+        );
+        body.insert(
+            "pickMerchantPhone".to_string(),
+            json!(local_phone_or_raw(
+                self.config.pickup_phone.as_deref().unwrap_or_default()
+            )),
+        );
+        body.insert(
+            "pickMerchantAddress".to_string(),
+            json!(self.config.pickup_address.as_deref().unwrap_or_default()),
+        );
+        body.insert("customerName".to_string(), json!(req.recipient_name));
+        // Paperfly requires the customer phone in the 11-digit local
+        // form (01XXXXXXXXX); the platform stores +880 canonical.
+        body.insert(
+            "customerPhone".to_string(),
+            json!(local_phone_or_raw(&req.recipient_phone)),
+        );
+        body.insert(
+            "customerAddress".to_string(),
+            json!(req.recipient_address),
+        );
+        // Paperfly collects WHOLE taka; poisha are rounded half-up
+        // at this boundary only (poisha_to_whole_taka).
+        body.insert(
+            "cashCollectionAmount".to_string(),
+            json!(poisha_to_whole_taka(req.parcel.cod_amount_poisha)),
+        );
+        // ShipmentRequest carries no product title (a sub-order can
+        // hold several products), so the product name is the honest
+        // generic form naming the order it belongs to.
+        body.insert(
+            "productName".to_string(),
+            json!(format!("Parcel for order {}", req.invoice)),
+        );
+        body.insert("productQuantity".to_string(), json!(1));
+        // Paperfly takes the product weight as a kg STRING.
+        body.insert(
+            "productWeight".to_string(),
+            json!(req.parcel.weight_kg.to_string()),
+        );
+        if let Some(note) = &req.note {
+            body.insert("orderNote".to_string(), json!(note));
+        }
+        let url = format!("{}/OrderPlacement", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            // Paperfly's documented auth: HTTP Basic (merchant
+            // username + password) PLUS the merchant key in a
+            // header. UNCERTAINTY: the exact key header name (this
+            // adapter sends `paperflykey`) must be confirmed at
+            // merchant onboarding (see README, Wave 11).
+            .basic_auth(
+                self.config.username.as_deref().unwrap_or_default(),
+                Some(self.config.password.as_deref().unwrap_or_default()),
+            )
+            .header(
+                "paperflykey",
+                self.config.merchant_id.as_deref().unwrap_or_default(),
+            )
+            .header("Content-Type", "application/json")
+            .json(&Value::Object(body))
+            .send()
+            .await
+            .map_err(|e| {
+                CourierError::Gateway(format!("paperfly order placement request failed: {e}"))
+            })?;
+        let http_status = response.status();
+        let payload: Value = response.json().await.map_err(|e| {
+            CourierError::Gateway(format!(
+                "paperfly order placement returned an unreadable response: {e}"
+            ))
+        })?;
+        if !http_status.is_success() {
+            return Err(CourierError::Gateway(gateway_message(
+                self.name(),
+                &payload,
+                http_status,
+            )));
+        }
+        parse_paperfly_create_response(self.name(), &payload)
+    }
+
+    async fn track(&self, consignment_id: &str) -> Result<TrackingUpdate, CourierError> {
+        self.check_configured()?;
+        // UNCERTAINTY: the exact tracking verb and path must be
+        // confirmed at merchant onboarding; this adapter POSTs the
+        // tracking id as JSON to /API-Order-Tracking, and the parser
+        // is defensive about the response shape either way (see
+        // README, Wave 11).
+        let url = format!("{}/API-Order-Tracking", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .basic_auth(
+                self.config.username.as_deref().unwrap_or_default(),
+                Some(self.config.password.as_deref().unwrap_or_default()),
+            )
+            .header(
+                "paperflykey",
+                self.config.merchant_id.as_deref().unwrap_or_default(),
+            )
+            .header("Content-Type", "application/json")
+            .json(&json!({ "trackingId": consignment_id }))
+            .send()
+            .await
+            .map_err(|e| {
+                CourierError::Gateway(format!("paperfly tracking request failed: {e}"))
+            })?;
+        let http_status = response.status();
+        let payload: Value = response.json().await.map_err(|e| {
+            CourierError::Gateway(format!(
+                "paperfly tracking returned an unreadable response: {e}"
+            ))
+        })?;
+        if !http_status.is_success() {
+            return Err(CourierError::Gateway(gateway_message(
+                self.name(),
+                &payload,
+                http_status,
+            )));
+        }
+        let raw_status = parse_paperfly_track_response(&payload)?;
+        Ok(TrackingUpdate {
+            status: domain::map_paperfly_status(&raw_status).to_string(),
+            raw_status: Some(raw_status),
+        })
+    }
+
+    async fn cancel(&self, _consignment_id: &str) -> Result<(), CourierError> {
+        self.check_configured()?;
+        // Honest limit: Paperfly's API documents no cancel call for
+        // a placed order — cancellations go through Paperfly
+        // support / the merchant panel. We report that instead of
+        // pretending a cancel happened.
+        Err(CourierError::Unsupported {
+            courier: "paperfly".to_string(),
+            operation: "cancel".to_string(),
+        })
+    }
+
+    async fn price_estimate(&self, parcel: &Parcel) -> Result<i64, CourierError> {
+        // A purely local estimate from the domain delivery-charge
+        // function, exactly like the other adapters — no network
+        // call, and an estimate under OUR tariff, not a Paperfly
+        // quote.
+        Ok(domain::calculate_delivery_charge(
+            parcel.zone,
+            parcel.weight_kg,
+            parcel.cod_amount_poisha,
+        ))
+    }
+}
 
 /// Poll counts for the DEV simulator, shared process-wide: adapters
 /// are constructed per call by the factory, so the progression state
@@ -1260,61 +1947,13 @@ impl CourierAdapter for DevCourierAdapter {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Stub adapters (typed NotConfigured — never fake success)
-// ---------------------------------------------------------------------------
-
-/// Defines a stub adapter: a named struct whose every operation
-/// returns `CourierError::NotConfigured`. No network, no credentials,
-/// no fake success. Real adapters replace these one courier at a
-/// time (Steadfast in Wave 6, Pathao and RedX in Wave 7); eCourier
-/// and Paperfly are the stubs that remain.
-macro_rules! stub_adapter {
-    ($struct_name:ident, $courier_name:literal) => {
-        #[derive(Debug, Default)]
-        pub struct $struct_name;
-
-        #[async_trait]
-        impl CourierAdapter for $struct_name {
-            fn name(&self) -> &str {
-                $courier_name
-            }
-
-            async fn create_shipment(
-                &self,
-                _req: &ShipmentRequest,
-            ) -> Result<Shipment, CourierError> {
-                Err(CourierError::NotConfigured($courier_name.to_string()))
-            }
-
-            async fn track(
-                &self,
-                _consignment_id: &str,
-            ) -> Result<TrackingUpdate, CourierError> {
-                Err(CourierError::NotConfigured($courier_name.to_string()))
-            }
-
-            async fn cancel(&self, _consignment_id: &str) -> Result<(), CourierError> {
-                Err(CourierError::NotConfigured($courier_name.to_string()))
-            }
-
-            async fn price_estimate(&self, _parcel: &Parcel) -> Result<i64, CourierError> {
-                Err(CourierError::NotConfigured($courier_name.to_string()))
-            }
-        }
-    };
-}
-
-stub_adapter!(EcourierAdapter, "ecourier");
-stub_adapter!(PaperflyAdapter, "paperfly");
-
 /// THE factory: the one callable place that decides which adapter
 /// serves a courier name. An unknown name is an error. In dev mode
 /// every known courier is served by the DEV simulator. Otherwise
-/// Steadfast, Pathao and RedX get their real (credential-gated)
-/// adapters — with incomplete credentials their network operations
-/// return `NotConfigured`, never fake success — and eCourier /
-/// Paperfly get their `NotConfigured` stubs.
+/// every known courier gets its real (credential-gated) adapter —
+/// Steadfast, Pathao and RedX since Waves 6/7, eCourier and
+/// Paperfly since Wave 11 — and with incomplete credentials their
+/// network operations return `NotConfigured`, never fake success.
 pub fn courier_adapter_for(
     name: &str,
     config: &CouriersConfig,
@@ -1329,8 +1968,8 @@ pub fn courier_adapter_for(
         "steadfast" => Ok(Box::new(SteadfastAdapter::new(config.steadfast.clone()))),
         "pathao" => Ok(Box::new(PathaoAdapter::new(config.pathao.clone()))),
         "redx" => Ok(Box::new(RedxAdapter::new(config.redx.clone()))),
-        "ecourier" => Ok(Box::new(EcourierAdapter)),
-        _ => Ok(Box::new(PaperflyAdapter)),
+        "ecourier" => Ok(Box::new(EcourierAdapter::new(config.ecourier.clone()))),
+        _ => Ok(Box::new(PaperflyAdapter::new(config.paperfly.clone()))),
     }
 }
 
@@ -1365,9 +2004,15 @@ mod tests {
     }
 
     #[test]
-    fn stub_adapters_have_expected_names() {
-        assert_eq!(EcourierAdapter.name(), "ecourier");
-        assert_eq!(PaperflyAdapter.name(), "paperfly");
+    fn adapter_names_match_courier_names() {
+        assert_eq!(
+            EcourierAdapter::new(EcourierConfig::default()).name(),
+            "ecourier"
+        );
+        assert_eq!(
+            PaperflyAdapter::new(PaperflyConfig::default()).name(),
+            "paperfly"
+        );
         let err = CourierError::NotConfigured("pathao".to_string());
         assert!(err.to_string().contains("not configured"));
     }
@@ -1527,7 +2172,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn factory_selects_dev_real_stub_and_rejects_unknown() {
+    async fn factory_selects_dev_real_and_rejects_unknown() {
         // Unknown names are an error in every mode.
         let config = CouriersConfig::default();
         assert!(matches!(
@@ -1864,6 +2509,313 @@ mod tests {
         with_area.area_id = Some(42);
         assert!(matches!(
             redx.create_shipment(&with_area).await,
+            Err(CourierError::NotConfigured(_))
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // Wave 11: eCourier + Paperfly adapters
+    // -----------------------------------------------------------------
+
+    fn complete_ecourier() -> EcourierConfig {
+        EcourierConfig {
+            api_key: Some("ecourier-token".to_string()),
+            user_id: Some("merchant-42".to_string()),
+            ..EcourierConfig::default()
+        }
+    }
+
+    fn complete_paperfly() -> PaperflyConfig {
+        PaperflyConfig {
+            username: Some("merchant".to_string()),
+            password: Some("paperfly-password".to_string()),
+            merchant_id: Some("paperfly-key".to_string()),
+            ..PaperflyConfig::default()
+        }
+    }
+
+    fn complete_paperfly_with_pickup() -> PaperflyConfig {
+        PaperflyConfig {
+            pickup_name: Some("Platform Warehouse".to_string()),
+            pickup_phone: Some("01712345678".to_string()),
+            pickup_address: Some("Warehouse 1, Tejgaon, Dhaka".to_string()),
+            ..complete_paperfly()
+        }
+    }
+
+    #[test]
+    fn ecourier_and_paperfly_credential_completeness() {
+        // eCourier needs BOTH the API token and the merchant user id.
+        assert!(!ecourier_credentials_complete(&EcourierConfig::default()));
+        let key_only = EcourierConfig {
+            api_key: Some("token".to_string()),
+            ..EcourierConfig::default()
+        };
+        assert!(!ecourier_credentials_complete(&key_only));
+        assert!(ecourier_credentials_complete(&complete_ecourier()));
+        let blank_user = EcourierConfig {
+            user_id: Some("  ".to_string()),
+            ..complete_ecourier()
+        };
+        assert!(!ecourier_credentials_complete(&blank_user));
+        // Paperfly needs username, password AND the merchant key —
+        // the pickup fields are placement config, not credentials,
+        // so a pickup-less but credentialed config is complete.
+        assert!(!paperfly_credentials_complete(&PaperflyConfig::default()));
+        let no_key = PaperflyConfig {
+            username: Some("merchant".to_string()),
+            password: Some("pw".to_string()),
+            ..PaperflyConfig::default()
+        };
+        assert!(!paperfly_credentials_complete(&no_key));
+        assert!(paperfly_credentials_complete(&complete_paperfly()));
+    }
+
+    #[test]
+    fn ecourier_create_response_fixtures() {
+        // Success with the order id as a NUMBER under `order_id`.
+        let payload = json!({ "order_id": 555001, "message": "Order created" });
+        let shipment =
+            parse_ecourier_create_response("ecourier", &payload).expect("create parses");
+        assert_eq!(shipment.courier, "ecourier");
+        assert_eq!(shipment.consignment_id, "555001");
+        assert_eq!(shipment.tracking_code, None);
+        assert_eq!(shipment.status, "created");
+
+        // Success with a distinct tracking code: it is kept as the
+        // customer-facing tracking code.
+        let payload = json!({ "order_id": "EC-9", "tracking": "TRK-9" });
+        let shipment =
+            parse_ecourier_create_response("ecourier", &payload).expect("create parses");
+        assert_eq!(shipment.consignment_id, "EC-9");
+        assert_eq!(shipment.tracking_code.as_deref(), Some("TRK-9"));
+
+        // The id nested under `data` (here the short `e_id`) is
+        // accepted too.
+        let payload = json!({ "data": { "e_id": "E77" } });
+        let shipment =
+            parse_ecourier_create_response("ecourier", &payload).expect("nested id parses");
+        assert_eq!(shipment.consignment_id, "E77");
+
+        // No recognisable id: a gateway error carrying eCourier's
+        // message.
+        let payload = json!({ "message": "Invalid area id" });
+        let err = parse_ecourier_create_response("ecourier", &payload)
+            .expect_err("error payload is rejected");
+        assert!(matches!(err, CourierError::Gateway(_)), "{err}");
+        assert!(err.to_string().contains("Invalid area id"), "{err}");
+
+        // No id and no message: still an honest gateway error.
+        let payload = json!({ "success": false });
+        assert!(matches!(
+            parse_ecourier_create_response("ecourier", &payload),
+            Err(CourierError::Gateway(_))
+        ));
+    }
+
+    #[test]
+    fn ecourier_track_response_fixtures() {
+        // The known field names are tried in order, top level first.
+        let payload = json!({ "status": "Delivered" });
+        let raw = parse_ecourier_track_response(&payload).expect("raw status");
+        assert_eq!(domain::map_ecourier_status(&raw), "delivered");
+        let payload = json!({ "order_status": "Shipped" });
+        let raw = parse_ecourier_track_response(&payload).expect("raw status");
+        assert_eq!(domain::map_ecourier_status(&raw), "in_transit");
+        let payload = json!({ "data": { "current_status": "Picked" } });
+        let raw = parse_ecourier_track_response(&payload).expect("raw status");
+        assert_eq!(domain::map_ecourier_status(&raw), "picked_up");
+        // Nothing recognisable: an honest gateway error.
+        let payload = json!({ "something": "else" });
+        assert!(matches!(
+            parse_ecourier_track_response(&payload),
+            Err(CourierError::Gateway(_))
+        ));
+    }
+
+    #[test]
+    fn paperfly_create_response_fixtures() {
+        // Success: a tracking id, which is both the consignment id
+        // and the customer-facing tracking code.
+        let payload = json!({ "trackingId": "PF98765", "message": "Order placed" });
+        let shipment =
+            parse_paperfly_create_response("paperfly", &payload).expect("create parses");
+        assert_eq!(shipment.courier, "paperfly");
+        assert_eq!(shipment.consignment_id, "PF98765");
+        assert_eq!(shipment.tracking_code.as_deref(), Some("PF98765"));
+        assert_eq!(shipment.status, "created");
+
+        // The snake_case name and the ref number are accepted too,
+        // including nested under `data`.
+        let payload = json!({ "tracking_id": "PF111" });
+        let shipment =
+            parse_paperfly_create_response("paperfly", &payload).expect("snake id parses");
+        assert_eq!(shipment.consignment_id, "PF111");
+        let payload = json!({ "data": { "refNo": "PF222" } });
+        let shipment =
+            parse_paperfly_create_response("paperfly", &payload).expect("refNo parses");
+        assert_eq!(shipment.consignment_id, "PF222");
+
+        // No tracking id: a gateway error carrying Paperfly's
+        // message.
+        let payload = json!({ "message": "Invalid merchant key" });
+        let err = parse_paperfly_create_response("paperfly", &payload)
+            .expect_err("error payload is rejected");
+        assert!(matches!(err, CourierError::Gateway(_)), "{err}");
+        assert!(err.to_string().contains("Invalid merchant key"), "{err}");
+    }
+
+    #[test]
+    fn paperfly_track_response_fixtures() {
+        let payload = json!({ "status": "Out for Delivery" });
+        let raw = parse_paperfly_track_response(&payload).expect("raw status");
+        assert_eq!(domain::map_paperfly_status(&raw), "out_for_delivery");
+        let payload = json!({ "data": { "order_status": "Order Received" } });
+        let raw = parse_paperfly_track_response(&payload).expect("raw status");
+        assert_eq!(domain::map_paperfly_status(&raw), "created");
+        // Nothing recognisable: an honest gateway error.
+        let payload = json!({ "something": "else" });
+        assert!(matches!(
+            parse_paperfly_track_response(&payload),
+            Err(CourierError::Gateway(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn unconfigured_ecourier_and_paperfly_never_fake_success() {
+        let ecourier = EcourierAdapter::new(EcourierConfig::default());
+        let mut with_area = sample_request();
+        with_area.area_id = Some(42);
+        assert!(matches!(
+            ecourier.create_shipment(&with_area).await,
+            Err(CourierError::NotConfigured(_))
+        ));
+        assert!(matches!(
+            ecourier.track("555001").await,
+            Err(CourierError::NotConfigured(_))
+        ));
+        // The local price estimate still works: it is our own tariff
+        // (inside Dhaka, 1 kg), computed by the domain function.
+        let estimate = ecourier
+            .price_estimate(&sample_request().parcel)
+            .await
+            .expect("local estimate needs no credentials");
+        assert_eq!(estimate, 6_000);
+
+        let paperfly = PaperflyAdapter::new(PaperflyConfig::default());
+        assert!(matches!(
+            paperfly.create_shipment(&sample_request()).await,
+            Err(CourierError::NotConfigured(_))
+        ));
+        assert!(matches!(
+            paperfly.track("PF1").await,
+            Err(CourierError::NotConfigured(_))
+        ));
+        let estimate = paperfly
+            .price_estimate(&sample_request().parcel)
+            .await
+            .expect("local estimate needs no credentials");
+        assert_eq!(estimate, 6_000);
+    }
+
+    #[tokio::test]
+    async fn configured_ecourier_requires_an_area_id() {
+        // Credentials complete but no area id in the request: the
+        // booking fails loudly BEFORE any network call — eCourier
+        // area ids are numeric and courier-specific, so there is no
+        // honest default (the same rule as RedX).
+        let ecourier = EcourierAdapter::new(complete_ecourier());
+        let err = ecourier
+            .create_shipment(&sample_request())
+            .await
+            .expect_err("no area id, no booking");
+        assert!(matches!(err, CourierError::Gateway(_)), "{err}");
+        assert!(err.to_string().contains("area_id"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn configured_paperfly_requires_pickup_config() {
+        // Credentials complete but no pickup config: the booking
+        // fails loudly BEFORE any network call, naming every missing
+        // pickup field — pickup details are platform config and are
+        // never invented per order.
+        let paperfly = PaperflyAdapter::new(complete_paperfly());
+        let err = paperfly
+            .create_shipment(&sample_request())
+            .await
+            .expect_err("no pickup config, no booking");
+        assert!(matches!(err, CourierError::Gateway(_)), "{err}");
+        assert!(err.to_string().contains("PAPERFLY_PICKUP_NAME"), "{err}");
+        assert!(err.to_string().contains("PAPERFLY_PICKUP_PHONE"), "{err}");
+        assert!(err.to_string().contains("PAPERFLY_PICKUP_ADDRESS"), "{err}");
+
+        // A partially filled pickup config names only what is
+        // actually missing.
+        let partial = PaperflyConfig {
+            pickup_name: Some("Platform Warehouse".to_string()),
+            ..complete_paperfly()
+        };
+        let paperfly = PaperflyAdapter::new(partial);
+        let err = paperfly
+            .create_shipment(&sample_request())
+            .await
+            .expect_err("partial pickup config, no booking");
+        assert!(matches!(err, CourierError::Gateway(_)), "{err}");
+        assert!(!err.to_string().contains("PAPERFLY_PICKUP_NAME"), "{err}");
+        assert!(err.to_string().contains("PAPERFLY_PICKUP_PHONE"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn configured_ecourier_and_paperfly_cancel_is_honestly_unsupported() {
+        let ecourier = EcourierAdapter::new(complete_ecourier());
+        assert!(matches!(
+            ecourier.cancel("555001").await,
+            Err(CourierError::Unsupported { .. })
+        ));
+        let paperfly = PaperflyAdapter::new(complete_paperfly_with_pickup());
+        assert!(matches!(
+            paperfly.cancel("PF1").await,
+            Err(CourierError::Unsupported { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn factory_selects_ecourier_and_paperfly_by_credentials() {
+        // Configured: the real adapters are selected (their local
+        // price estimates prove the selection without a network
+        // call).
+        let configured = CouriersConfig {
+            ecourier: complete_ecourier(),
+            paperfly: complete_paperfly(),
+            ..CouriersConfig::default()
+        };
+        let ecourier = courier_adapter_for("ecourier", &configured).expect("ecourier adapter");
+        assert_eq!(ecourier.name(), "ecourier");
+        let estimate = ecourier
+            .price_estimate(&sample_request().parcel)
+            .await
+            .expect("configured ecourier estimates locally");
+        assert_eq!(estimate, 6_000);
+        let paperfly = courier_adapter_for("paperfly", &configured).expect("paperfly adapter");
+        assert_eq!(paperfly.name(), "paperfly");
+        let estimate = paperfly
+            .price_estimate(&sample_request().parcel)
+            .await
+            .expect("configured paperfly estimates locally");
+        assert_eq!(estimate, 6_000);
+
+        // Unconfigured: same real adapters, honest NotConfigured.
+        let plain = CouriersConfig::default();
+        let ecourier = courier_adapter_for("ecourier", &plain).expect("ecourier adapter");
+        let mut with_area = sample_request();
+        with_area.area_id = Some(42);
+        assert!(matches!(
+            ecourier.create_shipment(&with_area).await,
+            Err(CourierError::NotConfigured(_))
+        ));
+        let paperfly = courier_adapter_for("paperfly", &plain).expect("paperfly adapter");
+        assert!(matches!(
+            paperfly.create_shipment(&sample_request()).await,
             Err(CourierError::NotConfigured(_))
         ));
     }
