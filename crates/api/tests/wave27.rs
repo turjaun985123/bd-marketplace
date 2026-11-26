@@ -388,12 +388,13 @@ async fn wave27_seller_and_admin_analytics_flow() {
     assert_eq!(count_for("delivered"), Some(2), "breakdown: {breakdown:?}");
     assert_eq!(count_for("cancelled"), Some(1), "breakdown: {breakdown:?}");
 
-    // Both delivered slices shipped with the DEV courier.
+    // Both delivered slices shipped via the courier-dev flow;
+    // the shipment row records the resolved courier (steadfast).
     let couriers = analytics["courier_breakdown"]
         .as_array()
         .expect("courier breakdown");
     assert_eq!(couriers.len(), 1, "couriers: {couriers:?}");
-    assert_eq!(couriers[0]["courier"], "dev", "couriers: {couriers:?}");
+    assert_eq!(couriers[0]["courier"], "steadfast", "couriers: {couriers:?}");
     assert_eq!(couriers[0]["count"], 2, "couriers: {couriers:?}");
 
     // 2. Isolation: seller B sees only their own 100_000 sale.
