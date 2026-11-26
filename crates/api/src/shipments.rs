@@ -167,13 +167,17 @@ pub async fn load_shipment_for_sub_order(
     .map_err(|e| ApiError::internal("load shipment for sub-order", e))
 }
 
+/// One shipment-summary row as stored: (id, courier, consignment
+/// id, status, manual courier name, manual tracking id).
+type ShipmentSummaryRow = (Uuid, String, String, String, Option<String>, Option<String>);
+
 /// The shipment on a sub-order, as a summary for the order views
 /// (buyer order detail and the seller sub-order list share it).
 pub async fn load_shipment_summary_for_sub_order(
     pool: &PgPool,
     sub_order_id: Uuid,
 ) -> Result<Option<ShipmentSummary>, ApiError> {
-    let row: Option<(Uuid, String, String, String, Option<String>, Option<String>)> =
+    let row: Option<ShipmentSummaryRow> =
         sqlx::query_as(
             "SELECT id, courier, consignment_id, status, manual_courier_name, \
              manual_tracking_id FROM shipments WHERE sub_order_id = $1",
