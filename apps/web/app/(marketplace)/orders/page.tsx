@@ -5,12 +5,17 @@ import Link from "next/link";
 import PriceTag from "@/components/PriceTag";
 import {
   cancelOrder,
+  createReturnRequest,
+  listBuyerReturnRequests,
   listOrders,
   paymentStatusLabel,
   refreshShipment,
+  refundStatusLabel,
   retryPayment,
+  returnStatusLabel,
   shipmentStatusLabel,
   type Order,
+  type ReturnRequest,
   type SubOrder,
 } from "@/lib/api";
 import { useAuth } from "@/hooks/useAuth";
@@ -21,14 +26,70 @@ import { useAuth } from "@/hooks/useAuth";
  * cancelled from here while EVERY sub-order is still placed (Wave 4) —
  * the button mirrors that rule, but the server is the source of truth:
  * a 409 answer is shown as an error and nothing changes locally.
+ *
+ * Wave 16: a DELIVERED sub-order can be returned from here — the
+ * buyer gives a reason, the seller approves or rejects, and once the
+ * goods are received back the refund (goods minus any coupon
+ * discount; delivery is never refunded) shows as pending until the
+ * platform records it done. The sub-order's `return_status` summary
+ * comes with the order; the refund figures come from the buyer's
+ * return-request list, keyed by sub-order.
  */
 export default function BuyerOrdersPage() {
   const { ready, token } = useAuth();
   const [orders, setOrders] = useState<Order[] | null>(null);
+  const [returnsBySubOrder, setReturnsBySubOrder] = useState<
+    Record<string, ReturnRequest>
+  >({});
   const [error, setError] = useState<string | null>(null);
   const [cancellingId, setCancellingId] = useState<string | null>(null);
   const [retryingId, setRetryingId] = useState<string | null>(null);
   const [refreshingId, setRefreshingId] = useState<string | null>(null);
+  const [returnReasons, setReturnReasons] = useState<Record<string, string>>(
+    {}
+  );
+  const [returningId, setReturningId] = useState<string | null>(null);
+
+  // Reload orders + the buyer's return requests together; both
+  // lists are re-read after any action so what is shown is always
+  // the server's state.
+  async function reload() {
+    if (!token) return;
+    const [list, returns] = await Promise.all([
+      listOrders(token, { limit: 50 }),
+      listBuyerReturnRequests(token, { limit: 50 }),
+    ]);
+    setOrders(list.items);
+    setReturnsBySubOrder(
+      Object.fromEntries(returns.items.map((r) => [r.sub_order_id, r]))
+    );
+  }
+
+  // Ask to return one delivered sub-order (Wave 16). The API
+  // enforces the rules (delivered only, one request per
+  // sub-order); its error is shown as-is.
+  async function onRequestReturn(sub: SubOrder) {
+    if (!token) return;
+    const reason = (returnReasons[sub.id] ?? "").trim();
+    if (!reason) {
+      setError("রিটার্নের কারণ লিখুন। (Give a reason for the return.)");
+      return;
+    }
+    setReturningId(sub.id);
+    setError(null);
+    try {
+      await createReturnRequest(token, sub.id, reason);
+      await reload();
+    } catch (err) {
+      setError(
+        `রিটার্নের আবেদন করা যায়নি। ${
+          err instanceof Error ? err.message : ""
+        }`.trim()
+      );
+    } finally {
+      setReturningId(null);
+    }
+  }
 
   // Refresh one sub-order's courier tracking (Wave 6): the API polls
   // the courier and applies any legal status change; the list is
@@ -97,9 +158,16 @@ export default function BuyerOrdersPage() {
   useEffect(() => {
     if (!token) return;
     let cancelled = false;
-    listOrders(token, { limit: 50 })
-      .then((list) => {
-        if (!cancelled) setOrders(list.items);
+    Promise.all([
+      listOrders(token, { limit: 50 }),
+      listBuyerReturnRequests(token, { limit: 50 }),
+    ])
+      .then(([list, returns]) => {
+        if (cancelled) return;
+        setOrders(list.items);
+        setReturnsBySubOrder(
+          Object.fromEntries(returns.items.map((r) => [r.sub_order_id, r]))
+        );
       })
       .catch((err) => {
         if (!cancelled) {
@@ -184,6 +252,55 @@ export default function BuyerOrdersPage() {
                       </button>
                     )}
                   </p>
+                )}
+                {sub.return_status ? (
+                  <p>
+                    রিটার্ন: {returnStatusLabel(sub.return_status)}
+                    {(() => {
+                      const ret = returnsBySubOrder[sub.id];
+                      if (!ret) return null;
+                      return (
+                        <>
+                          {" "}
+                          · রিফান্ড: {refundStatusLabel(ret.refund_status)}
+                          {ret.refund_poisha !== null && (
+                            <>
+                              {" "}
+                              (
+                              <PriceTag amountPoisha={ret.refund_poisha} />)
+                            </>
+                          )}
+                          {ret.seller_note && (
+                            <> · বিক্রেতার নোট: {ret.seller_note}</>
+                          )}
+                        </>
+                      );
+                    })()}
+                  </p>
+                ) : (
+                  sub.status === "delivered" && (
+                    <p>
+                      <input
+                        value={returnReasons[sub.id] ?? ""}
+                        onChange={(e) =>
+                          setReturnReasons((prev) => ({
+                            ...prev,
+                            [sub.id]: e.target.value,
+                          }))
+                        }
+                        placeholder="রিটার্নের কারণ (যেমন: পণ্য ছিঁড়ে গেছে)"
+                      />{" "}
+                      <button
+                        type="button"
+                        disabled={returningId === sub.id}
+                        onClick={() => void onRequestReturn(sub)}
+                      >
+                        {returningId === sub.id
+                          ? "আবেদন হচ্ছে…"
+                          : "রিটার্নের আবেদন করুন"}
+                      </button>
+                    </p>
+                  )
                 )}
               </div>
             ))}

@@ -160,6 +160,8 @@ export default function SellerDashboardPage() {
         <Link href="/seller/inbox">ইনবক্স — Inbox</Link>
         {" · "}
         <Link href="/seller/coupons">কুপন — Coupons</Link>
+        {" · "}
+        <Link href="/seller/returns">রিটার্ন — Returns</Link>
       </p>
       {message && <p role="status">{message}</p>}
       {dashboard === null ? (

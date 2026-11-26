@@ -735,6 +735,70 @@ find "শাড়ি"). Faceting is exactly the filters listed above —
 no per-category counts, no brand/size attributes. Ranking is
 the one fixed expression, not personalised.
 
+Wave 16 (public tracking + returns / RTO):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| GET | `/v1/track?order_id=&phone=` | PUBLIC, no login. The tracking timeline: per-store sub-order status + items, and each shipment with its full event history. The delivery phone given at checkout is the credential — an unknown id, a malformed id, a missing phone and a wrong phone all answer the SAME 404 |
+| POST | `/v1/buyer/sub-orders/{id}/return-request` | Bearer, the order's buyer only (anyone else: 404). Body `{reason}` (1–500 chars). Only for a `delivered` sub-order (else 409); one request per sub-order (a second is 409). 201 with the request |
+| GET | `/v1/buyer/return-requests` | Bearer. The buyer's own requests with statuses + refund fields. The buyer order views also summarise each sub-order's `return_status` |
+| GET | `/v1/seller/return-requests` | Bearer, own stores only. Newest first, with the buyer's MASKED phone and the sub-order's items |
+| POST | `/v1/seller/return-requests/{id}/approve` | Bearer, store owner. `requested` → `approved`; optional `{note}` for the buyer. Illegal moves are 409 |
+| POST | `/v1/seller/return-requests/{id}/reject` | Bearer, store owner. `requested` → `rejected`; optional `{note}` |
+| POST | `/v1/seller/return-requests/{id}/received` | Bearer, store owner. `approved` → `received` in ONE transaction: refund snapshot + refund `pending` + sub-order `returned` + items restocked |
+| GET | `/v1/admin/return-requests?refund_status=` | Admin. Every request; the refund queue filters `refund_status=pending` |
+| POST | `/v1/admin/return-requests/{id}/refund-done` | Admin. Records that a `pending` refund was paid off-platform; from any other state it is a 409 |
+
+**The tracking contract:** the endpoint is public because
+tracking links get shared (family, SMS) where no session
+exists. The order id is only an identifier; the delivery
+phone is the knowledge factor, compared through the pure
+domain rule `phones_match_for_tracking` (both sides
+normalized, so `01...`, `880...` and `+880...` all match).
+Every failure is the same 404 with the same body — the
+endpoint never confirms that an order exists, so it cannot
+be used as an oracle for enumerating order ids. The response
+is a purpose-built view: no delivery address, no commission,
+no payout split.
+
+**The return state machine:** `requested` → `approved` /
+`rejected` (the seller decides), `approved` → `received`
+(the goods came back) — the pure domain table
+`can_transition_return`; skips like `requested` → `received`
+are 409, and `rejected` / `received` are terminal for the
+request. The refund has its OWN lifecycle on the same row
+(`none` → `pending` → `done`), so a received return whose
+refund is still outstanding is representable without fake
+request states.
+
+**Refund math:** the refund snapshotted at receipt time is
+`compute_refund_poisha(goods, discount)` — what the buyer
+paid for the goods, minus any coupon discount allocated to
+the sub-order (never paid, so never refunded). The DELIVERY
+charge is never refunded: the courier trip happened and was
+paid for, whichever way the parcel travelled.
+
+**RTO restock (fixed in this wave):** when a shipment
+refresh syncs a sub-order to `returned` (the courier brought
+the parcel back), the refresh transaction now restocks the
+sub-order's items through the same shared restock helper the
+cancels and received returns use. Before this fix the
+sub-order was marked `returned` and the stock was silently
+lost. A courier return creates NO return request and NO
+refund: a COD parcel was never paid for, and a prepaid one
+is refunded by manual platform decision, never as an
+automatic side effect of a courier status.
+
+**Limits (stated, not hidden):** a refund marked `done`
+records that the platform refunded the buyer OFF-platform
+(bKash / cash) — no gateway refund API is wired (the Wave 5
+TODO stands), and nothing here claims a gateway moved
+money. One return per sub-order and the whole sub-order is
+the unit: partial-item returns are not supported yet.
+Buyers cannot cancel into a return — undelivered parcels go
+through cancellation or the courier's RTO path, never a
+return request (`can_request_return` demands `delivered`).
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -1309,6 +1373,35 @@ on storefronts (store-scoped), the `/search` results page with
 its filter form and pagination, and a category field on the
 seller product form.
 
+**Real (Wave 16):** public tracking and returns — migration
+0018 (`return_requests`: one per sub-order, request status and
+refund status as separate lifecycles, the refund snapshot
+column); the pure domain return rules (`can_request_return`,
+`can_transition_return`, `compute_refund_poisha`,
+`validate_return_reason`, `phones_match_for_tracking`);
+`GET /v1/track` (login-free, delivery phone as the credential,
+every failure the same 404, purpose-built timeline view over
+`shipment_events`); the buyer return create/list endpoints
+plus the `return_status` summary on the buyer order view; the
+seller decision endpoints (approve / reject / received — the
+receipt transaction snapshots the refund, returns the
+sub-order and restocks through the one shared helper); the
+admin refund queue (list with the refund-status filter,
+refund-done recording an off-platform refund, never twice);
+the RTO fix in shipment refresh (a courier-driven `returned`
+sync now restocks in the same transaction); an integration
+test (`crates/api/tests/wave16.rs`, same `DATABASE_URL` gate)
+covering the indistinguishable tracking 404s, the delivered
+timeline with events, the 409s (before delivery, second
+request, illegal moves, double refund-done), the stranger
+404, the full approve → received flow with stock restored and
+refund = goods, and the reject path; the Next.js public
+`/track` page, the return actions + refund display on the
+buyer orders page, the seller `/seller/returns` inbox and the
+admin `/admin/returns` refund queue, with track/returns nav
+links on the marketplace home, the checkout success screen,
+the seller dashboard and the admin shell.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters. Manual Phase 2 couriers (Sundarban,
@@ -1322,7 +1415,9 @@ import pipeline is the real source.
 
 **TODO / not wired:** live gateway calls and real-gateway webhook
 signature verification (need merchant credentials + each gateway's
-integration docs), refunds, Redis, a real SMS gateway,
+integration docs), gateway refund APIs (Wave 16 refunds are
+recorded off-platform obligations instead — see the Wave 16
+section), Redis, a real SMS gateway,
 worker jobs — including automatic courier status
 polling, which will call the same refresh service function the API
 exposes (the worker still logs its planned jobs and exits cleanly).
@@ -1337,16 +1432,17 @@ the external service at the other end of it, configured by
   /admin/payouts, /admin/users, /admin/settings; Wave 12 adds
   /seller/import; Wave 13 adds /messages, /messages/[id] and
   /seller/inbox; Wave 14 adds /seller/coupons and /admin/coupons;
-  Wave 15 adds /search).
+  Wave 15 adds /search; Wave 16 adds /track, /seller/returns and
+  /admin/returns).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
-  (domain 61, courier 31, payments 8 unit tests; the `DATABASE_URL`-
+  (domain 65, courier 31, payments 8 unit tests; the `DATABASE_URL`-
   gated integration tests skip cleanly without a database). The API
   binary was also smoke-tested locally without a database: routes
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
   (including the Wave 13 messaging endpoints), and the SIDRA
   callback answers 503 without a database.
-- **Rust integration + clippy: CI-only** — the Wave 2–15 integration
+- **Rust integration + clippy: CI-only** — the Wave 2–16 integration
   tests against a real Postgres 16 service and clippy `-D warnings`
   are verified via **GitHub Actions CI** (`.github/workflows/ci.yml`)
-  on push. Waves 1–14 are green there; Wave 15 awaits its first CI run.
+  on push. Waves 1–15 are green there; Wave 16 awaits its first CI run.

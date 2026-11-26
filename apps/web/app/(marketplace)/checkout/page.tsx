@@ -336,6 +336,9 @@ export default function CheckoutPage() {
           <Link href="/orders">আমার অর্ডার দেখুন — My orders</Link>
           {" · "}
           <Link href={`/orders/${placed.id}`}>রসিদ দেখুন — View receipt</Link>
+          {" · "}
+          <Link href="/track">অর্ডার ট্র্যাক করুন — Track order</Link>{" "}
+          (অর্ডার নম্বর ও মোবাইল নম্বর দিয়ে, লগইন ছাড়াই)
         </p>
       </main>
     );

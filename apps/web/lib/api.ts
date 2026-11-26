@@ -229,6 +229,12 @@ export interface SubOrder {
   items: OrderItem[];
   /** Courier shipment (Wave 6); null until the seller books one. */
   shipment: ShipmentSummary | null;
+  /**
+   * The buyer's return request status for this sub-order
+   * (Wave 16: requested | approved | rejected | received);
+   * null when no return was requested.
+   */
+  return_status: string | null;
 }
 
 /** The latest payment attempt on an order (Wave 5). */
@@ -1660,4 +1666,245 @@ export function setAdminCouponActive(
     token,
     body: { active },
   });
+}
+
+// ---------------------------------------------------------------------------
+// Wave 16 — public tracking + returns
+// ---------------------------------------------------------------------------
+
+/** One step in a tracked shipment's history, oldest first. */
+export interface TrackedShipmentEvent {
+  /** Unified shipment status. */
+  status: string;
+  /** The courier's raw status string, when it provided one. */
+  note: string | null;
+  at: string;
+}
+
+/** The courier shipment on a tracked sub-order, with its events. */
+export interface TrackedShipment {
+  courier: string;
+  consignment_id: string;
+  status: string;
+  events: TrackedShipmentEvent[];
+}
+
+/** One seller's slice of a tracked order. */
+export interface TrackedSubOrder {
+  store_slug: string;
+  status: string;
+  items: { title_snapshot: string; quantity: number }[];
+  shipment: TrackedShipment | null;
+}
+
+/**
+ * The public tracking view (GET /v1/track). No login: the order
+ * id plus the delivery phone given at checkout are the
+ * credential, and every failure (unknown id, wrong phone) is the
+ * same 404 — the page shows one "not found" message for all.
+ */
+export interface TrackedOrder {
+  order_id: string;
+  placed_at: string;
+  /** pay_on_delivery | pending | paid | failed | refunded */
+  payment_status: string;
+  payment_method: string;
+  grand_total_poisha: number;
+  sub_orders: TrackedSubOrder[];
+}
+
+/** GET /v1/track — public tracking by order id + delivery phone. */
+export function trackOrder(
+  orderId: string,
+  phone: string
+): Promise<TrackedOrder> {
+  const search = new URLSearchParams({ order_id: orderId, phone });
+  return call(`/v1/track?${search.toString()}`);
+}
+
+/** One returned line, summarised on the return views. */
+export interface ReturnItemSummary {
+  title_snapshot: string;
+  quantity: number;
+  line_total_poisha: number;
+}
+
+/**
+ * A return request. The buyer's view and the seller/admin view
+ * share every field except the masked buyer phone, which only
+ * the seller side carries.
+ */
+export interface ReturnRequest {
+  id: string;
+  sub_order_id: string;
+  order_id: string;
+  buyer_id: string;
+  store_id: string;
+  store_slug: string;
+  reason: string;
+  /** requested | approved | rejected | received */
+  status: string;
+  /** Goods minus coupon discount; null until the goods are received. */
+  refund_poisha: number | null;
+  /** none | pending | done — the refund's own lifecycle. */
+  refund_status: string;
+  seller_note: string | null;
+  created_at: string;
+  decided_at: string | null;
+  items: ReturnItemSummary[];
+}
+
+/** A return request as the seller / admin sees it. */
+export interface SellerReturnRequest extends ReturnRequest {
+  /** The buyer's phone, masked (e.g. 018****111). */
+  buyer_phone_masked: string;
+}
+
+export interface ReturnRequestList {
+  items: ReturnRequest[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+export interface SellerReturnRequestList {
+  items: SellerReturnRequest[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+/** Bangla label for a return request status (display only). */
+export function returnStatusLabel(status: string): string {
+  switch (status) {
+    case "requested":
+      return "আবেদন করা হয়েছে";
+    case "approved":
+      return "অনুমোদিত — ফেরত পাঠান";
+    case "rejected":
+      return "প্রত্যাখ্যাত";
+    case "received":
+      return "ফেরত পৌঁছেছে";
+    default:
+      return status;
+  }
+}
+
+/** Bangla label for a refund status (display only). */
+export function refundStatusLabel(status: string): string {
+  switch (status) {
+    case "pending":
+      return "রিফান্ড বাকি আছে";
+    case "done":
+      return "রিফান্ড দেওয়া হয়েছে";
+    default:
+      return "রিফান্ড প্রযোজ্য নয়";
+  }
+}
+
+/**
+ * POST /v1/buyer/sub-orders/{id}/return-request — ask to return
+ * a DELIVERED sub-order. A not-delivered sub-order is a 409, a
+ * second request is a 409, someone else's sub-order is a 404.
+ */
+export function createReturnRequest(
+  token: string,
+  subOrderId: string,
+  reason: string
+): Promise<ReturnRequest> {
+  return call(
+    `/v1/buyer/sub-orders/${encodeURIComponent(subOrderId)}/return-request`,
+    { method: "POST", token, body: { reason } }
+  );
+}
+
+/** GET /v1/buyer/return-requests — the buyer's own requests. */
+export function listBuyerReturnRequests(
+  token: string,
+  params?: { page?: number; limit?: number }
+): Promise<ReturnRequestList> {
+  const search = new URLSearchParams();
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/buyer/return-requests${qs ? `?${qs}` : ""}`, { token });
+}
+
+/** GET /v1/seller/return-requests — requests for the seller's stores. */
+export function listSellerReturnRequests(
+  token: string,
+  params?: { page?: number; limit?: number }
+): Promise<SellerReturnRequestList> {
+  const search = new URLSearchParams();
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/seller/return-requests${qs ? `?${qs}` : ""}`, { token });
+}
+
+/** POST /v1/seller/return-requests/{id}/approve — requested -> approved. */
+export function approveReturnRequest(
+  token: string,
+  returnId: string,
+  note?: string
+): Promise<SellerReturnRequest> {
+  return call(
+    `/v1/seller/return-requests/${encodeURIComponent(returnId)}/approve`,
+    { method: "POST", token, body: { note } }
+  );
+}
+
+/** POST /v1/seller/return-requests/{id}/reject — requested -> rejected. */
+export function rejectReturnRequest(
+  token: string,
+  returnId: string,
+  note?: string
+): Promise<SellerReturnRequest> {
+  return call(
+    `/v1/seller/return-requests/${encodeURIComponent(returnId)}/reject`,
+    { method: "POST", token, body: { note } }
+  );
+}
+
+/**
+ * POST /v1/seller/return-requests/{id}/received — the goods came
+ * back: the API snapshots the refund, opens it as pending, marks
+ * the sub-order returned and restocks the items, atomically.
+ */
+export function markReturnReceived(
+  token: string,
+  returnId: string
+): Promise<SellerReturnRequest> {
+  return call(
+    `/v1/seller/return-requests/${encodeURIComponent(returnId)}/received`,
+    { method: "POST", token }
+  );
+}
+
+/** GET /v1/admin/return-requests — every request; the refund queue filters refund_status=pending. */
+export function listAdminReturnRequests(
+  token: string,
+  params?: { refund_status?: string; page?: number; limit?: number }
+): Promise<SellerReturnRequestList> {
+  const search = new URLSearchParams();
+  if (params?.refund_status) search.set("refund_status", params.refund_status);
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/admin/return-requests${qs ? `?${qs}` : ""}`, { token });
+}
+
+/**
+ * POST /v1/admin/return-requests/{id}/refund-done — record that
+ * the platform refunded the buyer off-platform (bKash / cash).
+ * Only a pending refund can be marked done; a second call is 409.
+ */
+export function markRefundDone(
+  token: string,
+  returnId: string
+): Promise<SellerReturnRequest> {
+  return call(
+    `/v1/admin/return-requests/${encodeURIComponent(returnId)}/refund-done`,
+    { method: "POST", token }
+  );
 }

@@ -561,7 +561,10 @@ pub async fn create_shipment_for_seller(
 /// shipment, writes a `refresh` event with the courier's raw status,
 /// and syncs the sub-order where the two status sets overlap:
 /// `delivered` and `returned` (each still checked against the
-/// sub-order transition table).
+/// sub-order transition table). A sync to `returned` also restocks
+/// the sub-order's items in the same transaction (Wave 16) — the
+/// goods physically came back — but it creates no return request
+/// and no refund (see the note at the sync site).
 pub async fn refresh_shipment_for_participant(
     state: &AppState,
     user: &AuthUser,
@@ -635,6 +638,21 @@ pub async fn refresh_shipment_for_participant(
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| ApiError::internal("sync sub-order status", e))?;
+            // Wave 16 RTO fix: a courier-driven return puts the
+            // goods back on the seller's shelf — restock the
+            // sub-order's items in THIS transaction, via the one
+            // shared restock helper, so the status move and the
+            // stock restore commit or roll back together. (Before
+            // this fix the sub-order was marked `returned` and the
+            // stock was silently lost.) A courier return creates
+            // NO return_requests row and NO refund: whether money
+            // goes back is a separate platform decision (a COD
+            // parcel was never paid for; a prepaid one is refunded
+            // manually), never an automatic side effect of a
+            // courier status.
+            if target == "returned" {
+                crate::orders::restock_sub_order_items(&mut tx, shipment.sub_order_id).await?;
+            }
         }
     }
 

@@ -1652,6 +1652,93 @@ pub fn search_prefix_pattern(q: &str) -> String {
     format!("{}%", escape_like_text(q))
 }
 
+/// Maximum length of a buyer's return reason, in characters.
+pub const MAX_RETURN_REASON_CHARS: usize = 500;
+
+/// Return-request lifecycle statuses — mirrors the DB CHECK
+/// constraint on `return_requests.status` (migration 0018). The
+/// refund has its OWN status field (`none` / `pending` / `done`)
+/// on the same row: a request can be `received` while its refund
+/// is still `pending`, and conflating the two would force fake
+/// states like "received_but_unpaid" into this set.
+pub fn is_valid_return_status(status: &str) -> bool {
+    matches!(status, "requested" | "approved" | "rejected" | "received")
+}
+
+/// May the buyer open a return request for a sub-order in this
+/// status? Only `delivered`: a return is the buyer sending goods
+/// back, and goods can only come back after they arrived. A
+/// not-yet-delivered parcel is handled by cancellation (before
+/// shipping) or by the courier's own return path (RTO) — never by
+/// a buyer return request.
+pub fn can_request_return(sub_order_status: &str) -> bool {
+    sub_order_status == "delivered"
+}
+
+/// May a return request move from `from` to `to`? The single
+/// return transition table (Wave 16): the seller decides a fresh
+/// request (`requested` → `approved` or `rejected`), and only an
+/// approved request can be marked `received` when the goods come
+/// back. `rejected` and `received` are terminal for the REQUEST;
+/// the refund's own lifecycle continues on its separate field.
+/// Same-state moves and skips (e.g. `requested` → `received`) are
+/// rejected — the seller must approve before goods are accepted
+/// back, so a request can never jump the decision.
+pub fn can_transition_return(from: &str, to: &str) -> bool {
+    matches!(
+        (from, to),
+        ("requested", "approved") | ("requested", "rejected") | ("approved", "received")
+    )
+}
+
+/// The refund owed when a returned sub-order is received back:
+/// the goods the buyer paid for, minus any coupon discount that
+/// was allocated to the sub-order (the buyer never paid that
+/// part, so it is not refunded). The DELIVERY charge is never
+/// part of a refund — the courier trip happened and was paid
+/// for, whichever way the parcel travelled; refunding it would
+/// make the platform pay the courier twice for one delivery.
+/// Clamped at zero so a corrupt snapshot can never produce a
+/// negative refund.
+pub fn compute_refund_poisha(goods_poisha: i64, discount_poisha: i64) -> i64 {
+    (goods_poisha - discount_poisha).max(0)
+}
+
+/// Validate a buyer's return reason: required (a seller cannot
+/// judge a request with no reason), 1 to
+/// [`MAX_RETURN_REASON_CHARS`] characters after trimming.
+pub fn validate_return_reason(reason: &str) -> Result<(), &'static str> {
+    let len = reason.trim().chars().count();
+    if len == 0 {
+        return Err("return reason must not be empty");
+    }
+    if len > MAX_RETURN_REASON_CHARS {
+        return Err("return reason must be at most 500 characters");
+    }
+    Ok(())
+}
+
+/// Does a phone number supplied to the PUBLIC tracking endpoint
+/// match the phone stored on the order? The public endpoint has
+/// no login: the order id plus the delivery phone ARE the
+/// credential, so this comparison is the whole gate. Both sides
+/// are normalized with [`normalize_bd_phone`] first, so the
+/// local form (`01...`), the `880...` form and the canonical
+/// `+880...` form all match each other. An invalid supplied
+/// number simply does not match — the function returns `false`
+/// rather than an error, so the endpoint can answer every
+/// mismatch (wrong number, malformed number, unknown order)
+/// with the same indistinguishable 404.
+pub fn phones_match_for_tracking(stored_phone: &str, supplied_phone: &str) -> bool {
+    match (
+        normalize_bd_phone(stored_phone),
+        normalize_bd_phone(supplied_phone),
+    ) {
+        (Some(stored), Some(supplied)) => stored == supplied,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2892,5 +2979,92 @@ mod tests {
         assert_eq!(search_prefix_pattern("a_b"), "a\\_b%");
         // Bangla text passes through untouched.
         assert_eq!(search_like_pattern("শাড়ি"), "%শাড়ি%");
+    }
+
+    #[test]
+    fn return_request_eligibility_and_transitions() {
+        // Only a delivered sub-order can be returned by the buyer.
+        assert!(can_request_return("delivered"));
+        for status in ["placed", "confirmed", "shipped", "returned", "cancelled"] {
+            assert!(!can_request_return(status), "status {status}");
+        }
+
+        // The decision flow: requested -> approved/rejected,
+        // approved -> received; everything else is illegal.
+        assert!(can_transition_return("requested", "approved"));
+        assert!(can_transition_return("requested", "rejected"));
+        assert!(can_transition_return("approved", "received"));
+        for (from, to) in [
+            ("requested", "received"),
+            ("requested", "requested"),
+            ("approved", "approved"),
+            ("approved", "rejected"),
+            ("rejected", "approved"),
+            ("rejected", "received"),
+            ("received", "approved"),
+            ("received", "received"),
+        ] {
+            assert!(!can_transition_return(from, to), "{from} -> {to}");
+        }
+
+        assert!(is_valid_return_status("requested"));
+        assert!(is_valid_return_status("received"));
+        assert!(!is_valid_return_status("refunded"));
+    }
+
+    #[test]
+    fn refund_is_goods_minus_discount_never_delivery() {
+        // No coupon: the whole goods subtotal comes back. The
+        // delivery charge is not an input at all — it can never
+        // leak into a refund.
+        assert_eq!(compute_refund_poisha(200_000, 0), 200_000);
+        // A store coupon's discount was never paid by the buyer,
+        // so it is not refunded either.
+        assert_eq!(compute_refund_poisha(245_000, 10_000), 235_000);
+        // A corrupt snapshot can never produce a negative refund.
+        assert_eq!(compute_refund_poisha(100, 500), 0);
+    }
+
+    #[test]
+    fn return_reason_validation() {
+        assert!(validate_return_reason("পণ্যটি ছিঁড়ে গেছে").is_ok());
+        assert!(validate_return_reason("  wrong size  ").is_ok());
+        assert!(validate_return_reason("").is_err());
+        assert!(validate_return_reason("   ").is_err());
+        let at_limit = "x".repeat(MAX_RETURN_REASON_CHARS);
+        assert!(validate_return_reason(&at_limit).is_ok());
+        let over_limit = "x".repeat(MAX_RETURN_REASON_CHARS + 1);
+        assert!(validate_return_reason(&over_limit).is_err());
+    }
+
+    #[test]
+    fn tracking_phone_matching_normalizes_both_sides() {
+        // Stored canonical form vs every accepted supplied form.
+        assert!(phones_match_for_tracking(
+            "+8801712345678",
+            "01712345678"
+        ));
+        assert!(phones_match_for_tracking(
+            "+8801712345678",
+            "8801712345678"
+        ));
+        assert!(phones_match_for_tracking(
+            "+8801712345678",
+            "+8801712345678"
+        ));
+        assert!(phones_match_for_tracking(
+            "01712345678",
+            "+880 1712 345678"
+        ));
+        // A different valid number does not match.
+        assert!(!phones_match_for_tracking(
+            "+8801712345678",
+            "01712345679"
+        ));
+        // Invalid supplied input is a plain non-match, never an
+        // error the endpoint could leak.
+        assert!(!phones_match_for_tracking("+8801712345678", "12345"));
+        assert!(!phones_match_for_tracking("+8801712345678", ""));
+        assert!(!phones_match_for_tracking("not-a-phone", "01712345678"));
     }
 }

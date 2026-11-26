@@ -103,6 +103,12 @@ pub struct SubOrder {
     /// The courier shipment booked for this sub-order (Wave 6), or
     /// `None` until the seller books one.
     pub shipment: Option<ShipmentSummary>,
+    /// The buyer's return request status for this sub-order
+    /// (Wave 16: `requested`, `approved`, `rejected` or
+    /// `received`), or `None` when no return was requested. The
+    /// refund details live on the return-request views; this is
+    /// the summary the order page renders.
+    pub return_status: Option<String>,
 }
 
 /// The buyer's unified order, with its per-seller sub-orders.
@@ -238,6 +244,12 @@ async fn load_order_items(pool: &PgPool, sub_order_id: Uuid) -> Result<Vec<Order
 async fn sub_order_from_row(pool: &PgPool, row: SubOrderRow) -> Result<SubOrder, ApiError> {
     let items = load_order_items(pool, row.id).await?;
     let shipment = load_shipment_summary_for_sub_order(pool, row.id).await?;
+    let return_status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM return_requests WHERE sub_order_id = $1")
+            .bind(row.id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| ApiError::internal("load return status", e))?;
     Ok(SubOrder {
         id: row.id,
         order_id: row.order_id,
@@ -252,6 +264,7 @@ async fn sub_order_from_row(pool: &PgPool, row: SubOrderRow) -> Result<SubOrder,
         created_at: row.created_at,
         items,
         shipment,
+        return_status,
     })
 }
 
@@ -779,8 +792,13 @@ pub async fn get_order_for_buyer(
 /// `products.stock` grows by the ordered quantity. Shared by the buyer
 /// whole-order cancel and the seller sub-order cancel — both run it
 /// inside their own transaction on the connection handed in here, so a
-/// cancel and its restock always commit or roll back together.
-async fn restock_sub_order_items(
+/// cancel and its restock always commit or roll back together. Wave 16
+/// adds two more callers on the same rule: a received buyer return
+/// (the `returns` module) and a courier-driven return (RTO) applied
+/// by the shipment refresh path — returned goods re-enter stock
+/// exactly once, inside whichever transaction moves the sub-order to
+/// `returned`.
+pub(crate) async fn restock_sub_order_items(
     conn: &mut sqlx::PgConnection,
     sub_order_id: Uuid,
 ) -> Result<(), ApiError> {

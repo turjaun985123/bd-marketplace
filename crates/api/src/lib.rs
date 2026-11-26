@@ -68,6 +68,17 @@
 //! preview shares the one rejection rule with checkout, and
 //! seller earnings now sum the payout snapshot so borne
 //! discounts are never paid out.
+//! Wave 16: public tracking and returns (`tracking` and
+//! `returns` modules) — a login-free tracking view gated on the
+//! order's delivery phone (every failure is the same 404), buyer
+//! return requests for delivered sub-orders with the seller's
+//! approve / reject / received flow (receipt snapshots the
+//! refund — goods minus discount, never delivery — restocks the
+//! items and opens the refund as pending), the admin refund
+//! queue (marking a refund done records an off-platform refund;
+//! no gateway refund API is wired), and the RTO fix: a
+//! courier-driven return applied by shipment refresh now
+//! restocks the sub-order's items in the same transaction.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -88,10 +99,12 @@ pub mod orders;
 pub mod payments;
 pub mod payouts;
 pub mod products;
+pub mod returns;
 pub mod reviews;
 pub mod search;
 pub mod shipments;
 pub mod stores;
+pub mod tracking;
 
 use axum::{
     http::StatusCode,
@@ -804,6 +817,46 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/v1/admin/coupons/:id",
             patch(coupons::set_admin_coupon_active_handler),
+        )
+        // Wave 16 — public tracking: NO auth by design; the
+        // order's delivery phone is the credential and every
+        // failure is the same 404 (see the tracking module).
+        .route("/v1/track", get(tracking::track_handler))
+        // Wave 16 — returns: buyer requests a return for a
+        // delivered sub-order and lists their own; the seller
+        // decides (approve / reject) and marks the goods
+        // received; admins work the refund queue.
+        .route(
+            "/v1/buyer/sub-orders/:id/return-request",
+            post(returns::create_return_request_handler),
+        )
+        .route(
+            "/v1/buyer/return-requests",
+            get(returns::list_buyer_return_requests_handler),
+        )
+        .route(
+            "/v1/seller/return-requests",
+            get(returns::list_seller_return_requests_handler),
+        )
+        .route(
+            "/v1/seller/return-requests/:id/approve",
+            post(returns::approve_return_handler),
+        )
+        .route(
+            "/v1/seller/return-requests/:id/reject",
+            post(returns::reject_return_handler),
+        )
+        .route(
+            "/v1/seller/return-requests/:id/received",
+            post(returns::received_return_handler),
+        )
+        .route(
+            "/v1/admin/return-requests",
+            get(returns::list_admin_return_requests_handler),
+        )
+        .route(
+            "/v1/admin/return-requests/:id/refund-done",
+            post(returns::refund_done_handler),
         )
         .layer(CorsLayer::permissive())
         .with_state(state)

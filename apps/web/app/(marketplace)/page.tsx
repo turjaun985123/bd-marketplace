@@ -21,6 +21,8 @@ export default function MarketplaceHomePage() {
         {" · "}
         <Link href="/orders">আমার অর্ডার — My orders</Link>
         {" · "}
+        <Link href="/track">অর্ডার ট্র্যাক — Track order</Link>
+        {" · "}
         <Link href="/messages">মেসেজ — Messages</Link>
         <AdminLink />
       </p>
