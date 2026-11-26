@@ -34,7 +34,11 @@ use crate::{ApiError, AppState};
 /// (`theme_key`, `brand_color`, `logo_url`, `banner_url`,
 /// `announcement`) are the storefront's look — validated values
 /// only, never seller-supplied markup (see
-/// [`update_store_branding_for_owner`]).
+/// [`update_store_branding_for_owner`]). `verified_tier`
+/// (Wave 21) is the store's KYC trust tier — `unverified`,
+/// `basic` or `verified` — earned through document review (see
+/// the `verification` module); it is display metadata here, and
+/// the payout gate reads it at payout creation time.
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct Store {
     pub id: Uuid,
@@ -51,6 +55,7 @@ pub struct Store {
     pub logo_url: Option<String>,
     pub banner_url: Option<String>,
     pub announcement: Option<String>,
+    pub verified_tier: String,
     pub created_at: DateTime<Utc>,
 }
 
@@ -58,20 +63,20 @@ const INSERT_STORE_SQL: &str = "INSERT INTO stores (owner_user_id, slug, name, d
     VALUES ($1, $2, $3, $4) \
     RETURNING id, owner_user_id, slug, name, description, status, \
     facebook_page_id, facebook_page_name, sidra_auto_reply, \
-    theme_key, brand_color, logo_url, banner_url, announcement, created_at";
+    theme_key, brand_color, logo_url, banner_url, announcement, verified_tier, created_at";
 const SELECT_STORE_BY_SLUG_SQL: &str =
     "SELECT id, owner_user_id, slug, name, description, status, \
      facebook_page_id, facebook_page_name, sidra_auto_reply, \
-     theme_key, brand_color, logo_url, banner_url, announcement, created_at \
+     theme_key, brand_color, logo_url, banner_url, announcement, verified_tier, created_at \
      FROM stores WHERE slug = $1";
 const SELECT_STORE_BY_ID_SQL: &str =
     "SELECT id, owner_user_id, slug, name, description, status, \
      facebook_page_id, facebook_page_name, sidra_auto_reply, \
-     theme_key, brand_color, logo_url, banner_url, announcement, created_at \
+     theme_key, brand_color, logo_url, banner_url, announcement, verified_tier, created_at \
      FROM stores WHERE id = $1";
 const SELECT_STORE_BY_OWNER_SQL: &str = "SELECT id, owner_user_id, slug, name, description, \
     status, facebook_page_id, facebook_page_name, sidra_auto_reply, \
-    theme_key, brand_color, logo_url, banner_url, announcement, created_at \
+    theme_key, brand_color, logo_url, banner_url, announcement, verified_tier, created_at \
     FROM stores WHERE owner_user_id = $1 ORDER BY created_at ASC LIMIT 1";
 
 /// Create a store for the authenticated user. Validates the slug with

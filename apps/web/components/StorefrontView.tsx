@@ -4,6 +4,7 @@ import { useEffect, useState, type CSSProperties } from "react";
 import MessageStoreButton from "./MessageStoreButton";
 import ProductGrid from "./ProductGrid";
 import SearchBar from "./SearchBar";
+import VerificationBadge from "./VerificationBadge";
 import { getStore, type Store } from "@/lib/api";
 
 /**
@@ -104,6 +105,7 @@ export default function StorefrontView({ slug }: { slug: string }) {
           />
         )}
         <h1>{store.name}</h1>
+        <VerificationBadge tier={store.verified_tier} />
       </div>
       {store.description && <p>{store.description}</p>}
       <p>

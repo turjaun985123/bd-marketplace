@@ -187,6 +187,8 @@ export default function SellerDashboardPage() {
         <Link href="/seller/returns">রিটার্ন — Returns</Link>
         {" · "}
         <Link href="/seller/branding">স্টোরের সাজসজ্জা — Branding</Link>
+        {" · "}
+        <Link href="/seller/verification">স্টোর যাচাইকরণ — Verification</Link>
       </p>
       {message && <p role="status">{message}</p>}
       {dashboard === null ? (

@@ -25,7 +25,10 @@
 //! constant. Wave 17 adds the COD advance pair under the same
 //! discipline: `advance_percent_bps` beats `ADVANCE_PERCENT_BPS`
 //! and `advance_threshold_poisha` beats
-//! `ADVANCE_THRESHOLD_POISHA`. The effective-value helpers below
+//! `ADVANCE_THRESHOLD_POISHA`. Wave 21 adds the KYC payout gate
+//! (`kyc_payout_gate`, stored as the text `on` / `off`): a flag
+//! with no startup fallback, on only when the stored value reads
+//! exactly `on`. The effective-value helpers below
 //! are the ONLY readers; checkout and payout creation call them,
 //! never the raw values, so the precedence (setting, then
 //! startup, then built-in default) lives in exactly one place. A
@@ -40,7 +43,7 @@ use chrono::{DateTime, Utc};
 use domain::{
     can_transition_payout, parse_setting_i64, validate_advance_bps, validate_advance_threshold,
     validate_commission_bps, ADVANCE_PERCENT_BPS_KEY, ADVANCE_THRESHOLD_KEY, COMMISSION_BPS_KEY,
-    MIN_PAYOUT_KEY, MIN_PAYOUT_POISHA,
+    KYC_PAYOUT_GATE_KEY, MIN_PAYOUT_KEY, MIN_PAYOUT_POISHA,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
@@ -158,6 +161,38 @@ pub async fn effective_min_payout(state: &AppState) -> i64 {
         }
     }
     MIN_PAYOUT_POISHA
+}
+
+/// Read one platform setting as raw text (trimmed). The text
+/// sibling of [`platform_setting_i64`], for the settings that
+/// are flags rather than numbers; a missing row or a database
+/// problem reads as "no override", exactly like the integer
+/// reader.
+pub async fn platform_setting_text(pool: &PgPool, key: &str) -> Option<String> {
+    let raw: Option<Option<String>> =
+        sqlx::query_scalar("SELECT value FROM platform_settings WHERE key = $1")
+            .bind(key)
+            .fetch_optional(pool)
+            .await
+            .ok();
+    raw.flatten().map(|value| value.trim().to_string())
+}
+
+/// Is the KYC payout gate on right now (Wave 21)? The stored
+/// `kyc_payout_gate` setting must read exactly `on`; anything
+/// else — `off`, a missing row, a garbled value — is OFF, so
+/// the gate can only ever be enabled deliberately, and payout
+/// creation (its one caller) falls back to the Wave 9
+/// behaviour whenever the setting is not positively on. There
+/// is no startup/env fallback for this one: the gate is a
+/// runtime platform decision, not a deployment parameter.
+pub async fn effective_kyc_payout_gate(state: &AppState) -> bool {
+    if let Some(pool) = &state.pool {
+        if let Some(value) = platform_setting_text(pool, KYC_PAYOUT_GATE_KEY).await {
+            return value == "on";
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -330,7 +365,7 @@ pub async fn set_store_status(
         "UPDATE stores SET status = $2 WHERE id = $1 \
          RETURNING id, owner_user_id, slug, name, description, status, \
          facebook_page_id, facebook_page_name, sidra_auto_reply, \
-         theme_key, brand_color, logo_url, banner_url, announcement, created_at",
+         theme_key, brand_color, logo_url, banner_url, announcement, verified_tier, created_at",
     )
     .bind(store_id)
     .bind(status)
@@ -612,6 +647,11 @@ pub struct AdminSettings {
     /// COD advance threshold in poisha (Wave 17); 0 disables
     /// threshold-based advances.
     pub advance_threshold_poisha: i64,
+    /// KYC payout gate (Wave 21): when true, a store must hold
+    /// at least the `basic` verification tier to request a
+    /// payout. Defaults to false — see
+    /// [`effective_kyc_payout_gate`].
+    pub kyc_payout_gate: bool,
     pub platform_name: &'static str,
 }
 
@@ -622,18 +662,26 @@ pub async fn get_settings(state: &AppState) -> AdminSettings {
         min_payout_poisha: effective_min_payout(state).await,
         advance_percent_bps: i64::from(effective_advance_bps(state).await),
         advance_threshold_poisha: effective_advance_threshold(state).await,
+        kyc_payout_gate: effective_kyc_payout_gate(state).await,
         platform_name: PLATFORM_NAME,
     }
 }
 
 /// Store one setting row (insert or overwrite).
 async fn save_setting(pool: &PgPool, key: &str, value: i64) -> Result<(), ApiError> {
+    save_setting_text(pool, key, &value.to_string()).await
+}
+
+/// Store one setting row as raw text (insert or overwrite) —
+/// the shared writer behind [`save_setting`] and the flag
+/// settings like the KYC payout gate.
+async fn save_setting_text(pool: &PgPool, key: &str, value: &str) -> Result<(), ApiError> {
     sqlx::query(
         "INSERT INTO platform_settings (key, value) VALUES ($1, $2) \
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
     )
     .bind(key)
-    .bind(value.to_string())
+    .bind(value)
     .execute(pool)
     .await
     .map_err(|e| ApiError::internal("save platform setting", e))?;
@@ -681,6 +729,10 @@ pub async fn update_settings(
             ));
         }
         save_setting(pool, ADVANCE_THRESHOLD_KEY, advance_threshold).await?;
+    }
+    if let Some(kyc_gate) = input.kyc_payout_gate {
+        save_setting_text(pool, KYC_PAYOUT_GATE_KEY, if kyc_gate { "on" } else { "off" })
+            .await?;
     }
     Ok(get_settings(state).await)
 }
@@ -740,6 +792,9 @@ pub struct UpdateSettingsInput {
     pub advance_percent_bps: Option<i64>,
     /// Wave 17: COD advance threshold override (poisha).
     pub advance_threshold_poisha: Option<i64>,
+    /// Wave 21: KYC payout gate — true stores `on`, false
+    /// stores `off` (see [`effective_kyc_payout_gate`]).
+    pub kyc_payout_gate: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------

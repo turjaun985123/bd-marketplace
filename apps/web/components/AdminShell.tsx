@@ -95,6 +95,8 @@ export default function AdminShell({
         {" · "}
         <Link href="/admin/returns">রিটার্ন ও রিফান্ড</Link>
         {" · "}
+        <Link href="/admin/verifications">যাচাইকরণ</Link>
+        {" · "}
         <Link href="/admin/users">ব্যবহারকারী</Link>
         {" · "}
         <Link href="/admin/settings">সেটিংস</Link>

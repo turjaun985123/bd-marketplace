@@ -137,6 +137,7 @@ pub mod search;
 pub mod shipments;
 pub mod stores;
 pub mod tracking;
+pub mod verification;
 
 use axum::{
     http::{HeaderValue, Method, StatusCode},
@@ -1078,6 +1079,33 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/v1/admin/return-requests/:id/refund-done",
             post(returns::refund_done_handler),
+        )
+        // Wave 21 — seller KYC: the seller submits and reads
+        // their own store's verification application; admins
+        // work the review queue, open the single full-NID view,
+        // and approve or reject. Every admin route is behind
+        // require_admin; the full view is the ONLY response in
+        // the API that carries a complete NID number.
+        .route(
+            "/v1/seller/store/verification",
+            put(verification::submit_seller_verification_handler)
+                .get(verification::get_seller_verification_handler),
+        )
+        .route(
+            "/v1/admin/verifications",
+            get(verification::list_admin_verifications_handler),
+        )
+        .route(
+            "/v1/admin/verifications/:store_id/full",
+            get(verification::get_admin_verification_full_handler),
+        )
+        .route(
+            "/v1/admin/verifications/:store_id/approve",
+            post(verification::approve_verification_handler),
+        )
+        .route(
+            "/v1/admin/verifications/:store_id/reject",
+            post(verification::reject_verification_handler),
         )
         .layer(cors)
         .with_state(state)

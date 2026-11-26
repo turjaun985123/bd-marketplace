@@ -1000,6 +1000,81 @@ be corrected but never cleared. Partial-item and split
 manual shipments do not exist: one sub-order, one parcel,
 one receipt.
 
+Wave 21 (seller KYC & verification tiers):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| PUT | `/v1/seller/store/verification` | Bearer, store owner. Submit (or resubmit) the verification application: `nid_number` (required), `trade_license_number` and `document_url` (optional). Always lands as `pending`; a still-pending application is REPLACED in place; an approved store gets a 409 |
+| GET | `/v1/seller/store/verification` | Bearer, store owner. The seller's own view: status (`none` until the first application), tier, masked NID, reviewer note, timestamps |
+| GET | `/v1/admin/verifications?status=pending` | Admin. The review queue (`status`: `pending` default, `approved`, `rejected`, `all`): store slug/name, owner phone MASKED, NID masked, `has_trade_license`, document URL, timestamps |
+| GET | `/v1/admin/verifications/{store_id}/full` | Admin. The full NID for one application — the single endpoint that ever returns it (see NID handling below) |
+| POST | `/v1/admin/verifications/{store_id}/approve` | Admin. Body `{tier: "basic" \| "verified"}`. Approves the pending application and sets the store's `verified_tier`; `verified` without a trade license on the application is a 400; no pending application is a 409 |
+| POST | `/v1/admin/verifications/{store_id}/reject` | Admin. Body `{note}` — required, 1–500 chars; the seller sees it. Sets the application rejected; the store tier does not move; no pending application is a 409 |
+
+**The tiers:** every store starts `unverified`. `basic`
+means the platform reviewed and approved the seller's NID —
+the storefront and product pages show a "যাচাইকৃত বিক্রেতা ✓"
+badge next to the store name. `verified` means NID plus a
+trade license were approved — the badge reads "যাচাইকৃত
+ব্যবসা ✓✓". An unverified store shows NO badge; the tier is
+granted by review, never chosen by the seller, and the
+public/seller `Store` views carry it as `verified_tier`
+(migration 0022 also adds the `store_verifications` table).
+
+**What each tier requires:** `basic` — a valid NID number
+(the domain validator accepts the three issued lengths: 10,
+13 or 17 digits). `verified` — the same NID plus a trade
+license number on the application; the approve endpoint
+enforces it, so a license-less application cannot be
+approved at `verified` even by mistake.
+
+**The review flow:** the seller submits from
+`/seller/verification` (NID, optional trade license,
+optional hotlinked document image). An admin works the
+queue at `/admin/verifications`: open the document, reveal
+the full NID only when needed to compare it against the
+document, then approve at a tier or reject with a note. A
+rejected seller sees the note on their verification page,
+fixes the problem, and resubmits — resubmission from
+`rejected` is a normal transition, and the old note is
+cleared. `approved` is terminal for applications: changing
+an approved store's tier is a fresh admin action, not a new
+application.
+
+**NID handling (the sensitive rule of this wave):** the full
+NID number is stored exactly once, in
+`store_verifications.nid_number`, and returned by exactly
+ONE endpoint — the admin full view above, which exists
+because a reviewer cannot check a number against a document
+image without seeing it. Every other surface carries only
+the masked form (`domain::mask_nid`: all but the last four
+digits starred; the stored `nid_last4` backs it): the
+seller's own view, the admin queue list, and logs. The
+public store view carries the tier and nothing about the
+NID at all.
+
+**The payout gate:** the `kyc_payout_gate` platform setting
+(admin settings, stored as `on` / `off`) controls whether
+payout creation demands verification. When ON,
+`POST /v1/seller/payouts` rejects an `unverified` store
+with a 400 that names verification (in Bangla and English)
+and points the seller at the verification page; `basic` and
+`verified` stores pass to the ordinary Wave 9 rules. When
+OFF — the default — payout behaviour is exactly Wave 9's:
+existing sellers are never surprised by a rule that did not
+exist when they joined, and the platform enables the gate
+when it is ready to enforce KYC for money movement.
+
+**Honest limits:** document review is MANUAL — a human
+compares the number against the document image; there is
+**no NID authenticity check against any government database,
+and none is claimed**. A plausible-looking number with the
+right length passes the format validator; only the human
+review stands behind the badge. `document_url` is a hotlink
+exactly like the Wave 18 branding images (no upload storage
+exists yet), and the tier is trust metadata — it does not
+change prices, commissions or search ranking.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -1869,6 +1944,38 @@ the honest limits). Docker is not installed on the
 development machine, so the image builds are verified by
 the CI `docker` job, not locally.
 
+**Real (Wave 21):** seller KYC & verification tiers —
+migration 0022 (`stores.verified_tier` plus the
+`store_verifications` application table); the domain rules
+(the tier list and ranking, the BD NID validator accepting
+the 10/13/17-digit issued lengths, NID masking, the
+optional trade-license validator, the application
+transition table — `none → pending`, `pending →
+approved/rejected`, `rejected → pending`, `approved`
+terminal — and the reviewer-note validator); the
+`verification` API module (seller submit/own-view, the
+admin review queue with masked phone and NID, the single
+admin full-NID view, approve/reject in one transaction
+with the tier landing on the store); the settings-gated
+KYC payout gate (`kyc_payout_gate`, default off — when on,
+an unverified store's payout request fails with a
+verification-specific 400 before the account and balance
+rules; when off, payout creation is exactly Wave 9's); an
+integration test (`crates/api/tests/wave21.rs`, same
+`DATABASE_URL` gate) covering the masked-everywhere rule
+(the full NID asserted ABSENT from the seller view and the
+admin queue JSON), the license requirement for the
+`verified` tier, both tier landings on the public store
+view, the reject → note → resubmit loop, the 409 on a
+non-pending decision, and the gate's on/off behaviour with
+its settings-row cleanup; the Next.js seller verification
+page, the admin verification queue (approve basic/verified
+with `verified` disabled without a trade license, reject
+with a required note, full-NID reveal behind an explicit
+button), the admin settings KYC gate toggle, and the
+storefront/product verification badges (an unverified
+store shows nothing).
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters, and the four manual couriers run
@@ -1901,19 +2008,20 @@ the external service at the other end of it, configured by
   /seller/inbox; Wave 14 adds /seller/coupons and /admin/coupons;
   Wave 15 adds /search; Wave 16 adds /track, /seller/returns and
   /admin/returns; Wave 18 adds /seller/branding; Wave 19 extends
-  /seller/orders and /track with the manual-courier workflow).
+  /seller/orders and /track with the manual-courier workflow;
+  Wave 21 adds /seller/verification and /admin/verifications).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
-  (domain 77, courier 31, payments 8 unit tests; the `DATABASE_URL`-
+  (domain 85, courier 31, payments 8 unit tests; the `DATABASE_URL`-
   gated integration tests skip cleanly without a database). The API
   binary was also smoke-tested locally without a database: routes
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
   (including the Wave 13 messaging endpoints), and the SIDRA
   callback answers 503 without a database.
-- **Rust integration + clippy: CI-only** — the Wave 2–20 integration
+- **Rust integration + clippy: CI-only** — the Wave 2–21 integration
   tests against a real Postgres 16 service and clippy `-D warnings`
   are verified via **GitHub Actions CI** (`.github/workflows/ci.yml`)
-  on push. Waves 1–19 are green there; Wave 20 awaits its first CI run.
+  on push. Waves 1–20 are green there; Wave 21 awaits its first CI run.
 - **Docker images: CI-only** — Docker is not installed on the
   development machine, so `Dockerfile.api`, `Dockerfile.worker`
   and `apps/web/Dockerfile` are verified by the CI `docker` job

@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import PriceTag from "@/components/PriceTag";
 import Stars from "@/components/Stars";
+import VerificationBadge from "@/components/VerificationBadge";
 import {
   createConversation,
   createReview,
@@ -59,10 +60,11 @@ export default function ProductDetailPage({
     ]);
     setProduct(p);
     setReviews(list.items);
-    if (token && user) {
-      const s = await getStore(p.store_slug).catch(() => null);
-      setStore(s);
-    }
+    // The store is public data: it carries the owner check AND
+    // the Wave 21 verification tier for the trust badge, which
+    // every visitor should see — not only signed-in users.
+    const s = await getStore(p.store_slug).catch(() => null);
+    setStore(s);
   }, [params.id, token, user]);
 
   useEffect(() => {
@@ -150,6 +152,12 @@ export default function ProductDetailPage({
         <Link href="/">← মার্কেটপ্লেস</Link>
         {" · "}
         <Link href={`/${product.store_slug}`}>স্টোর: {product.store_slug}</Link>
+        {store && (
+          <>
+            {" "}
+            <VerificationBadge tier={store.verified_tier} />
+          </>
+        )}
       </p>
       <h1>{product.title_bn ?? product.title}</h1>
       {product.title_bn && <p>{product.title}</p>}

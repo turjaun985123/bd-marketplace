@@ -29,6 +29,11 @@
 //!   rejection and payment are platform operations driven by the
 //!   admin endpoints (Wave 10, `admin` module) through the same
 //!   domain transition table (`can_transition_payout`).
+//! - KYC gate (Wave 21): when the `kyc_payout_gate` platform
+//!   setting is on, payout creation first demands a verified
+//!   store (at least the `basic` tier — see the `verification`
+//!   module). The gate defaults to off, and with it off every
+//!   rule above behaves exactly as it did in Wave 9.
 //!
 //! Scoping: every query starts from the authenticated user. The
 //! payout store is the seller's earliest-created store
@@ -323,6 +328,24 @@ pub async fn request_payout(
     amount_poisha: i64,
 ) -> Result<Payout, ApiError> {
     let store = seller_store(pool, user).await?;
+
+    // Wave 21 — the KYC payout gate: when the platform has
+    // turned the `kyc_payout_gate` setting on, an unverified
+    // store cannot move money out until its seller verifies
+    // (NID review, at least the `basic` tier). The gate is
+    // checked FIRST, before the account and balance rules, so
+    // an unverified seller always hears the one thing they must
+    // fix. With the gate off (the default) this block never
+    // fires and behaviour is exactly Wave 9's.
+    if crate::admin::effective_kyc_payout_gate(state).await
+        && store.verified_tier == "unverified"
+    {
+        return Err(ApiError::bad_request(
+            "payouts require a verified store: verify your store first \
+             (submit your NID for verification) — \
+             পে-আউট পেতে আগে স্টোর যাচাইকরণ সম্পন্ন করুন",
+        ));
+    }
 
     let account: Option<PayoutAccount> = sqlx::query_as(
         "SELECT id, store_id, method, account_name, account_number, created_at, updated_at \

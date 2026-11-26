@@ -19,8 +19,10 @@ import { useAuth } from "@/hooks/useAuth";
  * pair: the advance percent of the grand total, and the taka
  * threshold at/above which COD orders must collect it (0 turns
  * threshold-based advances off; risk-forced advances remain).
- * The form works in percent and taka for humans; the API speaks
- * bps and poisha.
+ * Wave 21 adds the KYC payout gate checkbox: while it is on, a
+ * store must hold at least the basic verification tier to
+ * request a payout. The form works in percent and taka for
+ * humans; the API speaks bps and poisha.
  */
 export default function AdminSettingsPage() {
   return (
@@ -37,6 +39,7 @@ function Settings() {
   const [minPayoutTaka, setMinPayoutTaka] = useState("");
   const [advancePct, setAdvancePct] = useState("");
   const [advanceThresholdTaka, setAdvanceThresholdTaka] = useState("");
+  const [kycGate, setKycGate] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -49,6 +52,7 @@ function Settings() {
       setMinPayoutTaka(String(current.min_payout_poisha / 100));
       setAdvancePct(String(current.advance_percent_bps / 100));
       setAdvanceThresholdTaka(String(current.advance_threshold_poisha / 100));
+      setKycGate(current.kyc_payout_gate);
     } catch (err) {
       setMessage(err instanceof Error ? err.message : "সেটিংস লোড করা যায়নি।");
     }
@@ -89,6 +93,7 @@ function Settings() {
         min_payout_poisha: minPoisha,
         advance_percent_bps: Math.round(advPct * 100),
         advance_threshold_poisha: thresholdPoisha,
+        kyc_payout_gate: kycGate,
       });
       setSettings(updated);
       setMessage("সেটিংস সংরক্ষিত হয়েছে।");
@@ -110,7 +115,8 @@ function Settings() {
           {settings.commission_bps / 100}% · বর্তমান সর্বনিম্ন পে-আউট:{" "}
           {formatBdt(settings.min_payout_poisha)} · বর্তমান অগ্রিম:{" "}
           {settings.advance_percent_bps / 100}% (থ্রেশহোল্ড:{" "}
-          {formatBdt(settings.advance_threshold_poisha)})
+          {formatBdt(settings.advance_threshold_poisha)}) · KYC পে-আউট
+          গেট: {settings.kyc_payout_gate ? "চালু" : "বন্ধ"}
         </p>
       )}
       <form onSubmit={onSave}>
@@ -145,6 +151,15 @@ function Settings() {
             onChange={(e) => setAdvanceThresholdTaka(e.target.value)}
             inputMode="decimal"
           />
+        </label>
+        <label>
+          <input
+            type="checkbox"
+            checked={kycGate}
+            onChange={(e) => setKycGate(e.target.checked)}
+          />{" "}
+          KYC পে-আউট গেট চালু — পে-আউট পেতে স্টোর যাচাইকরণ (কমপক্ষে
+          basic স্তর) আবশ্যক
         </label>
         <button type="submit" disabled={busy}>
           সংরক্ষণ করুন

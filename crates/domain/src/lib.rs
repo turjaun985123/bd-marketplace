@@ -2086,6 +2086,174 @@ fn validate_optional_text(
     Ok(Some(trimmed.to_string()))
 }
 
+// ---------------------------------------------------------------------------
+// Seller verification / KYC (Wave 21)
+// ---------------------------------------------------------------------------
+
+/// The verification tiers a store can hold, lowest first. A
+/// tier is TRUST metadata earned through document review (see
+/// the API's `verification` module), never a seller-chosen
+/// label: `unverified` is every new store, `basic` means the
+/// platform has seen and approved the seller's NID, and
+/// `verified` means NID plus a trade license were approved.
+/// The database CHECK (migration 0022) mirrors this list.
+pub const VERIFICATION_TIERS: [&str; 3] = ["unverified", "basic", "verified"];
+
+/// The tier every store starts with — also the database
+/// default (migration 0022).
+pub const DEFAULT_VERIFIED_TIER: &str = "unverified";
+
+/// Rank a verification tier for comparisons (higher is more
+/// trusted): `unverified` is 0, `basic` is 1, `verified` is 2.
+/// An unknown string ranks 0 — it claims no trust — so a
+/// corrupted value can never outrank a real tier.
+pub fn tier_rank(tier: &str) -> u8 {
+    match tier {
+        "basic" => 1,
+        "verified" => 2,
+        _ => 0,
+    }
+}
+
+/// Validate a verification tier: an exact match against
+/// [`VERIFICATION_TIERS`] (case-sensitive — tiers are machine
+/// values, not display text). Returns the tier itself on
+/// success so callers can store the validated value.
+pub fn validate_tier(tier: &str) -> Result<&str, &'static str> {
+    if VERIFICATION_TIERS.contains(&tier) {
+        Ok(tier)
+    } else {
+        Err("tier must be one of: unverified, basic, verified")
+    }
+}
+
+/// Validate a Bangladeshi national ID (NID) number. NIDs are
+/// issued in three lengths — 10, 13 and 17 digits — and sellers
+/// routinely type them with spaces between groups, so spaces
+/// are removed before the check; everything else must be an
+/// ASCII digit. Returns the bare digit string for storage.
+/// This checks the SHAPE only: no checksum exists for NIDs
+/// that a platform could verify offline, and authenticity is
+/// established by the human document review, never by this
+/// function (the README says so plainly).
+pub fn validate_nid_number(raw: &str) -> Result<String, &'static str> {
+    let digits: String = raw.trim().chars().filter(|c| *c != ' ').collect();
+    if !digits.chars().all(|c| c.is_ascii_digit()) {
+        return Err("NID number must contain digits only");
+    }
+    if !matches!(digits.len(), 10 | 13 | 17) {
+        return Err("NID number must be 10, 13 or 17 digits");
+    }
+    Ok(digits)
+}
+
+/// Mask an NID number for display: every digit but the last
+/// four becomes a `*`, the same convention the stored
+/// `nid_last4` column supports. Inputs of four digits or fewer
+/// are fully masked (there is nothing safe to show). The full
+/// number is an identity document identifier: it leaves the
+/// database through exactly one admin endpoint (see the API's
+/// `verification` module), and every other surface — seller
+/// views included — shows only this masked form.
+pub fn mask_nid(nid: &str) -> String {
+    let chars: Vec<char> = nid.chars().collect();
+    if chars.len() <= 4 {
+        return "*".repeat(chars.len());
+    }
+    let masked: String = chars[..chars.len() - 4].iter().map(|_| '*').collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{masked}{tail}")
+}
+
+/// Maximum length of a trade license number, in characters.
+pub const MAX_TRADE_LICENSE_CHARS: usize = 40;
+
+/// Minimum length of a trade license number, in characters.
+pub const MIN_TRADE_LICENSE_CHARS: usize = 4;
+
+/// Validate an optional trade license number. `None` and
+/// blank input normalize to `None` (a seller without a trade
+/// license can still reach the `basic` tier — the license is
+/// what the `verified` tier adds). A present value is trimmed
+/// and must be [`MIN_TRADE_LICENSE_CHARS`] to
+/// [`MAX_TRADE_LICENSE_CHARS`] characters: license numbers
+/// are issued by many local authorities in many formats, so
+/// shape beyond length is all that can honestly be checked.
+pub fn validate_trade_license(text: Option<&str>) -> Result<Option<String>, &'static str> {
+    let Some(raw) = text else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let len = trimmed.chars().count();
+    if !(MIN_TRADE_LICENSE_CHARS..=MAX_TRADE_LICENSE_CHARS).contains(&len) {
+        return Err("trade license number must be 4 to 40 characters");
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+/// Verification application statuses. `none` is virtual — it
+/// means the store has never applied (there is no row in
+/// `store_verifications`); the stored statuses are `pending`,
+/// `approved` and `rejected`.
+pub fn is_valid_verification_status(status: &str) -> bool {
+    matches!(status, "none" | "pending" | "approved" | "rejected")
+}
+
+/// May a verification application move from `from` to `to`?
+/// The single verification transition table (Wave 21): a store
+/// applies from `none` (first application) or from `rejected`
+/// (resubmission after fixing what the reviewer flagged); a
+/// `pending` application is decided to `approved` or
+/// `rejected` by an admin; `approved` is terminal — changing
+/// an approved store's tier is a fresh admin action, not an
+/// application move. Same-state moves are NOT transitions: a
+/// seller editing a still-`pending` application replaces it
+/// in place (see the API module), which this table neither
+/// needs nor allows.
+pub fn can_transition_verification(from: &str, to: &str) -> bool {
+    matches!(
+        (from, to),
+        ("none", "pending")
+            | ("rejected", "pending")
+            | ("pending", "approved")
+            | ("pending", "rejected")
+    )
+}
+
+/// Maximum length of an admin's verification review note, in
+/// characters.
+pub const MAX_REVIEWER_NOTE_CHARS: usize = 500;
+
+/// Validate an admin's rejection note for a verification
+/// application. The note is REQUIRED on rejection (a seller
+/// told only "no" cannot fix the application), so blank is an
+/// error here — unlike the optional text validators, this one
+/// takes a plain `&str` and always returns text. The value is
+/// trimmed and may be at most [`MAX_REVIEWER_NOTE_CHARS`]
+/// characters, counted in Unicode characters.
+pub fn validate_reviewer_note(raw: &str) -> Result<String, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("a rejection note is required");
+    }
+    if trimmed.chars().count() > MAX_REVIEWER_NOTE_CHARS {
+        return Err("reviewer note must be at most 500 characters");
+    }
+    Ok(trimmed.to_string())
+}
+
+/// The `platform_settings` key for the KYC payout gate
+/// (Wave 21). When the row holds `on`, a store must hold at
+/// least the `basic` verification tier before it can request
+/// a payout; `off` (or no row) keeps the Wave 9 behaviour.
+/// Stored as text (`on` / `off`) because the gate is a flag,
+/// not a number — the settings table already stores text for
+/// every key.
+pub const KYC_PAYOUT_GATE_KEY: &str = "kyc_payout_gate";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3714,5 +3882,133 @@ mod tests {
             validate_store_description(Some(&"ক".repeat(MAX_STORE_DESCRIPTION_CHARS + 1)))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn verification_tiers_are_exact_and_ranked() {
+        assert_eq!(VERIFICATION_TIERS, ["unverified", "basic", "verified"]);
+        assert_eq!(DEFAULT_VERIFIED_TIER, "unverified");
+        for tier in VERIFICATION_TIERS {
+            assert_eq!(validate_tier(tier), Ok(tier));
+        }
+        assert!(validate_tier("Basic").is_err());
+        assert!(validate_tier("premium").is_err());
+        assert!(validate_tier("").is_err());
+        assert_eq!(tier_rank("unverified"), 0);
+        assert_eq!(tier_rank("basic"), 1);
+        assert_eq!(tier_rank("verified"), 2);
+        // An unknown tier claims no trust at all.
+        assert_eq!(tier_rank("platinum"), 0);
+        assert!(tier_rank("verified") > tier_rank("basic"));
+        assert!(tier_rank("basic") > tier_rank("unverified"));
+    }
+
+    #[test]
+    fn nid_number_accepts_the_three_issued_lengths() {
+        // 10, 13 and 17 digits are the three issued NID lengths.
+        assert_eq!(
+            validate_nid_number("1234567890").unwrap(),
+            "1234567890"
+        );
+        assert_eq!(
+            validate_nid_number("1234567890123").unwrap(),
+            "1234567890123"
+        );
+        assert_eq!(
+            validate_nid_number("12345678901234567").unwrap(),
+            "12345678901234567"
+        );
+        // Surrounding whitespace is trimmed and the spaces
+        // sellers type between digit groups are removed.
+        assert_eq!(
+            validate_nid_number("  1234 5678 9012 3  ").unwrap(),
+            "1234567890123"
+        );
+    }
+
+    #[test]
+    fn nid_number_rejects_other_lengths_and_non_digits() {
+        assert!(validate_nid_number("123456789").is_err()); // 9 digits
+        assert!(validate_nid_number("12345678901").is_err()); // 11 digits
+        assert!(validate_nid_number("123456789012").is_err()); // 12 digits
+        assert!(validate_nid_number("12345678901234").is_err()); // 14 digits
+        assert!(validate_nid_number("123456789012345678").is_err()); // 18 digits
+        assert!(validate_nid_number("").is_err());
+        assert!(validate_nid_number("   ").is_err());
+        assert!(validate_nid_number("123456789A").is_err()); // letter
+        assert!(validate_nid_number("1234-5678-90").is_err()); // hyphens are not spaces
+        // Bengali digits are digits to a human, but the stored
+        // form is the ASCII digit string — reject, never guess.
+        assert!(validate_nid_number("১২৩৪৫৬৭৮৯০").is_err());
+    }
+
+    #[test]
+    fn mask_nid_keeps_only_the_last_four() {
+        assert_eq!(mask_nid("1234567890123"), "*********0123");
+        assert_eq!(mask_nid("1234567890"), "******7890");
+        assert_eq!(mask_nid("12345678901234567"), "*************4567");
+        // Four digits or fewer: nothing safe to show.
+        assert_eq!(mask_nid("1234"), "****");
+        assert_eq!(mask_nid("123"), "***");
+        assert_eq!(mask_nid(""), "");
+        assert_eq!(mask_nid("12345"), "*2345");
+    }
+
+    #[test]
+    fn trade_license_is_optional_and_length_bounded() {
+        assert_eq!(validate_trade_license(None).unwrap(), None);
+        assert_eq!(validate_trade_license(Some("")).unwrap(), None);
+        assert_eq!(validate_trade_license(Some("   ")).unwrap(), None);
+        assert_eq!(
+            validate_trade_license(Some("  TL-2024-9988  ")).unwrap(),
+            Some("TL-2024-9988".to_string())
+        );
+        // Bounds: 4 and 40 characters pass, 3 and 41 do not.
+        assert!(validate_trade_license(Some("ABCD")).is_ok());
+        assert!(validate_trade_license(Some("ABC")).is_err());
+        assert!(validate_trade_license(Some(&"L".repeat(MAX_TRADE_LICENSE_CHARS))).is_ok());
+        assert!(
+            validate_trade_license(Some(&"L".repeat(MAX_TRADE_LICENSE_CHARS + 1))).is_err()
+        );
+    }
+
+    #[test]
+    fn verification_transitions_follow_the_application_lifecycle() {
+        assert!(is_valid_verification_status("none"));
+        assert!(is_valid_verification_status("pending"));
+        assert!(is_valid_verification_status("approved"));
+        assert!(is_valid_verification_status("rejected"));
+        assert!(!is_valid_verification_status("verified"));
+
+        // Applying and resubmitting reach pending; a pending
+        // application can be decided either way.
+        assert!(can_transition_verification("none", "pending"));
+        assert!(can_transition_verification("rejected", "pending"));
+        assert!(can_transition_verification("pending", "approved"));
+        assert!(can_transition_verification("pending", "rejected"));
+        // Approved is terminal, decisions need a pending row, and
+        // same-state moves are not transitions (a pending edit
+        // replaces the application instead).
+        assert!(!can_transition_verification("approved", "pending"));
+        assert!(!can_transition_verification("approved", "rejected"));
+        assert!(!can_transition_verification("none", "approved"));
+        assert!(!can_transition_verification("none", "rejected"));
+        assert!(!can_transition_verification("rejected", "approved"));
+        assert!(!can_transition_verification("pending", "pending"));
+        assert!(!can_transition_verification("pending", "none"));
+    }
+
+    #[test]
+    fn reviewer_note_is_required_trimmed_and_capped() {
+        assert_eq!(validate_reviewer_note("  ঝাপসা ছবি  ").unwrap(), "ঝাপসা ছবি");
+        assert!(validate_reviewer_note("").is_err());
+        assert!(validate_reviewer_note("   ").is_err());
+        assert!(validate_reviewer_note(&"x".repeat(MAX_REVIEWER_NOTE_CHARS)).is_ok());
+        assert!(validate_reviewer_note(&"x".repeat(MAX_REVIEWER_NOTE_CHARS + 1)).is_err());
+    }
+
+    #[test]
+    fn kyc_payout_gate_key_is_stable() {
+        assert_eq!(KYC_PAYOUT_GATE_KEY, "kyc_payout_gate");
     }
 }

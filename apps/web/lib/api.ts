@@ -45,11 +45,20 @@ export interface Store {
   banner_url: string | null;
   /** One-line announcement shown atop the storefront, or null. */
   announcement: string | null;
+  /**
+   * KYC verification tier (Wave 21): unverified | basic |
+   * verified — granted by platform document review, never
+   * seller-chosen. Drives the storefront trust badge.
+   */
+  verified_tier: VerificationTier;
   created_at: string;
 }
 
 /** The three storefront layout variants (Wave 18). */
 export type StoreTheme = "classic" | "minimal" | "bold";
+
+/** Seller KYC tiers (Wave 21), lowest trust first. */
+export type VerificationTier = "unverified" | "basic" | "verified";
 
 export interface Product {
   id: string;
@@ -1243,6 +1252,11 @@ export interface AdminSettings {
   advance_percent_bps: number;
   /** COD advance threshold in poisha; 0 disables it (Wave 17). */
   advance_threshold_poisha: number;
+  /**
+   * KYC payout gate (Wave 21): when true, a store must hold at
+   * least the basic verification tier to request a payout.
+   */
+  kyc_payout_gate: boolean;
   platform_name: string;
 }
 
@@ -1495,9 +1509,142 @@ export function updateAdminSettings(
     min_payout_poisha?: number;
     advance_percent_bps?: number;
     advance_threshold_poisha?: number;
+    kyc_payout_gate?: boolean;
   }
 ): Promise<AdminSettings> {
   return call("/v1/admin/settings", { method: "PUT", token, body: patch });
+}
+
+// ---------------------------------------------------------------------------
+// Wave 21 — seller KYC & verification tiers
+// ---------------------------------------------------------------------------
+
+/**
+ * The seller's own verification state (GET /v1/seller/store/
+ * verification). `status` is none until the first application.
+ * The NID appears ONLY masked — the API never echoes a full
+ * NID back, not even to the seller who typed it.
+ */
+export interface SellerVerification {
+  /** none | pending | approved | rejected */
+  status: string;
+  tier: VerificationTier;
+  nid_masked: string | null;
+  trade_license_number: string | null;
+  document_url: string | null;
+  /** The reviewer's reason, when the application was rejected. */
+  reviewer_note: string | null;
+  submitted_at: string | null;
+  reviewed_at: string | null;
+}
+
+/** What a seller submits to apply for verification. */
+export interface SubmitVerificationInput {
+  nid_number: string;
+  trade_license_number?: string;
+  document_url?: string;
+}
+
+/**
+ * One row of the admin review queue (GET /v1/admin/
+ * verifications). Owner phone and NID are masked here too;
+ * the full NID lives behind the separate full-view call.
+ */
+export interface AdminVerification {
+  store_id: string;
+  store_slug: string;
+  store_name: string;
+  owner_phone_masked: string;
+  /** pending | approved | rejected */
+  status: string;
+  tier: VerificationTier;
+  nid_masked: string;
+  has_trade_license: boolean;
+  document_url: string | null;
+  reviewer_note: string | null;
+  submitted_at: string;
+  reviewed_at: string | null;
+}
+
+/**
+ * The admin full view (GET /v1/admin/verifications/{storeId}/
+ * full): the ONLY API response carrying a complete NID
+ * number, so a reviewer can check it against the document.
+ */
+export interface AdminVerificationFull {
+  store_id: string;
+  nid_number: string;
+}
+
+/** GET /v1/seller/store/verification — the caller's own KYC state. */
+export function getSellerVerification(
+  token: string
+): Promise<SellerVerification> {
+  return call("/v1/seller/store/verification", { token });
+}
+
+/**
+ * PUT /v1/seller/store/verification — submit (or resubmit) the
+ * caller's application. A still-pending application is
+ * replaced; an approved store gets a 409.
+ */
+export function submitSellerVerification(
+  token: string,
+  input: SubmitVerificationInput
+): Promise<SellerVerification> {
+  return call("/v1/seller/store/verification", {
+    method: "PUT",
+    token,
+    body: input,
+  });
+}
+
+/** GET /v1/admin/verifications — the review queue (default: pending). */
+export function listAdminVerifications(
+  token: string,
+  status?: string
+): Promise<AdminVerification[]> {
+  const qs = status ? `?status=${encodeURIComponent(status)}` : "";
+  return call(`/v1/admin/verifications${qs}`, { token });
+}
+
+/**
+ * GET /v1/admin/verifications/{storeId}/full — reveal the full
+ * NID for one application. Reviewer-only; call it only on an
+ * explicit reveal action, never while listing the queue.
+ */
+export function getAdminVerificationFull(
+  token: string,
+  storeId: string
+): Promise<AdminVerificationFull> {
+  return call(
+    `/v1/admin/verifications/${encodeURIComponent(storeId)}/full`,
+    { token }
+  );
+}
+
+/** POST /v1/admin/verifications/{storeId}/approve — grant a tier. */
+export function approveVerification(
+  token: string,
+  storeId: string,
+  tier: "basic" | "verified"
+): Promise<SellerVerification> {
+  return call(
+    `/v1/admin/verifications/${encodeURIComponent(storeId)}/approve`,
+    { method: "POST", token, body: { tier } }
+  );
+}
+
+/** POST /v1/admin/verifications/{storeId}/reject — reject with a note. */
+export function rejectVerification(
+  token: string,
+  storeId: string,
+  note: string
+): Promise<SellerVerification> {
+  return call(
+    `/v1/admin/verifications/${encodeURIComponent(storeId)}/reject`,
+    { method: "POST", token, body: { note } }
+  );
 }
 
 // ---------------------------------------------------------------------------
