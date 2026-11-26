@@ -4,7 +4,9 @@
 //! Wave 1: stateless domain endpoints (delivery charge, cart split,
 //! commission). Wave 2: Postgres persistence (SQLx), phone + OTP + JWT
 //! auth, stores and products. Wave 3: carts, split orders and COD
-//! checkout (`cart` and `orders` modules). Handlers only parse/validate,
+//! checkout (`cart` and `orders` modules). Wave 4: weight-based
+//! delivery, buyer order cancellation with restock, and receipts.
+//! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
 //! functions in the per-resource modules, never inside handlers.
@@ -283,6 +285,9 @@ pub fn build_app(state: AppState) -> Router {
             post(orders::create_order).get(orders::list_orders),
         )
         .route("/v1/orders/:id", get(orders::get_order))
+        // Wave 4 — buyer cancel (with restock) + receipt view.
+        .route("/v1/orders/:id/cancel", post(orders::cancel_order))
+        .route("/v1/orders/:id/receipt", get(orders::get_receipt))
         // Wave 3 — seller sub-orders.
         .route(
             "/v1/seller/sub-orders",

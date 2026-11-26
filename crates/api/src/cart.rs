@@ -28,6 +28,8 @@ pub struct CartItemView {
     pub unit_price_poisha: i64,
     pub quantity: i32,
     pub stock: i32,
+    /// Weight of one unit in grams (Wave 4 — checkout preview sums it).
+    pub weight_grams: i32,
 }
 
 impl CartItemView {
@@ -54,7 +56,8 @@ pub struct CartView {
 }
 
 const CART_ITEMS_SQL: &str = "SELECT ci.product_id, p.store_id, s.slug AS store_slug, \
-    p.title, p.title_bn, p.price_poisha AS unit_price_poisha, ci.quantity, p.stock \
+    p.title, p.title_bn, p.price_poisha AS unit_price_poisha, ci.quantity, p.stock, \
+    p.weight_grams \
     FROM cart_items ci \
     JOIN products p ON p.id = ci.product_id \
     JOIN stores s ON s.id = p.store_id \

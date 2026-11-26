@@ -12,6 +12,14 @@
 //!
 //! Wave 3 payment rule: COD only. Other methods are rejected with a
 //! clear 400 (online payments land in Wave 5).
+//!
+//! Wave 4: delivery charges are weight-based (each product carries
+//! `weight_grams`; a sub-order's parcel weight is the sum of unit
+//! weight times quantity, billed per started kilogram by the domain
+//! functions). Buyers can cancel an order while every sub-order is
+//! still `placed`, which restores stock for all items in the same
+//! transaction; a seller cancelling a sub-order likewise restores that
+//! sub-order's stock. A buyer receipt view is served per order.
 
 use axum::{
     extract::{Path, Query, State},
@@ -20,12 +28,13 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use domain::{
-    build_order_totals, can_transition_sub_order, is_valid_sub_order_status,
+    build_order_totals, can_buyer_cancel, can_transition_sub_order, is_valid_sub_order_status,
     normalize_bd_phone, parse_delivery_zone, split_cart_by_seller, CartItem as DomainCartItem,
     OrderGroupInput,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
@@ -279,12 +288,14 @@ struct LockedCartItem {
     stock: i32,
     status: String,
     quantity: i32,
+    weight_grams: i32,
 }
 
 /// Place an order for everything in the caller's cart. See the module
-/// docs for the transaction outline. Weight assumption (Wave 3): each
-/// item unit weighs 1 kg, so a sub-order group's billable weight is its
-/// total unit count — products carry no weight column yet.
+/// docs for the transaction outline. Delivery is weight-based (Wave
+/// 4): each locked product row carries its `weight_grams`, the domain
+/// cart items inherit it, and `build_order_totals` sums unit weight
+/// times quantity per seller group, billing per started kilogram.
 pub async fn place_order(
     pool: &PgPool,
     state: &AppState,
@@ -323,7 +334,8 @@ pub async fn place_order(
     // Lock the product rows so stock cannot change under this checkout.
     let locked: Vec<LockedCartItem> = sqlx::query_as(
         "SELECT ci.product_id, p.store_id, p.title, \
-         p.price_poisha AS unit_price_poisha, p.stock, p.status, ci.quantity \
+         p.price_poisha AS unit_price_poisha, p.stock, p.status, ci.quantity, \
+         p.weight_grams \
          FROM cart_items ci JOIN products p ON p.id = ci.product_id \
          WHERE ci.cart_id = $1 FOR UPDATE OF p",
     )
@@ -358,15 +370,17 @@ pub async fn place_order(
             store_id: item.store_id.to_string(),
             quantity: item.quantity as u32,
             unit_price_poisha: item.unit_price_poisha,
+            unit_weight_grams: i64::from(item.weight_grams),
         })
         .collect();
+    // The split items carry their real unit weights, so each group's
+    // parcel weight is derived inside `build_order_totals` from the
+    // items themselves — no weight is passed in separately.
     let groups: Vec<OrderGroupInput> = split_cart_by_seller(&domain_items)
         .iter()
         .map(|sub| OrderGroupInput {
             store_id: sub.store_id.clone(),
             items: sub.items.clone(),
-            // Wave 3 weight assumption: 1 kg per item unit.
-            weight_kg: sub.items.iter().map(|i| i.quantity).sum(),
         })
         .collect();
     let totals = build_order_totals(&groups, zone, state.commission_rate_bps);
@@ -514,6 +528,217 @@ pub async fn get_order_for_buyer(
 }
 
 // ---------------------------------------------------------------------------
+// Cancellation + restock (Wave 4)
+// ---------------------------------------------------------------------------
+
+/// Put one sub-order's items back into stock: for every order item,
+/// `products.stock` grows by the ordered quantity. Shared by the buyer
+/// whole-order cancel and the seller sub-order cancel — both run it
+/// inside their own transaction on the connection handed in here, so a
+/// cancel and its restock always commit or roll back together.
+async fn restock_sub_order_items(
+    conn: &mut sqlx::PgConnection,
+    sub_order_id: Uuid,
+) -> Result<(), ApiError> {
+    let items: Vec<(Uuid, i32)> =
+        sqlx::query_as("SELECT product_id, quantity FROM order_items WHERE sub_order_id = $1")
+            .bind(sub_order_id)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| ApiError::internal("load items for restock", e))?;
+    for (product_id, quantity) in items {
+        sqlx::query("UPDATE products SET stock = stock + $2, updated_at = now() WHERE id = $1")
+            .bind(product_id)
+            .bind(quantity)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| ApiError::internal("restock product", e))?;
+    }
+    Ok(())
+}
+
+/// Cancel the caller's own order. Allowed only while EVERY sub-order
+/// is still `placed` (the pure domain rule `can_buyer_cancel`); after
+/// any seller has confirmed, the buyer gets a 409. Runs in ONE
+/// transaction: lock the order and its sub-orders, flip the order and
+/// all sub-orders to `cancelled`, and restore stock for every item.
+pub async fn cancel_order_for_buyer(
+    pool: &PgPool,
+    user: &AuthUser,
+    order_id: Uuid,
+) -> Result<Order, ApiError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| ApiError::internal("begin cancel transaction", e))?;
+
+    let buyer_user_id: Uuid = sqlx::query_scalar(
+        "SELECT buyer_user_id FROM orders WHERE id = $1 FOR UPDATE",
+    )
+    .bind(order_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| ApiError::internal("lock order for cancel", e))?
+    .ok_or_else(|| ApiError::not_found("order not found"))?;
+    if buyer_user_id != user.user_id {
+        // Same rule as the detail endpoint: never leak another
+        // buyer's order through a distinguishable error.
+        return Err(ApiError::not_found("order not found"));
+    }
+
+    let sub_orders: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, status FROM sub_orders WHERE order_id = $1 FOR UPDATE",
+    )
+    .bind(order_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| ApiError::internal("lock sub-orders for cancel", e))?;
+
+    let statuses: Vec<&str> = sub_orders.iter().map(|(_, s)| s.as_str()).collect();
+    if !can_buyer_cancel(&statuses) {
+        return Err(ApiError::conflict(
+            "order can no longer be cancelled — a seller has already confirmed it",
+        ));
+    }
+
+    sqlx::query("UPDATE orders SET status = 'cancelled' WHERE id = $1")
+        .bind(order_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::internal("cancel order", e))?;
+    sqlx::query("UPDATE sub_orders SET status = 'cancelled' WHERE order_id = $1")
+        .bind(order_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::internal("cancel sub-orders", e))?;
+
+    for (sub_order_id, _) in &sub_orders {
+        restock_sub_order_items(&mut *tx, *sub_order_id).await?;
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::internal("commit cancel", e))?;
+
+    load_order(pool, order_id).await
+}
+
+// ---------------------------------------------------------------------------
+// Buyer receipt (Wave 4)
+// ---------------------------------------------------------------------------
+
+/// Platform name shown on receipts (placeholder until the product is
+/// named — see the MVP plan's owner decisions).
+pub const PLATFORM_NAME: &str = "BD Marketplace";
+
+/// Delivery details as printed on the receipt.
+#[derive(Debug, Serialize)]
+pub struct ReceiptDelivery {
+    pub name: String,
+    pub phone: String,
+    pub address: String,
+    pub zone: String,
+}
+
+/// One seller's slice of the receipt. Deliberately has NO commission
+/// or seller payout fields: those are platform/seller figures, not
+/// buyer information.
+#[derive(Debug, Serialize)]
+pub struct ReceiptSubOrder {
+    pub store_name: String,
+    pub store_slug: String,
+    pub status: String,
+    pub goods_subtotal_poisha: i64,
+    pub delivery_charge_poisha: i64,
+    pub items: Vec<OrderItem>,
+}
+
+/// The buyer receipt view-model: everything needed to render or print
+/// a receipt, and nothing the buyer should not see.
+#[derive(Debug, Serialize)]
+pub struct Receipt {
+    pub platform_name: &'static str,
+    pub order_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub status: String,
+    pub payment_method: String,
+    /// Amount the buyer hands over on delivery: the grand total for
+    /// COD orders, zero for anything already paid (no such method yet).
+    pub cod_amount_due_poisha: i64,
+    pub delivery: ReceiptDelivery,
+    pub sub_orders: Vec<ReceiptSubOrder>,
+    pub goods_total_poisha: i64,
+    pub delivery_total_poisha: i64,
+    pub grand_total_poisha: i64,
+}
+
+/// Build the receipt view-model from a loaded order plus a
+/// store-id → store-name lookup (receipts show the store's display
+/// name; the order itself only carries slugs). Pure assembly — the
+/// single builder every receipt response goes through.
+pub fn build_receipt(order: &Order, store_names: &HashMap<Uuid, String>) -> Receipt {
+    let sub_orders = order
+        .sub_orders
+        .iter()
+        .map(|sub| ReceiptSubOrder {
+            store_name: store_names
+                .get(&sub.store_id)
+                .cloned()
+                .unwrap_or_else(|| sub.store_slug.clone()),
+            store_slug: sub.store_slug.clone(),
+            status: sub.status.clone(),
+            goods_subtotal_poisha: sub.goods_subtotal_poisha,
+            delivery_charge_poisha: sub.delivery_charge_poisha,
+            items: sub.items.clone(),
+        })
+        .collect();
+    Receipt {
+        platform_name: PLATFORM_NAME,
+        order_id: order.id,
+        created_at: order.created_at,
+        status: order.status.clone(),
+        payment_method: order.payment_method.clone(),
+        cod_amount_due_poisha: if order.payment_method == "cod" {
+            order.grand_total_poisha
+        } else {
+            0
+        },
+        delivery: ReceiptDelivery {
+            name: order.delivery_name.clone(),
+            phone: order.delivery_phone.clone(),
+            address: order.delivery_address.clone(),
+            zone: order.delivery_zone.clone(),
+        },
+        sub_orders,
+        goods_total_poisha: order.goods_total_poisha,
+        delivery_total_poisha: order.delivery_total_poisha,
+        grand_total_poisha: order.grand_total_poisha,
+    }
+}
+
+/// The caller's own receipt: ownership via the shared buyer-order
+/// loader rule (another buyer's order is a 404), store display names
+/// resolved with one extra lookup, then the shared receipt builder.
+pub async fn get_receipt_for_buyer(
+    pool: &PgPool,
+    user: &AuthUser,
+    order_id: Uuid,
+) -> Result<Receipt, ApiError> {
+    let order = get_order_for_buyer(pool, user, order_id).await?;
+
+    let store_ids: Vec<Uuid> = order.sub_orders.iter().map(|sub| sub.store_id).collect();
+    let name_rows: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT id, name FROM stores WHERE id = ANY($1)")
+            .bind(&store_ids)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| ApiError::internal("load store names for receipt", e))?;
+    let store_names: HashMap<Uuid, String> = name_rows.into_iter().collect();
+
+    Ok(build_receipt(&order, &store_names))
+}
+
+// ---------------------------------------------------------------------------
 // Seller sub-orders
 // ---------------------------------------------------------------------------
 
@@ -604,6 +829,10 @@ pub async fn list_seller_sub_orders(
 /// Move one of the caller's sub-orders to a new fulfilment status.
 /// Ownership first (404 unknown id, 403 someone else's store), then the
 /// pure domain transition table decides legality (400 on illegal moves).
+/// The whole update runs in ONE transaction; when the move is a seller
+/// cancellation, the sub-order's items are restocked in the same
+/// transaction (the shared restock helper the buyer cancel also uses),
+/// so a cancelled parcel's stock can never be lost.
 pub async fn update_sub_order_status(
     pool: &PgPool,
     user: &AuthUser,
@@ -616,12 +845,17 @@ pub async fn update_sub_order_status(
         )));
     }
 
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| ApiError::internal("begin status transaction", e))?;
+
     let current: Option<(String, Uuid)> = sqlx::query_as(
         "SELECT so.status, s.owner_user_id FROM sub_orders so \
-         JOIN stores s ON s.id = so.store_id WHERE so.id = $1",
+         JOIN stores s ON s.id = so.store_id WHERE so.id = $1 FOR UPDATE OF so",
     )
     .bind(sub_order_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| ApiError::internal("load sub-order for status update", e))?;
     let (current_status, owner_user_id) =
@@ -635,12 +869,20 @@ pub async fn update_sub_order_status(
         )));
     }
 
+    if new_status == "cancelled" && current_status != "cancelled" {
+        restock_sub_order_items(&mut *tx, sub_order_id).await?;
+    }
+
     sqlx::query("UPDATE sub_orders SET status = $2 WHERE id = $1")
         .bind(sub_order_id)
         .bind(new_status)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| ApiError::internal("update sub-order status", e))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::internal("commit status update", e))?;
 
     load_sub_order(pool, sub_order_id).await
 }
@@ -688,6 +930,24 @@ pub async fn get_order(
 ) -> Result<Json<Order>, ApiError> {
     let pool = state.require_pool()?;
     Ok(Json(get_order_for_buyer(pool, &user, id).await?))
+}
+
+pub async fn cancel_order(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Order>, ApiError> {
+    let pool = state.require_pool()?;
+    Ok(Json(cancel_order_for_buyer(pool, &user, id).await?))
+}
+
+pub async fn get_receipt(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Receipt>, ApiError> {
+    let pool = state.require_pool()?;
+    Ok(Json(get_receipt_for_buyer(pool, &user, id).await?))
 }
 
 pub async fn list_seller_sub_orders_handler(

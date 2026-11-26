@@ -32,6 +32,7 @@ export default function SellerProductsPage() {
   const [priceTaka, setPriceTaka] = useState("");
   const [stock, setStock] = useState("0");
   const [status, setStatus] = useState("draft");
+  const [weightGrams, setWeightGrams] = useState("1000");
 
   const loadStore = useCallback(
     async (storeSlug: string) => {
@@ -68,12 +69,14 @@ export default function SellerProductsPage() {
         price_poisha: Math.round(Number(priceTaka) * 100),
         stock: Number(stock),
         status,
+        weight_grams: Number(weightGrams),
       });
       setProducts((prev) => [created, ...prev]);
       setTitle("");
       setTitleBn("");
       setPriceTaka("");
       setStock("0");
+      setWeightGrams("1000");
       setMessage("পণ্য যোগ হয়েছে। (Product created.)");
     } catch (err) {
       setMessage(
@@ -134,7 +137,7 @@ export default function SellerProductsPage() {
             products.map((p) => (
               <ProductCard
                 key={p.id}
-                name={`${p.title_bn ?? p.title} (${p.status})`}
+                name={`${p.title_bn ?? p.title} (${p.status}, ${p.weight_grams} গ্রাম)`}
                 storeName={p.store_slug}
                 pricePoisha={p.price_poisha}
               />
@@ -170,6 +173,17 @@ export default function SellerProductsPage() {
                 value={stock}
                 onChange={(e) => setStock(e.target.value)}
                 inputMode="numeric"
+                required
+              />
+            </label>
+            <label>
+              ওজন (গ্রাম) — ডেলিভারি চার্জ এই ওজন দিয়ে হিসাব হয়
+              <input
+                value={weightGrams}
+                onChange={(e) => setWeightGrams(e.target.value)}
+                inputMode="numeric"
+                min={1}
+                max={50000}
                 required
               />
             </label>

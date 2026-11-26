@@ -37,13 +37,15 @@ pub struct Product {
     pub compare_at_poisha: Option<i64>,
     pub stock: i32,
     pub status: String,
+    /// Weight of one unit in grams (Wave 4 — drives delivery charges).
+    pub weight_grams: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 const PRODUCT_COLUMNS: &str = "p.id, p.store_id, s.slug AS store_slug, p.title, p.title_bn, \
     p.description, p.price_poisha, p.compare_at_poisha, p.stock, p.status, \
-    p.created_at, p.updated_at";
+    p.weight_grams, p.created_at, p.updated_at";
 
 /// Visibility + search predicate shared by the listing SELECT and COUNT
 /// queries (static fragments only — all values stay bound parameters).
@@ -157,6 +159,7 @@ pub async fn create_product_for_owner(
         price_poisha: input.price_poisha,
         stock: input.stock,
         status: input.status.clone(),
+        weight_grams: input.weight_grams,
     };
     validate_product_input(&validated).map_err(ApiError::bad_request)?;
     if let Some(compare_at) = input.compare_at_poisha {
@@ -165,10 +168,14 @@ pub async fn create_product_for_owner(
         }
     }
 
+    // The domain validator has already proven 1..=50,000, so this fits.
+    let weight_grams = i32::try_from(validated.weight_grams)
+        .map_err(|_| ApiError::bad_request("weight_grams out of range"))?;
+
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO products (store_id, title, title_bn, description, \
-         price_poisha, compare_at_poisha, stock, status) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+         price_poisha, compare_at_poisha, stock, status, weight_grams) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
     )
     .bind(input.store_id)
     .bind(input.title.trim())
@@ -178,6 +185,7 @@ pub async fn create_product_for_owner(
     .bind(input.compare_at_poisha)
     .bind(input.stock)
     .bind(&input.status)
+    .bind(weight_grams)
     .fetch_one(pool)
     .await
     .map_err(|e| ApiError::internal("create product", e))?;
@@ -201,8 +209,14 @@ pub async fn update_product_for_owner(
         price_poisha: patch.price_poisha.unwrap_or(existing.price_poisha),
         stock: patch.stock.unwrap_or(existing.stock),
         status: patch.status.clone().unwrap_or(existing.status.clone()),
+        weight_grams: patch
+            .weight_grams
+            .unwrap_or(i64::from(existing.weight_grams)),
     };
     validate_product_input(&merged).map_err(ApiError::bad_request)?;
+    // The domain validator has already proven 1..=50,000, so this fits.
+    let merged_weight_grams = i32::try_from(merged.weight_grams)
+        .map_err(|_| ApiError::bad_request("weight_grams out of range"))?;
     if let Some(compare_at) = patch.compare_at_poisha {
         if compare_at < 0 {
             return Err(ApiError::bad_request("compare_at_poisha must be >= 0"));
@@ -212,7 +226,7 @@ pub async fn update_product_for_owner(
     sqlx::query(
         "UPDATE products SET title = $2, title_bn = $3, description = $4, \
          price_poisha = $5, compare_at_poisha = $6, stock = $7, status = $8, \
-         updated_at = now() WHERE id = $1",
+         weight_grams = $9, updated_at = now() WHERE id = $1",
     )
     .bind(id)
     .bind(merged.title.trim())
@@ -222,6 +236,7 @@ pub async fn update_product_for_owner(
     .bind(patch.compare_at_poisha.or(existing.compare_at_poisha))
     .bind(merged.stock)
     .bind(&merged.status)
+    .bind(merged_weight_grams)
     .execute(pool)
     .await
     .map_err(|e| ApiError::internal("update product", e))?;
@@ -245,10 +260,17 @@ pub struct CreateProductInput {
     pub stock: i32,
     #[serde(default = "default_status")]
     pub status: String,
+    /// Weight of one unit in grams; 1,000 when the payload omits it.
+    #[serde(default = "default_weight_grams")]
+    pub weight_grams: i64,
 }
 
 fn default_status() -> String {
     "draft".to_string()
+}
+
+fn default_weight_grams() -> i64 {
+    domain::DEFAULT_WEIGHT_GRAMS
 }
 
 #[derive(Deserialize)]
@@ -260,6 +282,7 @@ pub struct UpdateProductInput {
     pub compare_at_poisha: Option<i64>,
     pub stock: Option<i32>,
     pub status: Option<String>,
+    pub weight_grams: Option<i64>,
 }
 
 #[derive(Deserialize)]

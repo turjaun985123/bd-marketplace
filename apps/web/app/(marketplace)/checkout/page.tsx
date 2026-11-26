@@ -22,31 +22,46 @@ interface SellerGroup {
   storeSlug: string;
   items: CartItem[];
   goodsPoisha: number;
-  /** Total units — Wave 3 bills 1 kg per unit, same as the server. */
+  /**
+   * Billable weight in whole kg: the group's total grams (unit weight
+   * x quantity, Wave 4) rounded UP per started kilogram — the same
+   * rule the server applies in build_order_totals.
+   */
   weightKg: number;
 }
 
 function groupByStore(items: CartItem[]): SellerGroup[] {
-  const groups = new Map<string, SellerGroup>();
+  const groups = new Map<string, SellerGroup & { totalGrams: number }>();
   for (const item of items) {
     let group = groups.get(item.store_slug);
     if (!group) {
-      group = { storeSlug: item.store_slug, items: [], goodsPoisha: 0, weightKg: 0 };
+      group = {
+        storeSlug: item.store_slug,
+        items: [],
+        goodsPoisha: 0,
+        weightKg: 0,
+        totalGrams: 0,
+      };
       groups.set(item.store_slug, group);
     }
     group.items.push(item);
     group.goodsPoisha += item.line_total_poisha;
-    group.weightKg += item.quantity;
+    group.totalGrams += item.weight_grams * item.quantity;
   }
-  return Array.from(groups.values());
+  return Array.from(groups.values()).map(
+    ({ totalGrams, ...group }): SellerGroup => ({
+      ...group,
+      weightKg: Math.max(1, Math.ceil(totalGrams / 1000)),
+    })
+  );
 }
 
 /**
- * Checkout (Wave 3, COD only). The per-seller delivery preview is
- * display-only, quoted through the shared useDeliveryCharge hook (one
- * quote per seller group, 1 kg per unit — the server's Wave 3 rule).
- * The server's totals in the place-order response are the final truth
- * and are what the success screen shows.
+ * Checkout (COD only). The per-seller delivery preview is display-only,
+ * quoted through the shared useDeliveryCharge hook (one quote per
+ * seller group, billed on the group's real weight in grams — the
+ * server's Wave 4 rule). The server's totals in the place-order
+ * response are the final truth and are what the success screen shows.
  */
 export default function CheckoutPage() {
   const { ready, token } = useAuth();
@@ -168,6 +183,8 @@ export default function CheckoutPage() {
         ))}
         <p>
           <Link href="/orders">আমার অর্ডার দেখুন — My orders</Link>
+          {" · "}
+          <Link href={`/orders/${placed.id}`}>রসিদ দেখুন — View receipt</Link>
         </p>
       </main>
     );

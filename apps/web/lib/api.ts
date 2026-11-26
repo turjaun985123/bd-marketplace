@@ -33,6 +33,8 @@ export interface Product {
   compare_at_poisha: number | null;
   stock: number;
   status: string;
+  /** Weight of one unit in grams (Wave 4 — drives delivery charges). */
+  weight_grams: number;
   created_at: string;
   updated_at: string;
 }
@@ -64,6 +66,8 @@ export interface CreateProductInput {
   compare_at_poisha?: number;
   stock: number;
   status: string;
+  /** Grams per unit; the API defaults to 1000 when omitted. */
+  weight_grams?: number;
 }
 
 /** One cart line (flattened API shape: row fields + line_total_poisha). */
@@ -76,6 +80,8 @@ export interface CartItem {
   unit_price_poisha: number;
   quantity: number;
   stock: number;
+  /** Weight of one unit in grams (Wave 4). */
+  weight_grams: number;
   line_total_poisha: number;
 }
 
@@ -314,6 +320,53 @@ export function listSellerSubOrders(
   if (params?.limit) search.set("limit", String(params.limit));
   const qs = search.toString();
   return call(`/v1/seller/sub-orders${qs ? `?${qs}` : ""}`, { token });
+}
+
+/** One seller's slice of a receipt — no commission/payout (buyer view). */
+export interface ReceiptSubOrder {
+  store_name: string;
+  store_slug: string;
+  status: string;
+  goods_subtotal_poisha: number;
+  delivery_charge_poisha: number;
+  items: OrderItem[];
+}
+
+/** GET /v1/orders/{id}/receipt — the buyer receipt view-model. */
+export interface Receipt {
+  platform_name: string;
+  order_id: string;
+  created_at: string;
+  status: string;
+  payment_method: string;
+  /** Grand total for COD orders; 0 when nothing is due on delivery. */
+  cod_amount_due_poisha: number;
+  delivery: {
+    name: string;
+    phone: string;
+    address: string;
+    zone: string;
+  };
+  sub_orders: ReceiptSubOrder[];
+  goods_total_poisha: number;
+  delivery_total_poisha: number;
+  grand_total_poisha: number;
+}
+
+/**
+ * POST /v1/orders/{id}/cancel — buyer cancels while every sub-order is
+ * still placed; the API restores stock. Rejects with 409 afterwards.
+ */
+export function cancelOrder(token: string, id: string): Promise<Order> {
+  return call(`/v1/orders/${encodeURIComponent(id)}/cancel`, {
+    method: "POST",
+    token,
+  });
+}
+
+/** GET /v1/orders/{id}/receipt — receipt view-model for one own order. */
+export function getOrderReceipt(token: string, id: string): Promise<Receipt> {
+  return call(`/v1/orders/${encodeURIComponent(id)}/receipt`, { token });
 }
 
 /** PATCH /v1/seller/sub-orders/{id}/status — move a sub-order's status. */

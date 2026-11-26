@@ -2,8 +2,10 @@
 //!
 //! Money choice: all money is integer **poisha** (`i64`), the minor unit of
 //! BDT (1 BDT = 100 poisha). No floats are ever used for money, so pricing,
-//! commission and payout arithmetic is exact. `weight_kg` is a whole-kilogram
-//! `u32` (couriers bill per started kilogram; callers round up before calling).
+//! commission and payout arithmetic is exact. Product weights are stored in
+//! grams (`weight_grams`); delivery billing converts a parcel's total grams
+//! to whole kilograms with [`weight_kg_from_grams`] because couriers bill
+//! per started kilogram.
 //!
 //! Governing principle — Atomic, Individually Callable Functions: every
 //! capability here is a single-responsibility public function with typed
@@ -30,6 +32,16 @@ pub struct CartItem {
     pub quantity: u32,
     /// Unit price in poisha.
     pub unit_price_poisha: i64,
+    /// Weight of ONE unit in grams (the product's `weight_grams`).
+    /// Defaults to [`DEFAULT_WEIGHT_GRAMS`] when a payload omits it, so
+    /// older clients keep working; checkout copies the real product
+    /// weight here and order totals sum it per seller group.
+    #[serde(default = "default_unit_weight_grams")]
+    pub unit_weight_grams: i64,
+}
+
+fn default_unit_weight_grams() -> i64 {
+    DEFAULT_WEIGHT_GRAMS
 }
 
 impl CartItem {
@@ -177,14 +189,46 @@ pub fn validate_cart_quantity(quantity: i64) -> Result<u32, String> {
     }
 }
 
+/// Smallest accepted product weight in grams.
+pub const MIN_WEIGHT_GRAMS: i64 = 1;
+/// Largest accepted product weight in grams (50 kg per single product).
+pub const MAX_WEIGHT_GRAMS: i64 = 50_000;
+/// Weight assumed for a product that does not specify one (1 kg).
+pub const DEFAULT_WEIGHT_GRAMS: i64 = 1_000;
+
+/// Validate a product weight in grams: 1..=50,000. Takes and returns
+/// `i64` so raw JSON numbers can be handed over unchecked, mirroring
+/// [`validate_cart_quantity`].
+pub fn validate_weight_grams(weight_grams: i64) -> Result<i64, String> {
+    if (MIN_WEIGHT_GRAMS..=MAX_WEIGHT_GRAMS).contains(&weight_grams) {
+        Ok(weight_grams)
+    } else {
+        Err(format!(
+            "weight_grams must be between {MIN_WEIGHT_GRAMS} and {MAX_WEIGHT_GRAMS}"
+        ))
+    }
+}
+
+/// Convert a total weight in grams to kilograms (exact, fractional).
+/// Non-positive totals convert to 0.0. Callers that bill per started
+/// kilogram round the result up — [`build_order_totals`] does exactly
+/// that before calling [`calculate_delivery_charge`].
+pub fn weight_kg_from_grams(total_grams: i64) -> f64 {
+    if total_grams <= 0 {
+        0.0
+    } else {
+        total_grams as f64 / 1_000.0
+    }
+}
+
 /// One seller's group of cart items, ready for order-total computation.
-/// `weight_kg` is the group's total billable weight (callers decide how
-/// weight is derived — Wave 3 uses 1 kg per item unit).
+/// The group's parcel weight is derived from its items: each item
+/// carries its product's `unit_weight_grams`, and the group total is
+/// the sum of unit weight times quantity (see [`build_order_totals`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderGroupInput {
     pub store_id: String,
     pub items: Vec<CartItem>,
-    pub weight_kg: u32,
 }
 
 /// Money breakdown for one seller's sub-order, all in poisha.
@@ -216,6 +260,11 @@ pub struct OrderTotals {
 /// does not price on it, so the charge is exact) and commission/payout
 /// from [`compute_commission`]
 /// applied to the goods subtotal only.
+///
+/// Each group's parcel weight is the sum of its items' unit weights
+/// times quantities, converted with [`weight_kg_from_grams`] and
+/// rounded UP to the next whole kilogram (couriers bill per started
+/// kilogram), so a 3.5 kg group is billed as 4 kg.
 pub fn build_order_totals(
     groups: &[OrderGroupInput],
     zone: DeliveryZone,
@@ -228,9 +277,15 @@ pub fn build_order_totals(
     for group in groups {
         let goods_subtotal_poisha: i64 =
             group.items.iter().map(CartItem::line_total_poisha).sum();
+        let total_weight_grams: i64 = group
+            .items
+            .iter()
+            .map(|item| item.unit_weight_grams * i64::from(item.quantity))
+            .sum();
+        let billable_weight_kg = weight_kg_from_grams(total_weight_grams).ceil() as u32;
         let delivery_charge_poisha = calculate_delivery_charge(
             zone,
-            group.weight_kg,
+            billable_weight_kg,
             goods_subtotal_poisha,
         );
         let quote = compute_commission(goods_subtotal_poisha, commission_rate_bps);
@@ -276,6 +331,15 @@ pub fn can_transition_sub_order(from: &str, to: &str) -> bool {
             | ("confirmed", "cancelled")
             | ("shipped", "returned")
     )
+}
+
+/// May the BUYER cancel a whole order? Only while every sub-order is
+/// still `placed` — once any seller has confirmed (or beyond), the
+/// parcels are in motion and the buyer can no longer cancel. An order
+/// with no sub-orders is not cancellable. This is the order-level rule;
+/// the per-sub-order seller moves live in [`can_transition_sub_order`].
+pub fn can_buyer_cancel(sub_statuses: &[&str]) -> bool {
+    !sub_statuses.is_empty() && sub_statuses.iter().all(|status| *status == "placed")
 }
 
 /// Validate a Bangladeshi mobile number in local form: exactly 11 ASCII
@@ -351,6 +415,8 @@ pub struct ProductInput {
     pub price_poisha: i64,
     pub stock: i32,
     pub status: String,
+    /// Weight of one unit in grams (see [`validate_weight_grams`]).
+    pub weight_grams: i64,
 }
 
 /// Validate product input. Pure and shared by the create and update
@@ -369,6 +435,7 @@ pub fn validate_product_input(input: &ProductInput) -> Result<(), String> {
     if !is_valid_product_status(&input.status) {
         return Err("status must be one of: draft, active, archived".to_string());
     }
+    validate_weight_grams(input.weight_grams)?;
     Ok(())
 }
 
@@ -377,11 +444,22 @@ mod tests {
     use super::*;
 
     fn item(store: &str, product: &str, qty: u32, price_bdt: i64) -> CartItem {
+        witem(store, product, qty, price_bdt, DEFAULT_WEIGHT_GRAMS)
+    }
+
+    fn witem(
+        store: &str,
+        product: &str,
+        qty: u32,
+        price_bdt: i64,
+        unit_weight_grams: i64,
+    ) -> CartItem {
         CartItem {
             product_id: product.to_string(),
             store_id: store.to_string(),
             quantity: qty,
             unit_price_poisha: price_bdt * 100,
+            unit_weight_grams,
         }
     }
 
@@ -518,6 +596,7 @@ mod tests {
             price_poisha: 150_000,
             stock: 10,
             status: "active".to_string(),
+            weight_grams: 1_000,
         };
         assert!(validate_product_input(&ok).is_ok());
 
@@ -533,9 +612,81 @@ mod tests {
         bad.stock = -1;
         assert!(validate_product_input(&bad).is_err());
 
+        let mut bad = ok.clone();
+        bad.weight_grams = 0;
+        assert!(validate_product_input(&bad).is_err());
+
         let mut bad = ok;
         bad.status = "live".to_string();
         assert!(validate_product_input(&bad).is_err());
+    }
+
+    #[test]
+    fn weight_grams_bounds() {
+        assert_eq!(validate_weight_grams(1), Ok(1));
+        assert_eq!(validate_weight_grams(1_000), Ok(1_000));
+        assert_eq!(validate_weight_grams(50_000), Ok(50_000));
+        assert!(validate_weight_grams(0).is_err());
+        assert!(validate_weight_grams(50_001).is_err());
+        assert!(validate_weight_grams(-250).is_err());
+    }
+
+    #[test]
+    fn grams_convert_to_kilograms() {
+        assert_eq!(weight_kg_from_grams(0), 0.0);
+        assert_eq!(weight_kg_from_grams(-1), 0.0);
+        assert_eq!(weight_kg_from_grams(500), 0.5);
+        assert_eq!(weight_kg_from_grams(1_000), 1.0);
+        assert_eq!(weight_kg_from_grams(2_500), 2.5);
+        assert_eq!(weight_kg_from_grams(5_000), 5.0);
+    }
+
+    #[test]
+    fn order_totals_bill_group_weight_from_item_grams() {
+        // One seller, mixed weights: 2 x 500 g + 1 x 2,500 g = 3,500 g
+        // -> billed as 4 kg (per started kilogram). Outside Dhaka:
+        // 120 + 3*40 = 240 BDT delivery. Goods: 2 x 1,000 + 2,000 =
+        // 4,000 BDT; 8% commission = 320 BDT.
+        let groups = vec![group(
+            "store-a",
+            vec![
+                witem("store-a", "p1", 2, 1_000, 500),
+                witem("store-a", "p2", 1, 2_000, 2_500),
+            ],
+        )];
+        let totals = build_order_totals(&groups, DeliveryZone::OutsideDhaka, 800);
+        assert_eq!(totals.goods_total_poisha, 400_000);
+        assert_eq!(totals.delivery_total_poisha, 24_000);
+        assert_eq!(totals.grand_total_poisha, 424_000);
+        assert_eq!(totals.sub_orders[0].delivery_charge_poisha, 24_000);
+        assert_eq!(totals.sub_orders[0].commission_poisha, 32_000);
+        assert_eq!(totals.sub_orders[0].seller_payout_poisha, 368_000);
+
+        // The same items inside Dhaka at 4 kg: 60 + 3*20 = 120 BDT.
+        let totals = build_order_totals(&groups, DeliveryZone::InsideDhaka, 800);
+        assert_eq!(totals.delivery_total_poisha, 12_000);
+
+        // An exact whole number of kilograms is NOT rounded further:
+        // 2 x 2,500 g = 5,000 g -> exactly 5 kg, outside Dhaka:
+        // 120 + 4*40 = 280 BDT.
+        let groups = vec![group(
+            "store-a",
+            vec![witem("store-a", "p1", 2, 1_000, 2_500)],
+        )];
+        let totals = build_order_totals(&groups, DeliveryZone::OutsideDhaka, 800);
+        assert_eq!(totals.delivery_total_poisha, 28_000);
+    }
+
+    #[test]
+    fn buyer_cancel_requires_every_sub_order_placed() {
+        assert!(can_buyer_cancel(&["placed"]));
+        assert!(can_buyer_cancel(&["placed", "placed", "placed"]));
+        assert!(!can_buyer_cancel(&[]));
+        assert!(!can_buyer_cancel(&["placed", "confirmed"]));
+        assert!(!can_buyer_cancel(&["confirmed"]));
+        assert!(!can_buyer_cancel(&["placed", "shipped"]));
+        assert!(!can_buyer_cancel(&["placed", "cancelled"]));
+        assert!(!can_buyer_cancel(&["delivered"]));
     }
 
     #[test]
@@ -564,11 +715,10 @@ mod tests {
         assert!(validate_cart_quantity(-3).is_err());
     }
 
-    fn group(store: &str, items: Vec<CartItem>, weight_kg: u32) -> OrderGroupInput {
+    fn group(store: &str, items: Vec<CartItem>) -> OrderGroupInput {
         OrderGroupInput {
             store_id: store.to_string(),
             items,
-            weight_kg,
         }
     }
 
@@ -578,8 +728,8 @@ mod tests {
         // two sellers, goods 2,450 + 2,000 BDT, one 1 kg parcel each,
         // outside Dhaka -> delivery 120 BDT per seller.
         let groups = vec![
-            group("store-a", vec![item("store-a", "p1", 1, 2_450)], 1),
-            group("store-b", vec![item("store-b", "p2", 1, 2_000)], 1),
+            group("store-a", vec![item("store-a", "p1", 1, 2_450)]),
+            group("store-b", vec![item("store-b", "p2", 1, 2_000)]),
         ];
         let totals = build_order_totals(&groups, DeliveryZone::OutsideDhaka, 800);
         assert_eq!(totals.goods_total_poisha, 445_000);
@@ -603,14 +753,14 @@ mod tests {
     #[test]
     fn order_totals_single_seller_with_weight_and_quantities() {
         // One seller: 2 x 1,500 BDT + 1 x 500 BDT = 3,500 BDT goods,
-        // 3 units -> 3 kg, inside Dhaka: 60 + 2*20 = 100 BDT delivery.
+        // 3 units at the default 1,000 g each -> 3 kg, inside Dhaka:
+        // 60 + 2*20 = 100 BDT delivery.
         let groups = vec![group(
             "store-a",
             vec![
                 item("store-a", "p1", 2, 1_500),
                 item("store-a", "p2", 1, 500),
             ],
-            3,
         )];
         let totals = build_order_totals(&groups, DeliveryZone::InsideDhaka, 800);
         assert_eq!(totals.goods_total_poisha, 350_000);

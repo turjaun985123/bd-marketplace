@@ -88,9 +88,9 @@ Wave 2 (Postgres-backed; return 503 when `DATABASE_URL` is not set):
 | POST | `/v1/auth/verify-otp` | — | Verify the OTP, create the user if new (role `buyer`), return a 7-day JWT |
 | POST | `/v1/stores` | Bearer | Create a store (slug validated, duplicate slug → 409); first store upgrades the user to `seller` |
 | GET | `/v1/stores/{slug}` | — | Public store profile |
-| POST | `/v1/products` | Bearer (owner) | Create a product in your own store |
+| POST | `/v1/products` | Bearer (owner) | Create a product in your own store (Wave 4: accepts `weight_grams`, default 1000) |
 | GET | `/v1/products/{id}` | — | Product detail (non-active products: owner only) |
-| PATCH | `/v1/products/{id}` | Bearer (owner) | Update title/price/stock/status |
+| PATCH | `/v1/products/{id}` | Bearer (owner) | Update title/price/stock/status/`weight_grams` |
 | GET | `/v1/products?q=&store_slug=&page=&limit=` | — | Marketplace listing: active products, title/title_bn search (ILIKE + pg_trgm), pagination |
 | GET | `/v1/stores/{slug}/products` | — | Storefront listing — the SAME service function as the marketplace listing, with the store filter set |
 
@@ -119,15 +119,37 @@ function, on the goods subtotal only). It writes the order, sub_orders
 and order_items (title/price snapshots), decrements stock and clears
 the cart — all-or-nothing. **Payment: COD only in Wave 3** — any other
 `payment_method` is a 400 ("not yet available", online payments are
-Wave 5). **Weight assumption: 1 kg per item unit** — products have no
-weight column yet, so a sub-order's billable weight is its total unit
-count. Commission rate comes from `COMMISSION_RATE_BPS` (default 800 =
+Wave 5). Commission rate comes from `COMMISSION_RATE_BPS` (default 800 =
 8%), read once at startup.
 
 Sub-order status flow (pure domain function `can_transition_sub_order`,
 unit-tested): `placed → confirmed → shipped → delivered`, plus
 `placed/confirmed → cancelled` and `shipped → returned`. Everything
 else is a 400.
+
+Wave 4 (Postgres-backed, Bearer auth):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| POST | `/v1/orders/{id}/cancel` | Buyer cancels their own order — only while EVERY sub-order is still `placed` (pure domain rule `can_buyer_cancel`); otherwise 409. One transaction: order + all sub-orders become `cancelled` and every item's stock is restored |
+| GET | `/v1/orders/{id}/receipt` | Buyer receipt view-model (own order only): platform name, delivery details, per-store items with snapshots, totals, and the COD amount due. Commission and seller payout are deliberately NOT in this view |
+
+**Delivery is weight-based from Wave 4** (the Wave 3 "1 kg per item
+unit" assumption is gone): every product carries `weight_grams`
+(migration 0008, default 1000, validated to 1..=50,000 by the domain
+function `validate_weight_grams`). At checkout a seller group's parcel
+weight is the sum of unit weight × quantity; `build_order_totals`
+converts grams to kilograms with `weight_kg_from_grams` and bills per
+started kilogram, so 2 × 2,500 g = 5 kg exactly, and 3,500 g bills as
+4 kg.
+
+**Cancellation restores stock.** The buyer cancel above restocks all
+items. A seller cancelling their own sub-order (the status endpoint,
+`placed/confirmed → cancelled`) now also restocks that sub-order's
+items in the same transaction — previously the status changed but the
+stock stayed decremented. Both paths share one restock helper inside
+their transaction, so a cancel and its restock commit or roll back
+together.
 
 Auth rules that matter: only a SHA-256 hash of an OTP is ever stored;
 ownership is checked on every seller mutation (403 for non-owners);
@@ -195,8 +217,9 @@ cd apps/web
 npm install
 NEXT_PUBLIC_API_BASE_URL=http://localhost:8080 npm run dev   # http://localhost:3000
 # Pages: / (marketplace, real product grid), /login (phone + OTP),
-# /cart, /checkout, /orders (buyer), /seller, /seller/products
-# (seller catalogue + create form) and /seller/orders (sub-orders)
+# /cart, /checkout, /orders (buyer), /orders/{id} (printable receipt),
+# /seller, /seller/products (seller catalogue + create form, with a
+# weight-in-grams field) and /seller/orders (sub-orders)
 ```
 
 ## Scope — what is real, stubbed and TODO
@@ -237,6 +260,28 @@ delivery preview via the shared `useDeliveryCharge` hook — the
 server's totals at order time are final), `/orders` and
 `/seller/orders` pages.
 
+**Real (Wave 4):** product `weight_grams` (migration 0008; create and
+PATCH accept it, default 1000; the seller product form has a grams
+field); weight-based delivery everywhere — the domain sums unit weight
+× quantity per seller group and bills per started kilogram (new pure
+functions `validate_weight_grams` and `weight_kg_from_grams`, unit
+tests include a mixed-weight group: 2 × 500 g + 1 × 2,500 g bills as
+4 kg), and the checkout page preview uses the cart's real weights;
+buyer order cancellation (`POST /v1/orders/{id}/cancel`, pure rule
+`can_buyer_cancel`) with full stock restore in one transaction;
+seller sub-order cancellation now restocks that sub-order's items in
+the same transaction (shared restock helper); the buyer receipt
+(`GET /v1/orders/{id}/receipt`, built by the single `build_receipt`
+service function from the shared order loader, with NO commission or
+payout fields) and a printable `/orders/{id}` receipt page linked from
+the orders list and the checkout success screen, plus a Cancel button
+on the orders page shown only while every sub-order is `placed`; an
+end-to-end integration test (`crates/api/tests/wave4.rs`, same
+`DATABASE_URL` gate) covering a 2 × 2,500 g checkout outside Dhaka
+(delivery = the domain charge for 5 kg), receipt totals with no
+commission field, buyer-cancel restock, the cancel-after-confirm 409,
+and seller-cancel restocking only that sub-order's items.
+
 **Stubbed (typed `NotConfigured` errors — never fake success, no network
 calls, no credentials):** Steadfast / Pathao / RedX courier adapters;
 bKash / Nagad / SSLCommerz / ShurjoPay payment adapters. Tier 1b couriers
@@ -251,11 +296,10 @@ worker jobs (the worker logs its planned jobs and exits cleanly).
 ## Verification status
 
 - **Next.js: verified on this machine** — `npm ci && npm run build`
-  passes (Wave 3 routes `/cart`, `/checkout`, `/orders` and
-  `/seller/orders` included).
+  passes (Wave 4 route `/orders/[id]` included).
 - **Rust: NOT compiled locally** — this development VM has no `cargo`
   installed, by design. Rust compilation, `cargo test --workspace`
-  (including the Wave 2 + Wave 3 integration tests against CI's
-  Postgres service) and clippy `-D warnings` are verified via
-  **GitHub Actions CI** (`.github/workflows/ci.yml`) on push. Waves 1–2
-  are green there (Wave 2 at `0eb1ac1`); Wave 3 awaits its first CI run.
+  (including the Wave 2 + Wave 3 + Wave 4 integration tests against
+  CI's Postgres service) and clippy `-D warnings` are verified via
+  **GitHub Actions CI** (`.github/workflows/ci.yml`) on push. Waves 1–3
+  are green there; Wave 4 awaits its first CI run.

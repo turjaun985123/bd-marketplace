@@ -3,17 +3,41 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import PriceTag from "@/components/PriceTag";
-import { listOrders, type Order } from "@/lib/api";
+import { cancelOrder, listOrders, type Order } from "@/lib/api";
 import { useAuth } from "@/hooks/useAuth";
 
 /**
  * The buyer's own orders (login-gated), newest first, with the
- * per-seller sub-orders and their fulfilment statuses.
+ * per-seller sub-orders and their fulfilment statuses. An order can be
+ * cancelled from here while EVERY sub-order is still placed (Wave 4) —
+ * the button mirrors that rule, but the server is the source of truth:
+ * a 409 answer is shown as an error and nothing changes locally.
  */
 export default function BuyerOrdersPage() {
   const { ready, token } = useAuth();
   const [orders, setOrders] = useState<Order[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
+
+  async function onCancel(orderId: string) {
+    if (!token) return;
+    setCancellingId(orderId);
+    setError(null);
+    try {
+      const updated = await cancelOrder(token, orderId);
+      setOrders((prev) =>
+        (prev ?? []).map((o) => (o.id === updated.id ? updated : o))
+      );
+    } catch (err) {
+      setError(
+        `অর্ডার বাতিল করা যায়নি। ${
+          err instanceof Error ? err.message : ""
+        }`.trim()
+      );
+    } finally {
+      setCancellingId(null);
+    }
+  }
 
   useEffect(() => {
     if (!token) return;
@@ -95,6 +119,26 @@ export default function BuyerOrdersPage() {
               </strong>{" "}
               (ক্যাশ অন ডেলিভারি)
             </p>
+            <p>
+              <Link href={`/orders/${order.id}`}>
+                রসিদ / বিবরণ দেখুন — Receipt & details
+              </Link>
+            </p>
+            {order.sub_orders.length > 0 &&
+              order.sub_orders.every((sub) => sub.status === "placed") && (
+                <p>
+                  <button
+                    type="button"
+                    disabled={cancellingId === order.id}
+                    onClick={() => void onCancel(order.id)}
+                  >
+                    {cancellingId === order.id
+                      ? "বাতিল হচ্ছে…"
+                      : "অর্ডার বাতিল করুন — Cancel order"}
+                  </button>{" "}
+                  বাতিল করলে সব পণ্য স্টকে ফিরে যাবে।
+                </p>
+              )}
           </article>
         ))
       )}
