@@ -229,12 +229,26 @@ pub fn weight_kg_from_grams(total_grams: i64) -> f64 {
 pub struct OrderGroupInput {
     pub store_id: String,
     pub items: Vec<CartItem>,
+    /// Coupon discount allocated to this group (Wave 14), in poisha;
+    /// zero when the order uses no coupon. Allocated by
+    /// [`allocate_discount`] over the in-scope groups, so the group
+    /// discounts sum exactly to the order's discount.
+    pub discount_poisha: i64,
+    /// Who bears this group's discount (Wave 14). True for a STORE
+    /// coupon: the seller bears it, so commission is computed on
+    /// goods minus discount. False for a PLATFORM coupon: the
+    /// platform bears it, so commission stays on the full goods.
+    /// The API decides this from the coupon's scope; the totals
+    /// function only applies the arithmetic.
+    pub commission_on_discounted: bool,
 }
 
 /// Money breakdown for one seller's sub-order, all in poisha.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubOrderTotals {
     pub goods_subtotal_poisha: i64,
+    /// Coupon discount allocated to this sub-order (Wave 14).
+    pub discount_poisha: i64,
     pub delivery_charge_poisha: i64,
     pub commission_poisha: i64,
     pub seller_payout_poisha: i64,
@@ -246,8 +260,10 @@ pub struct SubOrderTotals {
 pub struct OrderTotals {
     pub sub_orders: Vec<SubOrderTotals>,
     pub goods_total_poisha: i64,
+    /// Total coupon discount across all sub-orders (Wave 14).
+    pub discount_total_poisha: i64,
     pub delivery_total_poisha: i64,
-    /// What the buyer pays (COD): goods + delivery.
+    /// What the buyer pays: goods − discount + delivery.
     pub grand_total_poisha: i64,
 }
 
@@ -257,14 +273,24 @@ pub struct OrderTotals {
 /// re-implement their maths: the delivery charge comes from
 /// [`calculate_delivery_charge`] (the COD amount passed is the group's
 /// goods subtotal; the Wave 1 charge rule validates the COD amount but
-/// does not price on it, so the charge is exact) and commission/payout
-/// from [`compute_commission`]
-/// applied to the goods subtotal only.
+/// does not price on it, so the charge is exact) and the commission
+/// figure from [`compute_commission`] applied to the group's
+/// commission base (see the coupon paragraph below).
 ///
 /// Each group's parcel weight is the sum of its items' unit weights
 /// times quantities, converted with [`weight_kg_from_grams`] and
 /// rounded UP to the next whole kilogram (couriers bill per started
 /// kilogram), so a 3.5 kg group is billed as 4 kg.
+///
+/// Coupon discounts (Wave 14) are applied per group, from the
+/// group's `discount_poisha` (clamped to its goods subtotal — a
+/// group can never be discounted below zero). The seller payout is
+/// always goods − discount − commission. The commission base is
+/// the discounted goods when the group bears its own discount
+/// (`commission_on_discounted`, a store coupon) and the full goods
+/// when the platform bears it (a platform coupon). The buyer pays
+/// goods − discount + delivery: the discount reduces the grand
+/// total no matter who bears it.
 pub fn build_order_totals(
     groups: &[OrderGroupInput],
     zone: DeliveryZone,
@@ -272,6 +298,7 @@ pub fn build_order_totals(
 ) -> OrderTotals {
     let mut sub_orders = Vec::with_capacity(groups.len());
     let mut goods_total_poisha = 0i64;
+    let mut discount_total_poisha = 0i64;
     let mut delivery_total_poisha = 0i64;
 
     for group in groups {
@@ -288,22 +315,32 @@ pub fn build_order_totals(
             billable_weight_kg,
             goods_subtotal_poisha,
         );
-        let quote = compute_commission(goods_subtotal_poisha, commission_rate_bps);
+        let discount_poisha = group.discount_poisha.clamp(0, goods_subtotal_poisha);
+        let commission_base_poisha = if group.commission_on_discounted {
+            goods_subtotal_poisha - discount_poisha
+        } else {
+            goods_subtotal_poisha
+        };
+        let commission_poisha =
+            compute_commission(commission_base_poisha, commission_rate_bps).commission_poisha;
         goods_total_poisha += goods_subtotal_poisha;
+        discount_total_poisha += discount_poisha;
         delivery_total_poisha += delivery_charge_poisha;
         sub_orders.push(SubOrderTotals {
             goods_subtotal_poisha,
+            discount_poisha,
             delivery_charge_poisha,
-            commission_poisha: quote.commission_poisha,
-            seller_payout_poisha: quote.seller_payout_poisha,
+            commission_poisha,
+            seller_payout_poisha: goods_subtotal_poisha - discount_poisha - commission_poisha,
         });
     }
 
     OrderTotals {
         sub_orders,
         goods_total_poisha,
+        discount_total_poisha,
         delivery_total_poisha,
-        grand_total_poisha: goods_total_poisha + delivery_total_poisha,
+        grand_total_poisha: goods_total_poisha - discount_total_poisha + delivery_total_poisha,
     }
 }
 
@@ -1286,6 +1323,161 @@ pub fn draft_from_fb_post(text: &str) -> FbProductDraft {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Coupons (Wave 14)
+// ---------------------------------------------------------------------------
+
+/// The two coupon kinds. A coupon's SCOPE is separate: a coupon
+/// with a store is a store coupon (discounts only that store's
+/// goods, borne by the seller); a coupon without one is a platform
+/// coupon (discounts all goods, borne by the platform). See the
+/// README's Wave 14 section for the full money design.
+pub fn is_valid_coupon_discount_type(discount_type: &str) -> bool {
+    matches!(discount_type, "percent" | "fixed")
+}
+
+/// Normalize a coupon code for storage and lookup: trimmed and
+/// upper-cased. Codes are case-insensitive for buyers; the
+/// database stores exactly this form (and its UNIQUE constraint
+/// is on it).
+pub fn normalize_coupon_code(code: &str) -> String {
+    code.trim().to_uppercase()
+}
+
+/// Highest percent a coupon may take off (90%). A 100% coupon
+/// would zero out goods while delivery and commission rules still
+/// apply — a configuration error, not a promotion.
+pub const MAX_COUPON_PERCENT: i64 = 90;
+
+/// Smallest fixed-amount coupon, in poisha (1 taka). Below this a
+/// "discount" is rounding noise.
+pub const MIN_FIXED_COUPON_POISHA: i64 = 100;
+
+/// Validate the fields of a coupon being created. The code is
+/// checked in its normalized form: 3 to 32 characters of
+/// `A-Z 0-9 _ -`. A percent coupon's value is 1..=90; a fixed
+/// coupon's value is at least [`MIN_FIXED_COUPON_POISHA`]. The
+/// minimum order must be non-negative. The discount cap
+/// (`max_discount_poisha`) only takes effect on percent coupons;
+/// when present it must be non-negative for either kind.
+/// Error strings are user-facing.
+pub fn validate_coupon_input(
+    code: &str,
+    discount_type: &str,
+    discount_value: i64,
+    min_order_poisha: i64,
+    max_discount_poisha: Option<i64>,
+) -> Result<(), &'static str> {
+    let normalized = normalize_coupon_code(code);
+    if normalized.chars().count() < 3 || normalized.chars().count() > 32 {
+        return Err("coupon code must be 3 to 32 characters");
+    }
+    if !normalized
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    {
+        return Err("coupon code may only contain A-Z, 0-9, '_' and '-'");
+    }
+    match discount_type {
+        "percent" => {
+            if !(1..=MAX_COUPON_PERCENT).contains(&discount_value) {
+                return Err("percent coupon value must be between 1 and 90");
+            }
+        }
+        "fixed" => {
+            if discount_value < MIN_FIXED_COUPON_POISHA {
+                return Err("fixed coupon value must be at least 100 poisha (1 taka)");
+            }
+        }
+        _ => return Err("discount_type must be 'percent' or 'fixed'"),
+    }
+    if min_order_poisha < 0 {
+        return Err("min_order_poisha must not be negative");
+    }
+    if max_discount_poisha.is_some_and(|cap| cap < 0) {
+        return Err("max_discount_poisha must not be negative");
+    }
+    Ok(())
+}
+
+/// The discount a coupon gives on an eligible goods subtotal, in
+/// poisha. Percent: subtotal × value / 100, floored, then capped
+/// by `max_discount_poisha` when one is set. Fixed: the value,
+/// reduced to the subtotal when it exceeds it. Either way the
+/// result never exceeds the subtotal and never goes negative;
+/// a zero (or negative) eligible subtotal, and an unknown
+/// discount type, give zero.
+pub fn compute_coupon_discount(
+    discount_type: &str,
+    discount_value: i64,
+    max_discount_poisha: Option<i64>,
+    eligible_subtotal_poisha: i64,
+) -> i64 {
+    if eligible_subtotal_poisha <= 0 {
+        return 0;
+    }
+    let raw = match discount_type {
+        "percent" => {
+            let percent_off = eligible_subtotal_poisha * discount_value / 100;
+            match max_discount_poisha {
+                Some(cap) => percent_off.min(cap),
+                None => percent_off,
+            }
+        }
+        "fixed" => discount_value,
+        _ => return 0,
+    };
+    raw.clamp(0, eligible_subtotal_poisha)
+}
+
+/// Split an order-level discount across groups, proportional to
+/// each group's goods subtotal: every group gets the floor of its
+/// exact share, and the leftover poisha go one at a time to the
+/// largest subtotals first (ties: the earliest group), never
+/// pushing a group above its own subtotal. The shares therefore
+/// sum EXACTLY to the discount — the property checkout's money
+/// maths relies on. A zero discount, no groups, or all-zero
+/// subtotals give all-zero shares; a discount above the subtotal
+/// sum is clamped to it (checkout never produces one — the
+/// discount comes from [`compute_coupon_discount`] — the clamp
+/// only keeps this function total).
+pub fn allocate_discount(subtotals: &[i64], discount: i64) -> Vec<i64> {
+    let mut shares = vec![0i64; subtotals.len()];
+    let total: i64 = subtotals.iter().sum();
+    if discount <= 0 || total <= 0 {
+        return shares;
+    }
+    let discount = discount.min(total);
+    let mut allocated = 0i64;
+    for (i, subtotal) in subtotals.iter().enumerate() {
+        // i128 keeps subtotal * discount exact for any realistic
+        // poisha figures before the floor division.
+        shares[i] = (i128::from(*subtotal) * i128::from(discount) / i128::from(total)) as i64;
+        allocated += shares[i];
+    }
+    // Leftover distribution order: largest subtotal first, ties
+    // keep the original order. One pass always suffices: each
+    // floor loses less than one poisha, so the remainder is
+    // smaller than the number of groups, and whenever a remainder
+    // exists every non-zero group still has headroom (a group at
+    // its subtotal would mean discount == total, whose shares are
+    // exact and leave no remainder).
+    let mut order: Vec<usize> = (0..subtotals.len()).collect();
+    order.sort_by(|&a, &b| subtotals[b].cmp(&subtotals[a]).then(a.cmp(&b)));
+    let mut remainder = discount - allocated;
+    for idx in order {
+        if remainder == 0 {
+            break;
+        }
+        if shares[idx] < subtotals[idx] {
+            shares[idx] += 1;
+            remainder -= 1;
+        }
+    }
+    debug_assert_eq!(remainder, 0, "allocation must sum to the discount");
+    shares
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1606,6 +1798,22 @@ mod tests {
         OrderGroupInput {
             store_id: store.to_string(),
             items,
+            discount_poisha: 0,
+            commission_on_discounted: false,
+        }
+    }
+
+    fn discounted_group(
+        store: &str,
+        items: Vec<CartItem>,
+        discount_poisha: i64,
+        commission_on_discounted: bool,
+    ) -> OrderGroupInput {
+        OrderGroupInput {
+            store_id: store.to_string(),
+            items,
+            discount_poisha,
+            commission_on_discounted,
         }
     }
 
@@ -1655,6 +1863,132 @@ mod tests {
         assert_eq!(totals.grand_total_poisha, 360_000);
         assert_eq!(totals.sub_orders[0].commission_poisha, 28_000);
         assert_eq!(totals.sub_orders[0].seller_payout_poisha, 322_000);
+    }
+
+    #[test]
+    fn order_totals_platform_coupon_keeps_commission_on_full_goods() {
+        // Platform coupon: the platform bears the discount, so
+        // commission stays on the FULL goods while the payout and
+        // the grand total drop by the discount.
+        let groups = vec![
+            discounted_group("store-a", vec![item("store-a", "p1", 1, 2_450)], 2_753, false),
+            discounted_group("store-b", vec![item("store-b", "p2", 1, 2_000)], 2_247, false),
+        ];
+        let totals = build_order_totals(&groups, DeliveryZone::OutsideDhaka, 800);
+        assert_eq!(totals.discount_total_poisha, 5_000);
+        assert_eq!(totals.grand_total_poisha, 469_000 - 5_000);
+        // Commission unchanged vs the no-coupon worked example.
+        assert_eq!(totals.sub_orders[0].commission_poisha, 19_600);
+        assert_eq!(totals.sub_orders[1].commission_poisha, 16_000);
+        // Payout = goods - discount - commission.
+        assert_eq!(totals.sub_orders[0].seller_payout_poisha, 245_000 - 2_753 - 19_600);
+        assert_eq!(totals.sub_orders[1].seller_payout_poisha, 200_000 - 2_247 - 16_000);
+        assert_eq!(totals.sub_orders[0].discount_poisha, 2_753);
+    }
+
+    #[test]
+    fn order_totals_store_coupon_moves_commission_to_discounted_goods() {
+        // Store coupon: the seller bears the discount, so store
+        // A's commission is 8% of (245,000 - 10,000) = 18,800 and
+        // store B is completely untouched.
+        let groups = vec![
+            discounted_group("store-a", vec![item("store-a", "p1", 1, 2_450)], 10_000, true),
+            group("store-b", vec![item("store-b", "p2", 1, 2_000)]),
+        ];
+        let totals = build_order_totals(&groups, DeliveryZone::OutsideDhaka, 800);
+        assert_eq!(totals.discount_total_poisha, 10_000);
+        assert_eq!(totals.sub_orders[0].commission_poisha, 18_800);
+        assert_eq!(totals.sub_orders[0].seller_payout_poisha, 245_000 - 10_000 - 18_800);
+        assert_eq!(totals.sub_orders[1].discount_poisha, 0);
+        assert_eq!(totals.sub_orders[1].commission_poisha, 16_000);
+        assert_eq!(totals.sub_orders[1].seller_payout_poisha, 184_000);
+        assert_eq!(totals.grand_total_poisha, 469_000 - 10_000);
+    }
+
+    #[test]
+    fn coupon_code_normalization_and_validation() {
+        assert_eq!(normalize_coupon_code(" eid10 "), "EID10");
+        assert_eq!(normalize_coupon_code("save-20_x"), "SAVE-20_X");
+
+        // Happy paths.
+        assert!(validate_coupon_input("EID10", "percent", 10, 0, Some(5_000)).is_ok());
+        assert!(validate_coupon_input("FLAT100", "fixed", 10_000, 50_000, None).is_ok());
+        assert!(validate_coupon_input("A1-", "percent", 90, 0, None).is_ok());
+
+        // Code shape: too short, too long, illegal characters.
+        assert!(validate_coupon_input("AB", "percent", 10, 0, None).is_err());
+        assert!(validate_coupon_input(&"A".repeat(33), "percent", 10, 0, None).is_err());
+        assert!(validate_coupon_input("BAD CODE", "percent", 10, 0, None).is_err());
+        assert!(validate_coupon_input("কুপন", "percent", 10, 0, None).is_err());
+
+        // Percent bounds: 1..=90.
+        assert!(validate_coupon_input("P0", "percent", 0, 0, None).is_err());
+        assert!(validate_coupon_input("P91", "percent", 91, 0, None).is_err());
+        assert!(validate_coupon_input("P100", "percent", 100, 0, None).is_err());
+
+        // Fixed floor: at least 100 poisha.
+        assert!(validate_coupon_input("F99", "fixed", 99, 0, None).is_err());
+        assert!(validate_coupon_input("F100", "fixed", 100, 0, None).is_ok());
+
+        // Unknown type, negative minimum order, negative cap.
+        assert!(validate_coupon_input("XYZ", "bogus", 10, 0, None).is_err());
+        assert!(validate_coupon_input("XYZ", "percent", 10, -1, None).is_err());
+        assert!(validate_coupon_input("XYZ", "percent", 10, 0, Some(-1)).is_err());
+    }
+
+    #[test]
+    fn coupon_discount_computation() {
+        // Percent, uncapped and floored: 10% of 445,000 = 44,500.
+        assert_eq!(compute_coupon_discount("percent", 10, None, 445_000), 44_500);
+        // Percent capped: the Wave 14 checkout example — cap 5,000 wins.
+        assert_eq!(
+            compute_coupon_discount("percent", 10, Some(5_000), 445_000),
+            5_000
+        );
+        // Percent floor: 10% of 999 = 99 (not 100).
+        assert_eq!(compute_coupon_discount("percent", 10, None, 999), 99);
+        // A cap above the subtotal never inflates past the subtotal.
+        assert_eq!(
+            compute_coupon_discount("percent", 90, Some(9_999_999), 10_000),
+            9_000
+        );
+        // Fixed: the value, or the subtotal when the value exceeds it.
+        assert_eq!(compute_coupon_discount("fixed", 10_000, None, 245_000), 10_000);
+        assert_eq!(compute_coupon_discount("fixed", 10_000, None, 8_000), 8_000);
+        // Zero eligible subtotal and unknown types give zero.
+        assert_eq!(compute_coupon_discount("percent", 10, None, 0), 0);
+        assert_eq!(compute_coupon_discount("fixed", 10_000, None, 0), 0);
+        assert_eq!(compute_coupon_discount("bogus", 10, None, 10_000), 0);
+    }
+
+    #[test]
+    fn discount_allocation_sums_exactly() {
+        // The checkout example: 5,000 over [245,000, 200,000] —
+        // floors are 2,752 and 2,247; the leftover poisha goes to
+        // the largest subtotal (store A).
+        assert_eq!(
+            allocate_discount(&[245_000, 200_000], 5_000),
+            vec![2_753, 2_247]
+        );
+        // Exact division leaves no remainder.
+        assert_eq!(allocate_discount(&[100, 100], 50), vec![25, 25]);
+        // Ties: the earliest largest group takes the remainder.
+        assert_eq!(allocate_discount(&[100, 100], 51), vec![26, 25]);
+        // A single group takes everything.
+        assert_eq!(allocate_discount(&[245_000], 10_000), vec![10_000]);
+        // Zero discount, no groups, all-zero subtotals.
+        assert_eq!(allocate_discount(&[100, 200], 0), vec![0, 0]);
+        assert!(allocate_discount(&[], 1_000).is_empty());
+        assert_eq!(allocate_discount(&[0, 0], 1_000), vec![0, 0]);
+        // Zero-subtotal groups never receive a share.
+        assert_eq!(allocate_discount(&[0, 300], 90), vec![0, 90]);
+        // Near-total discount stays within every subtotal.
+        assert_eq!(
+            allocate_discount(&[100, 100, 100], 299),
+            vec![100, 100, 99]
+        );
+        // A discount above the total is clamped to it.
+        assert_eq!(allocate_discount(&[100, 50], 1_000), vec![100, 50]);
     }
 
     #[test]

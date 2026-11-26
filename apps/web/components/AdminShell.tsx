@@ -91,6 +91,8 @@ export default function AdminShell({
         {" · "}
         <Link href="/admin/payouts">পে-আউট</Link>
         {" · "}
+        <Link href="/admin/coupons">কুপন</Link>
+        {" · "}
         <Link href="/admin/users">ব্যবহারকারী</Link>
         {" · "}
         <Link href="/admin/settings">সেটিংস</Link>

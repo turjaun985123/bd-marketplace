@@ -141,6 +141,13 @@ export default function OrderReceiptPage({
         <h2>মোট হিসাব</h2>
         <p>
           পণ্যের মোট: <PriceTag amountPoisha={receipt.goods_total_poisha} />
+          {receipt.discount_total_poisha > 0 && (
+            <>
+              <br />
+              কুপন ছাড় ({receipt.coupon_code}): −
+              <PriceTag amountPoisha={receipt.discount_total_poisha} />
+            </>
+          )}
           <br />
           ডেলিভারি মোট:{" "}
           <PriceTag amountPoisha={receipt.delivery_total_poisha} />

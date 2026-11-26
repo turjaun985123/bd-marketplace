@@ -588,6 +588,95 @@ notification it can still answer later through the callback
 only for messages it knows about, so a missed notification can
 mean a missed AI reply — the seller's own inbox is unaffected.
 
+Wave 14 (coupons and promotions):
+
+Two coupon scopes, one code namespace. A **platform coupon**
+(admin-created, `store_id` NULL) discounts the whole order's
+goods; a **store coupon** (seller-created) discounts only that
+store's goods. Codes are case-insensitive (stored upper-case)
+and unique across BOTH scopes — a buyer types one code at
+checkout and it must mean exactly one coupon. A coupon is a
+percent (1–90, optionally capped at `max_discount_poisha`) or a
+fixed poisha amount, with an optional minimum eligible subtotal,
+an optional active window (`starts_at` / `ends_at`), an optional
+global `usage_limit`, and an `active` flag.
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| POST | `/v1/coupons/preview` | Bearer. Stateless check: `{code, goods_total_poisha, store_id?, store_goods_poisha?}` → `{valid, code, scope, store_id, discount_poisha, reason?}`. Writes nothing, reserves nothing |
+| POST | `/v1/seller/coupons` | Bearer, own store. Create a store coupon; a code that exists in any scope is a 409, invalid fields a 400 |
+| GET | `/v1/seller/coupons` | Bearer, own store. The store's coupons, newest first, with `used_count` |
+| PATCH | `/v1/seller/coupons/{id}` | Bearer, own store (another store's coupon is a 404). `{active}` toggle |
+| DELETE | `/v1/seller/coupons/{id}` | Bearer, own store. Delete an unused coupon; one with redemptions is a 409 — deactivate it instead |
+| POST | `/v1/admin/coupons` | Admin. Create a platform coupon (same validation; 409 on a duplicate code) |
+| GET | `/v1/admin/coupons` | Admin. Every coupon on the platform, newest first |
+| PATCH | `/v1/admin/coupons/{id}` | Admin. `{active}` toggle for any coupon |
+| POST | `/v1/orders` | Checkout accepts an optional `coupon_code`; see the checkout rule below |
+
+**The money design (decided once, applied everywhere through
+the pure domain functions):**
+
+- **Who bears the discount decides the commission basis.** A
+  store coupon is the seller's own promotion, so the seller
+  bears it: that sub-order's commission is computed on
+  (goods − discount). A platform coupon is the platform's
+  promotion, so the platform bears it: commission stays on the
+  FULL goods, and the platform's loss is exactly the discount.
+  In domain terms each order group carries its allocated
+  `discount_poisha` plus a `commission_on_discounted` flag
+  (set exactly when the coupon is a store coupon), and
+  `build_order_totals` stays the one pure totals function.
+- **Allocation:** the order-level discount is split across the
+  in-scope sub-orders proportionally to their goods subtotals
+  (`allocate_discount`: integer-floor shares, the rounding
+  remainder goes one poisha at a time to the largest subtotal
+  first), so the shares sum EXACTLY to the discount — no poisha
+  is created or lost. Each sub-order snapshots its share in
+  `discount_poisha`.
+- **Snapshots:** every sub-order's `seller_payout_poisha` is
+  goods − discount − commission, whoever bore the discount —
+  the payout snapshot always nets the discount out, because the
+  buyer really paid less. The buyer pays goods − discount +
+  delivery; the COD due and any online payment amount derive
+  from that one discounted grand total.
+- **Earnings switch (Wave 9 → 14):** seller earnings originally
+  recomputed `SUM(goods − commission)` over delivered
+  sub-orders. They now sum the `seller_payout_poisha` SNAPSHOT
+  instead. For pre-coupon orders the two are identical; after
+  coupons exist, a recompute would silently pay a seller for a
+  discount they bore. One aggregate still feeds the dashboard,
+  the balance and payout creation.
+
+**The preview contract:** the preview is honest about what it
+can know before checkout. A platform coupon needs only the
+cart's whole goods total. A store coupon's discount depends on
+THAT store's goods in the cart, which a bare total cannot
+express — so the first preview answers with `scope: "store"`
+and the coupon's `store_id`, and the client re-previews passing
+`store_goods_poisha` (the checkout page does exactly this). The
+preview and checkout share ONE rejection rule
+(`coupon_rejection_reason`: inactive / not started / expired /
+usage exhausted / not applicable / below the minimum, in that
+order), so they cannot disagree about validity — time and usage
+races aside.
+
+**The checkout rule:** with a `coupon_code`, checkout loads the
+coupon row `FOR UPDATE` inside the order transaction and
+re-validates it. Any rejection fails the WHOLE checkout with a
+400 and the cart stays intact — there is no silent
+"coupon ignored" order. On success the same transaction writes
+the order's `coupon_code` / `discount_total_poisha`, each
+sub-order's allocated share, the `coupon_redemptions` row, and
+`used_count + 1` — so a rolled-back checkout never consumes a
+use, and the usage limit cannot be raced.
+
+**Lifecycle limits (stated, not hidden):** there is NO
+per-buyer usage limit in this wave — the optional global
+`usage_limit` is the only cap, so one buyer may redeem the same
+coupon on many orders while it lasts. Coupons never discount
+delivery, never stack (one code per order), and a coupon whose
+redemptions exist cannot be deleted, only deactivated.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -1116,6 +1205,30 @@ SIDRA settings card), the shared `MessageThread` component
 (10-second polling), and "মেসেজ করুন" buttons on the storefront
 and product pages.
 
+**Real (Wave 14):** coupons and promotions — migration 0016
+(`coupons` with the platform/store scope split, `coupon_redemptions`,
+the discount snapshot columns on `orders` and `sub_orders`); the
+pure domain coupon rules (code normalization, input validation,
+discount computation with the percent cap, and `allocate_discount`
+with exact-sum proportional allocation); the shared rejection
+rule serving both the stateless preview and checkout; checkout
+applying the coupon inside its transaction under a coupon row
+lock (rejection = 400, cart intact; redemption + `used_count`
+committing with the order); the per-group discount and
+commission-basis fields on `build_order_totals` (store coupons
+move the commission basis, platform coupons do not); seller
+earnings switched to the `seller_payout_poisha` snapshot sum;
+an integration test (`crates/api/tests/wave14.rs`, same
+`DATABASE_URL` gate) covering the capped platform percent
+coupon (allocation sums, commission unchanged, redemption,
+receipt), the store fixed coupon (commission on discounted
+goods, earnings after delivery), min-order / expired /
+usage-limit / inactive rejections with the cart intact, and
+preview agreement; the Next.js checkout coupon field with the
+two-step store-scope preview, the receipt discount line, and
+the shared `CouponManager` component behind the seller
+(`/seller/coupons`) and admin (`/admin/coupons`) pages.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters. Manual Phase 2 couriers (Sundarban,
@@ -1143,16 +1256,16 @@ the external service at the other end of it, configured by
   passes (Wave 10 admin pages included: /admin, /admin/stores,
   /admin/payouts, /admin/users, /admin/settings; Wave 12 adds
   /seller/import; Wave 13 adds /messages, /messages/[id] and
-  /seller/inbox).
+  /seller/inbox; Wave 14 adds /seller/coupons and /admin/coupons).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
-  (domain 53, courier 31, payments 8 unit tests; the `DATABASE_URL`-
+  (domain 58, courier 31, payments 8 unit tests; the `DATABASE_URL`-
   gated integration tests skip cleanly without a database). The API
   binary was also smoke-tested locally without a database: routes
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
   (including the Wave 13 messaging endpoints), and the SIDRA
   callback answers 503 without a database.
-- **Rust integration + clippy: CI-only** — the Wave 2–13 integration
+- **Rust integration + clippy: CI-only** — the Wave 2–14 integration
   tests against a real Postgres 16 service and clippy `-D warnings`
   are verified via **GitHub Actions CI** (`.github/workflows/ci.yml`)
-  on push. Waves 1–12 are green there; Wave 13 awaits its first CI run.
+  on push. Waves 1–13 are green there; Wave 14 awaits its first CI run.

@@ -9,7 +9,9 @@ import {
   getPaymentMethods,
   paymentStatusLabel,
   placeOrder,
+  previewCoupon,
   type CartItem,
+  type CouponPreview,
   type Order,
   type PaymentMethodInfo,
 } from "@/lib/api";
@@ -81,6 +83,12 @@ function groupByStore(items: CartItem[]): SellerGroup[] {
  * seller group, billed on the group's real weight in grams — the
  * server's Wave 4 rule). The server's totals in the place-order
  * response are the final truth and are what the success screen shows.
+ *
+ * Wave 14: an optional coupon code is checked through the preview
+ * endpoint (a store coupon needs a second preview carrying that
+ * store's goods share, which only the cart knows) and shown as a
+ * discount line; the code rides along with the order and checkout
+ * re-validates it — the checkout response remains the authority.
  */
 export default function CheckoutPage() {
   const { ready, token } = useAuth();
@@ -101,6 +109,10 @@ export default function CheckoutPage() {
   const [methods, setMethods] = useState<PaymentMethodInfo[] | null>(null);
   const [method, setMethod] = useState("cod");
   const [simulating, setSimulating] = useState(false);
+  // Coupon (Wave 14): the typed code, and the last preview answer.
+  const [couponCode, setCouponCode] = useState("");
+  const [coupon, setCoupon] = useState<CouponPreview | null>(null);
+  const [applyingCoupon, setApplyingCoupon] = useState(false);
 
   const groups = useMemo(() => groupByStore(items), [items]);
 
@@ -151,6 +163,44 @@ export default function CheckoutPage() {
   );
   const previewKnown = groups.every((g) => charges[g.storeSlug] != null);
 
+  // A coupon preview is priced against the cart it was applied to;
+  // when the cart's goods total changes, the preview is stale.
+  useEffect(() => {
+    setCoupon(null);
+  }, [goodsTotalPoisha]);
+
+  async function onApplyCoupon() {
+    if (!token || !couponCode.trim()) return;
+    setApplyingCoupon(true);
+    setError(null);
+    try {
+      let preview = await previewCoupon(token, {
+        code: couponCode.trim(),
+        goods_total_poisha: goodsTotalPoisha,
+      });
+      // A store coupon's discount depends on that store's goods in
+      // the cart — the first preview only reveals the scope, so
+      // re-preview with the store's share once it is known.
+      if (preview.scope === "store" && preview.store_id) {
+        const storeGoods = items
+          .filter((item) => item.store_id === preview.store_id)
+          .reduce((sum, item) => sum + item.line_total_poisha, 0);
+        preview = await previewCoupon(token, {
+          code: couponCode.trim(),
+          goods_total_poisha: goodsTotalPoisha,
+          store_id: preview.store_id,
+          store_goods_poisha: storeGoods,
+        });
+      }
+      setCoupon(preview);
+    } catch (err) {
+      setCoupon(null);
+      setError(err instanceof Error ? err.message : "কুপন যাচাই করা যায়নি।");
+    } finally {
+      setApplyingCoupon(false);
+    }
+  }
+
   async function onPlaceOrder(e: React.FormEvent) {
     e.preventDefault();
     if (!token) return;
@@ -163,6 +213,9 @@ export default function CheckoutPage() {
         delivery_address: address.trim(),
         delivery_zone: zone.value,
         payment_method: method,
+        // Only a preview-valid code is sent; checkout re-checks it
+        // and its response is the final authority either way.
+        coupon_code: coupon?.valid ? coupon.code : undefined,
       });
       setPlaced(order);
       await refresh(); // the server cleared the cart
@@ -221,8 +274,15 @@ export default function CheckoutPage() {
           অর্ডার নম্বর: <code>{placed.id}</code>
         </p>
         <p>
-          পণ্যের দাম: <PriceTag amountPoisha={placed.goods_total_poisha} /> ·
-          ডেলিভারি: <PriceTag amountPoisha={placed.delivery_total_poisha} /> ·
+          পণ্যের দাম: <PriceTag amountPoisha={placed.goods_total_poisha} />
+          {placed.discount_total_poisha > 0 && (
+            <>
+              {" "}
+              · কুপন ছাড় ({placed.coupon_code}): −
+              <PriceTag amountPoisha={placed.discount_total_poisha} />
+            </>
+          )}{" "}
+          · ডেলিভারি: <PriceTag amountPoisha={placed.delivery_total_poisha} /> ·
           সর্বমোট:{" "}
           <strong>
             <PriceTag amountPoisha={placed.grand_total_poisha} />
@@ -331,6 +391,50 @@ export default function CheckoutPage() {
             চূড়ান্ত। (Preview only; the server's totals at order time are
             final.)
           </p>
+
+          <h2>কুপন — Coupon</h2>
+          <p>
+            <label>
+              কুপন কোড
+              <input
+                value={couponCode}
+                onChange={(e) => {
+                  setCouponCode(e.target.value);
+                  setCoupon(null);
+                }}
+                placeholder="EID10"
+              />
+            </label>{" "}
+            <button
+              type="button"
+              disabled={applyingCoupon || !couponCode.trim()}
+              onClick={() => void onApplyCoupon()}
+            >
+              {applyingCoupon ? "যাচাই হচ্ছে…" : "কুপন প্রয়োগ করুন"}
+            </button>
+          </p>
+          {coupon &&
+            (coupon.valid ? (
+              <p>
+                কুপন ছাড়: −<PriceTag amountPoisha={coupon.discount_poisha} />
+                {previewKnown && (
+                  <>
+                    {" "}
+                    · নতুন আনুমানিক সর্বমোট:{" "}
+                    <PriceTag
+                      amountPoisha={
+                        goodsTotalPoisha - coupon.discount_poisha + previewDelivery
+                      }
+                    />
+                  </>
+                )}
+              </p>
+            ) : (
+              <p role="alert">
+                কুপনটি ব্যবহার করা যাচ্ছে না
+                {coupon.reason ? `: ${coupon.reason}` : ""}
+              </p>
+            ))}
 
           <h2>ডেলিভারির তথ্য — Delivery details</h2>
           <form onSubmit={onPlaceOrder}>

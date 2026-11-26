@@ -30,6 +30,16 @@
 //! still `placed`, which restores stock for all items in the same
 //! transaction; a seller cancelling a sub-order likewise restores that
 //! sub-order's stock. A buyer receipt view is served per order.
+//!
+//! Wave 14: checkout accepts an optional coupon code. The coupon
+//! row is locked and re-validated inside the checkout transaction
+//! (the shared rule in the `coupons` module); the discount is
+//! allocated across the in-scope seller groups by the pure domain
+//! functions before totals are computed, so every money figure —
+//! the buyer's grand total, each sub-order's payout snapshot, the
+//! payment amount — comes from the one discounted totals run. The
+//! redemption row and the coupon's `used_count` increment commit
+//! or roll back with the order.
 
 use axum::{
     extract::{Path, Query, State},
@@ -38,9 +48,10 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use domain::{
-    build_order_totals, can_buyer_cancel, can_transition_sub_order, is_valid_sub_order_status,
-    normalize_bd_phone, parse_delivery_zone, split_cart_by_seller, CartItem as DomainCartItem,
-    OrderGroupInput,
+    allocate_discount, build_order_totals, can_buyer_cancel, can_transition_sub_order,
+    compute_coupon_discount, is_valid_sub_order_status, normalize_bd_phone,
+    normalize_coupon_code, parse_delivery_zone, split_cart_by_seller,
+    CartItem as DomainCartItem, OrderGroupInput,
 };
 use payments::{payment_adapter_for, parse_payment_method};
 use serde::{Deserialize, Serialize};
@@ -49,6 +60,9 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
+use crate::coupons::{
+    coupon_rejection_reason, eligible_subtotal_for, Coupon, GroupGoods, COUPON_COLUMNS,
+};
 use crate::payments::{insert_pending_payment, load_latest_payment_summary, PaymentSummary};
 use crate::products::clamp_pagination;
 use crate::shipments::{load_shipment_summary_for_sub_order, ShipmentSummary};
@@ -79,6 +93,8 @@ pub struct SubOrder {
     pub store_slug: String,
     pub status: String,
     pub goods_subtotal_poisha: i64,
+    /// Coupon discount allocated to this sub-order (Wave 14).
+    pub discount_poisha: i64,
     pub delivery_charge_poisha: i64,
     pub commission_poisha: i64,
     pub seller_payout_poisha: i64,
@@ -107,6 +123,10 @@ pub struct Order {
     pub delivery_address: String,
     pub delivery_zone: String,
     pub goods_total_poisha: i64,
+    /// The coupon code applied at checkout (Wave 14), or `None`.
+    pub coupon_code: Option<String>,
+    /// Total coupon discount across the sub-orders (Wave 14).
+    pub discount_total_poisha: i64,
     pub delivery_total_poisha: i64,
     pub grand_total_poisha: i64,
     pub created_at: DateTime<Utc>,
@@ -132,6 +152,8 @@ pub struct SellerSubOrder {
     pub store_slug: String,
     pub status: String,
     pub goods_subtotal_poisha: i64,
+    /// Coupon discount allocated to this sub-order (Wave 14).
+    pub discount_poisha: i64,
     pub delivery_charge_poisha: i64,
     pub commission_poisha: i64,
     pub seller_payout_poisha: i64,
@@ -171,6 +193,8 @@ struct OrderRow {
     delivery_address: String,
     delivery_zone: String,
     goods_total_poisha: i64,
+    coupon_code: Option<String>,
+    discount_total_poisha: i64,
     delivery_total_poisha: i64,
     grand_total_poisha: i64,
     created_at: DateTime<Utc>,
@@ -184,6 +208,7 @@ struct SubOrderRow {
     store_slug: String,
     status: String,
     goods_subtotal_poisha: i64,
+    discount_poisha: i64,
     delivery_charge_poisha: i64,
     commission_poisha: i64,
     seller_payout_poisha: i64,
@@ -192,10 +217,11 @@ struct SubOrderRow {
 
 const ORDER_COLUMNS: &str = "id, buyer_user_id, status, payment_method, payment_status, \
     delivery_name, delivery_phone, delivery_address, delivery_zone, goods_total_poisha, \
+    coupon_code, discount_total_poisha, \
     delivery_total_poisha, grand_total_poisha, created_at";
 
 const SUB_ORDER_COLUMNS: &str = "so.id, so.order_id, so.store_id, s.slug AS store_slug, \
-    so.status, so.goods_subtotal_poisha, so.delivery_charge_poisha, so.commission_poisha, \
+    so.status, so.goods_subtotal_poisha, so.discount_poisha, so.delivery_charge_poisha, so.commission_poisha, \
     so.seller_payout_poisha, so.created_at";
 
 async fn load_order_items(pool: &PgPool, sub_order_id: Uuid) -> Result<Vec<OrderItem>, ApiError> {
@@ -219,6 +245,7 @@ async fn sub_order_from_row(pool: &PgPool, row: SubOrderRow) -> Result<SubOrder,
         store_slug: row.store_slug,
         status: row.status,
         goods_subtotal_poisha: row.goods_subtotal_poisha,
+        discount_poisha: row.discount_poisha,
         delivery_charge_poisha: row.delivery_charge_poisha,
         commission_poisha: row.commission_poisha,
         seller_payout_poisha: row.seller_payout_poisha,
@@ -283,6 +310,8 @@ pub async fn load_order(pool: &PgPool, order_id: Uuid) -> Result<Order, ApiError
         delivery_address: row.delivery_address,
         delivery_zone: row.delivery_zone,
         goods_total_poisha: row.goods_total_poisha,
+        coupon_code: row.coupon_code,
+        discount_total_poisha: row.discount_total_poisha,
         delivery_total_poisha: row.delivery_total_poisha,
         grand_total_poisha: row.grand_total_poisha,
         created_at: row.created_at,
@@ -306,6 +335,12 @@ pub struct PlaceOrderInput {
     /// otherwise checkout fails with a 503 (see module docs).
     #[serde(default = "default_payment_method")]
     pub payment_method: String,
+    /// Optional coupon code (Wave 14). When present, the coupon
+    /// is loaded and re-validated inside the checkout transaction;
+    /// an unusable coupon fails the whole checkout with a 400 and
+    /// the cart stays intact.
+    #[serde(default)]
+    pub coupon_code: Option<String>,
 }
 
 fn default_payment_method() -> String {
@@ -326,6 +361,91 @@ struct LockedCartItem {
     store_status: String,
     quantity: i32,
     weight_grams: i32,
+}
+
+/// Apply the checkout's coupon (if any) to the order groups, in
+/// place: each in-scope group gains its allocated `discount_poisha`
+/// share and its `commission_on_discounted` flag (see the domain
+/// money design). Runs on the checkout transaction's connection
+/// with the coupon row locked `FOR UPDATE`, so the usage-limit
+/// check here and the `used_count` increment after the order is
+/// written are atomic against concurrent checkouts. Returns the
+/// applied coupon, or `None` when the buyer gave no code. Every
+/// rejection is a 400 — the caller drops the transaction, so a
+/// bad coupon never produces a partial order.
+async fn apply_coupon_to_groups(
+    conn: &mut sqlx::PgConnection,
+    groups: &mut [OrderGroupInput],
+    input: &PlaceOrderInput,
+) -> Result<Option<Coupon>, ApiError> {
+    let Some(raw_code) = input
+        .coupon_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+    else {
+        return Ok(None);
+    };
+    let code = normalize_coupon_code(raw_code);
+    let coupon: Coupon = sqlx::query_as(&format!(
+        "SELECT {COUPON_COLUMNS} FROM coupons WHERE code = $1 FOR UPDATE"
+    ))
+    .bind(&code)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| ApiError::internal("load coupon for checkout", e))?
+    .ok_or_else(|| ApiError::bad_request(format!("coupon '{code}' was not found")))?;
+
+    let mut group_goods: Vec<GroupGoods> = Vec::with_capacity(groups.len());
+    for group in groups.iter() {
+        let store_id = Uuid::parse_str(&group.store_id)
+            .map_err(|_| ApiError::internal("parse store id", sqlx::Error::RowNotFound))?;
+        group_goods.push(GroupGoods {
+            store_id,
+            goods_subtotal_poisha: group.items.iter().map(|item| item.line_total_poisha()).sum(),
+        });
+    }
+
+    let eligible = eligible_subtotal_for(&coupon, &group_goods);
+    if let Some(reason) = coupon_rejection_reason(&coupon, Utc::now(), eligible) {
+        return Err(ApiError::bad_request(format!(
+            "coupon '{}': {reason}",
+            coupon.code
+        )));
+    }
+    let discount_total = compute_coupon_discount(
+        &coupon.discount_type,
+        coupon.discount_value,
+        coupon.max_discount_poisha,
+        eligible,
+    );
+    if discount_total <= 0 {
+        return Err(ApiError::bad_request(format!(
+            "coupon '{}' does not reduce this order",
+            coupon.code
+        )));
+    }
+
+    // In-scope groups: all of them for a platform coupon, only the
+    // coupon's own store for a store coupon.
+    let in_scope: Vec<usize> = group_goods
+        .iter()
+        .enumerate()
+        .filter(|(_, goods)| {
+            coupon.store_id.is_none() || coupon.store_id == Some(goods.store_id)
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+    let subtotals: Vec<i64> = in_scope
+        .iter()
+        .map(|&idx| group_goods[idx].goods_subtotal_poisha)
+        .collect();
+    let shares = allocate_discount(&subtotals, discount_total);
+    for (pos, &idx) in in_scope.iter().enumerate() {
+        groups[idx].discount_poisha = shares[pos];
+        groups[idx].commission_on_discounted = coupon.store_id.is_some();
+    }
+    Ok(Some(coupon))
 }
 
 /// Place an order for everything in the caller's cart. See the module
@@ -421,13 +541,24 @@ pub async fn place_order(
     // The split items carry their real unit weights, so each group's
     // parcel weight is derived inside `build_order_totals` from the
     // items themselves — no weight is passed in separately.
-    let groups: Vec<OrderGroupInput> = split_cart_by_seller(&domain_items)
+    let mut groups: Vec<OrderGroupInput> = split_cart_by_seller(&domain_items)
         .iter()
         .map(|sub| OrderGroupInput {
             store_id: sub.store_id.clone(),
             items: sub.items.clone(),
+            discount_poisha: 0,
+            commission_on_discounted: false,
         })
         .collect();
+
+    // Wave 14: apply the coupon, if one was given, BEFORE totals —
+    // still inside the transaction, with the coupon row locked
+    // FOR UPDATE so the usage-limit check and the used_count
+    // increment below are atomic against concurrent checkouts.
+    // Any rejection returns an error here: the transaction drops
+    // uncommitted, nothing is written, and the cart stays intact.
+    let applied_coupon = apply_coupon_to_groups(&mut *tx, &mut groups, &input).await?;
+
     // The commission rate is the EFFECTIVE one (Wave 10): an
     // admin-set platform setting wins over the startup value.
     let commission_rate_bps = crate::admin::effective_commission_bps(state).await;
@@ -441,8 +572,9 @@ pub async fn place_order(
     let order_id: Uuid = sqlx::query_scalar(
         "INSERT INTO orders (buyer_user_id, payment_method, payment_status, \
          delivery_name, delivery_phone, delivery_address, delivery_zone, \
-         goods_total_poisha, delivery_total_poisha, grand_total_poisha) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id",
+         goods_total_poisha, delivery_total_poisha, grand_total_poisha, \
+         coupon_code, discount_total_poisha) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id",
     )
     .bind(user.user_id)
     .bind(method.as_str())
@@ -454,6 +586,8 @@ pub async fn place_order(
     .bind(totals.goods_total_poisha)
     .bind(totals.delivery_total_poisha)
     .bind(totals.grand_total_poisha)
+    .bind(applied_coupon.as_ref().map(|coupon| coupon.code.clone()))
+    .bind(totals.discount_total_poisha)
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| ApiError::internal("insert order", e))?;
@@ -498,12 +632,13 @@ pub async fn place_order(
             .map_err(|_| ApiError::internal("parse store id", sqlx::Error::RowNotFound))?;
         let sub_order_id: Uuid = sqlx::query_scalar(
             "INSERT INTO sub_orders (order_id, store_id, goods_subtotal_poisha, \
-             delivery_charge_poisha, commission_poisha, seller_payout_poisha) \
-             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+             discount_poisha, delivery_charge_poisha, commission_poisha, seller_payout_poisha) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
         )
         .bind(order_id)
         .bind(store_id)
         .bind(sub_totals.goods_subtotal_poisha)
+        .bind(sub_totals.discount_poisha)
         .bind(sub_totals.delivery_charge_poisha)
         .bind(sub_totals.commission_poisha)
         .bind(sub_totals.seller_payout_poisha)
@@ -541,6 +676,29 @@ pub async fn place_order(
             .await
             .map_err(|e| ApiError::internal("decrement stock", e))?;
         }
+    }
+
+    // Wave 14: record the redemption and count the use, in the
+    // same transaction — a rolled-back checkout never consumes a
+    // coupon use, and a committed one always does.
+    if let Some(coupon) = &applied_coupon {
+        sqlx::query(
+            "INSERT INTO coupon_redemptions (coupon_id, order_id, buyer_id, discount_poisha) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(coupon.id)
+        .bind(order_id)
+        .bind(user.user_id)
+        .bind(totals.discount_total_poisha)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::internal("record coupon redemption", e))?;
+
+        sqlx::query("UPDATE coupons SET used_count = used_count + 1 WHERE id = $1")
+            .bind(coupon.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ApiError::internal("count coupon use", e))?;
     }
 
     sqlx::query("DELETE FROM cart_items WHERE cart_id = $1")
@@ -758,6 +916,11 @@ pub struct Receipt {
     pub delivery: ReceiptDelivery,
     pub sub_orders: Vec<ReceiptSubOrder>,
     pub goods_total_poisha: i64,
+    /// The coupon applied at checkout (Wave 14) and its total
+    /// discount; the receipt renders the discount as its own line
+    /// when it is positive.
+    pub coupon_code: Option<String>,
+    pub discount_total_poisha: i64,
     pub delivery_total_poisha: i64,
     pub grand_total_poisha: i64,
 }
@@ -802,6 +965,8 @@ pub fn build_receipt(order: &Order, store_names: &HashMap<Uuid, String>) -> Rece
         },
         sub_orders,
         goods_total_poisha: order.goods_total_poisha,
+        coupon_code: order.coupon_code.clone(),
+        discount_total_poisha: order.discount_total_poisha,
         delivery_total_poisha: order.delivery_total_poisha,
         grand_total_poisha: order.grand_total_poisha,
     }
@@ -841,6 +1006,7 @@ struct SellerSubOrderRow {
     store_slug: String,
     status: String,
     goods_subtotal_poisha: i64,
+    discount_poisha: i64,
     delivery_charge_poisha: i64,
     commission_poisha: i64,
     seller_payout_poisha: i64,
@@ -872,7 +1038,7 @@ pub async fn list_seller_sub_orders(
 
     let rows: Vec<SellerSubOrderRow> = sqlx::query_as(
         "SELECT so.id, so.order_id, so.store_id, s.slug AS store_slug, so.status, \
-         so.goods_subtotal_poisha, so.delivery_charge_poisha, so.commission_poisha, \
+         so.goods_subtotal_poisha, so.discount_poisha, so.delivery_charge_poisha, so.commission_poisha, \
          so.seller_payout_poisha, so.created_at, \
          o.delivery_name, o.delivery_phone, o.delivery_address, o.delivery_zone \
          FROM sub_orders so \
@@ -899,6 +1065,7 @@ pub async fn list_seller_sub_orders(
             store_slug: row.store_slug,
             status: row.status,
             goods_subtotal_poisha: row.goods_subtotal_poisha,
+            discount_poisha: row.discount_poisha,
             delivery_charge_poisha: row.delivery_charge_poisha,
             commission_poisha: row.commission_poisha,
             seller_payout_poisha: row.seller_payout_poisha,

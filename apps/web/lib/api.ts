@@ -216,6 +216,8 @@ export interface SubOrder {
   store_slug: string;
   status: string;
   goods_subtotal_poisha: number;
+  /** Coupon discount allocated to this sub-order (Wave 14). */
+  discount_poisha: number;
   delivery_charge_poisha: number;
   commission_poisha: number;
   seller_payout_poisha: number;
@@ -288,6 +290,10 @@ export interface Order {
   delivery_address: string;
   delivery_zone: string;
   goods_total_poisha: number;
+  /** Coupon code applied at checkout (Wave 14); null when none. */
+  coupon_code: string | null;
+  /** Total coupon discount across the sub-orders (Wave 14). */
+  discount_total_poisha: number;
   delivery_total_poisha: number;
   grand_total_poisha: number;
   created_at: string;
@@ -309,6 +315,8 @@ export interface SellerSubOrder {
   store_slug: string;
   status: string;
   goods_subtotal_poisha: number;
+  /** Coupon discount allocated to this sub-order (Wave 14). */
+  discount_poisha: number;
   delivery_charge_poisha: number;
   commission_poisha: number;
   seller_payout_poisha: number;
@@ -337,6 +345,8 @@ export interface PlaceOrderInput {
   /** inside_dhaka | dhaka_suburb | outside_dhaka */
   delivery_zone: string;
   payment_method: string;
+  /** Optional coupon code (Wave 14); checkout re-validates it. */
+  coupon_code?: string;
 }
 
 function apiBase(): string {
@@ -673,6 +683,10 @@ export interface Receipt {
   };
   sub_orders: ReceiptSubOrder[];
   goods_total_poisha: number;
+  /** Coupon applied at checkout (Wave 14); null when none. */
+  coupon_code: string | null;
+  /** Total coupon discount (Wave 14); shown as its own line. */
+  discount_total_poisha: number;
   delivery_total_poisha: number;
   grand_total_poisha: number;
 }
@@ -1421,5 +1435,163 @@ export function setSidraAutoReply(
     method: "PUT",
     token,
     body: { auto_reply: autoReply },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Coupons (Wave 14)
+// ---------------------------------------------------------------------------
+
+/**
+ * A coupon. `store_id` null = platform coupon (discounts the whole
+ * order's goods; the platform bears it). A store coupon discounts
+ * only its store's goods and the seller bears it. Codes are
+ * case-insensitive (stored upper-case).
+ */
+export interface Coupon {
+  id: string;
+  code: string;
+  store_id: string | null;
+  /** percent | fixed */
+  discount_type: string;
+  /** Percent (1–90) for percent coupons; poisha for fixed ones. */
+  discount_value: number;
+  min_order_poisha: number;
+  /** Percent coupons only: the discount ceiling in poisha. */
+  max_discount_poisha: number | null;
+  starts_at: string | null;
+  ends_at: string | null;
+  /** Global redemption cap; null = unlimited. */
+  usage_limit: number | null;
+  used_count: number;
+  active: boolean;
+  created_at: string;
+}
+
+export interface CouponList {
+  items: Coupon[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+/** Create payload for seller and admin coupons (scope comes from the endpoint). */
+export interface CreateCouponInput {
+  code: string;
+  discount_type: string;
+  discount_value: number;
+  min_order_poisha?: number;
+  max_discount_poisha?: number | null;
+  starts_at?: string | null;
+  ends_at?: string | null;
+  usage_limit?: number | null;
+}
+
+/**
+ * The coupon preview answer. `scope`/`store_id` say WHICH goods the
+ * coupon applies to: for a store coupon the discount depends on that
+ * store's goods in the cart, so the client re-previews with
+ * `store_goods_poisha` once it knows the scope.
+ */
+export interface CouponPreview {
+  valid: boolean;
+  code: string;
+  /** "platform" | "store" | null (coupon not found). */
+  scope: string | null;
+  store_id: string | null;
+  discount_poisha: number;
+  reason: string | null;
+}
+
+/** Preview input: the cart's whole goods total plus, for store coupons, one store's share. */
+export interface CouponPreviewInput {
+  code: string;
+  goods_total_poisha: number;
+  store_id?: string | null;
+  store_goods_poisha?: number | null;
+}
+
+/**
+ * POST /v1/coupons/preview — stateless coupon check for the cart.
+ * Checkout re-validates under a row lock and stays the authority.
+ */
+export function previewCoupon(
+  token: string,
+  input: CouponPreviewInput
+): Promise<CouponPreview> {
+  return call("/v1/coupons/preview", { method: "POST", token, body: input });
+}
+
+/** GET /v1/seller/coupons — the store's own coupons, newest first. */
+export function listSellerCoupons(
+  token: string,
+  params?: { page?: number; limit?: number }
+): Promise<CouponList> {
+  const search = new URLSearchParams();
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/seller/coupons${qs ? `?${qs}` : ""}`, { token });
+}
+
+/** POST /v1/seller/coupons — create a coupon for the caller's store. */
+export function createSellerCoupon(
+  token: string,
+  input: CreateCouponInput
+): Promise<Coupon> {
+  return call("/v1/seller/coupons", { method: "POST", token, body: input });
+}
+
+/** PATCH /v1/seller/coupons/{id} — activate or deactivate a store coupon. */
+export function setSellerCouponActive(
+  token: string,
+  couponId: string,
+  active: boolean
+): Promise<Coupon> {
+  return call(`/v1/seller/coupons/${encodeURIComponent(couponId)}`, {
+    method: "PATCH",
+    token,
+    body: { active },
+  });
+}
+
+/** DELETE /v1/seller/coupons/{id} — delete an unused store coupon (409 once redeemed). */
+export function deleteSellerCoupon(token: string, couponId: string): Promise<void> {
+  return call(`/v1/seller/coupons/${encodeURIComponent(couponId)}`, {
+    method: "DELETE",
+    token,
+  });
+}
+
+/** GET /v1/admin/coupons — every coupon on the platform, newest first. */
+export function listAdminCoupons(
+  token: string,
+  params?: { page?: number; limit?: number }
+): Promise<CouponList> {
+  const search = new URLSearchParams();
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/admin/coupons${qs ? `?${qs}` : ""}`, { token });
+}
+
+/** POST /v1/admin/coupons — create a platform coupon (store_id null). */
+export function createAdminCoupon(
+  token: string,
+  input: CreateCouponInput
+): Promise<Coupon> {
+  return call("/v1/admin/coupons", { method: "POST", token, body: input });
+}
+
+/** PATCH /v1/admin/coupons/{id} — activate or deactivate any coupon. */
+export function setAdminCouponActive(
+  token: string,
+  couponId: string,
+  active: boolean
+): Promise<Coupon> {
+  return call(`/v1/admin/coupons/${encodeURIComponent(couponId)}`, {
+    method: "PATCH",
+    token,
+    body: { active },
   });
 }

@@ -2,8 +2,15 @@
 //!
 //! The money rules, each enforced by exactly one function below:
 //! - Earnings: a store earns from its DELIVERED sub-orders only —
-//!   goods subtotal minus the commission snapshot taken at checkout
-//!   (`seller_earnings`). The delivery charge share is courier and
+//!   the sum of the `seller_payout_poisha` snapshots taken at
+//!   checkout (`seller_earnings`). Wave 9 originally recomputed
+//!   goods minus commission here; Wave 14 switched the aggregate
+//!   to the snapshot column, because checkout now also nets the
+//!   coupon discount out of the payout (goods − discount −
+//!   commission) and a recompute would silently pay sellers for
+//!   discounts they bore. For pre-coupon orders the two formulas
+//!   are identical, so the switch changes nothing historically.
+//!   The delivery charge share is courier and
 //!   platform money and never earns; a `partial_delivered` shipment
 //!   does not make its sub-order `delivered`, so it earns nothing
 //!   until the sub-order itself is fully delivered. Conservative on
@@ -165,7 +172,7 @@ pub fn available_balance(earnings: &Earnings) -> i64 {
 pub async fn seller_earnings(pool: &PgPool, store_id: Uuid) -> Result<Earnings, ApiError> {
     let row: (i64, i64, i64) = sqlx::query_as(
         "SELECT \
-           (SELECT COALESCE(SUM(goods_subtotal_poisha - commission_poisha), 0)::bigint \
+           (SELECT COALESCE(SUM(seller_payout_poisha), 0)::bigint \
               FROM sub_orders \
              WHERE store_id = $1 AND status = 'delivered') AS earned_poisha, \
            (SELECT COALESCE(SUM(amount_poisha), 0)::bigint \

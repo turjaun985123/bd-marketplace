@@ -59,6 +59,15 @@
 //! held as a seller-approved suggestion otherwise. SIDRA is an
 //! external service and is never reimplemented here; with no
 //! SIDRA configuration the inbox is a complete human chat.
+//! Wave 14: coupons and promotions (`coupons` module) —
+//! platform coupons (the platform bears the discount, commission
+//! stays on full goods) and store coupons (the seller bears it,
+//! commission moves to the discounted goods), allocated across
+//! sub-orders by the pure domain functions and applied inside
+//! the checkout transaction under a coupon row lock; a stateless
+//! preview shares the one rejection rule with checkout, and
+//! seller earnings now sum the payout snapshot so borne
+//! discounts are never paid out.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -72,6 +81,7 @@
 pub mod admin;
 pub mod auth;
 pub mod cart;
+pub mod coupons;
 pub mod facebook;
 pub mod messaging;
 pub mod orders;
@@ -766,6 +776,28 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/v1/admin/settings",
             get(admin::get_settings_handler).put(admin::update_settings_handler),
+        )
+        // Coupons (Wave 14): stateless preview for buyers, seller
+        // CRUD for store coupons, admin CRUD for platform coupons.
+        .route("/v1/coupons/preview", post(coupons::preview_handler))
+        .route(
+            "/v1/seller/coupons",
+            get(coupons::list_seller_coupons_handler)
+                .post(coupons::create_seller_coupon_handler),
+        )
+        .route(
+            "/v1/seller/coupons/:id",
+            patch(coupons::set_seller_coupon_active_handler)
+                .delete(coupons::delete_seller_coupon_handler),
+        )
+        .route(
+            "/v1/admin/coupons",
+            get(coupons::list_admin_coupons_handler)
+                .post(coupons::create_admin_coupon_handler),
+        )
+        .route(
+            "/v1/admin/coupons/:id",
+            patch(coupons::set_admin_coupon_active_handler),
         )
         .layer(CorsLayer::permissive())
         .with_state(state)
