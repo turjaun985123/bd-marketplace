@@ -130,6 +130,7 @@ async fn create_store(app: &axum::Router, token: &str, slug: &str) -> Value {
 async fn create_product(
     app: &axum::Router,
     token: &str,
+    store_id: &str,
     title: &str,
     price_poisha: i64,
     stock: i64,
@@ -137,9 +138,10 @@ async fn create_product(
     let (status, body) = call(
         app,
         "POST",
-        "/v1/seller/products",
+        "/v1/products",
         Some(token),
         Some(json!({
+            "store_id": store_id,
             "title": title,
             "price_poisha": price_poisha,
             "stock": stock,
@@ -253,8 +255,10 @@ async fn wave14_coupons_end_to_end() {
     let store_a_id = store_a["id"].as_str().unwrap().to_string();
     let store_b_id = store_b["id"].as_str().unwrap().to_string();
 
-    let product_a = create_product(&app, &seller_a, "Wave14 A", 245_000, 10).await;
-    let product_b = create_product(&app, &seller_b, "Wave14 B", 200_000, 10).await;
+    let product_a =
+        create_product(&app, &seller_a, &store_a_id, "Wave14 A", 245_000, 10).await;
+    let product_b =
+        create_product(&app, &seller_b, &store_b_id, "Wave14 B", 200_000, 10).await;
     let product_a_id = product_a["id"].as_str().unwrap().to_string();
     let product_b_id = product_b["id"].as_str().unwrap().to_string();
 
@@ -460,7 +464,7 @@ async fn wave14_coupons_end_to_end() {
     let (status, balance) = call(
         &app,
         "GET",
-        "/v1/seller/payout-balance",
+        "/v1/seller/balance",
         Some(&seller_a),
         None,
     )
