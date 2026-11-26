@@ -87,6 +87,13 @@ export interface Product {
   rating_avg: number | null;
   /** Number of reviews (Wave 8). */
   rating_count: number;
+  /**
+   * Inside a live sponsored-promotion window right now
+   * (Wave 26). Sponsored products sort first in the default
+   * listings and always render the স্পন্সরড badge — placement
+   * is paid and labelled, never disguised.
+   */
+  is_promoted: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -1230,6 +1237,12 @@ export interface Earnings {
   earned_poisha: number;
   paid_out_poisha: number;
   pending_poisha: number;
+  /**
+   * Total taken from the balance outside payouts (Wave 26):
+   * sponsored-promotion purchases. Part of the available
+   * balance equation: earned − paid out − pending − charges.
+   */
+  charges_total_poisha: number;
   available_poisha: number;
 }
 
@@ -1522,6 +1535,115 @@ export function setLowStockThreshold(
 }
 
 // ---------------------------------------------------------------------------
+// Wave 26 — sponsored product promotions. A promotion is prepaid
+// from the seller's earnings balance (there is no other way to
+// pay), runs a whole number of days, and while live the product
+// sorts first in the default listings carrying the স্পন্সরড
+// badge. Cancelling stops the placement immediately and refunds
+// NOTHING — the charge stands; the UI says so before purchase.
+// ---------------------------------------------------------------------------
+
+/** The public promotion policy (GET /v1/promotions/policy). */
+export interface PromotionPolicy {
+  price_per_day_poisha: number;
+  max_days: number;
+  currency_note: string;
+}
+
+/** One promotion as the seller sees it (list + cancel views). */
+export interface SellerPromotion {
+  id: string;
+  product_id: string;
+  product_title: string;
+  store_id: string;
+  starts_at: string;
+  ends_at: string;
+  days: number;
+  cost_poisha: number;
+  /** active | cancelled — expiry is read off display_status. */
+  status: string;
+  /** active (live now) | expired | cancelled — API-derived. */
+  display_status: string;
+  created_at: string;
+}
+
+/** The purchase receipt (POST /v1/seller/products/{id}/promote). */
+export interface PromoteResult {
+  promotion: {
+    id: string;
+    product_id: string;
+    store_id: string;
+    seller_user_id: string;
+    starts_at: string;
+    ends_at: string;
+    days: number;
+    cost_poisha: number;
+    status: string;
+    created_at: string;
+  };
+  cost_poisha: number;
+  available_after_poisha: number;
+}
+
+/** Bangla-first label for a promotion's display status. */
+export function promotionStatusLabel(displayStatus: string): string {
+  switch (displayStatus) {
+    case "active":
+      return "সক্রিয় — চলছে";
+    case "expired":
+      return "মেয়াদ শেষ";
+    case "cancelled":
+      return "বাতিল করা হয়েছে";
+    default:
+      return displayStatus;
+  }
+}
+
+/** GET /v1/promotions/policy — the current per-day price + cap. */
+export function getPromotionPolicy(): Promise<PromotionPolicy> {
+  return call("/v1/promotions/policy");
+}
+
+/**
+ * POST /v1/seller/products/{id}/promote — buy `days` of
+ * sponsorship for an own active product, prepaid from the
+ * earnings balance. 400 when the balance cannot cover it,
+ * 409 while another promotion for the product is live.
+ */
+export function promoteProduct(
+  token: string,
+  productId: string,
+  days: number
+): Promise<PromoteResult> {
+  return call(`/v1/seller/products/${encodeURIComponent(productId)}/promote`, {
+    method: "POST",
+    token,
+    body: { days },
+  });
+}
+
+/** GET /v1/seller/promotions — the caller's promotions, newest first. */
+export function listMyPromotions(
+  token: string
+): Promise<{ items: SellerPromotion[] }> {
+  return call("/v1/seller/promotions", { token });
+}
+
+/**
+ * POST /v1/seller/promotions/{id}/cancel — stop a live
+ * promotion now. The charge is NOT refunded.
+ */
+export function cancelPromotion(
+  token: string,
+  promotionId: string
+): Promise<SellerPromotion> {
+  return call(
+    `/v1/seller/promotions/${encodeURIComponent(promotionId)}/cancel`,
+    { method: "POST", token }
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Wave 10 — platform admin. Every call needs an admin token; the API
 // answers 403 for everyone else (the pages also gate on /v1/auth/me).
 // ---------------------------------------------------------------------------
@@ -1616,6 +1738,11 @@ export interface AdminSettings {
    * least the basic verification tier to request a payout.
    */
   kyc_payout_gate: boolean;
+  /**
+   * Per-day sponsored-promotion price in poisha (Wave 26) —
+   * the effective value new promotions are charged at.
+   */
+  promotion_price_per_day_poisha: number;
   platform_name: string;
 }
 
@@ -1869,6 +1996,7 @@ export function updateAdminSettings(
     advance_percent_bps?: number;
     advance_threshold_poisha?: number;
     kyc_payout_gate?: boolean;
+    promotion_price_per_day_poisha?: number;
   }
 ): Promise<AdminSettings> {
   return call("/v1/admin/settings", { method: "PUT", token, body: patch });

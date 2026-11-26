@@ -231,6 +231,7 @@ function SearchResultsView() {
                 href={`/products/${p.id}`}
                 ratingAvg={p.rating_avg}
                 ratingCount={p.rating_count}
+                isPromoted={p.is_promoted}
               />
               {token ? (
                 <p>

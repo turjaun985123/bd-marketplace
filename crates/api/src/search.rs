@@ -14,6 +14,17 @@
 //! endpoints, not through search). Result rows are the shared
 //! `products::Product` view, rating aggregate included, so search
 //! results can never drift from every other product shape.
+//!
+//! Wave 26 — sponsored placement: products inside a live
+//! promotion window (`is_promoted`, computed in the shared
+//! product columns) sort FIRST under the default orderings —
+//! relevance (with or without search text) and newest — ahead
+//! of the relevance rank itself: sponsored placement is the
+//! product the platform sells, and it is always labelled with
+//! the স্পন্সরড badge in the UI. Explicit buyer-chosen sorts
+//! stay pure: price ascending/descending and rating order
+//! exactly by price or rating, promoted or not — a buyer who
+//! asks for the cheapest first gets the cheapest first.
 
 use axum::{extract::Query, extract::State, Json};
 use domain::{
@@ -101,13 +112,16 @@ pub async fn search_products(
     .map_err(|e| ApiError::internal("count search results", e))?;
 
     // The ORDER BY text comes from this fixed match on the
-    // validated sort enum — never from user input.
+    // validated sort enum — never from user input. Wave 26:
+    // the default orderings (relevance, newest) put live
+    // sponsored promotions first via the `is_promoted` output
+    // column; the explicit price and rating sorts stay pure.
     let order_by = match (params.sort, params.q.is_some()) {
         (SearchSort::Relevance, true) => {
-            format!("ORDER BY {SEARCH_RANK} DESC, p.created_at DESC")
+            format!("ORDER BY is_promoted DESC, {SEARCH_RANK} DESC, p.created_at DESC")
         }
         (SearchSort::Relevance, false) | (SearchSort::Newest, _) => {
-            "ORDER BY p.created_at DESC".to_string()
+            "ORDER BY is_promoted DESC, p.created_at DESC".to_string()
         }
         (SearchSort::PriceAsc, _) => "ORDER BY p.price_poisha ASC, p.created_at DESC".to_string(),
         (SearchSort::PriceDesc, _) => {

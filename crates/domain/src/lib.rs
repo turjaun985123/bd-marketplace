@@ -1169,6 +1169,90 @@ pub fn validate_payout_amount(
     validate_payout_amount_with_min(amount_poisha, available_poisha, MIN_PAYOUT_POISHA)
 }
 
+// ---------------------------------------------------------------------------
+// Sponsored promotions (Wave 26)
+// ---------------------------------------------------------------------------
+
+/// The longest single promotion a seller may buy, in days. A cap
+/// exists so a seller cannot lock the sponsored slot of their
+/// catalogue years ahead at today's price: after 30 days the
+/// promotion simply expires and can be bought again at the
+/// then-current price.
+pub const PROMOTION_MAX_DAYS: i64 = 30;
+
+/// The built-in per-day promotion price, in poisha (100 taka a
+/// day), used when neither a platform setting nor the startup
+/// `PROMOTION_PRICE_PER_DAY_POISHA` provides one. The effective
+/// price resolution (setting, then startup, then this constant)
+/// lives in the API's `admin` module, mirroring the commission
+/// and advance settings.
+pub const DEFAULT_PROMOTION_PRICE_PER_DAY_POISHA: i64 = 10_000;
+
+/// The `platform_settings` key for the per-day promotion price
+/// override (Wave 26). When a row with this key holds a valid
+/// value, it beats the startup `PROMOTION_PRICE_PER_DAY_POISHA`
+/// for NEW promotions; promotions already bought keep the cost
+/// snapshot they were charged.
+pub const PROMOTION_PRICE_PER_DAY_KEY: &str = "promotion_price_per_day_poisha";
+
+/// Is `price` a legal per-day promotion price, in poisha? The
+/// price must be positive — a free promotion is not a product,
+/// and a zero or negative stored price would silently make the
+/// promotion endpoint hand out sponsored placement for nothing
+/// (or worse, charge a negative amount). The cap is 100,000
+/// taka a day, far above any plausible rate; anything past it
+/// is a data-entry error. The same rule gates the admin
+/// settings endpoint, the startup value and the read-back of a
+/// stored setting, so an out-of-range row is ignored rather
+/// than applied.
+pub fn validate_promotion_price_per_day(price_poisha: i64) -> bool {
+    (1..=10_000_000).contains(&price_poisha)
+}
+
+/// Validate a requested promotion length: a whole number of
+/// days between 1 and [`PROMOTION_MAX_DAYS`]. Returns the day
+/// count unchanged on success. Error strings are user-facing.
+pub fn validate_promotion_days(days: i64) -> Result<i64, &'static str> {
+    if days < 1 {
+        return Err("a promotion must run for at least 1 day");
+    }
+    if days > PROMOTION_MAX_DAYS {
+        return Err("a promotion may run for at most 30 days");
+    }
+    Ok(days)
+}
+
+/// What a promotion costs: `days` at `price_per_day_poisha`,
+/// or `None` when the inputs cannot describe a real charge —
+/// a non-positive price (free placement is never sold through
+/// this path) or a non-positive day count, or a product that
+/// overflows i64. Callers validate first, so `None` here means
+/// "refuse the sale", never "charge zero".
+pub fn promotion_cost_poisha(days: i64, price_per_day_poisha: i64) -> Option<i64> {
+    if days <= 0 || price_per_day_poisha <= 0 {
+        return None;
+    }
+    days.checked_mul(price_per_day_poisha)
+}
+
+/// Is a promotion in its paid window at `now`? The one activity
+/// rule: the stored status must still be `active` (a cancelled
+/// promotion is never active, even inside its window) and `now`
+/// must lie in the half-open window [starts_at, ends_at) — a
+/// promotion is live from its first second and stops exactly
+/// at `ends_at`. Times are unix seconds so the rule stays pure
+/// and testable; the API's SQL `is_promoted` flag and the
+/// seller-facing display status both implement this same rule
+/// over the stored timestamps.
+pub fn promotion_is_active(
+    starts_at_unix: i64,
+    ends_at_unix: i64,
+    status: &str,
+    now_unix: i64,
+) -> bool {
+    status == "active" && starts_at_unix <= now_unix && now_unix < ends_at_unix
+}
+
 /// The `platform_settings` key for the commission rate override
 /// (Wave 10). When a row with this key holds a valid value, it
 /// beats the startup `COMMISSION_RATE_BPS` at checkout.
@@ -3516,6 +3600,58 @@ mod tests {
             validate_payout_amount(49_999, 184_000),
             validate_payout_amount_with_min(49_999, 184_000, MIN_PAYOUT_POISHA)
         );
+    }
+
+    #[test]
+    fn promotion_days_validation() {
+        // The legal window is 1..=30 days.
+        assert_eq!(PROMOTION_MAX_DAYS, 30);
+        assert_eq!(validate_promotion_days(1), Ok(1));
+        assert_eq!(validate_promotion_days(30), Ok(30));
+        assert!(validate_promotion_days(0).is_err());
+        assert!(validate_promotion_days(-3).is_err());
+        assert!(validate_promotion_days(31).is_err());
+    }
+
+    #[test]
+    fn promotion_cost_is_days_times_price() {
+        // The default price is 10_000 poisha (100 taka) a day.
+        assert_eq!(DEFAULT_PROMOTION_PRICE_PER_DAY_POISHA, 10_000);
+        assert_eq!(promotion_cost_poisha(3, 10_000), Some(30_000));
+        assert_eq!(promotion_cost_poisha(1, 5_000), Some(5_000));
+        assert_eq!(promotion_cost_poisha(30, 10_000), Some(300_000));
+        // A non-positive price or day count is never a charge.
+        assert_eq!(promotion_cost_poisha(3, 0), None);
+        assert_eq!(promotion_cost_poisha(3, -10_000), None);
+        assert_eq!(promotion_cost_poisha(0, 10_000), None);
+        assert_eq!(promotion_cost_poisha(-1, 10_000), None);
+        // Overflow refuses the sale instead of wrapping.
+        assert_eq!(promotion_cost_poisha(i64::MAX, 10_000), None);
+    }
+
+    #[test]
+    fn promotion_price_validation() {
+        assert!(validate_promotion_price_per_day(1));
+        assert!(validate_promotion_price_per_day(10_000));
+        assert!(validate_promotion_price_per_day(10_000_000));
+        assert!(!validate_promotion_price_per_day(0));
+        assert!(!validate_promotion_price_per_day(-1));
+        assert!(!validate_promotion_price_per_day(10_000_001));
+        // The setting key is the contract with the settings table.
+        assert_eq!(PROMOTION_PRICE_PER_DAY_KEY, "promotion_price_per_day_poisha");
+    }
+
+    #[test]
+    fn promotion_activity_window() {
+        // Live inside the half-open window [start, end).
+        assert!(promotion_is_active(1_000, 2_000, "active", 1_000));
+        assert!(promotion_is_active(1_000, 2_000, "active", 1_999));
+        // Not before the start, and over exactly at the end.
+        assert!(!promotion_is_active(1_000, 2_000, "active", 999));
+        assert!(!promotion_is_active(1_000, 2_000, "active", 2_000));
+        assert!(!promotion_is_active(1_000, 2_000, "active", 5_000));
+        // A cancelled promotion is never active, even in-window.
+        assert!(!promotion_is_active(1_000, 2_000, "cancelled", 1_500));
     }
 
     #[test]

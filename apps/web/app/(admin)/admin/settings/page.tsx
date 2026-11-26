@@ -21,8 +21,11 @@ import { useAuth } from "@/hooks/useAuth";
  * threshold-based advances off; risk-forced advances remain).
  * Wave 21 adds the KYC payout gate checkbox: while it is on, a
  * store must hold at least the basic verification tier to
- * request a payout. The form works in percent and taka for
- * humans; the API speaks bps and poisha.
+ * request a payout. Wave 26 adds the per-day sponsored-
+ * promotion price: a stored value reprices NEW promotions
+ * only — bought promotions keep their cost snapshot. The form
+ * works in percent and taka for humans; the API speaks bps
+ * and poisha.
  */
 export default function AdminSettingsPage() {
   return (
@@ -40,6 +43,7 @@ function Settings() {
   const [advancePct, setAdvancePct] = useState("");
   const [advanceThresholdTaka, setAdvanceThresholdTaka] = useState("");
   const [kycGate, setKycGate] = useState(false);
+  const [promotionPriceTaka, setPromotionPriceTaka] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -53,6 +57,9 @@ function Settings() {
       setAdvancePct(String(current.advance_percent_bps / 100));
       setAdvanceThresholdTaka(String(current.advance_threshold_poisha / 100));
       setKycGate(current.kyc_payout_gate);
+      setPromotionPriceTaka(
+        String(current.promotion_price_per_day_poisha / 100)
+      );
     } catch (err) {
       setMessage(err instanceof Error ? err.message : "সেটিংস লোড করা যায়নি।");
     }
@@ -85,6 +92,11 @@ function Settings() {
       setMessage("অগ্রিমের থ্রেশহোল্ড একটি সঠিক টাকার পরিমাণ হতে হবে।");
       return;
     }
+    const promotionPoisha = parseTakaToPoisha(promotionPriceTaka);
+    if (promotionPoisha === null || promotionPoisha <= 0) {
+      setMessage("প্রমোশনের দৈনিক দাম একটি সঠিক ধনাত্মক টাকার পরিমাণ হতে হবে।");
+      return;
+    }
     setBusy(true);
     setMessage(null);
     try {
@@ -94,6 +106,7 @@ function Settings() {
         advance_percent_bps: Math.round(advPct * 100),
         advance_threshold_poisha: thresholdPoisha,
         kyc_payout_gate: kycGate,
+        promotion_price_per_day_poisha: promotionPoisha,
       });
       setSettings(updated);
       setMessage("সেটিংস সংরক্ষিত হয়েছে।");
@@ -116,7 +129,8 @@ function Settings() {
           {formatBdt(settings.min_payout_poisha)} · বর্তমান অগ্রিম:{" "}
           {settings.advance_percent_bps / 100}% (থ্রেশহোল্ড:{" "}
           {formatBdt(settings.advance_threshold_poisha)}) · KYC পে-আউট
-          গেট: {settings.kyc_payout_gate ? "চালু" : "বন্ধ"}
+          গেট: {settings.kyc_payout_gate ? "চালু" : "বন্ধ"} · প্রমোশনের
+          দৈনিক দাম: {formatBdt(settings.promotion_price_per_day_poisha)}
         </p>
       )}
       <form onSubmit={onSave}>
@@ -160,6 +174,14 @@ function Settings() {
           />{" "}
           KYC পে-আউট গেট চালু — পে-আউট পেতে স্টোর যাচাইকরণ (কমপক্ষে
           basic স্তর) আবশ্যক
+        </label>
+        <label>
+          প্রমোশনের দাম (প্রতি দিন, টাকা) — Promotion price per day
+          <input
+            value={promotionPriceTaka}
+            onChange={(e) => setPromotionPriceTaka(e.target.value)}
+            inputMode="decimal"
+          />
         </label>
         <button type="submit" disabled={busy}>
           সংরক্ষণ করুন

@@ -28,7 +28,10 @@
 //! `ADVANCE_THRESHOLD_POISHA`. Wave 21 adds the KYC payout gate
 //! (`kyc_payout_gate`, stored as the text `on` / `off`): a flag
 //! with no startup fallback, on only when the stored value reads
-//! exactly `on`. The effective-value helpers below
+//! exactly `on`. Wave 26 adds the sponsored-promotion price:
+//! `promotion_price_per_day_poisha` beats the startup
+//! `PROMOTION_PRICE_PER_DAY_POISHA` (itself defaulting to the
+//! domain's 100 taka a day) for NEW promotions. The effective-value helpers below
 //! are the ONLY readers; checkout and payout creation call them,
 //! never the raw values, so the precedence (setting, then
 //! startup, then built-in default) lives in exactly one place. A
@@ -42,8 +45,9 @@ use axum::{
 use chrono::{DateTime, Utc};
 use domain::{
     can_transition_payout, parse_setting_i64, validate_advance_bps, validate_advance_threshold,
-    validate_commission_bps, ADVANCE_PERCENT_BPS_KEY, ADVANCE_THRESHOLD_KEY, COMMISSION_BPS_KEY,
-    KYC_PAYOUT_GATE_KEY, MIN_PAYOUT_KEY, MIN_PAYOUT_POISHA,
+    validate_commission_bps, validate_promotion_price_per_day, ADVANCE_PERCENT_BPS_KEY,
+    ADVANCE_THRESHOLD_KEY, COMMISSION_BPS_KEY, KYC_PAYOUT_GATE_KEY, MIN_PAYOUT_KEY,
+    MIN_PAYOUT_POISHA, PROMOTION_PRICE_PER_DAY_KEY,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
@@ -193,6 +197,24 @@ pub async fn effective_kyc_payout_gate(state: &AppState) -> bool {
         }
     }
     false
+}
+
+/// The per-day sponsored-promotion price right now (Wave 26):
+/// the admin setting when one is stored and valid, else the
+/// startup value (`PROMOTION_PRICE_PER_DAY_POISHA`, itself
+/// defaulting to the domain's 100 taka a day). Mirrors
+/// [`effective_commission_bps`] exactly. The price applies to
+/// NEW promotions only — a bought promotion keeps its cost
+/// snapshot and its stored window.
+pub async fn effective_promotion_price_per_day(state: &AppState) -> i64 {
+    if let Some(pool) = &state.pool {
+        if let Some(value) = platform_setting_i64(pool, PROMOTION_PRICE_PER_DAY_KEY).await {
+            if validate_promotion_price_per_day(value) {
+                return value;
+            }
+        }
+    }
+    state.promotion_price_per_day_poisha
 }
 
 // ---------------------------------------------------------------------------
@@ -652,6 +674,10 @@ pub struct AdminSettings {
     /// payout. Defaults to false — see
     /// [`effective_kyc_payout_gate`].
     pub kyc_payout_gate: bool,
+    /// Per-day sponsored-promotion price in poisha (Wave 26),
+    /// charged to NEW promotions — see
+    /// [`effective_promotion_price_per_day`].
+    pub promotion_price_per_day_poisha: i64,
     pub platform_name: &'static str,
 }
 
@@ -663,6 +689,7 @@ pub async fn get_settings(state: &AppState) -> AdminSettings {
         advance_percent_bps: i64::from(effective_advance_bps(state).await),
         advance_threshold_poisha: effective_advance_threshold(state).await,
         kyc_payout_gate: effective_kyc_payout_gate(state).await,
+        promotion_price_per_day_poisha: effective_promotion_price_per_day(state).await,
         platform_name: PLATFORM_NAME,
     }
 }
@@ -734,6 +761,14 @@ pub async fn update_settings(
         save_setting_text(pool, KYC_PAYOUT_GATE_KEY, if kyc_gate { "on" } else { "off" })
             .await?;
     }
+    if let Some(promotion_price) = input.promotion_price_per_day_poisha {
+        if !validate_promotion_price_per_day(promotion_price) {
+            return Err(ApiError::bad_request(
+                "promotion_price_per_day_poisha must be between 1 and 10000000",
+            ));
+        }
+        save_setting(pool, PROMOTION_PRICE_PER_DAY_KEY, promotion_price).await?;
+    }
     Ok(get_settings(state).await)
 }
 
@@ -795,6 +830,9 @@ pub struct UpdateSettingsInput {
     /// Wave 21: KYC payout gate — true stores `on`, false
     /// stores `off` (see [`effective_kyc_payout_gate`]).
     pub kyc_payout_gate: Option<bool>,
+    /// Wave 26: per-day sponsored-promotion price override
+    /// (poisha), validated by the domain rule.
+    pub promotion_price_per_day_poisha: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------

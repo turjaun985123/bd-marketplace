@@ -100,6 +100,7 @@ export default function ProductGrid({
             href={`/products/${p.id}`}
             ratingAvg={p.rating_avg}
             ratingCount={p.rating_count}
+            isPromoted={p.is_promoted}
             variant={
               layout === "list" ? "row" : layout === "large" ? "large" : "card"
             }

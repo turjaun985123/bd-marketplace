@@ -18,6 +18,12 @@ export interface ProductCardProps {
   ratingAvg?: number | null;
   ratingCount?: number;
   /**
+   * Wave 26: the product is inside a live sponsored-promotion
+   * window. Sponsored placement is always labelled — the card
+   * renders the স্পন্সরড badge whenever this is set.
+   */
+  isPromoted?: boolean;
+  /**
    * Wave 18 storefront theme variant: "card" (default, the
    * marketplace look), "row" (minimal theme's compact list row),
    * "large" (bold theme's oversized card). Same content, three
@@ -39,10 +45,16 @@ export default function ProductCard({
   productId,
   ratingAvg,
   ratingCount,
+  isPromoted,
   variant = "card",
 }: ProductCardProps) {
   return (
     <article className={variant === "card" ? "card" : `card card--${variant}`}>
+      {isPromoted && (
+        <p>
+          <span className="sponsored-badge">স্পন্সরড — Sponsored</span>
+        </p>
+      )}
       <h3>{href ? <Link href={href}>{name}</Link> : name}</h3>
       <p>{storeName}</p>
       <PriceTag amountPoisha={pricePoisha} />

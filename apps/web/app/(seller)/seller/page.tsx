@@ -189,6 +189,8 @@ export default function SellerDashboardPage() {
         {" · "}
         <Link href="/seller/coupons">কুপন — Coupons</Link>
         {" · "}
+        <Link href="/seller/promotions">প্রমোশন — Promotions</Link>
+        {" · "}
         <Link href="/seller/returns">রিটার্ন — Returns</Link>
         {" · "}
         <Link href="/seller/branding">স্টোরের সাজসজ্জা — Branding</Link>
@@ -261,6 +263,13 @@ export default function SellerDashboardPage() {
               <p>
                 মোট পে-আউট হয়েছে:{" "}
                 <PriceTag amountPoisha={earnings?.paid_out_poisha ?? 0} />
+              </p>
+              <p>
+                প্রমোশনে কাটা হয়েছে:{" "}
+                <PriceTag
+                  amountPoisha={earnings?.charges_total_poisha ?? 0}
+                />{" "}
+                <Link href="/seller/promotions">প্রমোশন দেখুন</Link>
               </p>
               <p>
                 মোট পণ্য: {counts?.products ?? 0} · মোট সাব-অর্ডার:{" "}

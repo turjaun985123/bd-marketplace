@@ -31,6 +31,7 @@ export default function ProductRail({
             href={`/products/${p.id}`}
             ratingAvg={p.rating_avg}
             ratingCount={p.rating_count}
+            isPromoted={p.is_promoted}
           />
         ))}
       </div>

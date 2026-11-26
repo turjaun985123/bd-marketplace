@@ -152,6 +152,20 @@
 //! from the public list and from the dashboard's unanswered
 //! count, but stay visible in the seller inbox so the hide
 //! can be undone. The asker is shown only as a masked phone.
+//! Wave 26: sponsored promotions (`promotions` module) — a
+//! seller prepays whole days (1..=30) at the effective
+//! per-day price from their EARNINGS BALANCE: the purchase
+//! locks the payout-store row, reads the one shared earnings
+//! aggregate inside its transaction, and writes the
+//! promotion plus its `seller_charges` row together, so the
+//! charge then gates payouts through the same available
+//! balance. While the window is live the product view
+//! carries `is_promoted` (an EXISTS in the shared product
+//! columns implementing the domain activity rule), the
+//! default and relevance orderings put it first — always
+//! labelled স্পন্সরড, with explicit price/rating sorts kept
+//! pure — and cancelling stops placement immediately with
+//! NO refund: the charge stands.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -174,6 +188,7 @@ pub mod orders;
 pub mod payments;
 pub mod payouts;
 pub mod products;
+pub mod promotions;
 pub mod qna;
 pub mod recommend;
 pub mod returns;
@@ -234,6 +249,12 @@ pub struct AppState {
     /// advances (risk-forced advances still apply). The FALLBACK
     /// value: `admin::effective_advance_threshold` wins over it.
     pub advance_threshold_poisha: i64,
+    /// Sponsored-promotion price per day in poisha (10,000 =
+    /// 100 taka), read once at startup from
+    /// `PROMOTION_PRICE_PER_DAY_POISHA` (Wave 26). The FALLBACK
+    /// value: `admin::effective_promotion_price_per_day` wins
+    /// over it, and it prices NEW promotions only.
+    pub promotion_price_per_day_poisha: i64,
     /// Payment configuration (Wave 5): the DEV simulator switch and
     /// secret, plus one merchant credential set per gateway. Built
     /// from the environment in `from_env`; tests set it explicitly
@@ -313,6 +334,12 @@ pub const DEFAULT_ADVANCE_PERCENT_BPS: u32 = 2_000;
 /// at or above this grand total collect an advance before shipping.
 pub const DEFAULT_ADVANCE_THRESHOLD_POISHA: i64 = 200_000;
 
+/// Default sponsored-promotion price: 100 taka per day
+/// (Wave 26) — the domain constant, re-exported here so the
+/// startup defaults read in one place.
+pub const DEFAULT_PROMOTION_PRICE_PER_DAY_POISHA: i64 =
+    domain::DEFAULT_PROMOTION_PRICE_PER_DAY_POISHA;
+
 /// The one origin allowed by CORS when `CORS_ORIGINS` is not set
 /// (Wave 20): the local Next.js dev server. A real deployment
 /// sets `CORS_ORIGINS` to its deployed web origin(s).
@@ -327,6 +354,7 @@ impl AppState {
             commission_rate_bps: DEFAULT_COMMISSION_RATE_BPS,
             advance_percent_bps: DEFAULT_ADVANCE_PERCENT_BPS,
             advance_threshold_poisha: DEFAULT_ADVANCE_THRESHOLD_POISHA,
+            promotion_price_per_day_poisha: DEFAULT_PROMOTION_PRICE_PER_DAY_POISHA,
             payments_config: PaymentsConfig::default(),
             couriers_config: CouriersConfig::default(),
             facebook_config: FacebookConfig::default(),
@@ -427,6 +455,22 @@ impl AppState {
                 _ => eprintln!(
                     "WARNING: ADVANCE_THRESHOLD_POISHA='{raw}' is invalid — \
                      using the default {DEFAULT_ADVANCE_THRESHOLD_POISHA} poisha"
+                ),
+            }
+        }
+        // PROMOTION_PRICE_PER_DAY_POISHA is read once, here at
+        // startup, under the same discipline: an invalid or
+        // out-of-range value keeps the default rather than
+        // breaking the promotion price later. An admin platform
+        // setting (Wave 26) overrides it at read time.
+        if let Ok(raw) = std::env::var("PROMOTION_PRICE_PER_DAY_POISHA") {
+            match raw.parse::<i64>() {
+                Ok(price) if domain::validate_promotion_price_per_day(price) => {
+                    state.promotion_price_per_day_poisha = price
+                }
+                _ => eprintln!(
+                    "WARNING: PROMOTION_PRICE_PER_DAY_POISHA='{raw}' is invalid — \
+                     using the default {DEFAULT_PROMOTION_PRICE_PER_DAY_POISHA} poisha"
                 ),
             }
         }
@@ -1220,6 +1264,24 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/seller/products/:id/low-stock-threshold",
             put(inventory::set_low_stock_threshold_handler),
         )
+        // Wave 26 — sponsored promotions: the public policy
+        // (effective per-day price + the 30-day cap), buying a
+        // promotion for an own active product prepaid from the
+        // earnings balance, the seller's promotion list, and
+        // cancellation (placement stops, the charge stands).
+        .route("/v1/promotions/policy", get(promotions::policy_handler))
+        .route(
+            "/v1/seller/products/:id/promote",
+            post(promotions::promote_handler),
+        )
+        .route(
+            "/v1/seller/promotions",
+            get(promotions::list_promotions_handler),
+        )
+        .route(
+            "/v1/seller/promotions/:id/cancel",
+            post(promotions::cancel_promotion_handler),
+        )
         // Wave 24 — wishlist: the caller's server-side
         // saved-for-later list. Add/remove are idempotent
         // and answer with the resulting state; the ids read
@@ -1283,7 +1345,7 @@ fn log_config_summary(state: &AppState) {
         "config summary: sms_dev_mode={} payments_dev_mode={} couriers_dev_mode={} \
          payment gateways configured={}/4 couriers live={}/5 sidra_configured={} \
          facebook_app_configured={} cors_origins={} commission={}bps \
-         advance={}bps at/above {} poisha",
+         advance={}bps at/above {} poisha promotion_price={} poisha/day",
         state.sms_dev_mode,
         state.payments_config.dev_mode,
         state.couriers_config.dev_mode,
@@ -1295,6 +1357,7 @@ fn log_config_summary(state: &AppState) {
         state.commission_rate_bps,
         state.advance_percent_bps,
         state.advance_threshold_poisha,
+        state.promotion_price_per_day_poisha,
     );
 }
 

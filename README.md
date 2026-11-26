@@ -1321,6 +1321,77 @@ AI answers here by design: SIDRA answers store chat
 (Wave 13), but Q&A answers are public, permanent and
 signed by the store, so they stay human-written.
 
+Wave 26 (sponsored product promotions):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| GET | `/v1/promotions/policy` | Public. The effective per-day price, the 30-day cap and the currency note |
+| POST | `/v1/seller/products/{id}/promote` | Bearer, own product only (anyone else's: 404). Buy `{days}` (1–30) of sponsorship for an ACTIVE product (draft/archived: 400), prepaid from the earnings balance (insufficient: 400; another live promotion for the product: 409). 201 with the promotion, its cost and the balance after |
+| GET | `/v1/seller/promotions` | Bearer. The caller's promotions, newest first, each with product title and derived `display_status` (`active` / `expired` / `cancelled`) |
+| POST | `/v1/seller/promotions/{id}/cancel` | Bearer, own promotion only (anyone else's: 404). Stop a live promotion now; already cancelled/expired: 409. **No refund — the charge stands** |
+| PUT | `/v1/admin/settings` | Admin. Now also accepts `promotion_price_per_day_poisha` (validated 1..=10,000,000) — reprices NEW promotions only |
+
+**The model:** a promotion is prepaid sponsorship of ONE
+product for a whole number of days, bought ONLY from the
+seller's earnings balance — there is no card charge and no
+cash top-up, so a brand-new seller cannot promote until
+they have actually sold something. The per-day price is
+an effective setting: the admin's `platform_settings` row
+beats the startup `PROMOTION_PRICE_PER_DAY_POISHA`, which
+beats the built-in 10,000 poisha (৳100/day); the maximum
+single purchase is 30 days.
+
+**The balance equation** (the one aggregate in the
+`payouts` module — dashboard, balance endpoint, payout
+creation and promotion purchase all read it):
+
+```
+available = earned (delivered sub-order snapshots)
+          − paid out (approved + paid payouts)
+          − pending (requested payouts)
+          − charges (seller_charges: promotion purchases)
+```
+
+The purchase runs in ONE transaction: it locks the
+seller's payout-store row, reads that aggregate inside
+the transaction (through the shared executor-generic
+`seller_earnings_on`), refuses when the balance cannot
+cover the cost, and writes the promotion row plus its
+`seller_charges` row together — so the money is spent
+exactly once and the same available figure then gates
+payout requests. Charges belong to the seller (user),
+not to one store, because a promotion may target any of
+the seller's stores while money settles through the one
+payout store.
+
+**Ranking rule:** while a promotion window is live
+(status `active`, now inside [starts_at, ends_at) — the
+domain's `promotion_is_active`), the product view
+carries `is_promoted`, computed as an EXISTS in the
+shared product columns so cards, detail, search and
+wishlist all agree. Promoted products sort FIRST in the
+default marketplace/storefront listing and in search's
+relevance and newest orderings — and always render the
+স্পন্সরড badge. Explicit buyer sorts stay pure: price
+ascending/descending and rating order exactly by price
+or rating, promoted or not.
+
+**No-refund policy, stated plainly:** cancelling a
+promotion stops the placement immediately and refunds
+NOTHING. The charge stands. The seller UI says this
+before purchase (in the page copy and on the cancel
+button itself), not after.
+
+**Honest limits:** there is no external ad network, no
+per-click or per-impression billing, and no impression /
+click statistics — a promotion is a fixed prepaid window,
+nothing is metered. There is no cash top-up: promotions
+are bought only from earned balance. One live window per
+product (no stacking, no scheduling a future start —
+every promotion starts now). Sponsored ranking applies
+to the default/relevance/newest orderings only, by the
+documented rule above.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -1673,6 +1744,7 @@ broken or unsafe without it.
 | `APP_ENV` / `SMS_DEV_MODE` | Dev mode: log SMS sender + `dev_otp` in responses | **Must be off** — `APP_ENV` must not be `dev` and `SMS_DEV_MODE` must not be `true`, or OTP codes are public |
 | `COMMISSION_RATE_BPS` | Startup commission fallback (admin settings override it) | No |
 | `ADVANCE_PERCENT_BPS` / `ADVANCE_THRESHOLD_POISHA` | Startup COD-advance fallback (admin settings override) | No |
+| `PROMOTION_PRICE_PER_DAY_POISHA` | Startup per-day sponsored-promotion price fallback (admin settings override; Wave 26) | No |
 | `NEXT_PUBLIC_API_BASE_URL` | API origin baked into the browser bundle at web build time | **Yes** for the web image — the public API origin |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Compose Postgres credentials (defaults match the dev database) | **Yes** — change the password from the dev default |
 | `S3_ENDPOINT` / `S3_BUCKET` / `S3_ACCESS_KEY` / `S3_SECRET_KEY` | Object storage placeholders | No — not wired to any code yet |
@@ -2338,6 +2410,45 @@ Q&A inbox at /seller/questions (filter queues, answer /
 correct forms, hide/unhide), and the dashboard's
 unanswered-questions strip and nav link.
 
+**Real (Wave 26):** sponsored product promotions —
+migration 0027 (`promotions`: stored window, cost
+snapshot, `active`/`cancelled` status; `seller_charges`:
+the balance deduction ledger, kind `promotion`); the
+domain rules (`validate_promotion_days` 1..=30,
+`promotion_cost_poisha` as a checked multiply that
+refuses non-positive prices, `validate_promotion_price_per_day`,
+and `promotion_is_active` — the one activity rule the
+SQL flag and the display status both implement); the
+balance unification (the earnings aggregate is now
+executor-generic `seller_earnings_on`, gains the
+seller's charges term, and `available_balance_poisha`
+resolves a seller's spendable balance through it —
+dashboard, balance, payout creation and promotion
+purchase all read the same number); the `promotions`
+API module (public policy, the one-transaction purchase
+under the payout-store row lock, the seller list with
+derived display status, cancel-with-no-refund); the
+admin setting + startup env for the per-day price; the
+product view's `is_promoted` (an EXISTS in the shared
+product columns) with promoted-first default/relevance
+ordering in listings and search (explicit price/rating
+sorts stay pure); an integration test
+(`crates/api/tests/wave26.rs`, same `DATABASE_URL` gate)
+covering the insufficient-balance 400, the exact 30,000
+charge at the default price, overlap 409, the search
+ordering pair (promoted first by default, pure by
+price), the admin reprice to 5,000 for the next purchase
+only, cancel-without-refund, the payout boundary at the
+exact remaining balance, cross-seller 404s, and the
+settings-row cleanup; and the Next.js seller promotions
+page at /seller/promotions (policy + balance, per-product
+promote forms with live cost preview and the no-refund
+copy stated before purchase, the promotion list with
+cancel), the স্পন্সরড badge on the shared ProductCard,
+promote links on the seller products page, the dashboard
+nav link and charges line, and the admin settings price
+field.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters, and the four manual couriers run
@@ -2378,19 +2489,21 @@ the external service at the other end of it, configured by
   also-bought rails, and the home page's personalised +
   recently-viewed strips; Wave 25 adds /seller/questions,
   the product page's Q&A section, and the dashboard's
-  unanswered-questions strip).
+  unanswered-questions strip; Wave 26 adds
+  /seller/promotions, the স্পন্সরড badge on the shared
+  ProductCard, and the admin settings promotion price).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
-  (domain 94, courier 31, payments 8 unit tests; the `DATABASE_URL`-
+  (domain 98, courier 31, payments 8 unit tests; the `DATABASE_URL`-
   gated integration tests skip cleanly without a database). The API
   binary was also smoke-tested locally without a database: routes
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
   (including the Wave 13 messaging endpoints), and the SIDRA
   callback answers 503 without a database.
-- **Rust integration + clippy: CI-only** — the Wave 2–25 integration
+- **Rust integration + clippy: CI-only** — the Wave 2–26 integration
   tests against a real Postgres 16 service and clippy `-D warnings`
   are verified via **GitHub Actions CI** (`.github/workflows/ci.yml`)
-  on push. Waves 1–24 are green there; Wave 25 awaits its first CI run.
+  on push. Waves 1–25 are green there; Wave 26 awaits its first CI run.
 - **Docker images: CI-only** — Docker is not installed on the
   development machine, so `Dockerfile.api`, `Dockerfile.worker`
   and `apps/web/Dockerfile` are verified by the CI `docker` job

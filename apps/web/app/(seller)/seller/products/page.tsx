@@ -142,12 +142,21 @@ export default function SellerProductsPage() {
             <p>এই স্টোরে এখনো কোনো পণ্য নেই। (No products in this store yet.)</p>
           ) : (
             products.map((p) => (
-              <ProductCard
-                key={p.id}
-                name={`${p.title_bn ?? p.title} (${p.status}, ${p.weight_grams} গ্রাম)`}
-                storeName={p.store_slug}
-                pricePoisha={p.price_poisha}
-              />
+              <div key={p.id}>
+                <ProductCard
+                  name={`${p.title_bn ?? p.title} (${p.status}, ${p.weight_grams} গ্রাম)`}
+                  storeName={p.store_slug}
+                  pricePoisha={p.price_poisha}
+                  isPromoted={p.is_promoted}
+                />
+                {p.status === "active" && (
+                  <p>
+                    <Link href={`/seller/promotions?product=${p.id}`}>
+                      প্রমোট করুন — Promote this product
+                    </Link>
+                  </p>
+                )}
+              </div>
             ))
           )}
 

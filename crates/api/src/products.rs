@@ -69,6 +69,14 @@ pub struct Product {
     pub rating_avg: Option<f64>,
     /// Number of reviews (Wave 8); 0 when there are none.
     pub rating_count: i64,
+    /// Whether the product is inside a live sponsored-promotion
+    /// window right now (Wave 26). Computed by the EXISTS in
+    /// `PRODUCT_COLUMNS` — the same rule as the domain's
+    /// `promotion_is_active` (status still `active`, now inside
+    /// [starts_at, ends_at)) evaluated by the database clock, so
+    /// every product surface agrees and the flag can never be a
+    /// stale stored value.
+    pub is_promoted: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -77,7 +85,10 @@ pub(crate) const PRODUCT_COLUMNS: &str = "p.id, p.store_id, s.slug AS store_slug
     p.description, p.category, p.price_poisha, p.compare_at_poisha, p.stock, \
     p.low_stock_threshold, p.status, \
     p.weight_grams, p.source, p.source_ref, rv.rating_avg, rv.rating_count, \
-    p.created_at, p.updated_at";
+    p.created_at, p.updated_at, \
+    EXISTS (SELECT 1 FROM promotions pr \
+            WHERE pr.product_id = p.id AND pr.status = 'active' \
+              AND pr.starts_at <= now() AND pr.ends_at > now()) AS is_promoted";
 
 /// Fill a loaded product's computed `stock_status` from the
 /// domain rule (Wave 23). Every query site that materialises
@@ -163,10 +174,17 @@ pub async fn list_products(
     .await
     .map_err(|e| ApiError::internal("count products", e))?;
 
+    // Wave 26: this listing's only ordering is the default
+    // (newest first), so live sponsored promotions sort ahead
+    // of it — the same promoted-first rule search applies to
+    // its default and relevance orderings. The flag is an
+    // output column of PRODUCT_COLUMNS, so ORDER BY can name
+    // it directly. Sponsored placement is always labelled in
+    // the UI (the স্পন্সরড badge), never disguised as organic.
     let items: Vec<Product> = sqlx::query_as(&format!(
         "SELECT {PRODUCT_COLUMNS} FROM products p JOIN stores s ON s.id = p.store_id \
          {PRODUCT_RATING_JOIN} \
-         WHERE {PRODUCT_WHERE} ORDER BY p.created_at DESC LIMIT $4 OFFSET $5"
+         WHERE {PRODUCT_WHERE} ORDER BY is_promoted DESC, p.created_at DESC LIMIT $4 OFFSET $5"
     ))
     .bind(&pattern)
     .bind(store_slug)

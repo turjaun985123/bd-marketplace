@@ -17,9 +17,17 @@
 //!   purpose: money is only counted once it is certainly the
 //!   seller's.
 //! - Balance: available = earned − paid out (payouts in `approved`
-//!   or `paid`) − pending (payouts still `requested`), computed by
-//!   the pure domain function and clamped at zero at this boundary
-//!   (see `available_balance`).
+//!   or `paid`) − pending (payouts still `requested`) − charges
+//!   (the seller's `seller_charges` rows — Wave 26 promotion
+//!   purchases), computed by the pure domain function plus the
+//!   charges term and clamped at zero at this boundary (see
+//!   `available_balance`). Charges belong to the SELLER, not to
+//!   one store: a promotion may target a product in any of the
+//!   seller's stores while money settles through the one payout
+//!   store, so the aggregate subtracts the store owner's charges
+//!   whichever store it summarises. Before Wave 26 no charges
+//!   existed, so the term was zero and the equation was exactly
+//!   Wave 9's.
 //! - Payout requests: the seller must first save a payout account
 //!   (validated by the domain), and the amount must satisfy the
 //!   domain minimum (500 taka) and fit the available balance. The
@@ -69,7 +77,8 @@ use crate::{ApiError, AppState};
 
 /// A store's money summary: what it earned from delivered
 /// sub-orders, what is already paid or committed out, what sits in
-/// requested payouts, and what can still be requested.
+/// requested payouts, what the seller has spent from the balance
+/// (Wave 26 charges), and what can still be requested.
 #[derive(Debug, Clone, Serialize)]
 pub struct Earnings {
     pub earned_poisha: i64,
@@ -77,7 +86,11 @@ pub struct Earnings {
     pub paid_out_poisha: i64,
     /// Payouts still in `requested`, waiting for the platform.
     pub pending_poisha: i64,
-    /// earned − paid out − pending, clamped at zero.
+    /// The seller's `seller_charges` total (Wave 26): money
+    /// taken from the balance outside the payout flow —
+    /// promotion purchases. Zero until the seller buys one.
+    pub charges_total_poisha: i64,
+    /// earned − paid out − pending − charges, clamped at zero.
     pub available_poisha: i64,
 }
 
@@ -167,24 +180,33 @@ async fn seller_store(pool: &PgPool, user: &AuthUser) -> Result<Store, ApiError>
 }
 
 /// The available balance for an earnings summary: the raw domain
-/// arithmetic, clamped at zero. With consistent inputs the raw
-/// value is never negative (a payout can only be requested against
-/// the available balance), so the clamp only guards the display
-/// against inconsistent history.
+/// arithmetic (earned − paid out − pending) minus the seller's
+/// charges, clamped at zero. With consistent inputs the raw
+/// value is never negative (a payout — and, since Wave 26, a
+/// promotion — can only be charged against the available
+/// balance), so the clamp only guards the display against
+/// inconsistent history.
 pub fn available_balance(earnings: &Earnings) -> i64 {
-    compute_available_balance(
+    (compute_available_balance(
         earnings.earned_poisha,
         earnings.paid_out_poisha,
         earnings.pending_poisha,
-    )
-    .max(0)
+    ) - earnings.charges_total_poisha)
+        .max(0)
 }
 
 /// THE earnings aggregate for a store — dashboard, balance and
 /// payout creation all read money through this one function, so
-/// the numbers can never disagree between endpoints.
-pub async fn seller_earnings(pool: &PgPool, store_id: Uuid) -> Result<Earnings, ApiError> {
-    let row: (i64, i64, i64) = sqlx::query_as(
+/// the numbers can never disagree between endpoints. Runs on
+/// any executor so the promotion purchase (Wave 26) can read
+/// the SAME aggregate inside its transaction, under the payout
+/// store's row lock, instead of racing a pool read against its
+/// own charge insert.
+pub async fn seller_earnings_on<'e, E>(executor: E, store_id: Uuid) -> Result<Earnings, ApiError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let row: (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT \
            (SELECT COALESCE(SUM(seller_payout_poisha), 0)::bigint \
               FROM sub_orders \
@@ -194,10 +216,15 @@ pub async fn seller_earnings(pool: &PgPool, store_id: Uuid) -> Result<Earnings, 
              WHERE store_id = $1 AND status IN ('approved', 'paid')) AS paid_out_poisha, \
            (SELECT COALESCE(SUM(amount_poisha), 0)::bigint \
               FROM payouts \
-             WHERE store_id = $1 AND status = 'requested') AS pending_poisha",
+             WHERE store_id = $1 AND status = 'requested') AS pending_poisha, \
+           (SELECT COALESCE(SUM(amount_poisha), 0)::bigint \
+              FROM seller_charges \
+             WHERE seller_user_id = \
+                   (SELECT owner_user_id FROM stores WHERE id = $1)) \
+             AS charges_total_poisha",
     )
     .bind(store_id)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
     .map_err(|e| ApiError::internal("load seller earnings", e))?;
 
@@ -205,10 +232,31 @@ pub async fn seller_earnings(pool: &PgPool, store_id: Uuid) -> Result<Earnings, 
         earned_poisha: row.0,
         paid_out_poisha: row.1,
         pending_poisha: row.2,
+        charges_total_poisha: row.3,
         available_poisha: 0,
     };
     earnings.available_poisha = available_balance(&earnings);
     Ok(earnings)
+}
+
+/// [`seller_earnings_on`] on the pool — the form every
+/// non-transactional caller uses.
+pub async fn seller_earnings(pool: &PgPool, store_id: Uuid) -> Result<Earnings, ApiError> {
+    seller_earnings_on(pool, store_id).await
+}
+
+/// THE available-balance read for a seller: resolve the
+/// seller's payout store (their earliest store — 404 when they
+/// have none, exactly like the balance endpoint) and read the
+/// one earnings aggregate for it. Dashboard, balance, payout
+/// creation and promotion purchase all end at this number or
+/// at [`seller_earnings_on`] over the same store, so the
+/// balance a seller sees is the balance every money gate
+/// enforces.
+pub async fn available_balance_poisha(pool: &PgPool, user_id: Uuid) -> Result<i64, ApiError> {
+    let store = get_store_by_owner(pool, user_id).await?;
+    let earnings = seller_earnings(pool, store.id).await?;
+    Ok(earnings.available_poisha)
 }
 
 /// The seller dashboard: payout store, activity counts, earnings,
