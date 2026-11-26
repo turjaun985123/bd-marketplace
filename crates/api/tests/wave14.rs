@@ -263,7 +263,9 @@ async fn wave14_coupons_end_to_end() {
     let product_a_id = product_a["id"].as_str().unwrap().to_string();
     let product_b_id = product_b["id"].as_str().unwrap().to_string();
 
-    // The wave-3-style two-store cart: goods 445_000, delivery 24_000.
+    // The wave-3-style two-store cart: goods 445_000; each product
+    // defaults to 1 kg, so inside-Dhaka delivery is 6_000 per store
+    // group — 12_000 total.
     async fn fill_cart(app: &axum::Router, buyer: &str, a: &str, b: &str) {
         add_to_cart(app, buyer, a, 1).await;
         add_to_cart(app, buyer, b, 1).await;
@@ -387,8 +389,8 @@ async fn wave14_coupons_end_to_end() {
     assert_eq!(order["discount_total_poisha"], 5_000);
     assert_eq!(order["goods_total_poisha"], 445_000);
     assert_eq!(
-        order["grand_total_poisha"], 464_000,
-        "469_000 without the coupon, minus the 5_000 discount"
+        order["grand_total_poisha"], 452_000,
+        "457_000 without the coupon, minus the 5_000 discount"
     );
     let sub_a = sub_order(&order, &store_a_id);
     let sub_b = sub_order(&order, &store_b_id);
@@ -439,14 +441,14 @@ async fn wave14_coupons_end_to_end() {
     assert_eq!(status, StatusCode::OK, "receipt: {receipt}");
     assert_eq!(receipt["discount_total_poisha"], 5_000);
     assert_eq!(receipt["coupon_code"], "EID10");
-    assert_eq!(receipt["grand_total_poisha"], 464_000);
+    assert_eq!(receipt["grand_total_poisha"], 452_000);
 
     // --- Checkout 2: store coupon — seller A bears it. -----------
     fill_cart(&app, &buyer, &product_a_id, &product_b_id).await;
     let (status, order2) = checkout(&app, &buyer, Some("ASTORE")).await;
     assert_eq!(status, StatusCode::CREATED, "checkout with ASTORE: {order2}");
     assert_eq!(order2["discount_total_poisha"], 10_000);
-    assert_eq!(order2["grand_total_poisha"], 459_000);
+    assert_eq!(order2["grand_total_poisha"], 447_000);
     let sub_a2 = sub_order(&order2, &store_a_id);
     let sub_b2 = sub_order(&order2, &store_b_id);
     assert_eq!(sub_a2["discount_poisha"], 10_000, "only A's sub is discounted");
