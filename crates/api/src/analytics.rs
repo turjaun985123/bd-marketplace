@@ -113,7 +113,7 @@ use crate::{ApiError, AppState};
 /// today (Asia/Dhaka). `$1` is the clamped day count in
 /// every query in this module.
 const WINDOW_START: &str =
-    "(((now() AT TIME ZONE 'Asia/Dhaka')::date - ($1 - 1))::timestamp \
+    "(((now() AT TIME ZONE 'Asia/Dhaka')::date - (($1 - 1)::int))::timestamp \
       AT TIME ZONE 'Asia/Dhaka')";
 
 /// Format a Dhaka date for the wire: `YYYY-MM-DD`.
@@ -275,7 +275,7 @@ async fn seller_daily(
                 COALESCE(SUM(so.seller_payout_poisha) \
                     FILTER (WHERE so.status = 'delivered'), 0)::bigint AS earnings_poisha \
            FROM generate_series( \
-                    (now() AT TIME ZONE 'Asia/Dhaka')::date - ($1 - 1), \
+                    (now() AT TIME ZONE 'Asia/Dhaka')::date - (($1 - 1)::int), \
                     (now() AT TIME ZONE 'Asia/Dhaka')::date, \
                     interval '1 day') AS gs \
            LEFT JOIN sub_orders so \
@@ -546,7 +546,7 @@ pub async fn admin_analytics(pool: &PgPool, days: i64) -> Result<AdminAnalytics,
                 COALESCE(SUM(so.goods_subtotal_poisha - so.discount_poisha \
                              + so.delivery_charge_poisha), 0)::bigint AS gmv_poisha \
            FROM generate_series( \
-                    (now() AT TIME ZONE 'Asia/Dhaka')::date - ($1 - 1), \
+                    (now() AT TIME ZONE 'Asia/Dhaka')::date - (($1 - 1)::int), \
                     (now() AT TIME ZONE 'Asia/Dhaka')::date, \
                     interval '1 day') AS gs \
            LEFT JOIN sub_orders so \
