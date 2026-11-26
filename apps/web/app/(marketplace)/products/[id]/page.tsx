@@ -4,24 +4,30 @@ import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import PriceTag from "@/components/PriceTag";
+import ProductRail from "@/components/ProductRail";
 import Stars from "@/components/Stars";
 import VerificationBadge from "@/components/VerificationBadge";
+import WishlistButton from "@/components/WishlistButton";
 import {
   createConversation,
   createReview,
   deleteReview,
+  getAlsoBought,
   getProduct,
   getProductReviews,
+  getRelatedProducts,
   getStore,
   replyToReview,
   updateReply,
   updateReview,
+  type AlsoBoughtItem,
   type Product,
   type Review,
   type Store,
 } from "@/lib/api";
 import { useAuth } from "@/hooks/useAuth";
 import { useCart } from "@/hooks/useCart";
+import { recordRecentlyViewed } from "@/hooks/useRecentlyViewed";
 
 /**
  * Product detail page (Wave 8): product info with the live rating
@@ -32,6 +38,12 @@ import { useCart } from "@/hooks/useCart";
  * as-is. The author gets edit/delete controls on their own review;
  * the store owner gets a reply box here (no separate seller page —
  * replies live where the reviews are read).
+ *
+ * Wave 24: the wishlist heart, the related + also-bought
+ * discovery rails (the shared ProductRail — the also-bought
+ * rail renders nothing while the product has no
+ * co-purchases), and the device-local recently-viewed
+ * recording.
  */
 export default function ProductDetailPage({
   params,
@@ -44,6 +56,8 @@ export default function ProductDetailPage({
   const [messageError, setMessageError] = useState<string | null>(null);
   const [product, setProduct] = useState<Product | null>(null);
   const [reviews, setReviews] = useState<Review[] | null>(null);
+  const [related, setRelated] = useState<Product[]>([]);
+  const [alsoBought, setAlsoBought] = useState<AlsoBoughtItem[]>([]);
   const [store, setStore] = useState<Store | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [added, setAdded] = useState(false);
@@ -65,7 +79,21 @@ export default function ProductDetailPage({
     // every visitor should see — not only signed-in users.
     const s = await getStore(p.store_slug).catch(() => null);
     setStore(s);
+    // Wave 24 discovery rails: public endpoints, best-effort —
+    // a failed rail hides itself, it never breaks the page.
+    const [rel, also] = await Promise.all([
+      getRelatedProducts(params.id).catch(() => null),
+      getAlsoBought(params.id).catch(() => null),
+    ]);
+    if (rel) setRelated(rel.items);
+    if (also) setAlsoBought(also.items);
   }, [params.id, token, user]);
+
+  // Wave 24: record the view in the DEVICE-LOCAL history
+  // (localStorage only — see useRecentlyViewed).
+  useEffect(() => {
+    if (product) recordRecentlyViewed(product.id);
+  }, [product]);
 
   useEffect(() => {
     if (!ready) return;
@@ -188,6 +216,10 @@ export default function ProductDetailPage({
       </p>
       {product.description && <p>{product.description}</p>}
 
+      <p>
+        <WishlistButton productId={product.id} />
+      </p>
+
       {token ? (
         <p>
           <button type="button" onClick={() => void onAdd()}>
@@ -214,6 +246,17 @@ export default function ProductDetailPage({
           {messageError && <span role="alert"> {messageError}</span>}
         </p>
       )}
+
+      <ProductRail
+        title="সম্পর্কিত পণ্য — Related products"
+        products={related}
+      />
+      {/* Renders nothing at all while the product has no
+          co-purchases — the rail never pads itself. */}
+      <ProductRail
+        title="অন্যরা এটাও কিনেছেন — Others also bought"
+        products={alsoBought}
+      />
 
       <h2>রিভিউ — Reviews</h2>
 

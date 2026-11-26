@@ -1,5 +1,6 @@
 import Link from "next/link";
 import PriceTag from "./PriceTag";
+import WishlistButton from "./WishlistButton";
 
 export interface ProductCardProps {
   name: string;
@@ -7,6 +8,12 @@ export interface ProductCardProps {
   pricePoisha: number;
   /** When set, the title links to the product detail page. */
   href?: string;
+  /**
+   * Wave 24: when the product id is known, the card carries
+   * the wishlist heart toggle. Presentational callers that
+   * only have display data (seller/admin previews) omit it.
+   */
+  productId?: string;
   /** Wave 8 rating summary; the rating line shows only when count > 0. */
   ratingAvg?: number | null;
   ratingCount?: number;
@@ -29,6 +36,7 @@ export default function ProductCard({
   storeName,
   pricePoisha,
   href,
+  productId,
   ratingAvg,
   ratingCount,
   variant = "card",
@@ -41,6 +49,11 @@ export default function ProductCard({
       {ratingCount !== undefined && ratingCount > 0 && (
         <p>
           ★ {(ratingAvg ?? 0).toFixed(1)} ({ratingCount})
+        </p>
+      )}
+      {productId && (
+        <p>
+          <WishlistButton productId={productId} />
         </p>
       )}
     </article>

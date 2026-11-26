@@ -1199,6 +1199,90 @@ concurrency story. Movements from before migration 0024
 are not backfilled — the trail honestly starts with this
 wave.
 
+Wave 24 (wishlist & recommendations):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| POST | `/v1/wishlist/{product_id}` | Bearer. Save a product for later. The product must be publicly visible (active product, active store) — anything else is a 404. Idempotent: re-adding is a 200 with `{wishlisted: true, product_id}` |
+| DELETE | `/v1/wishlist/{product_id}` | Bearer. Unsave. Idempotent: removing an absent product is a 200 with `{wishlisted: false, product_id}` |
+| GET | `/v1/wishlist` | Bearer. The caller's saved products as full product views (rating summary + stock health included), newest first |
+| GET | `/v1/wishlist/ids` | Bearer. Only the saved product ids — the lightweight read the heart toggles share |
+| GET | `/v1/products/{id}/related?limit=` | Public. Products related to this one, ranked by the scoring rule below; 404 when the base product is not publicly visible |
+| GET | `/v1/products/{id}/also-bought?limit=` | Public. Cross-store co-purchase companions with their `co_count`; 404 when the base product is not publicly visible |
+| GET | `/v1/recommendations?limit=` | Bearer. The caller's personalised rail, or the labelled top-rated fallback (`{personalized, items}`) |
+
+**Wishlist semantics:** the list is account data and lives
+server-side (migration 0025, one row per user + product),
+so it follows the user to any device they sign in on. Add
+requires public visibility — a wishlist must not become a
+way to hold on to a draft or a suspended store's product —
+while the list itself returns what the user saved without
+re-filtering (the product page enforces visibility when
+they click through). Add and remove always answer with
+the resulting truth, so clients never guess state.
+
+**The related scoring rule** (one SQL query; the weights
+are far enough apart that a higher tier always wins):
+
+| Signal | Points |
+| --- | --- |
+| Same category (both non-null, case-insensitive) | +4 |
+| Same store | +2 |
+| Well reviewed (rating average ≥ 4.0) | +1 |
+
+Ties break by rating average (unreviewed last), review
+count, then newest first. Only publicly visible products
+are candidates, and the base product never appears.
+
+**Also-bought** is ORDER-LEVEL co-purchase: a product
+counts when it sits in a DIFFERENT sub-order of an order
+that also contains the base product — the split checkout
+puts each store's goods in its own sub-order under one
+order, so this is exactly the cross-store "bought
+together" signal. `co_count` is the number of DISTINCT
+orders the pair shares. Only publicly visible companions
+are returned, ordered by `co_count`, then rating. A
+product nobody has ordered yet returns an empty list:
+co-purchases are counted, never invented.
+
+**Recommendations** are category signals, not a model.
+The signals are the categories of (a) products the caller
+received in a delivered sub-order and (b) products on
+their wishlist, each category weighted by its most
+recent signal. Candidates are publicly visible products
+in a signal category that the caller has NOT bought (any
+non-cancelled sub-order) and has NOT wishlisted —
+recommendations surface discoveries, not saved or owned
+items — ordered by signal recency, then rating. A caller
+with no signals gets the documented fallback (top-rated
+publicly visible products) and the response says so:
+`personalized: false`. A caller WITH signals whose
+candidates are all excluded gets `personalized: true`
+with an empty list, never the fallback dressed up as
+personalisation. Every rail's page size goes through
+the one domain rule (`recommendation_limit`: default 8,
+clamped to 1..=24).
+
+**Recently viewed** is the deliberate opposite of the
+wishlist: the viewed product ids live in the browser's
+localStorage on ONE device and are never sent to the
+server as tracking data. The home page resolves them
+through the ordinary public product endpoint (ids that
+no longer resolve are skipped silently), caps the rail
+at 12, and clearing the browser's site data clears the
+history — that is the privacy model, stated plainly.
+
+**Honest limits:** there is no ML, no click/view event
+pipeline and no A/B testing behind any rail — the
+rankings are the documented rules above, computed from
+orders, wishlist rows and review aggregates the platform
+already stores. Same-sub-order companions do not count
+toward also-bought (the definition is the cross-store
+pair), and the personalised rail is only as good as its
+category signals: a catalogue with sparse categories
+gives sparse personalisation, and the fallback carries
+new users until they buy or save something.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -2163,6 +2247,33 @@ inventory summary and dashboard alerts, and foreign-seller
 forms, threshold editors, expandable history) plus the
 dashboard's low-stock alert strip and nav link.
 
+**Real (Wave 24):** wishlist & recommendations —
+migration 0025 (`wishlist_items`, composite primary key,
+product index); the domain page-size rule
+(`recommendation_limit` — default 8, clamped to 1..=24);
+the `wishlist` API module (idempotent add/remove
+answering with the resulting state, add gated on the one
+public-visibility rule now shared as
+`products::get_public_product`, the full-view list and
+the lightweight ids read); the `recommend` API module
+with the three documented SQL rails (related by the
++4/+2/+1 scoring rule, also-bought as order-level
+co-purchase counted in distinct orders, and the
+personalised category-signal rail with bought/wishlisted
+exclusions and the labelled top-rated fallback); an
+integration test (`crates/api/tests/wave24.rs`, same
+`DATABASE_URL` gate) covering wishlist idempotency,
+per-user isolation and the draft 404, the related
+scoring order, symmetric cross-store also-bought with
+`co_count`, and all three recommendation cases
+(delivered signal, wishlist-only signal, fallback); and
+the Next.js wishlist page at /wishlist, the shared
+WishlistProvider + heart toggle on product cards and the
+product page, the related + also-bought rails on the
+product page, and the home page's personalised and
+device-local recently-viewed strips (localStorage only,
+never sent to the server).
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters, and the four manual couriers run
@@ -2198,19 +2309,22 @@ the external service at the other end of it, configured by
   /seller/orders and /track with the manual-courier workflow;
   Wave 21 adds /seller/verification and /admin/verifications;
   Wave 22 adds /invoice/[subOrderId]; Wave 23 adds
-  /seller/inventory and the dashboard low-stock strip).
+  /seller/inventory and the dashboard low-stock strip;
+  Wave 24 adds /wishlist, the product page's related +
+  also-bought rails, and the home page's personalised +
+  recently-viewed strips).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
-  (domain 91, courier 31, payments 8 unit tests; the `DATABASE_URL`-
+  (domain 92, courier 31, payments 8 unit tests; the `DATABASE_URL`-
   gated integration tests skip cleanly without a database). The API
   binary was also smoke-tested locally without a database: routes
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
   (including the Wave 13 messaging endpoints), and the SIDRA
   callback answers 503 without a database.
-- **Rust integration + clippy: CI-only** — the Wave 2–23 integration
+- **Rust integration + clippy: CI-only** — the Wave 2–24 integration
   tests against a real Postgres 16 service and clippy `-D warnings`
   are verified via **GitHub Actions CI** (`.github/workflows/ci.yml`)
-  on push. Waves 1–22 are green there; Wave 23 awaits its first CI run.
+  on push. Waves 1–23 are green there; Wave 24 awaits its first CI run.
 - **Docker images: CI-only** — Docker is not installed on the
   development machine, so `Dockerfile.api`, `Dockerfile.worker`
   and `apps/web/Dockerfile` are verified by the CI `docker` job

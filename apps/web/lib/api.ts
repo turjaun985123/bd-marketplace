@@ -2546,3 +2546,120 @@ export function riskLevelLabel(level: string): string {
       return "নিম্ন ঝুঁকি";
   }
 }
+
+/** The answer to a wishlist add/remove (Wave 24): the
+ * resulting state of that product on the caller's list. */
+export interface WishlistToggle {
+  wishlisted: boolean;
+  product_id: string;
+}
+
+/** The caller's saved products as full product views (Wave 24). */
+export interface Wishlist {
+  items: Product[];
+}
+
+/** Just the saved product ids (Wave 24) — the heart toggles' read. */
+export interface WishlistIds {
+  product_ids: string[];
+}
+
+/** POST /v1/wishlist/{productId} — save a product for later.
+ * Idempotent: saving an already-saved product is a 200. */
+export function addToWishlist(
+  token: string,
+  productId: string
+): Promise<WishlistToggle> {
+  return call(`/v1/wishlist/${encodeURIComponent(productId)}`, {
+    method: "POST",
+    token,
+  });
+}
+
+/** DELETE /v1/wishlist/{productId} — unsave a product.
+ * Idempotent: removing an absent product is a 200 too. */
+export function removeFromWishlist(
+  token: string,
+  productId: string
+): Promise<WishlistToggle> {
+  return call(`/v1/wishlist/${encodeURIComponent(productId)}`, {
+    method: "DELETE",
+    token,
+  });
+}
+
+/** GET /v1/wishlist — the caller's saved products, newest first. */
+export function getWishlist(token: string): Promise<Wishlist> {
+  return call("/v1/wishlist", { token });
+}
+
+/** GET /v1/wishlist/ids — only the saved ids, for heart states. */
+export function getWishlistIds(token: string): Promise<WishlistIds> {
+  return call("/v1/wishlist/ids", { token });
+}
+
+/** Related products for one product (Wave 24): the shared
+ * Product shape in rank order (category, store, rating). */
+export interface RelatedProducts {
+  items: Product[];
+}
+
+/** GET /v1/products/{id}/related — public; 404 when the
+ * product itself is not publicly visible. */
+export function getRelatedProducts(
+  productId: string,
+  limit?: number
+): Promise<RelatedProducts> {
+  const search = new URLSearchParams();
+  if (limit) search.set("limit", String(limit));
+  const qs = search.toString();
+  return call(
+    `/v1/products/${encodeURIComponent(productId)}/related${qs ? `?${qs}` : ""}`
+  );
+}
+
+/** One also-bought companion (Wave 24): the product view plus
+ * how many distinct orders pair it with the base product. */
+export interface AlsoBoughtItem extends Product {
+  co_count: number;
+}
+
+/** The also-bought rail (Wave 24); honestly empty when the
+ * product has no cross-store co-purchases yet. */
+export interface AlsoBought {
+  items: AlsoBoughtItem[];
+}
+
+/** GET /v1/products/{id}/also-bought — public co-purchase rail. */
+export function getAlsoBought(
+  productId: string,
+  limit?: number
+): Promise<AlsoBought> {
+  const search = new URLSearchParams();
+  if (limit) search.set("limit", String(limit));
+  const qs = search.toString();
+  return call(
+    `/v1/products/${encodeURIComponent(productId)}/also-bought${qs ? `?${qs}` : ""}`
+  );
+}
+
+/**
+ * The personalised rail (Wave 24). `personalized` false means
+ * the answer is the top-rated fallback — the caller has no
+ * category signals (delivered purchases / wishlist) yet.
+ */
+export interface Recommendations {
+  personalized: boolean;
+  items: Product[];
+}
+
+/** GET /v1/recommendations — the caller's discovery rail. */
+export function getRecommendations(
+  token: string,
+  limit?: number
+): Promise<Recommendations> {
+  const search = new URLSearchParams();
+  if (limit) search.set("limit", String(limit));
+  const qs = search.toString();
+  return call(`/v1/recommendations${qs ? `?${qs}` : ""}`, { token });
+}

@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { WishlistProvider } from "@/hooks/useWishlist";
 
 export const metadata: Metadata = {
   title: "বিডি মার্কেটপ্লেস — BD Marketplace",
@@ -14,7 +15,11 @@ export default function RootLayout({
 }) {
   return (
     <html lang="bn">
-      <body>{children}</body>
+      <body>
+        {/* Wave 24: one shared wishlist state for every heart
+            toggle in the app (see hooks/useWishlist). */}
+        <WishlistProvider>{children}</WishlistProvider>
+      </body>
     </html>
   );
 }

@@ -131,6 +131,19 @@
 //! Sellers also get per-product low-stock thresholds (null =
 //! the domain default), a stock-history view, an inventory
 //! overview, and low-stock alerts on the dashboard.
+//! Wave 24: wishlist + recommendations (`wishlist` and
+//! `recommend` modules) — the signed-in user's server-side
+//! saved-for-later list (idempotent add/remove; adding
+//! requires the product to be publicly visible), and three
+//! SQL-ranked discovery rails with documented rules and no
+//! ML anywhere: related products (category +4, same store
+//! +2, well-reviewed +1), also-bought (order-level
+//! co-purchase across the split checkout's sub-orders,
+//! counted in distinct orders, honestly empty when nobody
+//! has bought the product), and a personalised rail fed by
+//! the categories of the caller's delivered purchases and
+//! wishlist items — with a labelled top-rated fallback
+//! (`personalized: false`) for callers without signals.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -153,6 +166,7 @@ pub mod orders;
 pub mod payments;
 pub mod payouts;
 pub mod products;
+pub mod recommend;
 pub mod returns;
 pub mod reviews;
 pub mod risk;
@@ -161,6 +175,7 @@ pub mod shipments;
 pub mod stores;
 pub mod tracking;
 pub mod verification;
+pub mod wishlist;
 
 use axum::{
     http::{HeaderValue, Method, StatusCode},
@@ -1164,6 +1179,34 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/v1/seller/products/:id/low-stock-threshold",
             put(inventory::set_low_stock_threshold_handler),
+        )
+        // Wave 24 — wishlist: the caller's server-side
+        // saved-for-later list. Add/remove are idempotent
+        // and answer with the resulting state; the ids read
+        // is the lightweight one the heart toggles use.
+        // `/ids` is registered alongside the `:product_id`
+        // routes — the static segment wins for GETs.
+        .route("/v1/wishlist", get(wishlist::list_wishlist_handler))
+        .route("/v1/wishlist/ids", get(wishlist::list_wishlist_ids_handler))
+        .route(
+            "/v1/wishlist/:product_id",
+            post(wishlist::add_to_wishlist_handler)
+                .delete(wishlist::remove_from_wishlist_handler),
+        )
+        // Wave 24 — recommendations: related and also-bought
+        // are public rails on the product; the personalised
+        // rail is the caller's own (Bearer).
+        .route(
+            "/v1/products/:id/related",
+            get(recommend::related_handler),
+        )
+        .route(
+            "/v1/products/:id/also-bought",
+            get(recommend::also_bought_handler),
+        )
+        .route(
+            "/v1/recommendations",
+            get(recommend::recommendations_handler),
         )
         .layer(cors)
         .with_state(state)

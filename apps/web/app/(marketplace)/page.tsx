@@ -1,6 +1,7 @@
 import Link from "next/link";
 import AdminLink from "@/components/AdminLink";
 import DeliveryChargeWidget from "@/components/DeliveryChargeWidget";
+import HomeDiscovery from "@/components/HomeDiscovery";
 import ProductGrid from "@/components/ProductGrid";
 import SearchBar from "@/components/SearchBar";
 
@@ -19,6 +20,8 @@ export default function MarketplaceHomePage() {
         {" · "}
         <Link href="/cart">আমার কার্ট — Cart</Link>
         {" · "}
+        <Link href="/wishlist">♡ উইশলিস্ট — Wishlist</Link>
+        {" · "}
         <Link href="/orders">আমার অর্ডার — My orders</Link>
         {" · "}
         <Link href="/track">অর্ডার ট্র্যাক — Track order</Link>
@@ -28,6 +31,8 @@ export default function MarketplaceHomePage() {
       </p>
 
       <SearchBar />
+
+      <HomeDiscovery />
 
       <h2>পণ্য — Products</h2>
       <ProductGrid />

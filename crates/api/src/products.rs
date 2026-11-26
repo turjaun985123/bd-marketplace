@@ -203,6 +203,25 @@ pub async fn get_product_by_id(pool: &PgPool, id: Uuid) -> Result<Product, ApiEr
     Ok(with_stock_status(product))
 }
 
+/// Fetch one product under the PUBLIC visibility rule — the
+/// stricter rule the discovery surfaces use (Wave 15 search,
+/// Wave 24 wishlist / recommendations): the product must be
+/// `active` and its store must be `active`, with no owner
+/// exception. Anything else — missing, draft, archived, or a
+/// suspended store's product — is the same 404, so a caller
+/// cannot probe for hidden products through these endpoints.
+pub async fn get_public_product(pool: &PgPool, id: Uuid) -> Result<Product, ApiError> {
+    let product = get_product_by_id(pool, id).await?;
+    if product.status != "active" {
+        return Err(ApiError::not_found("product not found"));
+    }
+    let store = get_store_by_id(pool, product.store_id).await?;
+    if store.status != "active" {
+        return Err(ApiError::not_found("product not found"));
+    }
+    Ok(product)
+}
+
 /// Assert the caller owns the store; 404 if the store does not exist,
 /// 403 if it belongs to someone else.
 async fn require_store_owner(pool: &PgPool, store_id: Uuid, user: &AuthUser) -> Result<(), ApiError> {

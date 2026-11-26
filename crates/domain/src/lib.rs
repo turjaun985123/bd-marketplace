@@ -2365,6 +2365,30 @@ pub fn validate_low_stock_threshold(
     }
 }
 
+/// How many products a recommendation surface shows when
+/// the caller does not ask for a specific count (Wave 24):
+/// the related, also-bought and personalised rails all share
+/// this one default.
+pub const DEFAULT_RECOMMENDATION_LIMIT: i64 = 8;
+
+/// The most products any recommendation surface returns in
+/// one call (Wave 24). The rails are discovery aids, not
+/// catalogue listings — a caller who wants the whole
+/// catalogue uses the listing and search endpoints.
+pub const MAX_RECOMMENDATION_LIMIT: i64 = 24;
+
+/// Normalise a caller-supplied recommendation limit
+/// (Wave 24): an absent limit means
+/// [`DEFAULT_RECOMMENDATION_LIMIT`]; a supplied one clamps
+/// into 1..=[`MAX_RECOMMENDATION_LIMIT`] (zero or negative
+/// asks still get one product rather than an error — the
+/// rail simply shows less).
+pub fn recommendation_limit(limit: Option<i64>) -> i64 {
+    limit
+        .unwrap_or(DEFAULT_RECOMMENDATION_LIMIT)
+        .clamp(1, MAX_RECOMMENDATION_LIMIT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4207,5 +4231,28 @@ mod tests {
         );
         assert!(validate_low_stock_threshold(Some(-1)).is_err());
         assert!(validate_low_stock_threshold(Some(MAX_LOW_STOCK_THRESHOLD + 1)).is_err());
+    }
+
+    #[test]
+    fn recommendation_limit_defaults_and_clamps() {
+        // Absent means the shared default.
+        assert_eq!(recommendation_limit(None), DEFAULT_RECOMMENDATION_LIMIT);
+        assert_eq!(recommendation_limit(None), 8);
+        // In-range values pass through untouched.
+        assert_eq!(recommendation_limit(Some(1)), 1);
+        assert_eq!(recommendation_limit(Some(12)), 12);
+        assert_eq!(
+            recommendation_limit(Some(MAX_RECOMMENDATION_LIMIT)),
+            MAX_RECOMMENDATION_LIMIT
+        );
+        // Zero and negative asks still show one product.
+        assert_eq!(recommendation_limit(Some(0)), 1);
+        assert_eq!(recommendation_limit(Some(-7)), 1);
+        // Oversized asks clamp to the cap, never error.
+        assert_eq!(
+            recommendation_limit(Some(MAX_RECOMMENDATION_LIMIT + 1)),
+            MAX_RECOMMENDATION_LIMIT
+        );
+        assert_eq!(recommendation_limit(Some(10_000)), MAX_RECOMMENDATION_LIMIT);
     }
 }

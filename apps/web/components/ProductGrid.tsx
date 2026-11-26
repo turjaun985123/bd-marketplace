@@ -96,6 +96,7 @@ export default function ProductGrid({
             name={p.title_bn ?? p.title}
             storeName={p.store_slug}
             pricePoisha={p.price_poisha}
+            productId={p.id}
             href={`/products/${p.id}`}
             ratingAvg={p.rating_avg}
             ratingCount={p.rating_count}
