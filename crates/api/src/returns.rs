@@ -42,6 +42,7 @@ use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
 use crate::admin::require_admin;
+use crate::audit::record_admin_action;
 use crate::auth::AuthUser;
 use crate::orders::restock_sub_order_items;
 use crate::products::clamp_pagination;
@@ -596,12 +597,22 @@ pub async fn list_return_requests_for_admin(
 /// so a refund can never be recorded twice.
 pub async fn mark_refund_done(
     pool: &PgPool,
+    admin_id: Uuid,
     return_id: Uuid,
 ) -> Result<SellerReturnRequest, ApiError> {
+    // Wave 28: the status check, the update and the audit row
+    // (`return.refund_done`) run in one transaction — marking
+    // a refund done is the platform asserting money moved
+    // off-platform, so it is exactly the kind of claim the
+    // audit log exists to pin to an admin.
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| ApiError::internal("begin mark refund done", e))?;
     let refund_status: Option<String> =
         sqlx::query_scalar("SELECT refund_status FROM return_requests WHERE id = $1")
             .bind(return_id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|e| ApiError::internal("load return refund status", e))?;
     let refund_status =
@@ -614,9 +625,21 @@ pub async fn mark_refund_done(
 
     sqlx::query("UPDATE return_requests SET refund_status = 'done' WHERE id = $1")
         .bind(return_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| ApiError::internal("mark refund done", e))?;
+    record_admin_action(
+        &mut *tx,
+        admin_id,
+        "return.refund_done",
+        "return_request",
+        Some(&return_id.to_string()),
+        None,
+    )
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::internal("commit mark refund done", e))?;
 
     load_seller_return_request(pool, return_id).await
 }
@@ -735,7 +758,7 @@ pub async fn refund_done_handler(
     user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<SellerReturnRequest>, ApiError> {
-    require_admin(&state, &user).await?;
+    let admin = require_admin(&state, &user).await?;
     let pool = state.require_pool()?;
-    Ok(Json(mark_refund_done(pool, id).await?))
+    Ok(Json(mark_refund_done(pool, admin.id, id).await?))
 }

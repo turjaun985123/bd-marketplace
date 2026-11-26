@@ -178,6 +178,20 @@
 //! non-cancelled slices, and commission counts delivered
 //! slices only. The seller daily series also exports as
 //! CSV through the domain CSV builder.
+//! Wave 28: security hardening + the admin audit log
+//! (`audit` module) — OTP requests are throttled per phone
+//! against the domain hourly cap (counted from the
+//! append-only `otp_request_log`, since `otp_codes` keeps
+//! only one row per phone); every response carries the
+//! security header set and request bodies are capped at
+//! 1 MiB in `build_app`; the process refuses to start
+//! outside dev mode on a short or well-known JWT secret
+//! (`validate_jwt_secret`, enforced in `run`); and every
+//! consequential admin action — payout transitions, store
+//! suspension, settings updates, verification decisions,
+//! admin Q&A moderation, refund completion — writes an
+//! audit row inside its own transaction via the one
+//! writer in the `audit` module.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -190,6 +204,7 @@
 
 pub mod admin;
 pub mod analytics;
+pub mod audit;
 pub mod auth;
 pub mod cart;
 pub mod coupons;
@@ -215,7 +230,9 @@ pub mod verification;
 pub mod wishlist;
 
 use axum::{
-    http::{HeaderValue, Method, StatusCode},
+    extract::{DefaultBodyLimit, Request},
+    http::{header, HeaderValue, Method, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, patch, post, put},
     Json, Router,
@@ -358,6 +375,54 @@ pub const DEFAULT_PROMOTION_PRICE_PER_DAY_POISHA: i64 =
 /// sets `CORS_ORIGINS` to its deployed web origin(s).
 pub const DEFAULT_CORS_ORIGIN: &str = "http://localhost:3000";
 
+/// The well-known DEV-ONLY JWT secret `AppState::from_env`
+/// falls back to when `JWT_SECRET` is unset. It is public by
+/// definition — it is printed in this source file — so anyone
+/// can forge tokens signed with it; [`validate_jwt_secret`]
+/// refuses it outside dev mode.
+pub const DEV_JWT_SECRET: &str = "dev-only-insecure-jwt-secret-change-me";
+
+/// Minimum length of a production JWT secret (Wave 28).
+pub const MIN_JWT_SECRET_CHARS: usize = 32;
+
+/// Maximum request body the router accepts (Wave 28): 1 MiB.
+/// Every current payload is far below this (the largest, the
+/// Facebook post import, caps its own post count well under
+/// it); the cap exists so a client cannot stream unbounded
+/// bodies at the JSON extractors.
+pub const MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
+
+/// May the API start with this JWT secret (Wave 28)? In dev
+/// mode anything goes — local development must not need a
+/// real secret, and dev mode already gates the log SMS sender
+/// and the `dev_otp` field. Outside dev mode the secret must
+/// be at least [`MIN_JWT_SECRET_CHARS`] characters and must
+/// not be the well-known [`DEV_JWT_SECRET`] fallback: starting
+/// anyway would mean every token the API issues can be forged
+/// by anyone who has read this source file. The error names
+/// the problem and the required length; it never echoes the
+/// secret itself.
+pub fn validate_jwt_secret(secret: &str, dev_mode: bool) -> Result<(), String> {
+    if dev_mode {
+        return Ok(());
+    }
+    if secret == DEV_JWT_SECRET {
+        return Err(
+            "JWT_SECRET is not set (the dev-only default secret is in use) — \
+             set a real JWT_SECRET before running outside dev mode"
+                .to_string(),
+        );
+    }
+    if secret.chars().count() < MIN_JWT_SECRET_CHARS {
+        return Err(format!(
+            "JWT_SECRET is too short ({} characters) — use at least \
+             {MIN_JWT_SECRET_CHARS} characters outside dev mode",
+            secret.chars().count()
+        ));
+    }
+    Ok(())
+}
+
 impl AppState {
     pub fn new(pool: Option<PgPool>, jwt_secret: String, sms_dev_mode: bool) -> Self {
         AppState {
@@ -418,6 +483,10 @@ impl AppState {
     /// WARNING: if `JWT_SECRET` is not set we fall back to a well-known
     /// DEV-ONLY secret and log a loud warning. Never run production with
     /// the fallback — anyone can forge tokens signed with a public secret.
+    /// Since Wave 28 this is also enforced: `run` validates the
+    /// resulting secret with [`validate_jwt_secret`] and refuses
+    /// to start outside dev mode when it fails, so the fallback
+    /// can only ever serve local development.
     pub fn from_env(pool: Option<PgPool>) -> Self {
         let jwt_secret = match std::env::var("JWT_SECRET") {
             Ok(secret) if !secret.is_empty() => secret,
@@ -426,7 +495,7 @@ impl AppState {
                     "WARNING: JWT_SECRET is not set — using the DEV-ONLY default secret. \
                      Tokens can be forged; set JWT_SECRET before any real deployment."
                 );
-                "dev-only-insecure-jwt-secret-change-me".to_string()
+                DEV_JWT_SECRET.to_string()
             }
         };
         let sms_dev_mode = std::env::var("APP_ENV").map(|v| v == "dev").unwrap_or(false)
@@ -892,6 +961,38 @@ async fn commission_quote(Json(req): Json<CommissionQuoteRequest>) -> Json<Commi
     Json(compute_commission(req.subtotal_poisha, req.rate_bps))
 }
 
+/// Wave 28 security headers, applied to EVERY response the
+/// router produces (including errors and CORS preflights).
+/// This service is a JSON API — it never serves HTML, frames
+/// or assets — so the set is strict: no MIME sniffing, no
+/// framing at all (the header and the CSP agree), no referrer
+/// leakage, a `default-src 'none'` CSP that would make any
+/// accidentally-served markup inert, and HSTS for the TLS
+/// terminators deployed in front of it. The Next.js app
+/// serves its own header set — see `apps/web/next.config.js`.
+async fn security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
+    );
+    headers.insert(
+        header::STRICT_TRANSPORT_SECURITY,
+        HeaderValue::from_static("max-age=31536000"),
+    );
+    response
+}
+
 /// Build the full router around a state. Used by `main` and by the
 /// integration tests (which drive it via tower oneshot, no TCP port).
 pub fn build_app(state: AppState) -> Router {
@@ -1164,6 +1265,10 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/admin/settings",
             get(admin::get_settings_handler).put(admin::update_settings_handler),
         )
+        // Wave 28 — the admin audit log: the read side of the
+        // rows the audited admin actions write inside their
+        // own transactions (see the `audit` module).
+        .route("/v1/admin/audit-log", get(audit::list_audit_log_handler))
         // Coupons (Wave 14): stateless preview for buyers, seller
         // CRUD for store coupons, admin CRUD for platform coupons.
         .route("/v1/coupons/preview", post(coupons::preview_handler))
@@ -1338,6 +1443,10 @@ pub fn build_app(state: AppState) -> Router {
             get(recommend::recommendations_handler),
         )
         .layer(cors)
+        // Wave 28: security headers on every response, and a
+        // hard cap on request bodies for the body extractors.
+        .layer(middleware::from_fn(security_headers))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
 
@@ -1438,6 +1547,16 @@ pub async fn run() {
     };
 
     let state = AppState::from_env(pool);
+    // Wave 28: refuse to start on a forgeable JWT secret
+    // outside dev mode. `from_env` has already warned loudly
+    // about the unset-secret fallback; this turns the warning
+    // into a hard stop — the reason on stderr, the
+    // conventional configuration-error exit code 2, and no
+    // secret value in the message.
+    if let Err(reason) = validate_jwt_secret(&state.jwt_secret, state.sms_dev_mode) {
+        eprintln!("FATAL: {reason}");
+        std::process::exit(2);
+    }
     log_config_summary(&state);
     let port: u16 = std::env::var("API_PORT")
         .ok()
@@ -1452,4 +1571,48 @@ pub async fn run() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("API server error");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jwt_secret_dev_mode_accepts_anything() {
+        // Dev mode is the local-development path: even the
+        // well-known fallback and a one-character secret pass,
+        // because dev mode already gates everything dangerous
+        // (log SMS sender, dev_otp) behind the same flag.
+        assert!(validate_jwt_secret(DEV_JWT_SECRET, true).is_ok());
+        assert!(validate_jwt_secret("x", true).is_ok());
+        assert!(validate_jwt_secret("", true).is_ok());
+    }
+
+    #[test]
+    fn jwt_secret_production_rules() {
+        // The well-known fallback is refused even though it is
+        // longer than the minimum — length alone is not safety.
+        assert!(validate_jwt_secret(DEV_JWT_SECRET, false).is_err());
+        // Short secrets are refused; the boundary is exact.
+        assert!(validate_jwt_secret("short-secret", false).is_err());
+        assert!(validate_jwt_secret(&"a".repeat(31), false).is_err());
+        assert!(validate_jwt_secret(&"a".repeat(32), false).is_ok());
+        assert!(validate_jwt_secret(
+            "a-real-production-secret-with-plenty-of-entropy",
+            false
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn jwt_secret_errors_never_echo_the_secret() {
+        let secret = "tiny";
+        let err = validate_jwt_secret(secret, false).expect_err("short secret refused");
+        assert!(!err.contains(secret), "error leaked the secret: {err}");
+        let err = validate_jwt_secret(DEV_JWT_SECRET, false).expect_err("fallback refused");
+        assert!(
+            !err.contains(DEV_JWT_SECRET),
+            "error leaked the secret: {err}"
+        );
+    }
 }

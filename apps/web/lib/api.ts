@@ -3048,3 +3048,43 @@ export function getAdminAnalytics(
   const qs = days ? `?days=${days}` : "";
   return call(`/v1/admin/analytics${qs}`, { token });
 }
+
+/**
+ * One admin audit-log entry (Wave 28): a consequential admin
+ * action, written by the API inside the action's own
+ * transaction. The acting admin is identified by MASKED phone
+ * only — the audit API never returns a full number. `detail`
+ * is the action's non-secret context (the changed setting
+ * keys, the granted verification tier, the payout transition
+ * endpoints); it never contains values of secrets.
+ */
+export interface AdminAuditEntry {
+  id: string;
+  admin_user_id: string;
+  admin_phone_masked: string;
+  action: string;
+  target_type: string;
+  target_id: string | null;
+  detail: Record<string, unknown> | null;
+  created_at: string;
+}
+
+export interface AdminAuditList {
+  items: AdminAuditEntry[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+/** GET /v1/admin/audit-log — admin only (the API answers 403 otherwise). */
+export function getAdminAuditLog(
+  token: string,
+  params?: { page?: number; perPage?: number; action?: string }
+): Promise<AdminAuditList> {
+  const search = new URLSearchParams();
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.perPage) search.set("per_page", String(params.perPage));
+  if (params?.action) search.set("action", params.action);
+  const qs = search.toString();
+  return call(`/v1/admin/audit-log${qs ? `?${qs}` : ""}`, { token });
+}

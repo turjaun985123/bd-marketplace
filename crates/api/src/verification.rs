@@ -49,6 +49,7 @@ use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
 use crate::admin::require_admin;
+use crate::audit::record_admin_action;
 use crate::auth::AuthUser;
 use crate::stores::{get_store_by_id, get_store_by_owner};
 use crate::{ApiError, AppState};
@@ -360,6 +361,7 @@ pub async fn get_verification_full_nid(
 /// transaction. A store with no pending application is a 409.
 pub async fn approve_verification(
     pool: &PgPool,
+    admin_id: Uuid,
     store_id: Uuid,
     tier: &str,
 ) -> Result<SellerVerificationView, ApiError> {
@@ -403,6 +405,18 @@ pub async fn approve_verification(
         .execute(&mut *tx)
         .await
         .map_err(|e| ApiError::internal("set store verified tier", e))?;
+    // Wave 28: the decision joins the admin audit log inside
+    // the same transaction. The detail carries the granted
+    // tier only — never the NID or license numbers.
+    record_admin_action(
+        &mut *tx,
+        admin_id,
+        "verification.approve",
+        "store",
+        Some(&store_id.to_string()),
+        Some(serde_json::json!({ "tier": tier })),
+    )
+    .await?;
     tx.commit()
         .await
         .map_err(|e| ApiError::internal("commit approve verification", e))?;
@@ -418,6 +432,7 @@ pub async fn approve_verification(
 /// nothing. A store with no pending application is a 409.
 pub async fn reject_verification(
     pool: &PgPool,
+    admin_id: Uuid,
     store_id: Uuid,
     note: &str,
 ) -> Result<SellerVerificationView, ApiError> {
@@ -432,6 +447,14 @@ pub async fn reject_verification(
         )));
     }
 
+    // Wave 28: the update and its audit row commit together.
+    // The audit detail carries the reviewer note — the same
+    // text the seller reads on their own view; no document
+    // numbers are ever written to the log.
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| ApiError::internal("begin reject verification", e))?;
     sqlx::query(
         "UPDATE store_verifications \
          SET status = 'rejected', reviewer_note = $2, reviewed_at = now() \
@@ -439,9 +462,21 @@ pub async fn reject_verification(
     )
     .bind(store_id)
     .bind(&note)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| ApiError::internal("reject verification", e))?;
+    record_admin_action(
+        &mut *tx,
+        admin_id,
+        "verification.reject",
+        "store",
+        Some(&store_id.to_string()),
+        Some(serde_json::json!({ "note": note })),
+    )
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::internal("commit reject verification", e))?;
 
     let store = get_store_by_id(pool, store_id).await?;
     let row = load_verification(pool, store_id).await?;
@@ -516,10 +551,10 @@ pub async fn approve_verification_handler(
     Path(store_id): Path<Uuid>,
     Json(input): Json<ApproveVerificationInput>,
 ) -> Result<Json<SellerVerificationView>, ApiError> {
-    require_admin(&state, &user).await?;
+    let admin = require_admin(&state, &user).await?;
     let pool = state.require_pool()?;
     Ok(Json(
-        approve_verification(pool, store_id, &input.tier).await?,
+        approve_verification(pool, admin.id, store_id, &input.tier).await?,
     ))
 }
 
@@ -529,9 +564,9 @@ pub async fn reject_verification_handler(
     Path(store_id): Path<Uuid>,
     Json(input): Json<RejectVerificationInput>,
 ) -> Result<Json<SellerVerificationView>, ApiError> {
-    require_admin(&state, &user).await?;
+    let admin = require_admin(&state, &user).await?;
     let pool = state.require_pool()?;
     Ok(Json(
-        reject_verification(pool, store_id, &input.note).await?,
+        reject_verification(pool, admin.id, store_id, &input.note).await?,
     ))
 }

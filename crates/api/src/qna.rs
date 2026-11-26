@@ -35,6 +35,7 @@ use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
 use crate::admin::require_admin;
+use crate::audit::record_admin_action;
 use crate::auth::AuthUser;
 use crate::products::{clamp_pagination, get_public_product};
 use crate::stores::get_store_by_id;
@@ -365,6 +366,46 @@ pub async fn set_question_hidden(
     get_seller_question_by_id(pool, question_id).await
 }
 
+/// The ADMIN moderation write (Wave 28): the same flag flip
+/// as [`set_question_hidden`], but performed by a platform
+/// admin, so the flip and its audit row (`qna.hide` /
+/// `qna.unhide`) commit in one transaction. A missing
+/// question is a 404 and writes no audit row.
+pub async fn admin_set_question_hidden(
+    pool: &PgPool,
+    admin_id: Uuid,
+    question_id: Uuid,
+    hidden: bool,
+) -> Result<SellerQuestion, ApiError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| ApiError::internal("begin admin set question hidden", e))?;
+    let affected = sqlx::query("UPDATE product_questions SET is_hidden = $2 WHERE id = $1")
+        .bind(question_id)
+        .bind(hidden)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::internal("admin set question hidden", e))?
+        .rows_affected();
+    if affected == 0 {
+        return Err(ApiError::not_found("question not found"));
+    }
+    record_admin_action(
+        &mut *tx,
+        admin_id,
+        if hidden { "qna.hide" } else { "qna.unhide" },
+        "question",
+        Some(&question_id.to_string()),
+        None,
+    )
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::internal("commit admin set question hidden", e))?;
+    get_seller_question_by_id(pool, question_id).await
+}
+
 /// The seller inbox: questions across every store the caller
 /// owns, newest first. `answered` selects the queue — `false`
 /// (the default) is the work queue, `true` the answered ones,
@@ -530,9 +571,11 @@ pub async fn admin_hide_question_handler(
     user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<SellerQuestion>, ApiError> {
-    require_admin(&state, &user).await?;
+    let admin = require_admin(&state, &user).await?;
     let pool = state.require_pool()?;
-    Ok(Json(set_question_hidden(pool, id, true).await?))
+    Ok(Json(
+        admin_set_question_hidden(pool, admin.id, id, true).await?,
+    ))
 }
 
 pub async fn admin_unhide_question_handler(
@@ -540,9 +583,11 @@ pub async fn admin_unhide_question_handler(
     user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<SellerQuestion>, ApiError> {
-    require_admin(&state, &user).await?;
+    let admin = require_admin(&state, &user).await?;
     let pool = state.require_pool()?;
-    Ok(Json(set_question_hidden(pool, id, false).await?))
+    Ok(Json(
+        admin_set_question_hidden(pool, admin.id, id, false).await?,
+    ))
 }
 
 pub async fn list_seller_questions_handler(

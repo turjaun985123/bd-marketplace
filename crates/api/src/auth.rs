@@ -10,6 +10,10 @@
 //! - `issue_token` / `authenticate` — JWT (HS256) issue and verification.
 //! - `request_otp_code` / `verify_otp_code` — the service functions that
 //!   talk to the database; the handlers below only call them.
+//!   Wave 28 adds a per-phone request throttle inside
+//!   `request_otp_code`: requests are counted from the append-only
+//!   `otp_request_log` table against the domain hourly cap, and
+//!   excess requests get a 429 before any code is stored or sent.
 
 use axum::{
     extract::{FromRequestParts, State},
@@ -17,7 +21,7 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, TimeDelta, Utc};
-use domain::normalize_bd_phone;
+use domain::{normalize_bd_phone, otp_request_allowed};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -227,6 +231,41 @@ pub async fn request_otp_code(
         .ok_or_else(|| ApiError::bad_request("invalid Bangladeshi phone number"))?;
     // Fail before storing anything if we cannot deliver the code.
     let sender = sms_sender(state)?;
+
+    // Wave 28 throttle: cap how many codes one number may
+    // request per rolling hour (the pure rule is the domain's
+    // `otp_request_allowed`). The count comes from the
+    // append-only `otp_request_log` table — `otp_codes` itself
+    // holds at most one row per phone (a new request deletes
+    // the previous rows), so it cannot answer "how many
+    // requests in the last hour". The count check and the log
+    // insert are two statements in one request path, so two
+    // concurrent requests can both pass the check; that small
+    // race is accepted for a throttle whose job is capping
+    // SMS cost, not exact accounting. A refused request is
+    // NOT logged: hammering the endpoint costs one COUNT
+    // query per attempt and no SMS.
+    let recent_requests: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM otp_request_log \
+         WHERE phone = $1 AND created_at > now() - interval '1 hour'",
+    )
+    .bind(&phone)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::internal("count recent OTP requests", e))?;
+    if !otp_request_allowed(recent_requests) {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many OTP requests for this number — please wait a while and \
+             try again (এই নম্বরে অনেকবার OTP চাওয়া হয়েছে — কিছুক্ষণ অপেক্ষা \
+             করে আবার চেষ্টা করুন)",
+        ));
+    }
+    sqlx::query("INSERT INTO otp_request_log (phone) VALUES ($1)")
+        .bind(&phone)
+        .execute(pool)
+        .await
+        .map_err(|e| ApiError::internal("log OTP request", e))?;
 
     let code = generate_otp();
     let code_hash = hash_otp(&phone, &code);

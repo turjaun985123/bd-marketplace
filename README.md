@@ -1466,6 +1466,111 @@ per-request aggregates would move to rollup tables
 behind these same definitions; the 90-day cap keeps a
 single request bounded until then.
 
+Wave 28 (security hardening + the admin audit log):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| GET | `/v1/admin/audit-log?page=&per_page=&action=` | Admin (403 otherwise). The audit entries, newest first; `action` filters to one action; `limit` is accepted as an alias of `per_page` |
+
+Everything else in this wave is behaviour of existing
+surfaces, not new endpoints:
+
+**OTP request throttle.** `POST /v1/auth/request-otp`
+counts the phone's requests in the last hour and answers
+**429** once the domain cap
+(`OTP_REQUEST_LIMIT_PER_HOUR`) is reached; no code is
+stored or sent for a refused request, and refused requests
+are not themselves counted. The count comes from the
+append-only `otp_request_log` table (migration 0028) —
+`otp_codes` cannot answer it, because it holds at most
+one row per phone (a new request deletes the previous
+rows, a successful verify deletes them too). The cap is
+**20 per hour**, set from evidence: the design target
+was 5, but the integration suites share ONE Postgres
+database across 25+ test binaries in a single CI run,
+and the busiest fixture phone legitimately logs in 9
+times across those suites within the run — a cap of 5
+(or 10) would throttle the test suite itself. 20/hour
+still bounds SMS cost to at most 480 messages per number
+per day, and brute force stays impractical because every
+issued code still expires in 5 minutes and allows only
+5 verify attempts against a 6-digit space. The count
+check and the log insert are two statements in one
+request path, so two concurrent requests can both pass
+the check — an accepted race for a cost cap, not exact
+accounting.
+
+**Security headers (API).** Every API response —
+including errors and CORS preflights — carries:
+
+| Header | Value |
+| --- | --- |
+| `X-Content-Type-Options` | `nosniff` |
+| `X-Frame-Options` | `DENY` |
+| `Referrer-Policy` | `no-referrer` |
+| `Content-Security-Policy` | `default-src 'none'; frame-ancestors 'none'` |
+| `Strict-Transport-Security` | `max-age=31536000` |
+
+The set is strict because the API serves JSON only —
+never HTML, frames or assets. The Next.js app serves
+its own subset from `next.config.js` (`nosniff`,
+`DENY`, `no-referrer`, HSTS): the API's
+`default-src 'none'` CSP would break a site that serves
+HTML/JS/CSS, so the web app does not send it — a real
+web CSP is future work.
+
+**Request body cap.** Request bodies are capped at
+1 MiB (`MAX_REQUEST_BODY_BYTES`); an oversized body is
+a **413** before any handler runs. Every current
+payload is far below this — the largest, the Facebook
+post import, caps its own post count well under it.
+
+**JWT secret startup rule.** Outside dev mode the API
+refuses to start (stderr reason, exit code 2) when the
+JWT secret is the well-known dev-only fallback
+(`JWT_SECRET` unset) or shorter than 32 characters
+(`validate_jwt_secret` in the API crate, enforced in
+`run`). In dev mode anything goes — local development
+must not need a real secret. The error never echoes the
+secret itself. Integration tests build state directly
+(`AppState::new`), never through the env path, so the
+rule cannot fire inside a test.
+
+**Admin audit log.** Every consequential admin action
+writes one row to `admin_audit_log` (migration 0028)
+through the ONE writer (`audit::record_admin_action`)
+inside the SAME transaction as the action itself — the
+log can never claim an action that rolled back, or
+miss one that committed:
+
+| Action | Target | Written by |
+| --- | --- | --- |
+| `payout.approve` / `payout.reject` / `payout.mark_paid` | payout id | the payout transition (detail: `{from, to}`, plus the note when supplied) |
+| `store.suspend` / `store.reactivate` | store id | the store status change |
+| `settings.update` | — | the settings patch (detail: `{changed_keys}` — key NAMES only, never values; a no-op patch writes no row) |
+| `verification.approve` / `verification.reject` | store id | the KYC decision (detail: the granted tier, resp. the reviewer note the seller reads) |
+| `qna.hide` / `qna.unhide` | question id | the ADMIN Q&A moderation endpoints only — a seller hiding a question on their own product is not audited |
+| `return.refund_done` | return request id | marking an off-platform refund done |
+
+The read side identifies the acting admin by MASKED
+phone only. What is never logged: any secret value
+(JWT secret, gateway credentials), OTP codes, full NID
+numbers, and setting values.
+
+**Honest limits:** the throttle is per PHONE, not
+per IP — an attacker rotating through many numbers is
+bounded only by the SMS provider's own caps and the
+platform's SMS budget, which is a provider-account
+setting, not something this API can enforce. Headers
+are set by the API and (subset) by the Next.js config;
+anything deployed in front of them (a reverse proxy
+that strips or overrides headers) can silently undo
+them — verify with `curl -I` after deploying. The
+audit log covers the six admin action families above;
+seller-side and buyer-side actions are not in it (their
+own histories — stock adjustments, payment events —
+already exist from earlier waves).
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -1713,7 +1818,10 @@ curl -X POST localhost:8080/v1/auth/verify-otp \
 Outside dev mode there is no SMS gateway configured yet, so
 request-otp honestly returns 503 instead of pretending an SMS was sent.
 `JWT_SECRET` must be set for any real deployment: if it is missing the
-API falls back to a public dev-only secret and logs a loud warning.
+API falls back to a public dev-only secret and logs a loud warning —
+and since Wave 28 the API refuses to start outside dev mode on that
+fallback (or on any secret under 32 characters), so a production
+process that is running at all has a real secret.
 
 Stateless check (Wave 1):
 
@@ -1814,7 +1922,7 @@ broken or unsafe without it.
 | `CORS_ORIGINS` | Comma-separated browser origins allowed to call the API (Wave 20) | **Yes** — set to the deployed web origin; unset allows only `http://localhost:3000` |
 | `DATABASE_URL` | Postgres connection string; migrations auto-apply on startup | **Yes** (compose rewrites it to the `postgres` service) |
 | `REDIS_URL` | Placeholder for the worker's planned queue | No — nothing connects yet |
-| `JWT_SECRET` | HMAC secret for auth tokens | **Yes** — unset falls back to a public DEV-ONLY secret (loud warning) and anyone can forge tokens |
+| `JWT_SECRET` | HMAC secret for auth tokens | **Yes** — unset falls back to a public DEV-ONLY secret (loud warning) and anyone can forge tokens; since Wave 28 the API refuses to start outside dev mode on the fallback or a <32-char secret |
 | `APP_ENV` / `SMS_DEV_MODE` | Dev mode: log SMS sender + `dev_otp` in responses | **Must be off** — `APP_ENV` must not be `dev` and `SMS_DEV_MODE` must not be `true`, or OTP codes are public |
 | `COMMISSION_RATE_BPS` | Startup commission fallback (admin settings override it) | No |
 | `ADVANCE_PERCENT_BPS` / `ADVANCE_THRESHOLD_POISHA` | Startup COD-advance fallback (admin settings override) | No |
@@ -2550,6 +2658,34 @@ stores, courier breakdown), with nav links in the
 seller dashboard and the admin shell, and the shared
 DailyBars component (no chart library).
 
+**Real (Wave 28):** security hardening + the admin
+audit log — migration 0028 (`otp_request_log`, the
+append-only count source for the throttle, and
+`admin_audit_log`); the domain OTP cap
+(`OTP_REQUEST_LIMIT_PER_HOUR` = 20, evidence-based —
+see the Wave 28 section — with `otp_request_allowed`);
+the per-phone 429 throttle inside the request-otp
+service; the security-header middleware and 1 MiB
+body cap in `build_app`; `validate_jwt_secret`
+(api-local, unit-tested) enforced as a hard startup
+stop in `run` outside dev mode; the `audit` module
+(one writer, executor-generic so audited actions pass
+their transaction) wired into payout transitions,
+store status, settings updates, verification
+decisions, admin Q&A moderation and refund
+completion, plus the admin read endpoint; an
+integration test (`crates/api/tests/wave28.rs`, same
+`DATABASE_URL` gate) covering the header set on
+/health, the 413, the throttle boundary on fresh
+numbers (cap successes, then 429, another number
+unaffected), the non-admin 403, and the payout /
+store / settings audit rows (masked admin phone,
+changed-keys-only detail, settings-row cleanup); and
+the Next.js audit page at /admin/audit (action
+filter, pagination, detail summaries) with the
+AdminShell nav link, the api.ts client, and the web
+app's own header subset in `next.config.js`.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters, and the four manual couriers run
@@ -2593,19 +2729,21 @@ the external service at the other end of it, configured by
   unanswered-questions strip; Wave 26 adds
   /seller/promotions, the স্পন্সরড badge on the shared
   ProductCard, and the admin settings promotion price;
-  Wave 27 adds /seller/analytics and /admin/analytics).
+  Wave 27 adds /seller/analytics and /admin/analytics;
+  Wave 28 adds /admin/audit).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
-  (domain 101, courier 31, payments 8 unit tests; the `DATABASE_URL`-
+  (domain 102, courier 31, payments 8 unit tests, plus the API
+  crate's JWT-secret unit tests; the `DATABASE_URL`-
   gated integration tests skip cleanly without a database). The API
   binary was also smoke-tested locally without a database: routes
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
   (including the Wave 13 messaging endpoints), and the SIDRA
   callback answers 503 without a database.
-- **Rust integration + clippy: CI-only** — the Wave 2–27 integration
+- **Rust integration + clippy: CI-only** — the Wave 2–28 integration
   tests against a real Postgres 16 service and clippy `-D warnings`
   are verified via **GitHub Actions CI** (`.github/workflows/ci.yml`)
-  on push. Waves 1–26 are green there; Wave 27 awaits its first CI run.
+  on push. Waves 1–27 are green there; Wave 28 awaits its first CI run.
 - **Docker images: CI-only** — Docker is not installed on the
   development machine, so `Dockerfile.api`, `Dockerfile.worker`
   and `apps/web/Dockerfile` are verified by the CI `docker` job

@@ -37,6 +37,12 @@
 //! startup, then built-in default) lives in exactly one place. A
 //! stored value that no longer parses or is out of range is
 //! ignored on read.
+//!
+//! Wave 28: the consequential writes in this module (payout
+//! transitions, store status changes, settings updates) run
+//! in ONE transaction together with their admin audit row —
+//! see the `audit` module for the action vocabulary and the
+//! same-transaction rule.
 
 use axum::{
     extract::{Path, Query, State},
@@ -53,6 +59,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
+use crate::audit::record_admin_action;
 use crate::auth::{load_user, AuthUser, User};
 use crate::orders::{load_order, OrderList};
 use crate::payouts::Payout;
@@ -373,8 +380,11 @@ pub async fn list_stores(
 /// Set a store's status (`active` or `suspended`; anything else is
 /// a 400). Returns the shared store view. Suspending is reversible
 /// and deletes nothing — see the module docs for what it blocks.
+/// Wave 28: the update and its audit row (`store.suspend` /
+/// `store.reactivate`) commit in one transaction.
 pub async fn set_store_status(
     pool: &PgPool,
+    admin_id: Uuid,
     store_id: Uuid,
     status: &str,
 ) -> Result<Store, ApiError> {
@@ -383,7 +393,11 @@ pub async fn set_store_status(
             "store status must be 'active' or 'suspended'",
         ));
     }
-    sqlx::query_as(
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| ApiError::internal("begin set store status", e))?;
+    let store: Store = sqlx::query_as(
         "UPDATE stores SET status = $2 WHERE id = $1 \
          RETURNING id, owner_user_id, slug, name, description, status, \
          facebook_page_id, facebook_page_name, sidra_auto_reply, \
@@ -391,10 +405,28 @@ pub async fn set_store_status(
     )
     .bind(store_id)
     .bind(status)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| ApiError::internal("set store status", e))?
-    .ok_or_else(|| ApiError::not_found("store not found"))
+    .ok_or_else(|| ApiError::not_found("store not found"))?;
+    let action = if status == "suspended" {
+        "store.suspend"
+    } else {
+        "store.reactivate"
+    };
+    record_admin_action(
+        &mut *tx,
+        admin_id,
+        action,
+        "store",
+        Some(&store_id.to_string()),
+        Some(serde_json::json!({ "status": status })),
+    )
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::internal("commit set store status", e))?;
+    Ok(store)
 }
 
 // ---------------------------------------------------------------------------
@@ -525,17 +557,26 @@ pub async fn list_payouts(
 /// are three thin handlers over this one service. The domain
 /// transition table decides legality (an illegal move is a 409);
 /// a legal move stamps `processed_at`, and a supplied note (the
-/// rejection reason) replaces the stored note.
+/// rejection reason) replaces the stored note. Wave 28: the
+/// whole move — status read, update, and the audit row
+/// (`payout.approve` / `payout.reject` / `payout.mark_paid`) —
+/// runs in ONE transaction, so the audit log and the payout
+/// can never disagree.
 pub async fn transition_payout(
     pool: &PgPool,
+    admin_id: Uuid,
     payout_id: Uuid,
     target_status: &str,
     note: Option<&str>,
 ) -> Result<Payout, ApiError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| ApiError::internal("begin payout transition", e))?;
     let current: Option<String> =
         sqlx::query_scalar("SELECT status FROM payouts WHERE id = $1")
             .bind(payout_id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|e| ApiError::internal("load payout for transition", e))?;
     let current = current.ok_or_else(|| ApiError::not_found("payout not found"))?;
@@ -545,16 +586,40 @@ pub async fn transition_payout(
         )));
     }
 
-    sqlx::query_as(&format!(
+    let payout: Payout = sqlx::query_as(&format!(
         "UPDATE payouts SET status = $2, processed_at = now(), \
          note = COALESCE($3, note) WHERE id = $1 RETURNING {PAYOUT_COLUMNS}"
     ))
     .bind(payout_id)
     .bind(target_status)
     .bind(note)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await
-    .map_err(|e| ApiError::internal("transition payout", e))
+    .map_err(|e| ApiError::internal("transition payout", e))?;
+
+    let action = match target_status {
+        "approved" => "payout.approve",
+        "rejected" => "payout.reject",
+        "paid" => "payout.mark_paid",
+        _ => "payout.transition",
+    };
+    let mut detail = serde_json::json!({ "from": current, "to": target_status });
+    if let Some(note) = note {
+        detail["note"] = serde_json::Value::String(note.to_string());
+    }
+    record_admin_action(
+        &mut *tx,
+        admin_id,
+        action,
+        "payout",
+        Some(&payout_id.to_string()),
+        Some(detail),
+    )
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::internal("commit payout transition", e))?;
+    Ok(payout)
 }
 
 // ---------------------------------------------------------------------------
@@ -694,22 +759,32 @@ pub async fn get_settings(state: &AppState) -> AdminSettings {
     }
 }
 
-/// Store one setting row (insert or overwrite).
-async fn save_setting(pool: &PgPool, key: &str, value: i64) -> Result<(), ApiError> {
-    save_setting_text(pool, key, &value.to_string()).await
+/// Store one setting row (insert or overwrite). Takes any
+/// executor so [`update_settings`] can run every save of a
+/// patch inside its one transaction.
+async fn save_setting(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
+    key: &str,
+    value: i64,
+) -> Result<(), ApiError> {
+    save_setting_text(executor, key, &value.to_string()).await
 }
 
 /// Store one setting row as raw text (insert or overwrite) —
 /// the shared writer behind [`save_setting`] and the flag
 /// settings like the KYC payout gate.
-async fn save_setting_text(pool: &PgPool, key: &str, value: &str) -> Result<(), ApiError> {
+async fn save_setting_text(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
+    key: &str,
+    value: &str,
+) -> Result<(), ApiError> {
     sqlx::query(
         "INSERT INTO platform_settings (key, value) VALUES ($1, $2) \
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
     )
     .bind(key)
     .bind(value)
-    .execute(pool)
+    .execute(executor)
     .await
     .map_err(|e| ApiError::internal("save platform setting", e))?;
     Ok(())
@@ -719,19 +794,30 @@ async fn save_setting_text(pool: &PgPool, key: &str, value: &str) -> Result<(), 
 /// the same rules the readers enforce (commission via the domain
 /// validator, minimum payout via the range check) and upserted;
 /// absent fields keep their current effective value. Returns the
-/// new effective settings.
+/// new effective settings. Wave 28: all saves of one patch run
+/// in ONE transaction together with the audit row
+/// (`settings.update`, whose detail names the changed keys —
+/// never their values); a patch that changes nothing writes no
+/// audit row.
 pub async fn update_settings(
     state: &AppState,
+    admin_id: Uuid,
     input: UpdateSettingsInput,
 ) -> Result<AdminSettings, ApiError> {
     let pool = state.require_pool()?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| ApiError::internal("begin settings update", e))?;
+    let mut changed_keys: Vec<&str> = Vec::new();
     if let Some(bps) = input.commission_bps {
         if !validate_commission_bps(bps) {
             return Err(ApiError::bad_request(
                 "commission_bps must be between 0 and 3000",
             ));
         }
-        save_setting(pool, COMMISSION_BPS_KEY, bps).await?;
+        save_setting(&mut *tx, COMMISSION_BPS_KEY, bps).await?;
+        changed_keys.push(COMMISSION_BPS_KEY);
     }
     if let Some(min_payout) = input.min_payout_poisha {
         if !valid_min_payout_setting(min_payout) {
@@ -739,7 +825,8 @@ pub async fn update_settings(
                 "min_payout_poisha must be between 0 and 10000000",
             ));
         }
-        save_setting(pool, MIN_PAYOUT_KEY, min_payout).await?;
+        save_setting(&mut *tx, MIN_PAYOUT_KEY, min_payout).await?;
+        changed_keys.push(MIN_PAYOUT_KEY);
     }
     if let Some(advance_bps) = input.advance_percent_bps {
         if !validate_advance_bps(advance_bps) {
@@ -747,7 +834,8 @@ pub async fn update_settings(
                 "advance_percent_bps must be between 0 and 10000",
             ));
         }
-        save_setting(pool, ADVANCE_PERCENT_BPS_KEY, advance_bps).await?;
+        save_setting(&mut *tx, ADVANCE_PERCENT_BPS_KEY, advance_bps).await?;
+        changed_keys.push(ADVANCE_PERCENT_BPS_KEY);
     }
     if let Some(advance_threshold) = input.advance_threshold_poisha {
         if !validate_advance_threshold(advance_threshold) {
@@ -755,11 +843,17 @@ pub async fn update_settings(
                 "advance_threshold_poisha must be 0 or more",
             ));
         }
-        save_setting(pool, ADVANCE_THRESHOLD_KEY, advance_threshold).await?;
+        save_setting(&mut *tx, ADVANCE_THRESHOLD_KEY, advance_threshold).await?;
+        changed_keys.push(ADVANCE_THRESHOLD_KEY);
     }
     if let Some(kyc_gate) = input.kyc_payout_gate {
-        save_setting_text(pool, KYC_PAYOUT_GATE_KEY, if kyc_gate { "on" } else { "off" })
-            .await?;
+        save_setting_text(
+            &mut *tx,
+            KYC_PAYOUT_GATE_KEY,
+            if kyc_gate { "on" } else { "off" },
+        )
+        .await?;
+        changed_keys.push(KYC_PAYOUT_GATE_KEY);
     }
     if let Some(promotion_price) = input.promotion_price_per_day_poisha {
         if !validate_promotion_price_per_day(promotion_price) {
@@ -767,8 +861,23 @@ pub async fn update_settings(
                 "promotion_price_per_day_poisha must be between 1 and 10000000",
             ));
         }
-        save_setting(pool, PROMOTION_PRICE_PER_DAY_KEY, promotion_price).await?;
+        save_setting(&mut *tx, PROMOTION_PRICE_PER_DAY_KEY, promotion_price).await?;
+        changed_keys.push(PROMOTION_PRICE_PER_DAY_KEY);
     }
+    if !changed_keys.is_empty() {
+        record_admin_action(
+            &mut *tx,
+            admin_id,
+            "settings.update",
+            "platform_settings",
+            None,
+            Some(serde_json::json!({ "changed_keys": changed_keys })),
+        )
+        .await?;
+    }
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::internal("commit settings update", e))?;
     Ok(get_settings(state).await)
 }
 
@@ -866,9 +975,11 @@ pub async fn set_store_status_handler(
     Path(id): Path<Uuid>,
     Json(input): Json<SetStoreStatusInput>,
 ) -> Result<Json<Store>, ApiError> {
-    require_admin(&state, &user).await?;
+    let admin = require_admin(&state, &user).await?;
     let pool = state.require_pool()?;
-    Ok(Json(set_store_status(pool, id, &input.status).await?))
+    Ok(Json(
+        set_store_status(pool, admin.id, id, &input.status).await?,
+    ))
 }
 
 pub async fn list_orders_handler(
@@ -900,9 +1011,11 @@ pub async fn approve_payout_handler(
     user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Payout>, ApiError> {
-    require_admin(&state, &user).await?;
+    let admin = require_admin(&state, &user).await?;
     let pool = state.require_pool()?;
-    Ok(Json(transition_payout(pool, id, "approved", None).await?))
+    Ok(Json(
+        transition_payout(pool, admin.id, id, "approved", None).await?,
+    ))
 }
 
 pub async fn reject_payout_handler(
@@ -911,11 +1024,11 @@ pub async fn reject_payout_handler(
     Path(id): Path<Uuid>,
     body: Option<Json<RejectPayoutInput>>,
 ) -> Result<Json<Payout>, ApiError> {
-    require_admin(&state, &user).await?;
+    let admin = require_admin(&state, &user).await?;
     let pool = state.require_pool()?;
     let note = body.and_then(|Json(input)| input.note);
     Ok(Json(
-        transition_payout(pool, id, "rejected", note.as_deref()).await?,
+        transition_payout(pool, admin.id, id, "rejected", note.as_deref()).await?,
     ))
 }
 
@@ -924,9 +1037,11 @@ pub async fn mark_payout_paid_handler(
     user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Payout>, ApiError> {
-    require_admin(&state, &user).await?;
+    let admin = require_admin(&state, &user).await?;
     let pool = state.require_pool()?;
-    Ok(Json(transition_payout(pool, id, "paid", None).await?))
+    Ok(Json(
+        transition_payout(pool, admin.id, id, "paid", None).await?,
+    ))
 }
 
 pub async fn list_users_handler(
@@ -967,6 +1082,6 @@ pub async fn update_settings_handler(
     user: AuthUser,
     Json(input): Json<UpdateSettingsInput>,
 ) -> Result<Json<AdminSettings>, ApiError> {
-    require_admin(&state, &user).await?;
-    Ok(Json(update_settings(&state, input).await?))
+    let admin = require_admin(&state, &user).await?;
+    Ok(Json(update_settings(&state, admin.id, input).await?))
 }

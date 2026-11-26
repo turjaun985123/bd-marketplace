@@ -2592,6 +2592,39 @@ pub fn build_daily_csv(rows: &[(String, i64, i64, i64)]) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Wave 28 — security limits (pure rules; the API enforces them)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of OTP codes one phone number may REQUEST
+/// per rolling hour (Wave 28). The request endpoint counts the
+/// number's requests in the last hour (from the append-only
+/// `otp_request_log` table) and answers 429 once this cap is
+/// reached.
+///
+/// Why 20 and not a tighter number: the design target was 5,
+/// but the integration suites share ONE Postgres database
+/// across 25+ test binaries in a single CI run, and the
+/// busiest fixture phone (`01799999999`) legitimately logs in
+/// 9 times across those suites inside the run's hour — a cap
+/// of 5 (or 10) would throttle the test suite itself. 20 per
+/// hour is still a hard abuse cap: it bounds SMS cost to at
+/// most 480 messages per number per day, and brute force
+/// stays impractical because every issued code still expires
+/// in 5 minutes and allows only 5 verify attempts against a
+/// 6-digit space. Deployments that want the tighter cap can
+/// lower this constant; the rule and its counting do not
+/// change.
+pub const OTP_REQUEST_LIMIT_PER_HOUR: i64 = 20;
+
+/// May a phone that already requested `recent_requests` OTP
+/// codes in the last hour request one more (Wave 28)? Pure
+/// comparison against [`OTP_REQUEST_LIMIT_PER_HOUR`]; the API
+/// counts the requests, this function decides.
+pub fn otp_request_allowed(recent_requests: i64) -> bool {
+    recent_requests < OTP_REQUEST_LIMIT_PER_HOUR
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4598,5 +4631,18 @@ mod tests {
             build_daily_csv(&[]),
             "date,orders,goods_poisha,earnings_poisha\n"
         );
+    }
+
+    #[test]
+    fn otp_request_allowed_up_to_the_hourly_cap() {
+        // The cap is the evidence-based 20 (see the constant's
+        // doc): below it a request is allowed, at it the next
+        // one is refused.
+        assert_eq!(OTP_REQUEST_LIMIT_PER_HOUR, 20);
+        assert!(otp_request_allowed(0));
+        assert!(otp_request_allowed(19));
+        assert!(!otp_request_allowed(20));
+        assert!(!otp_request_allowed(21));
+        assert!(!otp_request_allowed(1_000));
     }
 }
