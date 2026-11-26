@@ -273,6 +273,19 @@
 //! endpoint: auto-renew charges extend from the old expiry,
 //! and a period the balance cannot cover lapses the store
 //! back to free.
+//! Wave 37: third-party / mobile API keys (`api_keys`
+//! module, migration 0035) — a user mints long-lived
+//! `bdm_live_...` bearer keys for external apps; only the
+//! SHA-256 hash is stored and the full key is shown exactly
+//! once. The `AuthUser` extractor routes a key token to the
+//! one central key check: hash lookup (revoked / expired →
+//! 401), the JWT-only route exclusions (admin, payout
+//! account + payout requests, subscription spend, key
+//! management itself, data exports → 403), the domain scope
+//! rule (read-only keys cannot write → 403), and a per-key
+//! fixed-window rate limit held in `AppState` (default 600
+//! requests/minute, `API_KEY_RATE_LIMIT_PER_MIN` overrides;
+//! JWT traffic is never limited by it).
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -286,6 +299,7 @@
 pub mod access;
 pub mod admin;
 pub mod analytics;
+pub mod api_keys;
 pub mod audit;
 pub mod auth;
 pub mod cart;
@@ -322,7 +336,7 @@ use axum::{
     http::{header, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, patch, post, put},
+    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 use ::courier::{
@@ -425,6 +439,20 @@ pub struct AppState {
     /// the list into the router's CORS layer — preflight answers
     /// name exactly these origins, no wildcard.
     pub cors_origins: Vec<String>,
+    /// Per-API-key rate limit, in requests per minute
+    /// (Wave 37). Read once at startup from
+    /// `API_KEY_RATE_LIMIT_PER_MIN`; invalid or zero values
+    /// keep the default
+    /// ([`api_keys::DEFAULT_API_KEY_RATE_LIMIT_PER_MIN`]).
+    /// Applies ONLY to key-authenticated traffic — JWT
+    /// sessions are never limited by it.
+    pub api_key_rate_limit_per_min: u32,
+    /// The rate limiter itself (Wave 37): per-key fixed
+    /// windows, in memory, behind an `Arc` so every clone of
+    /// the state shares the one counter set. See the
+    /// `api_keys` module for the honest limits of an
+    /// in-memory limiter.
+    pub api_key_rate_limiter: std::sync::Arc<api_keys::ApiKeyRateLimiter>,
 }
 
 /// SIDRA bridge configuration (Wave 13). See [`AppState::sidra_config`].
@@ -563,6 +591,8 @@ impl AppState {
             facebook_config: FacebookConfig::default(),
             sidra_config: SidraConfig::default(),
             cors_origins: vec![DEFAULT_CORS_ORIGIN.to_string()],
+            api_key_rate_limit_per_min: api_keys::DEFAULT_API_KEY_RATE_LIMIT_PER_MIN,
+            api_key_rate_limiter: std::sync::Arc::new(api_keys::ApiKeyRateLimiter::new()),
         }
     }
 
@@ -600,6 +630,15 @@ impl AppState {
     /// REPLACES the default; it is never merged with it.
     pub fn with_cors_origins(mut self, cors_origins: Vec<String>) -> Self {
         self.cors_origins = cors_origins;
+        self
+    }
+
+    /// Replace the per-key rate limit (used by `from_env` and
+    /// by tests that need a tiny limit to exercise the 429
+    /// path). The limiter itself is NOT replaced — a fresh
+    /// state already carries a fresh limiter.
+    pub fn with_api_key_rate_limit_per_min(mut self, limit: u32) -> Self {
+        self.api_key_rate_limit_per_min = limit;
         self
     }
 
@@ -719,6 +758,21 @@ impl AppState {
                 _ => eprintln!(
                     "WARNING: PLAN_FREE_PRODUCT_CAP='{raw}' is invalid — \
                      using the default {DEFAULT_PLAN_FREE_PRODUCT_CAP}"
+                ),
+            }
+        }
+        // API_KEY_RATE_LIMIT_PER_MIN is read once, here at
+        // startup, under the same discipline (Wave 37): a
+        // positive integer wins; anything else (zero,
+        // negative, non-numeric) keeps the default rather
+        // than silently disabling or zeroing the limit.
+        if let Ok(raw) = std::env::var("API_KEY_RATE_LIMIT_PER_MIN") {
+            match raw.parse::<u32>() {
+                Ok(limit) if limit >= 1 => state.api_key_rate_limit_per_min = limit,
+                _ => eprintln!(
+                    "WARNING: API_KEY_RATE_LIMIT_PER_MIN='{raw}' is invalid — \
+                     using the default {} requests/minute",
+                    api_keys::DEFAULT_API_KEY_RATE_LIMIT_PER_MIN
                 ),
             }
         }
@@ -1178,6 +1232,19 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/auth/verify-otp", post(auth::verify_otp))
         // Wave 10 — the caller's own row, re-read (carries is_admin).
         .route("/v1/auth/me", get(auth::me))
+        // Wave 37 — API keys: mint (the full key is shown
+        // once), list (metadata + prefixes only) and revoke
+        // (idempotent). JWT-only: the auth layer refuses key
+        // authentication on these very routes, so a key can
+        // never manage keys.
+        .route(
+            "/v1/api-keys",
+            post(api_keys::create_api_key_handler).get(api_keys::list_api_keys_handler),
+        )
+        .route(
+            "/v1/api-keys/:id",
+            delete(api_keys::revoke_api_key_handler),
+        )
         // Wave 2 — stores.
         .route("/v1/stores", post(stores::create_store))
         .route("/v1/stores/:slug", get(stores::get_store))
@@ -1732,7 +1799,7 @@ fn log_config_summary(state: &AppState) {
          facebook_app_configured={} cors_origins={} commission={}bps \
          advance={}bps at/above {} poisha promotion_price={} poisha/day \
          subscription_pro={} subscription_business={} poisha/period \
-         free_plan_cap={}",
+         free_plan_cap={} api_key_rate_limit={}/min",
         state.sms_dev_mode,
         state.payments_config.dev_mode,
         state.couriers_config.dev_mode,
@@ -1748,6 +1815,7 @@ fn log_config_summary(state: &AppState) {
         state.subscription_price_pro_poisha,
         state.subscription_price_business_poisha,
         state.plan_free_product_cap,
+        state.api_key_rate_limit_per_min,
     );
 }
 

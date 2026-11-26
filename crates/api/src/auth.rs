@@ -143,17 +143,39 @@ pub fn issue_token(state: &AppState, user: &User) -> Result<String, ApiError> {
     })
 }
 
-/// The authenticated caller, extracted from a Bearer JWT.
+/// How an API-key caller authenticated (Wave 37): the key's
+/// id and its stored scopes, carried on the `AuthUser` so the
+/// one central auth check (and any future per-handler rule)
+/// can see them. JWT callers carry `None` — a login session
+/// is never scope-narrowed and never rate limited by the key
+/// limiter.
+#[derive(Debug, Clone)]
+pub struct ApiKeyContext {
+    pub key_id: Uuid,
+    pub scopes: Vec<String>,
+}
+
+/// The authenticated caller, extracted from a Bearer token —
+/// a JWT from the OTP login, or (Wave 37) a `bdm_live_...`
+/// API key acting as its owner.
 #[derive(Debug, Clone)]
 pub struct AuthUser {
     pub user_id: Uuid,
     pub phone: String,
     pub role: String,
+    /// Wave 37: `Some` when this request authenticated with
+    /// an API key rather than a JWT.
+    pub api_key: Option<ApiKeyContext>,
 }
 
 /// Verify the `Authorization: Bearer <jwt>` header. Single function used
 /// by both the strict extractor (protected endpoints) and the optional
 /// variant (public endpoints that behave differently for owners).
+/// JWTs only: since Wave 37 the strict extractor routes
+/// `bdm_live_...` API keys to the `api_keys` module's
+/// authentication before ever calling this, and the optional
+/// variant deliberately stays JWT-only (on the public
+/// catalogue reads a key caller is simply a guest).
 pub fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<AuthUser, ApiError> {
     let value = headers
         .get(AUTHORIZATION)
@@ -174,6 +196,7 @@ pub fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<AuthUser, A
         user_id,
         phone: data.claims.phone,
         role: data.claims.role,
+        api_key: None,
     })
 }
 
@@ -190,6 +213,29 @@ impl FromRequestParts<AppState> for AuthUser {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        // Wave 37: a bearer token carrying the API-key marker
+        // is a key, not a JWT — it goes through the key path
+        // (hash lookup, JWT-only route exclusions, scope rule,
+        // per-key rate limit), which needs the method and the
+        // path, both available here and nowhere else in the
+        // auth layer. Everything else is a JWT, exactly as
+        // before.
+        let bearer = parts
+            .headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "));
+        if let Some(token) = bearer {
+            if crate::api_keys::is_api_key_token(token) {
+                return crate::api_keys::authenticate_request(
+                    state,
+                    &parts.method,
+                    parts.uri.path(),
+                    token,
+                )
+                .await;
+            }
+        }
         authenticate(state, &parts.headers)
     }
 }

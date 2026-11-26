@@ -2250,6 +2250,97 @@ the worker running; a stopped worker means plans lapse
 to `expired` at the next sweep rather than renewing,
 never a silent extension.
 
+Wave 37 (third-party / mobile API keys — long-lived keys
+for external apps):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| POST | `/v1/api-keys` | Bearer (JWT only). Body `{ "name": "Mobile app", "scopes": ["read"], "expires_in_days": 90 }` — scopes default to `["read"]`, expiry is optional (1..=365 days or null). 201 with the key metadata PLUS the full key — the one and only time it is ever shown |
+| GET | `/v1/api-keys` | Bearer (JWT only). The caller's keys: name, display prefix, scopes, derived status, last use, expiry. NEVER the full key, never the hash |
+| DELETE | `/v1/api-keys/{id}` | Bearer (JWT only). Revoke (a timestamp, never a delete). Own keys only — a stranger's key is a 404; re-revoking is a 200 with the same view |
+
+**The credential.** A full key is `bdm_live_` + 40
+alphanumeric characters from the same `rand` CSPRNG that
+generates OTP codes (~238 bits of entropy; no new
+dependency). Only its SHA-256 hash is stored
+(`api_keys.key_hash`, UNIQUE — the auth lookup is by hash)
+— the hash-only discipline OTP codes already use — plus
+the first 12 characters as the display prefix, so lists
+can tell keys apart without exposing anything usable.
+The pure rules are the domain's: name (trimmed,
+1..=60 characters), scope vocabulary and normalisation
+(`read`, `write`; write implies read; unknown scopes are
+refused, never stored), the scope permission rule, and
+the expiry bound.
+
+**Authentication is one central path.** The `AuthUser`
+extractor recognises the `bdm_live_` marker and routes
+the token to `api_keys::authenticate_request`, which
+applies, in order: the hash lookup (unknown, revoked or
+expired → 401; the owner's phone and role are re-read
+from the user row, so account changes apply immediately),
+the JWT-only route exclusions (→ 403), the scope rule (a
+read-only key gets 403 on any non-GET call), and the
+per-key rate limit (→ 429). The request then acts as the
+key's user everywhere — cart, orders, seller surfaces —
+with no handler aware of how it authenticated. JWT
+traffic takes the old path untouched and is never rate
+limited by this. On the public catalogue reads (the
+optional-auth product endpoints) a key caller is treated
+as a guest: those endpoints stay JWT-optional by design.
+
+**The JWT-only exclusions** (no scope overrides them —
+they are route rules, not scope rules): all of
+`/v1/admin/*`; `/v1/api-keys*` itself, so a leaked key
+cannot mint or revoke keys to persist itself; the payout
+account (every method) and payout requests
+(`POST /v1/seller/payouts`) — money out needs a login
+session, though the payout LIST stays readable;
+subscription subscribe/cancel (`POST
+/v1/seller/subscription*`) — spending the earnings
+balance, same reasoning, while reading the plan and
+catalogue stays allowed; and both data exports
+(`/v1/seller/export`, `/v1/buyer/export`) — a full account
+dump is a session-only action.
+
+**Rate limiting** is a per-key fixed-window counter in
+`AppState` (a `Mutex<HashMap>` behind an `Arc`): 600
+requests per key per 60-second window by default,
+overridable at startup with `API_KEY_RATE_LIMIT_PER_MIN`
+(invalid or zero keeps the default, with a warning — the
+usual env discipline). Windows reset wholesale; stale
+entries are swept opportunistically when the map grows,
+with no background task. `last_used_at` is stamped
+best-effort after a request is admitted — a failed stamp
+is logged, never a failed request.
+
+**Web.** `/seller/api-keys` (linked from the seller
+dashboard nav) lists the account's keys — name, prefix,
+scopes, status, created / last-used / expiry — with a
+create form (name, read/write scope checkboxes, optional
+expiry days) whose response opens a one-time reveal
+panel ("এই কীটি আর দেখানো হবে না — এখনই কপি করুন" —
+this key will not be shown again, copy it now) with a
+copy button, and a per-key revoke button behind a
+confirm. Keys belong to the account, not a store, so
+there is no store switcher on the page.
+
+**Honest limits:** the rate limiter is in-memory and
+per-process — a restart resets every window, and
+multiple API instances would each keep their own count,
+so the effective fleet-wide limit is the per-instance
+limit times the instance count; a shared store (Redis)
+is future work, like every other cross-instance concern
+here. Keys are bearer secrets: anyone holding one acts
+as its owner within its scopes and exclusions, so a
+leaked key is a leaked account for those routes until it
+is revoked — there is no per-key IP allowlist and no
+OAuth2 (no client credentials flow, no consent screen);
+rotation is manual by design: create the replacement,
+move the app, revoke the old key. A key with no expiry
+stays valid until revoked — the 365-day cap binds only
+keys created WITH an expiry.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -3548,6 +3639,33 @@ the old expiry (a third charge) then expiring the store
 back to full commission when the price outruns the
 balance.
 
+**Real (Wave 37):** third-party / mobile API keys —
+migration 0035 (`api_keys`: owner, name, display prefix,
+UNIQUE key hash, comma-joined canonical scopes,
+last-used / expiry / revocation timestamps; only the
+SHA-256 hash of a key is ever stored); the pure domain
+rules (name, scope vocabulary + normalisation, the
+scope permission rule with write implying read, the
+365-day expiry bound); the one central key
+authentication in `crates/api/src/api_keys.rs`, wired
+into the `AuthUser` extractor (hash lookup → JWT-only
+route exclusions → scope rule → per-key fixed-window
+rate limit, default 600/min from
+`API_KEY_RATE_LIMIT_PER_MIN`, JWT traffic unlimited);
+management endpoints that are JWT-only by that same
+central rule, with the full key shown exactly once at
+creation. Web: /seller/api-keys with the one-time
+reveal panel, and the seller nav link. An integration
+test (`crates/api/tests/wave37.rs`, same
+`DATABASE_URL` gate) covers the one-time reveal and
+prefix, key auth acting as the owner, the read-only
+write refusal, a write key writing, all five exclusion
+families, unknown / revoked / expired 401s, the
+stranger-revoke 404 and idempotent re-revoke, the list
+leaking neither key nor hash, and the per-key 429 with
+JWT traffic unaffected; the limiter and route rules
+also have unit tests in the module.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters, and the four manual couriers run
@@ -3609,7 +3727,8 @@ the external service at the other end of it, configured by
   it adds the checkout loyalty block, the orders-page
   loyalty card, and loyalty discount lines on the order
   and receipt views; Wave 36 adds /seller/subscription,
-  the dashboard plan badge and the seller nav link).
+  the dashboard plan badge and the seller nav link;
+  Wave 37 adds /seller/api-keys and the seller nav link).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
   (domain 118, courier 31, payments 8 unit tests, plus the API

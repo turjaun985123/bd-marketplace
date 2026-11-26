@@ -2080,6 +2080,76 @@ export function cancelSubscription(
 }
 
 // ---------------------------------------------------------------------------
+// Wave 37 — third-party / mobile API keys. A key acts as its
+// owner, narrowed by scopes; only its hash is stored, so the
+// full key exists ONLY in the create response — the list and
+// revoke calls below can never return it. Key management is
+// JWT-only on the API (a key cannot manage keys).
+// ---------------------------------------------------------------------------
+
+/** One API key as its owner may see it (GET /v1/api-keys). */
+export interface ApiKeyView {
+  id: string;
+  name: string;
+  /** First 12 characters of the full key — display only. */
+  key_prefix: string;
+  /** Canonical scope set: ["read"] or ["read", "write"]. */
+  scopes: string[];
+  /** active | revoked | expired (derived on the API). */
+  status: string;
+  last_used_at: string | null;
+  expires_at: string | null;
+  created_at: string;
+}
+
+/** The create response: the key view PLUS the full key, once. */
+export interface CreatedApiKey extends ApiKeyView {
+  /** The full key — shown once; it can never be read back. */
+  key: string;
+}
+
+/** Bangla label for an API key status (Wave 37). */
+export function apiKeyStatusLabel(status: string): string {
+  switch (status) {
+    case "active":
+      return "সক্রিয় — Active";
+    case "revoked":
+      return "বাতিল করা — Revoked";
+    case "expired":
+      return "মেয়াদ শেষ — Expired";
+    default:
+      return status;
+  }
+}
+
+/** GET /v1/api-keys — my keys (metadata + prefixes only). */
+export function listApiKeys(token: string): Promise<{ items: ApiKeyView[] }> {
+  return call("/v1/api-keys", { token });
+}
+
+/** POST /v1/api-keys — mint a key; the response carries it once. */
+export function createApiKey(
+  token: string,
+  name: string,
+  scopes: string[],
+  expiresInDays?: number | null
+): Promise<CreatedApiKey> {
+  return call("/v1/api-keys", {
+    method: "POST",
+    token,
+    body: { name, scopes, expires_in_days: expiresInDays ?? null },
+  });
+}
+
+/** DELETE /v1/api-keys/{id} — revoke a key (idempotent). */
+export function revokeApiKey(token: string, id: string): Promise<ApiKeyView> {
+  return call(`/v1/api-keys/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    token,
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Wave 10 — platform admin. Every call needs an admin token; the API
 // answers 403 for everyone else (the pages also gate on /v1/auth/me).
 // ---------------------------------------------------------------------------

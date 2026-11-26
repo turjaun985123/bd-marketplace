@@ -3158,6 +3158,147 @@ pub fn variant_final_price(base_poisha: i64, delta_poisha: i64) -> Option<i64> {
         .filter(|price| *price > 0)
 }
 
+// ---------------------------------------------------------------------------
+// Wave 37 — third-party / mobile API keys (pure rules; the API stores
+// the rows, hashes the secrets and enforces everything)
+// ---------------------------------------------------------------------------
+
+/// API keys (Wave 37) are the long-lived bearer credentials
+/// external apps authenticate with — a future mobile app, a
+/// seller's own integration — in place of the 7-day JWT a
+/// human login issues. A key belongs to ONE user and acts as
+/// that user, narrowed by its scopes. Only the SHA-256 hash
+/// of a key is ever stored (the hashing itself lives in the
+/// API crate, beside the OTP hashing it mirrors); the full
+/// key is shown exactly once, at creation. The rules in this
+/// section are the pure vocabulary the API enforces: what a
+/// key may be named, which scope sets are legal, what a scope
+/// set permits, how long a key may live, and which part of a
+/// key is safe to display.
+
+/// The longest name an API key may carry (Wave 37): a label
+/// the owner picks to recognise the key later ("Mobile app",
+/// "হিসাব সফটওয়্যার") — sixty characters is generous for a
+/// label in a list.
+pub const API_KEY_NAME_MAX_CHARS: usize = 60;
+
+/// How many leading characters of a full key are safe to
+/// store and display as its prefix (Wave 37): enough to tell
+/// two keys apart in a list (`bdm_live_ab3…` — the marker
+/// plus the first few random characters), far too few to
+/// reconstruct or brute-force the secret behind them.
+pub const API_KEY_PREFIX_CHARS: usize = 12;
+
+/// The read scope (Wave 37): the key may call GET endpoints
+/// (subject to the API's JWT-only route exclusions, which no
+/// scope overrides).
+pub const API_KEY_SCOPE_READ: &str = "read";
+
+/// The write scope (Wave 37): the key may also call
+/// non-GET endpoints. Write implies read — a key that can
+/// change things can obviously look at them.
+pub const API_KEY_SCOPE_WRITE: &str = "write";
+
+/// Every scope a key may carry, in canonical order. Stored
+/// scope sets are normalised against this list, so the
+/// stored form is always `read` or `read,write` — never a
+/// duplicate, never an unknown word.
+pub const API_KEY_SCOPES: [&str; 2] = [API_KEY_SCOPE_READ, API_KEY_SCOPE_WRITE];
+
+/// The longest lifetime a key may be created with, in days
+/// (Wave 37): a year. Keys are bearer secrets that outlive
+/// any session, so an unbounded lifetime is refused at
+/// creation; a key with NO expiry is a separate, deliberate
+/// choice (`expires_in_days` absent), not an accident of a
+/// huge number.
+pub const API_KEY_MAX_EXPIRY_DAYS: i64 = 365;
+
+/// Validate an API key's name (Wave 37): after trimming it
+/// must hold 1..=[`API_KEY_NAME_MAX_CHARS`] characters
+/// (counted as characters, not bytes, so Bangla labels
+/// measure fairly). On success the trimmed name is returned
+/// for storage.
+pub fn validate_api_key_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    let count = trimmed.chars().count();
+    if count == 0 {
+        return Err("api key name must not be empty".to_string());
+    }
+    if count > API_KEY_NAME_MAX_CHARS {
+        return Err(format!(
+            "api key name must be at most {API_KEY_NAME_MAX_CHARS} characters"
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// The displayable prefix of a full API key (Wave 37): its
+/// first [`API_KEY_PREFIX_CHARS`] characters. A key shorter
+/// than the prefix yields the whole string — that can only
+/// happen for a malformed key, and the prefix is a display
+/// aid, never a credential check.
+pub fn api_key_prefix(full_key: &str) -> String {
+    full_key.chars().take(API_KEY_PREFIX_CHARS).collect()
+}
+
+/// Validate and normalise a requested scope set (Wave 37):
+/// the set must be non-empty, every entry must be one of
+/// [`API_KEY_SCOPES`], and the result is deduplicated into
+/// canonical order (`read` before `write`). Anything else —
+/// an empty set, an invented scope like `admin` — is an
+/// error: a key must never silently gain or lose a scope on
+/// its way to storage.
+pub fn validate_api_key_scopes(scopes: &[String]) -> Result<Vec<String>, String> {
+    if scopes.is_empty() {
+        return Err("an api key needs at least one scope".to_string());
+    }
+    for scope in scopes {
+        if !API_KEY_SCOPES.contains(&scope.as_str()) {
+            return Err(format!(
+                "unknown api key scope '{scope}' — scopes are 'read' and 'write'"
+            ));
+        }
+    }
+    Ok(API_KEY_SCOPES
+        .iter()
+        .filter(|scope| scopes.iter().any(|s| s.as_str() == *scope))
+        .map(|scope| scope.to_string())
+        .collect())
+}
+
+/// May a key carrying `scopes` make this call (Wave 37)?
+/// Reads (GET and friends) need the read scope — or the
+/// write scope, which implies it; writes need the write
+/// scope. Unknown stored scopes grant nothing: the function
+/// fails closed, like the plan and role rules, so a garbled
+/// stored scope set can never mint access. This is the SCOPE
+/// rule only — the JWT-only route exclusions (admin, money
+/// movement, key management, exports) are a separate API
+/// layer rule that applies before scopes are even read.
+pub fn api_key_scope_allows(scopes: &[String], method_is_write: bool) -> bool {
+    let has = |wanted: &str| scopes.iter().any(|scope| scope == wanted);
+    if method_is_write {
+        has(API_KEY_SCOPE_WRITE)
+    } else {
+        has(API_KEY_SCOPE_READ) || has(API_KEY_SCOPE_WRITE)
+    }
+}
+
+/// Validate a requested key lifetime (Wave 37): `None` (no
+/// expiry) is a legal, deliberate choice; a given day count
+/// must lie in 1..=[`API_KEY_MAX_EXPIRY_DAYS`]. Zero or
+/// negative would create a key that is born expired, and
+/// anything past a year is refused rather than stored.
+pub fn validate_api_key_expiry_days(days: Option<i64>) -> Result<Option<i64>, String> {
+    match days {
+        None => Ok(None),
+        Some(days) if (1..=API_KEY_MAX_EXPIRY_DAYS).contains(&days) => Ok(Some(days)),
+        Some(_) => Err(format!(
+            "api key expiry must be between 1 and {API_KEY_MAX_EXPIRY_DAYS} days"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5523,5 +5664,80 @@ mod tests {
         // Unknown kinds still render a body.
         let other = render_body("some_future_kind", &vars);
         assert!(other.contains("#12345678"), "{other}");
+    }
+
+    // -- Wave 37: API keys ---------------------------------------------
+
+    #[test]
+    fn api_key_name_trims_and_bounds() {
+        assert_eq!(validate_api_key_name("  Mobile app  ").unwrap(), "Mobile app");
+        assert!(validate_api_key_name("").is_err());
+        assert!(validate_api_key_name("   ").is_err());
+        // The bound counts characters, not bytes: 60 Bangla
+        // characters pass, 61 fail.
+        assert!(validate_api_key_name(&"ক".repeat(60)).is_ok());
+        assert!(validate_api_key_name(&"ক".repeat(61)).is_err());
+        assert!(validate_api_key_name(&"a".repeat(60)).is_ok());
+        assert!(validate_api_key_name(&"a".repeat(61)).is_err());
+    }
+
+    #[test]
+    fn api_key_prefix_takes_the_first_twelve_characters() {
+        let key = "bdm_live_abcdefghij0123456789ABCDEFGHIJ";
+        assert_eq!(api_key_prefix(key), "bdm_live_abc");
+        assert_eq!(api_key_prefix(key).chars().count(), API_KEY_PREFIX_CHARS);
+        // A short (malformed) key yields itself, never a panic.
+        assert_eq!(api_key_prefix("bdm"), "bdm");
+        assert_eq!(api_key_prefix(""), "");
+    }
+
+    #[test]
+    fn api_key_scopes_validate_dedupe_and_order() {
+        let read = validate_api_key_scopes(&["read".to_string()]).unwrap();
+        assert_eq!(read, vec!["read".to_string()]);
+        // Input order and duplicates never reach storage.
+        let both = validate_api_key_scopes(&[
+            "write".to_string(),
+            "read".to_string(),
+            "write".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(both, vec!["read".to_string(), "write".to_string()]);
+        // Empty and invented scopes are refused outright.
+        assert!(validate_api_key_scopes(&[]).is_err());
+        assert!(validate_api_key_scopes(&["admin".to_string()]).is_err());
+        assert!(validate_api_key_scopes(&["read".to_string(), "all".to_string()]).is_err());
+    }
+
+    #[test]
+    fn api_key_scope_allows_the_full_matrix() {
+        let read_only = vec!["read".to_string()];
+        let read_write = vec!["read".to_string(), "write".to_string()];
+        let write_only = vec!["write".to_string()];
+        let garbled = vec!["everything".to_string()];
+        let empty: Vec<String> = Vec::new();
+
+        assert!(api_key_scope_allows(&read_only, false));
+        assert!(!api_key_scope_allows(&read_only, true));
+        assert!(api_key_scope_allows(&read_write, false));
+        assert!(api_key_scope_allows(&read_write, true));
+        // Write implies read.
+        assert!(api_key_scope_allows(&write_only, false));
+        assert!(api_key_scope_allows(&write_only, true));
+        // Unknown or empty scope sets fail closed.
+        assert!(!api_key_scope_allows(&garbled, false));
+        assert!(!api_key_scope_allows(&garbled, true));
+        assert!(!api_key_scope_allows(&empty, false));
+        assert!(!api_key_scope_allows(&empty, true));
+    }
+
+    #[test]
+    fn api_key_expiry_days_bounds() {
+        assert_eq!(validate_api_key_expiry_days(None).unwrap(), None);
+        assert_eq!(validate_api_key_expiry_days(Some(1)).unwrap(), Some(1));
+        assert_eq!(validate_api_key_expiry_days(Some(365)).unwrap(), Some(365));
+        assert!(validate_api_key_expiry_days(Some(0)).is_err());
+        assert!(validate_api_key_expiry_days(Some(-30)).is_err());
+        assert!(validate_api_key_expiry_days(Some(366)).is_err());
     }
 }
