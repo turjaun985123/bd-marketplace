@@ -557,7 +557,7 @@ pub async fn place_order(
     // increment below are atomic against concurrent checkouts.
     // Any rejection returns an error here: the transaction drops
     // uncommitted, nothing is written, and the cart stays intact.
-    let applied_coupon = apply_coupon_to_groups(&mut *tx, &mut groups, &input).await?;
+    let applied_coupon = apply_coupon_to_groups(&mut tx, &mut groups, &input).await?;
 
     // The commission rate is the EFFECTIVE one (Wave 10): an
     // admin-set platform setting wins over the startup value.
