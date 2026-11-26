@@ -190,7 +190,7 @@ async fn set_sub_order_status(app: &axum::Router, token: &str, id: &str, status:
     let (code, body) = call(
         app,
         "PATCH",
-        &format!("/v1/seller/sub-orders/{id}"),
+        &format!("/v1/seller/sub-orders/{id}/status"),
         Some(token),
         Some(json!({ "status": status })),
     )
