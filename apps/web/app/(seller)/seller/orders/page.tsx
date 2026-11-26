@@ -340,6 +340,13 @@ export default function SellerOrdersPage() {
               ডেলিভারি: {sub.delivery_name}, {sub.delivery_phone},{" "}
               {sub.delivery_address} ({sub.delivery_zone})
             </p>
+            {(sub.status === "delivered" || sub.status === "returned") && (
+              <p>
+                <Link href={`/invoice/${sub.id}?as=seller`}>
+                  ইনভয়েস দেখুন — Invoice
+                </Link>
+              </p>
+            )}
             <p>
               ক্রেতার ঝুঁকি:{" "}
               <strong>{riskLevelLabel(sub.buyer_risk_level)}</strong> (

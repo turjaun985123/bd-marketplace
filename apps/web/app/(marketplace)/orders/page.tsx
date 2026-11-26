@@ -34,6 +34,10 @@ import { useAuth } from "@/hooks/useAuth";
  * platform records it done. The sub-order's `return_status` summary
  * comes with the order; the refund figures come from the buyer's
  * return-request list, keyed by sub-order.
+ *
+ * Wave 22: a delivered or returned sub-order links to its
+ * printable per-store invoice (the seller's document for that
+ * slice; the receipt link below stays the whole-order summary).
  */
 export default function BuyerOrdersPage() {
   const { ready, token } = useAuth();
@@ -251,6 +255,14 @@ export default function BuyerOrdersPage() {
                           : "স্ট্যাটাস রিফ্রেশ"}
                       </button>
                     )}
+                  </p>
+                )}
+                {(sub.status === "delivered" ||
+                  sub.status === "returned") && (
+                  <p>
+                    <Link href={`/invoice/${sub.id}`}>
+                      ইনভয়েস দেখুন — Invoice ({sub.store_slug})
+                    </Link>
                   </p>
                 )}
                 {sub.return_status ? (

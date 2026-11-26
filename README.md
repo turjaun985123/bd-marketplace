@@ -1075,6 +1075,70 @@ exactly like the Wave 18 branding images (no upload storage
 exists yet), and the tier is trust metadata — it does not
 change prices, commissions or search ranking.
 
+Wave 22 (invoices with per-store sequential numbers):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| GET | `/v1/buyer/sub-orders/{id}/invoice` | Bearer, the order's buyer. The invoice for one sub-order — issued on this first read when the sub-order is `delivered` or `returned`; 409 before delivery; anyone else 404 |
+| GET | `/v1/seller/sub-orders/{id}/invoice` | Bearer, the store's owner. The same document through the seller's door |
+| GET | `/v1/admin/sub-orders/{id}/invoice` | Admin. The same document for support/disputes |
+
+**Numbering rule:** every store numbers its own invoices
+sequentially — `INV-000001`, `INV-000002`, … — from a
+per-store counter (migration 0023). The number is assigned
+on the FIRST entitled read of a delivered (or later
+returned) sub-order, inside one transaction that locks the
+store's counter row, so concurrent issues for one store
+never draw the same number. A number is **never reused**:
+the counter only moves forward, re-reading a sub-order's
+invoice returns the same row (the `invoices` table is
+UNIQUE on `sub_order_id`, and on `(store_id, seq)`), and a
+sub-order that has not been delivered has no invoice at
+all (409 — there is no completed sale to document). Two
+stores can both have an `INV-000001`; an invoice is
+identified by the pair (store, number), and the printed
+document carries the store's name and slug next to the
+number.
+
+**Invoice vs receipt:** the Wave 4 receipt
+(`/v1/orders/{id}/receipt`) is the BUYER's whole-order
+summary — every seller's slice on one page, with no
+commission or payout figures. The invoice is the SELLER's
+legal document for ONE sub-order: that store's number, its
+items (the checkout snapshots), and the money for that
+slice alone — goods minus its allocated coupon discount
+plus its delivery charge, built from the sub-order's
+stored snapshot columns through the same shared order
+loader the receipt uses. A collected COD advance (Wave
+17) is an order-level figure, so the invoice allocates
+it across the order's sub-orders in proportion to each
+sub-order's share of the order grand total (exact for
+single-seller orders; integer division can leave a poisha
+or two unallocated across a multi-seller order's invoices
+— the whole-order receipt remains the authority for the
+order-level cash due).
+
+**Printing / PDF:** the web invoice page
+(`/invoice/{subOrderId}`, linked from the buyer's orders
+and the seller's orders for delivered/returned sub-orders)
+renders a clean printable document — store header with the
+Wave 18 brand accent and the Wave 21 verification badge,
+buyer details, the item table, the money summary with the
+cash-due line highlighted — and the প্রিন্ট / PDF button
+uses the browser's print dialog (`window.print()`); the
+document title is the invoice filename stem
+(`invoice-<slug>-<seq>`), which browsers propose as the
+saved PDF's name. There is **no server-side PDF
+generator**.
+
+**What is NOT included:** no e-invoice / NBR integration
+and no VAT or tax fields — whether invoices must carry a
+Mushak challan reference or a VAT breakdown is a business
+and regulatory decision for the operator, and the schema
+deliberately does not invent one. Invoice corrections are
+not modelled either: a wrong invoice is a support matter
+today, not a credit-note flow.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -1976,6 +2040,39 @@ button), the admin settings KYC gate toggle, and the
 storefront/product verification badges (an unverified
 store shows nothing).
 
+**Real (Wave 22):** per-store sequential invoices —
+migration 0023 (the `store_invoice_counters` table and
+the `invoices` table, UNIQUE on `sub_order_id` and on
+`(store_id, seq)`); the domain formatters
+(`format_invoice_number` — `INV-` plus the sequence
+zero-padded to six digits, growing wider past 999_999,
+never truncated — and `invoice_filename`); the
+`invoices` API module with ONE service function
+(`get_or_issue_invoice`) behind the buyer, seller and
+admin endpoints: ownership-or-404 access per actor, a 409
+until the sub-order is delivered, lazy idempotent issuing
+in one transaction (counter row locked `FOR UPDATE`, an
+in-transaction re-check, and the unique violation as the
+race backstop — a sequence is never reused and never
+burned twice for one sub-order); the view assembled from
+the shared order loader and store loader (no forked item
+or money queries), with the money block scoped to the
+sub-order's stored snapshots and a collected COD advance
+allocated by the sub-order's share of the order grand
+total; an integration test (`crates/api/tests/wave22.rs`,
+same `DATABASE_URL` gate) covering the pre-delivery 409,
+`INV-000001` with matching items/money, idempotent
+re-reads (same row id), the same store's `INV-000002`, a
+different store's own `INV-000001`, stranger/other-seller
+404s, the admin door (403 for a non-admin), and a returned
+sub-order keeping its invoice; and the Next.js printable
+invoice page at /invoice/[subOrderId] (brand accent +
+verification badge header, item table, money summary,
+highlighted cash-due, browser print-to-PDF with the
+invoice filename as the document title), linked from the
+buyer orders page and the seller orders page for
+delivered/returned sub-orders.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters, and the four manual couriers run
@@ -2009,7 +2106,8 @@ the external service at the other end of it, configured by
   Wave 15 adds /search; Wave 16 adds /track, /seller/returns and
   /admin/returns; Wave 18 adds /seller/branding; Wave 19 extends
   /seller/orders and /track with the manual-courier workflow;
-  Wave 21 adds /seller/verification and /admin/verifications).
+  Wave 21 adds /seller/verification and /admin/verifications;
+  Wave 22 adds /invoice/[subOrderId]).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
   (domain 85, courier 31, payments 8 unit tests; the `DATABASE_URL`-
@@ -2018,10 +2116,10 @@ the external service at the other end of it, configured by
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
   (including the Wave 13 messaging endpoints), and the SIDRA
   callback answers 503 without a database.
-- **Rust integration + clippy: CI-only** — the Wave 2–21 integration
+- **Rust integration + clippy: CI-only** — the Wave 2–22 integration
   tests against a real Postgres 16 service and clippy `-D warnings`
   are verified via **GitHub Actions CI** (`.github/workflows/ci.yml`)
-  on push. Waves 1–20 are green there; Wave 21 awaits its first CI run.
+  on push. Waves 1–21 are green there; Wave 22 awaits its first CI run.
 - **Docker images: CI-only** — Docker is not installed on the
   development machine, so `Dockerfile.api`, `Dockerfile.worker`
   and `apps/web/Dockerfile` are verified by the CI `docker` job

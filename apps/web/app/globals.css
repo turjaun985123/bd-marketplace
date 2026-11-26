@@ -48,3 +48,18 @@ label { display: block; margin: 10px 0 4px; font-size: 0.9rem; }
   main { max-width: none; padding: 0; }
   .receipt { border: none; padding: 0; }
 }
+
+/* Wave 22: invoice layout (app/invoice/[subOrderId]) — an
+   A4-ish printable document: item table with right-aligned
+   numbers, the COD-due line emphasised, and the same print
+   rules as the receipt (chrome hidden, border dropped). */
+.invoice { border: 1px solid #ccc; border-radius: 8px; padding: 20px; max-width: 760px; }
+.invoice h1 { margin-top: 0; }
+.invoice table { width: 100%; border-collapse: collapse; }
+.invoice th, .invoice td { border-bottom: 1px solid #ddd; padding: 6px 8px; text-align: left; }
+.invoice th.num, .invoice td.num { text-align: right; }
+.invoice .cod-due { font-size: 1.1rem; }
+.invoice .invoice-note { color: #555; font-size: 0.9rem; }
+@media print {
+  .invoice { border: none; padding: 0; max-width: none; }
+}

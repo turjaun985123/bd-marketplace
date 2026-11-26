@@ -902,6 +902,80 @@ export function getOrderReceipt(token: string, id: string): Promise<Receipt> {
   return call(`/v1/orders/${encodeURIComponent(id)}/receipt`, { token });
 }
 
+/** The issuing store's block on an invoice (Wave 22). */
+export interface InvoiceStore {
+  name: string;
+  slug: string;
+  verified_tier: VerificationTier;
+  /** Wave 18 brand colour (#RRGGBB) for the print accent; null when unset. */
+  brand_color: string | null;
+}
+
+/** An invoice's money block (Wave 22) — this sub-order only, in poisha. */
+export interface InvoiceMoney {
+  goods_subtotal_poisha: number;
+  discount_poisha: number;
+  delivery_charge_poisha: number;
+  /** Goods − discount + delivery: this slice's total. */
+  grand_total_poisha: number;
+  /** This slice's share of any advance the COD order collected (Wave 17). */
+  advance_paid_poisha: number;
+  /** Cash still due on delivery for this slice; 0 for online orders. */
+  cod_amount_due_poisha: number;
+}
+
+/**
+ * GET /v1/{buyer|seller|admin}/sub-orders/{id}/invoice (Wave 22) —
+ * the per-seller invoice for one sub-order. The number is
+ * sequential PER STORE (INV-000001 is every store's first), the
+ * first read of a delivered/returned sub-order issues it, and
+ * later reads return the same invoice.
+ */
+export interface Invoice {
+  id: string;
+  sub_order_id: string;
+  order_id: string;
+  invoice_number: string;
+  /** The store-local sequence behind `invoice_number`. */
+  seq: number;
+  issued_at: string;
+  /** delivered, or returned when the sale later came back. */
+  sub_order_status: string;
+  store: InvoiceStore;
+  buyer: {
+    name: string;
+    phone: string;
+    address: string;
+    zone: string;
+  };
+  items: OrderItem[];
+  money: InvoiceMoney;
+  payment_method: string;
+  payment_status: string;
+}
+
+/** GET /v1/buyer/sub-orders/{id}/invoice — the buyer's copy. */
+export function getBuyerInvoice(
+  token: string,
+  subOrderId: string
+): Promise<Invoice> {
+  return call(
+    `/v1/buyer/sub-orders/${encodeURIComponent(subOrderId)}/invoice`,
+    { token }
+  );
+}
+
+/** GET /v1/seller/sub-orders/{id}/invoice — the seller's copy. */
+export function getSellerInvoice(
+  token: string,
+  subOrderId: string
+): Promise<Invoice> {
+  return call(
+    `/v1/seller/sub-orders/${encodeURIComponent(subOrderId)}/invoice`,
+    { token }
+  );
+}
+
 /** PATCH /v1/seller/sub-orders/{id}/status — move a sub-order's status. */
 export function updateSubOrderStatus(
   token: string,

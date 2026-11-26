@@ -110,6 +110,15 @@
 //! summary line. The deployable stack itself (Dockerfiles,
 //! root `docker-compose.yml`, the CI `docker` job) lives at
 //! the repository root — see the README Deployment section.
+//! Wave 22: invoices (`invoices` module) — the per-seller
+//! legal document for one sub-order, distinct from the Wave 4
+//! buyer receipt: numbered sequentially PER STORE from a
+//! counter row locked inside the issuing transaction, issued
+//! lazily on the first entitled request for a delivered (or
+//! later returned) sub-order and idempotently thereafter,
+//! with the money block scoped to the sub-order's own stored
+//! snapshots and any collected COD advance allocated by the
+//! sub-order's share of the order grand total.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -125,6 +134,7 @@ pub mod auth;
 pub mod cart;
 pub mod coupons;
 pub mod facebook;
+pub mod invoices;
 pub mod messaging;
 pub mod orders;
 pub mod payments;
@@ -1106,6 +1116,24 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/v1/admin/verifications/:store_id/reject",
             post(verification::reject_verification_handler),
+        )
+        // Wave 22 — invoices: the per-seller document for one
+        // sub-order, issued lazily (and idempotently) on the
+        // first entitled read once the sub-order is delivered.
+        // Buyer = the order's buyer, seller = the store's
+        // owner, admin behind require_admin; everyone else
+        // gets the same 404 as an unknown sub-order.
+        .route(
+            "/v1/buyer/sub-orders/:id/invoice",
+            get(invoices::get_buyer_invoice),
+        )
+        .route(
+            "/v1/seller/sub-orders/:id/invoice",
+            get(invoices::get_seller_invoice),
+        )
+        .route(
+            "/v1/admin/sub-orders/:id/invoice",
+            get(invoices::get_admin_invoice),
         )
         .layer(cors)
         .with_state(state)

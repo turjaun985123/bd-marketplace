@@ -2254,6 +2254,34 @@ pub fn validate_reviewer_note(raw: &str) -> Result<String, &'static str> {
 /// every key.
 pub const KYC_PAYOUT_GATE_KEY: &str = "kyc_payout_gate";
 
+// ---------------------------------------------------------------------------
+// Invoices (Wave 22)
+// ---------------------------------------------------------------------------
+
+/// Format one store's invoice sequence number as the printed
+/// invoice number: `INV-` plus the sequence zero-padded to six
+/// digits (`INV-000001`). A sequence past 999_999 simply grows
+/// wider — the padding is a minimum width, never a truncation.
+///
+/// The sequence is PER-STORE (each store has its own counter,
+/// migration 0023), so two different stores can both issue an
+/// `INV-000001`. An invoice is identified by the pair (store,
+/// number): the printed invoice carries the store's name and
+/// slug next to the number, and the database enforces
+/// uniqueness on `(store_id, seq)`.
+pub fn format_invoice_number(store_seq: i64) -> String {
+    format!("INV-{store_seq:06}")
+}
+
+/// The filename stem for one invoice's print view:
+/// `invoice-<slug>-<seq zero-padded to six digits>`. The web
+/// invoice page sets it as the document title, which is what
+/// browsers propose as the filename when the reader saves the
+/// print view as a PDF.
+pub fn invoice_filename(store_slug: &str, store_seq: i64) -> String {
+    format!("invoice-{store_slug}-{store_seq:06}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4010,5 +4038,24 @@ mod tests {
     #[test]
     fn kyc_payout_gate_key_is_stable() {
         assert_eq!(KYC_PAYOUT_GATE_KEY, "kyc_payout_gate");
+    }
+
+    #[test]
+    fn invoice_number_is_zero_padded_to_six_digits() {
+        assert_eq!(format_invoice_number(1), "INV-000001");
+        assert_eq!(format_invoice_number(42), "INV-000042");
+        assert_eq!(format_invoice_number(999_999), "INV-999999");
+        // Past the padded width the number grows; it is never
+        // truncated back into a collision.
+        assert_eq!(format_invoice_number(1_000_000), "INV-1000000");
+    }
+
+    #[test]
+    fn invoice_filename_combines_slug_and_padded_seq() {
+        assert_eq!(
+            invoice_filename("rahim-store", 7),
+            "invoice-rahim-store-000007"
+        );
+        assert_eq!(invoice_filename("a", 123_456), "invoice-a-123456");
     }
 }
