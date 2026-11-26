@@ -1931,6 +1931,122 @@ set each variant's stock explicitly (creation stock or
 adjust-stock), because the product's old count is NOT
 auto-distributed across variants.
 
+Wave 34 (multi-store access + staff roles — a store is a team):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| GET | `/v1/seller/stores` | Bearer. Every store the caller owns or is a team member of, each with `my_role` (owner \| manager \| staff), slug, name, status and verified tier. Owned stores first |
+| GET | `/v1/seller/stores/{id}/members` | Bearer. The store's team list (masked phones + roles). Owner and manager may view; staff get 403; a caller with no relationship to the store gets 404 |
+| POST | `/v1/seller/stores/{id}/members` | Bearer, OWNER only. Seat an EXISTING account by phone `{phone, role}` — 201 with the member view; 404 when no account has that number (no silent account creation, no invite SMS); 400 for the owner themself or a bad role/phone; 409 on a duplicate seat |
+| PATCH | `/v1/seller/stores/{id}/members/{user_id}` | Bearer, owner only. Change a member's role `{role}` (manager \| staff); a non-member is a 404 |
+| DELETE | `/v1/seller/stores/{id}/members/{user_id}` | Bearer, owner only. Remove a member — 204; access ends with the row. A non-member is a 404 |
+
+**The permission matrix** is one pure domain function —
+`store_role_can(role, action)` — over eight named actions;
+it fails closed (an unknown role or action can do nothing):
+
+| Action | Owner | Manager | Staff |
+| --- | --- | --- | --- |
+| `manage_members` (seat / re-role / remove) | ✓ | — | — |
+| `manage_payouts` (payout account, payout requests) | ✓ | — | — |
+| `view_finances` (balance, payout list, analytics, export) | ✓ | ✓ | — |
+| `manage_catalog` (products, variants, inventory) | ✓ | ✓ | ✓ |
+| `manage_orders` (sub-orders, shipments, return decisions) | ✓ | ✓ | ✓ |
+| `manage_marketing` (coupons, promotions, branding) | ✓ | ✓ | — |
+| `answer_questions` (product Q&A) | ✓ | ✓ | ✓ |
+| `manage_store_settings` (verification submit, SIDRA toggle) | ✓ | ✓ | — |
+
+**The access helper** (`crates/api/src/access.rs`) is the
+one place role resolution lives: `store_role` answers the
+caller's role in a store in ONE query (owner when
+`stores.owner_user_id` matches, else the member row's
+role, else none), `seller_access` turns "none" into a
+404 (a stranger must not learn the store exists), and
+`require_role` turns a matrix denial into a bilingual
+403. Two scoping shapes cover the whole seller surface:
+
+- **Store-in-hand surfaces** (the store comes from a
+  product, sub-order, shipment, question, return or
+  promotion row) keep each module's historical no-access
+  answer — the 403 modules (orders, shipments, returns)
+  still answer 403 to a caller with no relationship, the
+  404 modules (catalogue, inventory, variants, Q&A,
+  promotions) still answer 404 — and then apply the
+  matrix. Owner behaviour is byte-for-byte what it was.
+- **Caller-store surfaces** gained an optional
+  `?store_id=`: absent, they resolve the caller's own
+  earliest store exactly as before; present, they resolve
+  through `seller_access` + the matrix. That covers the
+  dashboard (any role may VIEW a served store's
+  dashboard), balance, payout list, payout account,
+  payout requests, seller analytics + CSV, the seller
+  export, store coupons, branding, verification and the
+  SIDRA toggle. Cross-store LISTS (seller sub-orders,
+  return requests, the Q&A inbox, the inventory overview,
+  the promotions list) scope to every store the caller
+  holds the relevant action in — for owners that is the
+  same set as before.
+
+**Per-family decisions.** Catalogue: members create and
+edit products in the store (creation keeps naming the
+store in the body); a non-active product is now visible
+to the store's whole team, not only its owner. Orders: a
+member confirms, books (API or manual), refreshes and
+decides returns; shipment refresh keeps its buyer-or-team
+participant rule. Finances: a manager reads a store's
+balance, payout history, analytics and export — the
+scoped export's document is that one store, and its
+charges total counts only that store's promotions.
+Payouts: the account and requests are owner-only in the
+matrix, so a manager naming the store is refused 403
+before any money rule runs, and the payout store
+(`get_store_by_owner`, the owner's earliest store) never
+resolves for a member at all. Promotions: sponsoring is
+gated by the PRODUCT's store role, but the money still
+moves from the CALLER's own earnings and payout store —
+a member's purchase is paid from the member's own
+balance, never silently from the owner's (a member with
+no earnings of their own cannot complete one); the list
+and cancel are scoped to the promotion's store.
+Verification review stays admin work; the seller side is
+store-settings work.
+
+**Web.** The seller dashboard gains a store switcher
+(shown only when the seller serves more than one store;
+the selection persists in localStorage as
+`seller-store-id`), a role badge next to the store name,
+and a টিম — Team link (hidden for staff). In a scoped
+store view the payout account/request, buyer-risk and
+export sections hide — they belong to the caller's own
+store — with a note that the store's owner manages its
+payouts. The new `/seller/members` page lists the team
+with masked phones; the owner gets the add-by-phone
+form, role selects and remove buttons, managers see the
+list read-only, and the page explains that membership
+requires an existing account. Earlier wave tables in
+this README that say "owner only" predate team access —
+the matrix above is the current rule.
+
+**Honest limits:** membership requires an existing
+account — there is no invite flow (no SMS invite, no
+pending-invite state). The payout store remains the
+owner's earliest store; a member can never receive or
+request a payout for a store they serve. Staff activity
+is not separately attributed in order history: actions
+record the acting user only where the underlying feature
+already did (stock adjustments do; sub-order status
+changes do not carry an actor column). Several surfaces
+remain owner-scoped this wave, deliberately: Facebook
+link/import, the SIDRA suggestion queue and conversation
+inbox, review replies, the seller invoice read, the
+buyer-risk lookup, and the SIDRA status read — each
+still resolves the caller's own store. A member's
+promotion purchase charges the member (see above), which
+most members cannot fund; owner-funded member marketing
+is not modelled. Roles are per store and there are
+exactly two of them; finer-grained or custom roles are
+not modelled.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -3154,6 +3270,28 @@ stock split, the 409, cancel restock, adjust-stock
 fidelity, and the variant-less Wave 9 totals
 (445_000 + 12_000 = 457_000) unchanged.
 
+**Real (Wave 34):** multi-store team access — migration
+0032 (`store_members`); the pure domain permission matrix
+(`store_role_can` over eight actions × owner / manager /
+staff, failing closed) and member-role validation; the
+one access helper (`crates/api/src/access.rs`) resolving
+a caller's role per store and scoping the seller surface
+by family (catalogue, orders, Q&A, marketing, store
+settings, finances) with each module's historical
+no-access answer preserved for owners and strangers;
+member management by phone (existing accounts only);
+the optional `?store_id=` scope on caller-store surfaces
+including the any-role store dashboard; the payout store
+staying owner-only. Web: the dashboard store switcher +
+role badge and the /seller/members team page. An
+integration test (`crates/api/tests/wave34.rs`, same
+`DATABASE_URL` gate) covers seating (201 / duplicate 409
+/ ghost 404 / self 400), the manager's catalogue + order
+powers and payout/member refusals (403), staff shipment
+booking against coupon + balance refusals (403), stranger
+invisibility, role change and removal ending access, and
+the Wave 9 owner money flow (184_000 earned) unchanged.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters, and the four manual couriers run
@@ -3209,22 +3347,27 @@ the external service at the other end of it, configured by
   adds the next/image remote allowlist in next.config.js;
   Wave 33 adds the product page's variant picker, variant
   names on the cart and buyer-order lines, and the seller
-  variant manager on /seller/products).
+  variant manager on /seller/products; Wave 34 adds
+  /seller/members, the dashboard store switcher and the
+  role badge next to the store name).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
-  (domain 109, courier 31, payments 8 unit tests, plus the API
+  (domain 114, courier 31, payments 8 unit tests, plus the API
   crate's JWT-secret unit tests; the `DATABASE_URL`-
   gated integration tests skip cleanly without a database). The API
   binary was also smoke-tested locally without a database: routes
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
   (including the Wave 13 messaging endpoints), and the SIDRA
   callback answers 503 without a database.
-- **Rust integration + clippy: CI-only** — the Wave 2–33 integration
+- **Rust integration + clippy: CI-only** — the Wave 2–34 integration
   tests (including the Wave 29 outbox test in the `notify`
   crate) against a real Postgres 16 service and clippy
   `-D warnings` are verified via **GitHub Actions CI**
   (`.github/workflows/ci.yml`)
-  on push. Waves 1–32 are green there; Wave 33 awaits its first CI run.
+  on push. Waves 1–33 are green there; Wave 34 awaits its first CI run.
+  Waves 33 and 34 were additionally verified locally against a
+  scratch Postgres 16 cluster on this machine: the full workspace
+  suite (191 tests) passes with `DATABASE_URL` set, twice in a row.
 - **Docker images: CI-only** — Docker is not installed on the
   development machine, so `Dockerfile.api`, `Dockerfile.worker`
   and `apps/web/Dockerfile` are verified by the CI `docker` job

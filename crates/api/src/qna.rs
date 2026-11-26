@@ -291,9 +291,11 @@ pub async fn list_product_questions(
 }
 
 /// Resolve a question to the store that sells its product,
-/// requiring the caller to own that store. Every failure is a
-/// 404: a question that is not the caller's to moderate is
-/// indistinguishable from one that does not exist.
+/// requiring the caller to belong to that store's team with
+/// the `answer_questions` right (Wave 34: owner, manager or
+/// staff). Every failure is a 404: a question that is not
+/// the caller's to moderate is indistinguishable from one
+/// that does not exist.
 async fn require_question_store(
     pool: &PgPool,
     user: &AuthUser,
@@ -308,9 +310,14 @@ async fn require_question_store(
     .await
     .map_err(|e| ApiError::internal("load question store", e))?;
     let store_id = store_id.ok_or_else(|| ApiError::not_found("question not found"))?;
-    let store = get_store_by_id(pool, store_id).await?;
-    if store.owner_user_id != user.user_id {
-        return Err(ApiError::not_found("question not found"));
+    // Wave 34: the owner, or a member whose role carries
+    // `answer_questions` (every member role does). No
+    // relationship keeps this module's 404.
+    match crate::access::store_role(pool, user.user_id, store_id).await? {
+        Some(role) => {
+            crate::access::require_role(&role, domain::STORE_ACTION_ANSWER_QUESTIONS)?;
+        }
+        None => return Err(ApiError::not_found("question not found")),
     }
     Ok(store_id)
 }
@@ -407,7 +414,8 @@ pub async fn admin_set_question_hidden(
 }
 
 /// The seller inbox: questions across every store the caller
-/// owns, newest first. `answered` selects the queue — `false`
+/// may answer for (Wave 34: own stores plus member stores),
+/// newest first. `answered` selects the queue — `false`
 /// (the default) is the work queue, `true` the answered ones,
 /// `all` everything; hidden questions are included and marked,
 /// because the inbox is where a hide is undone.
@@ -430,15 +438,19 @@ pub async fn list_seller_questions(
     };
     let (page, limit) = clamp_pagination(page, limit);
     let offset = (page - 1) * limit;
+    // Wave 34: the inbox spans every store the caller may
+    // answer questions in (own stores + member stores).
+    let store_ids =
+        crate::access::accessible_store_ids(pool, user.user_id, domain::STORE_ACTION_ANSWER_QUESTIONS)
+            .await?;
 
     let total: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM product_questions q \
          JOIN products p ON p.id = q.product_id \
-         JOIN stores s ON s.id = p.store_id \
-         WHERE s.owner_user_id = $1 \
+         WHERE p.store_id = ANY($1) \
            AND ($2::boolean IS NULL OR (q.answer_body IS NOT NULL) = $2)",
     )
-    .bind(user.user_id)
+    .bind(&store_ids)
     .bind(answered_filter)
     .fetch_one(pool)
     .await
@@ -446,11 +458,11 @@ pub async fn list_seller_questions(
 
     let rows: Vec<SellerQuestionRow> = sqlx::query_as(&format!(
         "SELECT {SELLER_QUESTION_COLUMNS} {SELLER_QUESTION_FROM} \
-         WHERE s.owner_user_id = $1 \
+         WHERE p.store_id = ANY($1) \
            AND ($2::boolean IS NULL OR (q.answer_body IS NOT NULL) = $2) \
          ORDER BY q.created_at DESC LIMIT $3 OFFSET $4"
     ))
-    .bind(user.user_id)
+    .bind(&store_ids)
     .bind(answered_filter)
     .bind(limit)
     .bind(offset)
@@ -466,18 +478,23 @@ pub async fn list_seller_questions(
     })
 }
 
-/// How many questions across the seller's stores still need an
-/// answer — the dashboard's Q&A counter. Hidden questions are
-/// EXCLUDED: a question the seller (or an admin) already dealt
-/// with by hiding it must not keep nagging as "unanswered".
-pub async fn count_unanswered_questions(pool: &PgPool, owner_user_id: Uuid) -> Result<i64, ApiError> {
+/// How many questions across a store scope still need an
+/// answer — the dashboard's Q&A counter (the caller passes
+/// the scope: the owner's stores for the default dashboard,
+/// one store for the Wave 34 store view). Hidden questions
+/// are EXCLUDED: a question the seller (or an admin) already
+/// dealt with by hiding it must not keep nagging as
+/// "unanswered".
+pub async fn count_unanswered_questions(
+    pool: &PgPool,
+    store_ids: &[Uuid],
+) -> Result<i64, ApiError> {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM product_questions q \
          JOIN products p ON p.id = q.product_id \
-         JOIN stores s ON s.id = p.store_id \
-         WHERE s.owner_user_id = $1 AND q.answer_body IS NULL AND NOT q.is_hidden",
+         WHERE p.store_id = ANY($1) AND q.answer_body IS NULL AND NOT q.is_hidden",
     )
-    .bind(owner_user_id)
+    .bind(store_ids)
     .fetch_one(pool)
     .await
     .map_err(|e| ApiError::internal("count unanswered questions", e))

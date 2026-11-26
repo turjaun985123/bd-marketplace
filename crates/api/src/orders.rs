@@ -84,6 +84,7 @@ use sqlx::{FromRow, PgPool};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use crate::access::{accessible_store_ids, require_role, store_role_on};
 use crate::auth::AuthUser;
 use crate::coupons::{
     coupon_rejection_reason, eligible_subtotal_for, Coupon, GroupGoods, COUPON_COLUMNS,
@@ -1505,14 +1506,33 @@ pub async fn list_seller_sub_orders(
     page: Option<i64>,
     limit: Option<i64>,
 ) -> Result<SellerSubOrderList, ApiError> {
+    // Wave 34: the scope is every store the caller may work
+    // orders in — their own stores plus member stores whose
+    // role carries `manage_orders` (all roles do). For an
+    // owner-only caller the set is exactly their stores, so
+    // the list is unchanged.
+    let store_ids =
+        accessible_store_ids(pool, user.user_id, domain::STORE_ACTION_MANAGE_ORDERS).await?;
+    list_seller_sub_orders_scoped(pool, &store_ids, page, limit).await
+}
+
+/// The seller sub-order list over an explicit store scope —
+/// the shared body behind [`list_seller_sub_orders`] and
+/// the Wave 34 store-scoped dashboard (which lists ONE
+/// store's recent sub-orders).
+pub(crate) async fn list_seller_sub_orders_scoped(
+    pool: &PgPool,
+    store_ids: &[Uuid],
+    page: Option<i64>,
+    limit: Option<i64>,
+) -> Result<SellerSubOrderList, ApiError> {
     let (page, limit) = clamp_pagination(page, limit);
     let offset = (page - 1) * limit;
 
     let total: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sub_orders so JOIN stores s ON s.id = so.store_id \
-         WHERE s.owner_user_id = $1",
+        "SELECT COUNT(*) FROM sub_orders so WHERE so.store_id = ANY($1)",
     )
-    .bind(user.user_id)
+    .bind(store_ids)
     .fetch_one(pool)
     .await
     .map_err(|e| ApiError::internal("count seller sub-orders", e))?;
@@ -1527,10 +1547,10 @@ pub async fn list_seller_sub_orders(
          FROM sub_orders so \
          JOIN stores s ON s.id = so.store_id \
          JOIN orders o ON o.id = so.order_id \
-         WHERE s.owner_user_id = $1 \
+         WHERE so.store_id = ANY($1) \
          ORDER BY so.created_at DESC LIMIT $2 OFFSET $3",
     )
-    .bind(user.user_id)
+    .bind(store_ids)
     .bind(limit)
     .bind(offset)
     .fetch_all(pool)
@@ -1607,18 +1627,28 @@ pub async fn update_sub_order_status(
         .await
         .map_err(|e| ApiError::internal("begin status transaction", e))?;
 
-    let current: Option<(String, Uuid)> = sqlx::query_as(
-        "SELECT so.status, s.owner_user_id FROM sub_orders so \
+    let current: Option<(String, Uuid, Uuid)> = sqlx::query_as(
+        "SELECT so.status, s.owner_user_id, so.store_id FROM sub_orders so \
          JOIN stores s ON s.id = so.store_id WHERE so.id = $1 FOR UPDATE OF so",
     )
     .bind(sub_order_id)
     .fetch_optional(&mut *tx)
     .await
     .map_err(|e| ApiError::internal("load sub-order for status update", e))?;
-    let (current_status, owner_user_id) =
+    let (current_status, owner_user_id, store_id) =
         current.ok_or_else(|| ApiError::not_found("sub-order not found"))?;
+    // Wave 34: the owner, or a member whose role carries
+    // `manage_orders` (every member role does). A caller with
+    // no relationship keeps this module's historical 403.
     if owner_user_id != user.user_id {
-        return Err(ApiError::forbidden("you do not own this sub-order's store"));
+        match store_role_on(&mut *tx, user.user_id, store_id).await? {
+            Some(role) => require_role(&role, domain::STORE_ACTION_MANAGE_ORDERS)?,
+            None => {
+                return Err(ApiError::forbidden(
+                    "you do not own this sub-order's store",
+                ))
+            }
+        }
     }
     if !can_transition_sub_order(&current_status, new_status) {
         return Err(ApiError::bad_request(format!(

@@ -35,11 +35,33 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
+use crate::access::{resolve_scoped_store, StoreScopeQuery};
 use crate::admin::require_admin;
 use crate::auth::AuthUser;
 use crate::products::clamp_pagination;
-use crate::stores::get_store_by_owner;
+use crate::stores::Store;
 use crate::{ApiError, AppState};
+
+/// Resolve the store a seller coupon endpoint acts on
+/// (Wave 34): the caller's own store by default, or the
+/// store named by `?store_id=` under a `manage_marketing`
+/// role — coupons are marketing work, so a manager may run
+/// them and staff may not (a staff attempt is the matrix's
+/// 403; a stranger's is a 404).
+async fn seller_coupon_store(
+    pool: &PgPool,
+    user: &AuthUser,
+    scope: &StoreScopeQuery,
+) -> Result<Store, ApiError> {
+    let (store, _role) = resolve_scoped_store(
+        pool,
+        user.user_id,
+        scope.store_id,
+        domain::STORE_ACTION_MANAGE_MARKETING,
+    )
+    .await?;
+    Ok(store)
+}
 
 // ---------------------------------------------------------------------------
 // Public shapes
@@ -469,10 +491,11 @@ pub async fn preview_handler(
 pub async fn create_seller_coupon_handler(
     State(state): State<AppState>,
     user: AuthUser,
+    Query(scope): Query<StoreScopeQuery>,
     Json(input): Json<CreateCouponInput>,
 ) -> Result<(StatusCode, Json<Coupon>), ApiError> {
     let pool = state.require_pool()?;
-    let store = get_store_by_owner(pool, user.user_id).await?;
+    let store = seller_coupon_store(pool, &user, &scope).await?;
     let coupon = create_coupon(pool, Some(store.id), &input).await?;
     Ok((StatusCode::CREATED, Json(coupon)))
 }
@@ -481,9 +504,10 @@ pub async fn list_seller_coupons_handler(
     State(state): State<AppState>,
     user: AuthUser,
     Query(query): Query<ListCouponsQuery>,
+    Query(scope): Query<StoreScopeQuery>,
 ) -> Result<Json<CouponList>, ApiError> {
     let pool = state.require_pool()?;
-    let store = get_store_by_owner(pool, user.user_id).await?;
+    let store = seller_coupon_store(pool, &user, &scope).await?;
     Ok(Json(
         list_coupons(pool, Some(store.id), query.page, query.limit).await?,
     ))
@@ -493,10 +517,11 @@ pub async fn set_seller_coupon_active_handler(
     State(state): State<AppState>,
     user: AuthUser,
     Path(id): Path<Uuid>,
+    Query(scope): Query<StoreScopeQuery>,
     Json(input): Json<SetCouponActiveInput>,
 ) -> Result<Json<Coupon>, ApiError> {
     let pool = state.require_pool()?;
-    let store = get_store_by_owner(pool, user.user_id).await?;
+    let store = seller_coupon_store(pool, &user, &scope).await?;
     Ok(Json(
         set_coupon_active(pool, id, Some(store.id), input.active).await?,
     ))
@@ -506,9 +531,10 @@ pub async fn delete_seller_coupon_handler(
     State(state): State<AppState>,
     user: AuthUser,
     Path(id): Path<Uuid>,
+    Query(scope): Query<StoreScopeQuery>,
 ) -> Result<StatusCode, ApiError> {
     let pool = state.require_pool()?;
-    let store = get_store_by_owner(pool, user.user_id).await?;
+    let store = seller_coupon_store(pool, &user, &scope).await?;
     delete_coupon(pool, id, store.id).await?;
     Ok(StatusCode::NO_CONTENT)
 }

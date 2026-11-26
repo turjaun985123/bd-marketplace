@@ -47,7 +47,7 @@
 use std::time::Duration;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
@@ -871,14 +871,16 @@ pub async fn dismiss_suggestion(
     load_suggestion(pool, suggestion_id).await
 }
 
-/// Set the caller's store SIDRA mode: auto-reply on or off.
-/// Returns the shared store view (which carries the flag).
+/// Set a store's SIDRA mode: auto-reply on or off. Returns
+/// the shared store view (which carries the flag). The
+/// store arrives resolved by the handler — the caller's
+/// own by default, or one named by `?store_id=` under
+/// `manage_store_settings` (Wave 34).
 pub async fn set_sidra_auto_reply(
     pool: &PgPool,
-    user: &AuthUser,
+    store: &Store,
     auto_reply: bool,
 ) -> Result<Store, ApiError> {
-    let store = get_store_by_owner(pool, user.user_id).await?;
     sqlx::query("UPDATE stores SET sidra_auto_reply = $2 WHERE id = $1")
         .bind(store.id)
         .bind(auto_reply)
@@ -1029,11 +1031,22 @@ pub struct SetSidraAutoReplyRequest {
 pub async fn set_sidra_auto_reply_handler(
     State(state): State<AppState>,
     user: AuthUser,
+    Query(scope): Query<crate::access::StoreScopeQuery>,
     Json(req): Json<SetSidraAutoReplyRequest>,
 ) -> Result<Json<Store>, ApiError> {
     let pool = state.require_pool()?;
+    // Wave 34: the toggle is store-settings work — with
+    // `?store_id=` a manager may flip it for a store they
+    // serve; without it, the caller's own store, as before.
+    let (store, _role) = crate::access::resolve_scoped_store(
+        pool,
+        user.user_id,
+        scope.store_id,
+        domain::STORE_ACTION_MANAGE_STORE_SETTINGS,
+    )
+    .await?;
     Ok(Json(
-        set_sidra_auto_reply(pool, &user, req.auto_reply).await?,
+        set_sidra_auto_reply(pool, &store, req.auto_reply).await?,
     ))
 }
 

@@ -1069,6 +1069,87 @@ pub fn mask_phone(phone: &str) -> String {
 /// worth, so earnings accumulate until they cross this floor.
 pub const MIN_PAYOUT_POISHA: i64 = 50_000;
 
+/// The actions a store role may be asked to perform (Wave 34).
+/// Every seller surface names exactly one of these; the matrix
+/// in [`store_role_can`] decides who may do it.
+pub const STORE_ACTION_MANAGE_MEMBERS: &str = "manage_members";
+/// Payout requests and the payout account — where money leaves.
+pub const STORE_ACTION_MANAGE_PAYOUTS: &str = "manage_payouts";
+/// Balance, analytics, payout list and the seller export.
+pub const STORE_ACTION_VIEW_FINANCES: &str = "view_finances";
+/// Products, variants and inventory.
+pub const STORE_ACTION_MANAGE_CATALOG: &str = "manage_catalog";
+/// Sub-orders, shipments and return decisions.
+pub const STORE_ACTION_MANAGE_ORDERS: &str = "manage_orders";
+/// Coupons, promotions and store branding.
+pub const STORE_ACTION_MANAGE_MARKETING: &str = "manage_marketing";
+/// Answering product questions (and review replies stay
+/// owner-only this wave — see the API's access module).
+pub const STORE_ACTION_ANSWER_QUESTIONS: &str = "answer_questions";
+/// Verification submission and the SIDRA auto-reply toggle.
+pub const STORE_ACTION_MANAGE_STORE_SETTINGS: &str = "manage_store_settings";
+
+/// Every store action, in the order the README's matrix table
+/// lists them. Tests iterate this so a new action can never
+/// silently miss a matrix row.
+pub const STORE_ACTIONS: [&str; 8] = [
+    STORE_ACTION_MANAGE_MEMBERS,
+    STORE_ACTION_MANAGE_PAYOUTS,
+    STORE_ACTION_VIEW_FINANCES,
+    STORE_ACTION_MANAGE_CATALOG,
+    STORE_ACTION_MANAGE_ORDERS,
+    STORE_ACTION_MANAGE_MARKETING,
+    STORE_ACTION_ANSWER_QUESTIONS,
+    STORE_ACTION_MANAGE_STORE_SETTINGS,
+];
+
+/// The store role permission matrix (Wave 34) — THE one place
+/// that decides what a role may do inside a store:
+///
+/// - `owner` (the store's `owner_user_id`; never a member row)
+///   may do everything.
+/// - `manager` may do everything EXCEPT `manage_members` and
+///   `manage_payouts` — a manager runs the shop day to day but
+///   cannot add people or move money out.
+/// - `staff` may only work the floor: `manage_catalog`,
+///   `manage_orders` and `answer_questions`.
+///
+/// Unknown roles and unknown actions are denied — the matrix
+/// fails closed, so a typo'd role string grants nothing.
+pub fn store_role_can(role: &str, action: &str) -> bool {
+    match role {
+        "owner" => STORE_ACTIONS.contains(&action),
+        "manager" => matches!(
+            action,
+            STORE_ACTION_VIEW_FINANCES
+                | STORE_ACTION_MANAGE_CATALOG
+                | STORE_ACTION_MANAGE_ORDERS
+                | STORE_ACTION_MANAGE_MARKETING
+                | STORE_ACTION_ANSWER_QUESTIONS
+                | STORE_ACTION_MANAGE_STORE_SETTINGS
+        ),
+        "staff" => matches!(
+            action,
+            STORE_ACTION_MANAGE_CATALOG
+                | STORE_ACTION_MANAGE_ORDERS
+                | STORE_ACTION_ANSWER_QUESTIONS
+        ),
+        _ => false,
+    }
+}
+
+/// Is this a role a store MEMBER row may carry? Only `manager`
+/// and `staff` — `owner` is never a member row (ownership lives
+/// on the store itself), so accepting it here would let a
+/// member write mint a second owner.
+pub fn validate_store_role(role: &str) -> Result<&str, &'static str> {
+    match role.trim() {
+        "manager" => Ok("manager"),
+        "staff" => Ok("staff"),
+        _ => Err("role must be 'manager' or 'staff'"),
+    }
+}
+
 /// A seller's available balance: what they have earned, minus what
 /// has already been paid or committed out, minus what is sitting in
 /// `requested` payouts waiting for approval. This is the raw
@@ -2881,6 +2962,72 @@ mod tests {
             unit_weight_grams,
             variant_id: None,
         }
+    }
+
+    #[test]
+    fn store_role_matrix_owner_can_do_everything() {
+        for action in STORE_ACTIONS {
+            assert!(store_role_can("owner", action), "owner must allow {action}");
+        }
+    }
+
+    #[test]
+    fn store_role_matrix_manager_except_members_and_payouts() {
+        for action in STORE_ACTIONS {
+            let expected = !matches!(
+                action,
+                STORE_ACTION_MANAGE_MEMBERS | STORE_ACTION_MANAGE_PAYOUTS
+            );
+            assert_eq!(
+                store_role_can("manager", action),
+                expected,
+                "manager / {action}"
+            );
+        }
+        // The two denials, named explicitly so the rule reads
+        // as policy, not as a table accident.
+        assert!(!store_role_can("manager", "manage_members"));
+        assert!(!store_role_can("manager", "manage_payouts"));
+    }
+
+    #[test]
+    fn store_role_matrix_staff_works_the_floor_only() {
+        let allowed = [
+            STORE_ACTION_MANAGE_CATALOG,
+            STORE_ACTION_MANAGE_ORDERS,
+            STORE_ACTION_ANSWER_QUESTIONS,
+        ];
+        for action in STORE_ACTIONS {
+            assert_eq!(
+                store_role_can("staff", action),
+                allowed.contains(&action),
+                "staff / {action}"
+            );
+        }
+    }
+
+    #[test]
+    fn store_role_matrix_fails_closed() {
+        // Unknown roles get nothing, unknown actions are
+        // granted to nobody (not even the owner), and role
+        // matching is exact — no case folding surprises.
+        for action in STORE_ACTIONS {
+            assert!(!store_role_can("superuser", action));
+            assert!(!store_role_can("", action));
+        }
+        assert!(!store_role_can("owner", "delete_store"));
+        assert!(!store_role_can("manager", "delete_store"));
+        assert!(!store_role_can("Owner", "manage_catalog"));
+    }
+
+    #[test]
+    fn store_role_validation_accepts_member_roles_only() {
+        assert_eq!(validate_store_role("manager").unwrap(), "manager");
+        assert_eq!(validate_store_role(" staff ").unwrap(), "staff");
+        // `owner` is never a member row.
+        assert!(validate_store_role("owner").is_err());
+        assert!(validate_store_role("admin").is_err());
+        assert!(validate_store_role("").is_err());
     }
 
     #[test]

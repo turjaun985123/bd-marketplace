@@ -42,9 +42,11 @@
 //! or the platform default when the threshold is NULL.
 //!
 //! Access: stock data is seller-private. Every endpoint here
-//! resolves the product through the caller's own stores, and a
-//! product that is missing OR belongs to another seller is the
-//! same 404 — the no-leak convention the invoice endpoints use.
+//! resolves the product through a store the caller serves
+//! (Wave 34: their own stores, or a store whose team they
+//! belong to with the catalogue right), and a product that is
+//! missing OR belongs to an unrelated store is the same 404 —
+//! the no-leak convention the invoice endpoints use.
 
 use axum::{
     extract::{Path, Query, State},
@@ -225,9 +227,11 @@ struct LockedProductRow {
     stock: i32,
 }
 
-/// Resolve a product the caller owns for the inventory
-/// endpoints: missing and someone else's are both a 404 (see
-/// the module doc). Runs on the pool — read-only.
+/// Resolve a product the caller may work for the inventory
+/// endpoints (Wave 34: the store's owner, or a member whose
+/// role carries `manage_catalog` — every member role does):
+/// missing and someone else's are both a 404 (see the module
+/// doc). Runs on the pool — read-only.
 async fn owned_product_row(
     pool: &PgPool,
     user: &AuthUser,
@@ -241,10 +245,13 @@ async fn owned_product_row(
     .fetch_optional(pool)
     .await
     .map_err(|e| ApiError::internal("load product for inventory", e))?;
-    let (store_id, owner_user_id, stock) =
+    let (store_id, _owner_user_id, stock) =
         row.ok_or_else(|| ApiError::not_found("product not found"))?;
-    if owner_user_id != user.user_id {
-        return Err(ApiError::not_found("product not found"));
+    match crate::access::store_role(pool, user.user_id, store_id).await? {
+        Some(role) => {
+            crate::access::require_role(&role, domain::STORE_ACTION_MANAGE_CATALOG)?;
+        }
+        None => return Err(ApiError::not_found("product not found")),
     }
     Ok((store_id, stock))
 }
@@ -289,8 +296,16 @@ pub async fn adjust_stock_for_seller(
     .await
     .map_err(|e| ApiError::internal("lock product for adjust-stock", e))?;
     let row = row.ok_or_else(|| ApiError::not_found("product not found"))?;
+    // Wave 34: the owner, or a member with `manage_catalog`;
+    // no relationship keeps this module's 404. The audit row
+    // below records the acting user either way.
     if row.owner_user_id != user.user_id {
-        return Err(ApiError::not_found("product not found"));
+        match crate::access::store_role_on(&mut *tx, user.user_id, row.store_id).await? {
+            Some(role) => {
+                crate::access::require_role(&role, domain::STORE_ACTION_MANAGE_CATALOG)?;
+            }
+            None => return Err(ApiError::not_found("product not found")),
+        }
     }
 
     // Wave 33: while a product has ACTIVE variants, its stock
@@ -437,6 +452,11 @@ struct InventoryRow {
 /// computed by the domain rule in Rust so the API and the
 /// dashboard alerts can never disagree.
 pub async fn get_inventory(pool: &PgPool, user: &AuthUser) -> Result<Inventory, ApiError> {
+    // Wave 34: the overview spans every store the caller may
+    // work the catalogue of (own stores + member stores).
+    let store_ids =
+        crate::access::accessible_store_ids(pool, user.user_id, domain::STORE_ACTION_MANAGE_CATALOG)
+            .await?;
     // Wave 33: the overview shows the EFFECTIVE stock (the
     // shared expression from the products module) — for a
     // variant product that is the sum of its variants'
@@ -445,11 +465,11 @@ pub async fn get_inventory(pool: &PgPool, user: &AuthUser) -> Result<Inventory, 
         "SELECT p.id AS product_id, p.title, s.slug AS store_slug, \
          {EFFECTIVE_STOCK} AS stock, p.low_stock_threshold \
          FROM products p JOIN stores s ON s.id = p.store_id \
-         WHERE s.owner_user_id = $1 \
+         WHERE p.store_id = ANY($1) \
          ORDER BY stock ASC, p.title ASC",
         EFFECTIVE_STOCK = crate::products::EFFECTIVE_STOCK_SQL
     ))
-    .bind(user.user_id)
+    .bind(&store_ids)
     .fetch_all(pool)
     .await
     .map_err(|e| ApiError::internal("load inventory", e))?;
@@ -494,7 +514,7 @@ pub async fn get_inventory(pool: &PgPool, user: &AuthUser) -> Result<Inventory, 
 /// domain function, like everywhere else.
 pub async fn low_stock_items_for_seller(
     pool: &PgPool,
-    owner_user_id: Uuid,
+    store_ids: &[Uuid],
 ) -> Result<Vec<LowStockItem>, ApiError> {
     // Wave 33: the alert filter runs on the EFFECTIVE stock
     // (see `get_inventory`) — a variant product whose variants
@@ -504,13 +524,13 @@ pub async fn low_stock_items_for_seller(
         "SELECT p.id AS product_id, p.title, s.slug AS store_slug, \
          {EFFECTIVE_STOCK} AS stock, p.low_stock_threshold \
          FROM products p JOIN stores s ON s.id = p.store_id \
-         WHERE s.owner_user_id = $1 \
+         WHERE p.store_id = ANY($1) \
          AND ({EFFECTIVE_STOCK}) <= COALESCE(p.low_stock_threshold, $2) \
          ORDER BY (stock <= 0) DESC, stock ASC, p.created_at ASC \
          LIMIT 10",
         EFFECTIVE_STOCK = crate::products::EFFECTIVE_STOCK_SQL
     ))
-    .bind(owner_user_id)
+    .bind(store_ids)
     .bind(LOW_STOCK_DEFAULT as i32)
     .fetch_all(pool)
     .await

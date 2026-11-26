@@ -51,7 +51,7 @@ use uuid::Uuid;
 use crate::admin::require_admin;
 use crate::audit::record_admin_action;
 use crate::auth::AuthUser;
-use crate::stores::{get_store_by_id, get_store_by_owner};
+use crate::stores::{get_store_by_id, Store};
 use crate::{ApiError, AppState};
 
 // ---------------------------------------------------------------------------
@@ -172,13 +172,15 @@ fn seller_view(tier: &str, row: Option<VerificationRow>) -> SellerVerificationVi
 // Seller side
 // ---------------------------------------------------------------------------
 
-/// The caller's own verification state: their store (404 when
-/// they have none) plus its application row.
+/// One store's verification state, for its team: the store
+/// (resolved by the handler — the caller's own by default,
+/// or one named by `?store_id=` under
+/// `manage_store_settings`, Wave 34) plus its application
+/// row.
 pub async fn get_seller_verification(
     pool: &PgPool,
-    user: &AuthUser,
+    store: &Store,
 ) -> Result<SellerVerificationView, ApiError> {
-    let store = get_store_by_owner(pool, user.user_id).await?;
     let row = load_verification(pool, store.id).await?;
     Ok(seller_view(&store.verified_tier, row))
 }
@@ -206,10 +208,9 @@ pub struct SubmitVerificationInput {
 /// nothing.
 pub async fn submit_verification(
     pool: &PgPool,
-    user: &AuthUser,
+    store: &Store,
     input: SubmitVerificationInput,
 ) -> Result<SellerVerificationView, ApiError> {
-    let store = get_store_by_owner(pool, user.user_id).await?;
 
     let nid_number = validate_nid_number(&input.nid_number).map_err(ApiError::bad_request)?;
     let trade_license =
@@ -509,18 +510,37 @@ pub struct RejectVerificationInput {
 pub async fn get_seller_verification_handler(
     State(state): State<AppState>,
     user: AuthUser,
+    Query(scope): Query<crate::access::StoreScopeQuery>,
 ) -> Result<Json<SellerVerificationView>, ApiError> {
     let pool = state.require_pool()?;
-    Ok(Json(get_seller_verification(pool, &user).await?))
+    // Wave 34: verification is store-settings work — with
+    // `?store_id=` a manager may read/submit for a store
+    // they serve; without it, the caller's own store.
+    let (store, _role) = crate::access::resolve_scoped_store(
+        pool,
+        user.user_id,
+        scope.store_id,
+        domain::STORE_ACTION_MANAGE_STORE_SETTINGS,
+    )
+    .await?;
+    Ok(Json(get_seller_verification(pool, &store).await?))
 }
 
 pub async fn submit_seller_verification_handler(
     State(state): State<AppState>,
     user: AuthUser,
+    Query(scope): Query<crate::access::StoreScopeQuery>,
     Json(input): Json<SubmitVerificationInput>,
 ) -> Result<Json<SellerVerificationView>, ApiError> {
     let pool = state.require_pool()?;
-    Ok(Json(submit_verification(pool, &user, input).await?))
+    let (store, _role) = crate::access::resolve_scoped_store(
+        pool,
+        user.user_id,
+        scope.store_id,
+        domain::STORE_ACTION_MANAGE_STORE_SETTINGS,
+    )
+    .await?;
+    Ok(Json(submit_verification(pool, &store, input).await?))
 }
 
 pub async fn list_admin_verifications_handler(

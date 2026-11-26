@@ -3,21 +3,25 @@
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import PriceTag from "@/components/PriceTag";
+import StoreSwitcher from "@/components/StoreSwitcher";
 import {
   downloadSellerExport,
   getBuyerRisk,
   getPayoutAccount,
   getSellerDashboard,
   listPayouts,
+  listSellerStores,
   payoutStatusLabel,
   requestPayout,
   riskLevelLabel,
   savePayoutAccount,
   stockStatusLabel,
+  storeRoleLabel,
   type BuyerRisk,
   type Payout,
   type PayoutAccount,
   type SellerDashboard,
+  type SellerStore,
 } from "@/lib/api";
 import { parseTakaToPoisha } from "@/lib/format";
 import { useAuth } from "@/hooks/useAuth";
@@ -55,6 +59,47 @@ export default function SellerDashboardPage() {
   const [payouts, setPayouts] = useState<Payout[]>([]);
   const [message, setMessage] = useState<string | null>(null);
 
+  // Wave 34 team stores + the switcher selection. "" is the
+  // default whole-activity view; a store id scopes the
+  // dashboard to that one store (the payout sections below
+  // belong to the caller's OWN store and hide in scoped view).
+  const [stores, setStores] = useState<SellerStore[]>([]);
+  const [selectedStoreId, setSelectedStoreId] = useState("");
+  const [selectionReady, setSelectionReady] = useState(false);
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const list = await listSellerStores(token);
+        if (cancelled) return;
+        setStores(list);
+        const saved = window.localStorage.getItem("seller-store-id");
+        if (saved && list.some((store) => store.id === saved)) {
+          setSelectedStoreId(saved);
+        }
+      } catch {
+        // The stores list only powers the switcher; the
+        // dashboard itself still loads without it.
+      } finally {
+        if (!cancelled) setSelectionReady(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [token]);
+
+  function onSelectStore(storeId: string) {
+    setSelectedStoreId(storeId);
+    if (storeId) {
+      window.localStorage.setItem("seller-store-id", storeId);
+    } else {
+      window.localStorage.removeItem("seller-store-id");
+    }
+  }
+
   // Payout account form state.
   const [method, setMethod] = useState("bkash");
   const [accountName, setAccountName] = useState("");
@@ -74,8 +119,15 @@ export default function SellerDashboardPage() {
   const [exportBusy, setExportBusy] = useState(false);
 
   const load = useCallback(async () => {
-    if (!token) return;
+    if (!token || !selectionReady) return;
     try {
+      if (selectedStoreId) {
+        // Scoped view: the dashboard for one served store.
+        // Payout account/history are the caller's own-store
+        // surfaces and are not fetched here (they hide below).
+        setDashboard(await getSellerDashboard(token, selectedStoreId));
+        return;
+      }
       const [dash, acc, list] = await Promise.all([
         getSellerDashboard(token),
         getPayoutAccount(token),
@@ -94,7 +146,7 @@ export default function SellerDashboardPage() {
         err instanceof Error ? err.message : "ড্যাশবোর্ড লোড করা যায়নি।"
       );
     }
-  }, [token]);
+  }, [token, selectedStoreId, selectionReady]);
 
   useEffect(() => {
     void load();
@@ -203,10 +255,24 @@ export default function SellerDashboardPage() {
 
   const earnings = dashboard?.earnings;
   const counts = dashboard?.counts;
+  // Wave 34: the caller's role in the store on screen, and
+  // whether this is a scoped (single served store) view.
+  const myRole = dashboard
+    ? stores.find((store) => store.id === dashboard.store.id)?.my_role
+    : undefined;
+  const scoped = selectedStoreId !== "";
 
   return (
     <main>
-      <h1>বিক্রেতা ড্যাশবোর্ড{dashboard ? ` — ${dashboard.store.name}` : ""}</h1>
+      <h1>
+        বিক্রেতা ড্যাশবোর্ড{dashboard ? ` — ${dashboard.store.name}` : ""}
+        {myRole ? ` (${storeRoleLabel(myRole)})` : ""}
+      </h1>
+      <StoreSwitcher
+        stores={stores}
+        value={selectedStoreId}
+        onChange={onSelectStore}
+      />
       <p>
         <Link href="/seller/products">আমার পণ্য — My products</Link>
         {" · "}
@@ -231,6 +297,12 @@ export default function SellerDashboardPage() {
         <Link href="/seller/branding">স্টোরের সাজসজ্জা — Branding</Link>
         {" · "}
         <Link href="/seller/verification">স্টোর যাচাইকরণ — Verification</Link>
+        {myRole !== "staff" && (
+          <>
+            {" · "}
+            <Link href="/seller/members">টিম — Team</Link>
+          </>
+        )}
       </p>
       {message && <p role="status">{message}</p>}
       {dashboard !== null && dashboard.unanswered_questions > 0 && (
@@ -363,6 +435,14 @@ export default function SellerDashboardPage() {
             </p>
           </section>
 
+          {scoped && (
+            <p>
+              এই স্টোরের পে-আউট শুধু স্টোরের মালিক পরিচালনা করেন —
+              payouts for this store are managed by its owner.
+            </p>
+          )}
+          {!scoped && (
+            <>
           <section>
             <h2>পে-আউট অ্যাকাউন্ট — Payout account</h2>
             <form onSubmit={(e) => void onSaveAccount(e)}>
@@ -513,6 +593,8 @@ export default function SellerDashboardPage() {
               {exportBusy ? "তৈরি হচ্ছে…" : "ডেটা এক্সপোর্ট ডাউনলোড"}
             </button>
           </section>
+            </>
+          )}
         </>
       )}
     </main>

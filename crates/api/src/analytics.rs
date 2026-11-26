@@ -257,7 +257,7 @@ pub struct AdminAnalytics {
 /// two can never disagree.
 async fn seller_daily(
     pool: &PgPool,
-    owner_user_id: Uuid,
+    store_ids: &[Uuid],
     days: i64,
 ) -> Result<Vec<SellerDailyRow>, ApiError> {
     #[derive(FromRow)]
@@ -281,12 +281,12 @@ async fn seller_daily(
            LEFT JOIN sub_orders so \
              ON (so.created_at AT TIME ZONE 'Asia/Dhaka')::date = gs::date \
             AND so.status <> 'cancelled' \
-            AND so.store_id IN (SELECT id FROM stores WHERE owner_user_id = $2) \
+            AND so.store_id = ANY($2) \
           GROUP BY gs \
           ORDER BY gs",
     )
     .bind(days)
-    .bind(owner_user_id)
+    .bind(store_ids)
     .fetch_all(pool)
     .await
     .map_err(|e| ApiError::internal("seller analytics daily series", e))?;
@@ -303,12 +303,12 @@ async fn seller_daily(
 }
 
 /// Shipments per courier over the window's sub-orders.
-/// `owner_user_id` scopes to one seller's stores; `None`
+/// `store_ids` scopes to one seller's store set; `None`
 /// is the platform-wide admin view. Manual bookings count
 /// under their counter name.
 async fn courier_breakdown(
     pool: &PgPool,
-    owner_user_id: Option<Uuid>,
+    store_ids: Option<&[Uuid]>,
     days: i64,
 ) -> Result<Vec<CourierCount>, ApiError> {
     sqlx::query_as(&format!(
@@ -317,14 +317,13 @@ async fn courier_breakdown(
            FROM shipments sh \
            JOIN sub_orders so ON so.id = sh.sub_order_id \
           WHERE so.created_at >= {WINDOW_START} \
-            AND ($2::uuid IS NULL \
-                 OR so.store_id IN \
-                    (SELECT id FROM stores WHERE owner_user_id = $2)) \
+            AND ($2::uuid[] IS NULL \
+                 OR so.store_id = ANY($2)) \
           GROUP BY 1 \
           ORDER BY count DESC, courier"
     ))
     .bind(days)
-    .bind(owner_user_id)
+    .bind(store_ids)
     .fetch_all(pool)
     .await
     .map_err(|e| ApiError::internal("analytics courier breakdown", e))
@@ -339,7 +338,18 @@ pub async fn seller_analytics(
     days: i64,
 ) -> Result<SellerAnalytics, ApiError> {
     get_store_by_owner(pool, user.user_id).await?;
+    let store_ids = crate::access::owned_store_ids(pool, user.user_id).await?;
+    seller_analytics_scoped(pool, &store_ids, days).await
+}
 
+/// The seller analytics over an explicit store scope — the
+/// shared body behind [`seller_analytics`] and the Wave 34
+/// scoped read (one store, resolved under `view_finances`).
+pub async fn seller_analytics_scoped(
+    pool: &PgPool,
+    store_ids: &[Uuid],
+    days: i64,
+) -> Result<SellerAnalytics, ApiError> {
     #[derive(FromRow)]
     struct TotalsRow {
         sub_orders: i64,
@@ -360,11 +370,10 @@ pub async fn seller_analytics(
                 COUNT(*) FILTER (WHERE so.status = 'returned') AS returned, \
                 COUNT(*) FILTER (WHERE so.status = 'cancelled') AS cancelled \
            FROM sub_orders so \
-           JOIN stores s ON s.id = so.store_id \
-          WHERE s.owner_user_id = $2 AND so.created_at >= {WINDOW_START}"
+          WHERE so.store_id = ANY($2) AND so.created_at >= {WINDOW_START}"
     ))
     .bind(days)
-    .bind(user.user_id)
+    .bind(store_ids)
     .fetch_one(pool)
     .await
     .map_err(|e| ApiError::internal("seller analytics totals", e))?;
@@ -376,7 +385,7 @@ pub async fn seller_analytics(
         0
     };
 
-    let daily = seller_daily(pool, user.user_id, days).await?;
+    let daily = seller_daily(pool, store_ids, days).await?;
 
     let top_products: Vec<TopProduct> = sqlx::query_as(&format!(
         "SELECT oi.product_id AS product_id, p.title AS title, \
@@ -386,14 +395,14 @@ pub async fn seller_analytics(
            JOIN sub_orders so ON so.id = oi.sub_order_id \
            JOIN products p ON p.id = oi.product_id \
           WHERE so.status <> 'cancelled' \
-            AND so.store_id IN (SELECT id FROM stores WHERE owner_user_id = $2) \
+            AND so.store_id = ANY($2) \
             AND so.created_at >= {WINDOW_START} \
           GROUP BY oi.product_id, p.title \
           ORDER BY goods_poisha DESC, oi.product_id \
           LIMIT 10"
     ))
     .bind(days)
-    .bind(user.user_id)
+    .bind(store_ids)
     .fetch_all(pool)
     .await
     .map_err(|e| ApiError::internal("seller analytics top products", e))?;
@@ -401,18 +410,18 @@ pub async fn seller_analytics(
     let status_breakdown: Vec<StatusCount> = sqlx::query_as(&format!(
         "SELECT so.status AS status, COUNT(*) AS count \
            FROM sub_orders so \
-          WHERE so.store_id IN (SELECT id FROM stores WHERE owner_user_id = $2) \
+          WHERE so.store_id = ANY($2) \
             AND so.created_at >= {WINDOW_START} \
           GROUP BY so.status \
           ORDER BY so.status"
     ))
     .bind(days)
-    .bind(user.user_id)
+    .bind(store_ids)
     .fetch_all(pool)
     .await
     .map_err(|e| ApiError::internal("seller analytics status breakdown", e))?;
 
-    let courier_breakdown = courier_breakdown(pool, Some(user.user_id), days).await?;
+    let courier_breakdown = courier_breakdown(pool, Some(store_ids), days).await?;
 
     Ok(SellerAnalytics {
         days,
@@ -440,7 +449,19 @@ pub async fn seller_analytics_csv(
     days: i64,
 ) -> Result<String, ApiError> {
     get_store_by_owner(pool, user.user_id).await?;
-    let daily = seller_daily(pool, user.user_id, days).await?;
+    let store_ids = crate::access::owned_store_ids(pool, user.user_id).await?;
+    seller_analytics_csv_scoped(pool, &store_ids, days).await
+}
+
+/// The CSV export over an explicit store scope — the
+/// shared body behind [`seller_analytics_csv`] and the
+/// Wave 34 scoped export (one store, `view_finances`).
+pub async fn seller_analytics_csv_scoped(
+    pool: &PgPool,
+    store_ids: &[Uuid],
+    days: i64,
+) -> Result<String, ApiError> {
+    let daily = seller_daily(pool, store_ids, days).await?;
     let rows: Vec<(String, i64, i64, i64)> = daily
         .into_iter()
         .map(|row| (row.date, row.sub_orders, row.goods_poisha, row.earnings_poisha))
@@ -612,20 +633,54 @@ pub async fn seller_analytics_handler(
     State(state): State<AppState>,
     user: AuthUser,
     Query(query): Query<AnalyticsQuery>,
+    Query(scope): Query<crate::access::StoreScopeQuery>,
 ) -> Result<Json<SellerAnalytics>, ApiError> {
     let pool = state.require_pool()?;
     let days = analytics_days(query.days);
-    Ok(Json(seller_analytics(pool, &user, days).await?))
+    // Wave 34: `?store_id=` scopes the analytics to one
+    // store under `view_finances` (owner or manager);
+    // without it, the caller's own stores, as before.
+    match scope.store_id {
+        Some(_) => {
+            let (store, _role) = crate::access::resolve_scoped_store(
+                pool,
+                user.user_id,
+                scope.store_id,
+                domain::STORE_ACTION_VIEW_FINANCES,
+            )
+            .await?;
+            Ok(Json(
+                seller_analytics_scoped(pool, &[store.id], days).await?,
+            ))
+        }
+        None => Ok(Json(seller_analytics(pool, &user, days).await?)),
+    }
 }
 
 pub async fn seller_analytics_csv_handler(
     State(state): State<AppState>,
     user: AuthUser,
     Query(query): Query<AnalyticsQuery>,
+    Query(scope): Query<crate::access::StoreScopeQuery>,
 ) -> Result<(HeaderMap, String), ApiError> {
     let pool = state.require_pool()?;
     let days = analytics_days(query.days);
-    let csv = seller_analytics_csv(pool, &user, days).await?;
+    // Wave 34: the CSV honours the same `?store_id=` scope
+    // as the JSON analytics (it is built from the same
+    // daily series, so the two can never disagree).
+    let csv = match scope.store_id {
+        Some(_) => {
+            let (store, _role) = crate::access::resolve_scoped_store(
+                pool,
+                user.user_id,
+                scope.store_id,
+                domain::STORE_ACTION_VIEW_FINANCES,
+            )
+            .await?;
+            seller_analytics_csv_scoped(pool, &[store.id], days).await?
+        }
+        None => seller_analytics_csv(pool, &user, days).await?,
+    };
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,

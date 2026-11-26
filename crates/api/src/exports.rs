@@ -51,7 +51,7 @@
 //! it back.
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::{header, HeaderMap, HeaderValue},
     Json,
 };
@@ -179,12 +179,41 @@ pub async fn seller_export(pool: &PgPool, user: &AuthUser) -> Result<ExportDownl
             .await
             .map_err(|e| ApiError::internal("export seller stores", e))?;
 
+    build_seller_export(pool, store, &store_ids, None).await
+}
+
+/// The Wave 34 store-scoped export: ONE store's document,
+/// for a caller the handler resolved under `view_finances`
+/// (the owner, or a manager of that store). The charges
+/// total narrows to the charges that store's own promotions
+/// caused — the owner's other stores' charges are the
+/// owner's data, not this store's team's.
+pub async fn seller_export_scoped(
+    pool: &PgPool,
+    store: Store,
+) -> Result<ExportDownload, ApiError> {
+    let store_ids = vec![store.id];
+    let charges_store = store.id;
+    build_seller_export(pool, store, &store_ids, Some(charges_store)).await
+}
+
+/// The export assembly shared by both scopes: `store` is
+/// the document's primary store, `store_ids` the section
+/// scope, and `charges_store` — when set — narrows the
+/// charges total to that store's promotions.
+async fn build_seller_export(
+    pool: &PgPool,
+    store: Store,
+    store_ids: &[Uuid],
+    charges_store: Option<Uuid>,
+) -> Result<ExportDownload, ApiError> {
+
     let products: Vec<Product> = sqlx::query_as(&format!(
         "SELECT {PRODUCT_COLUMNS} FROM products p JOIN stores s ON s.id = p.store_id \
          {PRODUCT_RATING_JOIN} \
          WHERE p.store_id = ANY($1) ORDER BY p.created_at ASC"
     ))
-    .bind(&store_ids)
+    .bind(store_ids)
     .fetch_all(pool)
     .await
     .map_err(|e| ApiError::internal("export products", e))?
@@ -196,7 +225,7 @@ pub async fn seller_export(pool: &PgPool, user: &AuthUser) -> Result<ExportDownl
         "SELECT {EXPORT_SUB_ORDER_COLUMNS} FROM sub_orders \
          WHERE store_id = ANY($1) ORDER BY created_at DESC LIMIT $2"
     ))
-    .bind(&store_ids)
+    .bind(store_ids)
     .bind(EXPORT_ROW_LIMIT)
     .fetch_all(pool)
     .await
@@ -210,7 +239,7 @@ pub async fn seller_export(pool: &PgPool, user: &AuthUser) -> Result<ExportDownl
          status, note, created_at, processed_at \
          FROM payouts WHERE store_id = ANY($1) ORDER BY created_at DESC",
     )
-    .bind(&store_ids)
+    .bind(store_ids)
     .fetch_all(pool)
     .await
     .map_err(|e| ApiError::internal("export payouts", e))?;
@@ -219,7 +248,7 @@ pub async fn seller_export(pool: &PgPool, user: &AuthUser) -> Result<ExportDownl
         "SELECT {COUPON_COLUMNS} FROM coupons \
          WHERE store_id = ANY($1) ORDER BY created_at DESC"
     ))
-    .bind(&store_ids)
+    .bind(store_ids)
     .fetch_all(pool)
     .await
     .map_err(|e| ApiError::internal("export coupons", e))?;
@@ -229,16 +258,20 @@ pub async fn seller_export(pool: &PgPool, user: &AuthUser) -> Result<ExportDownl
          cost_poisha, status, created_at \
          FROM promotions WHERE store_id = ANY($1) ORDER BY created_at DESC",
     )
-    .bind(&store_ids)
+    .bind(store_ids)
     .fetch_all(pool)
     .await
     .map_err(|e| ApiError::internal("export promotions", e))?;
 
     let charges_total_poisha: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(amount_poisha), 0)::bigint FROM seller_charges \
-         WHERE seller_user_id = $1",
+        "SELECT COALESCE(SUM(sc.amount_poisha), 0)::bigint FROM seller_charges sc \
+         WHERE sc.seller_user_id = $1 \
+           AND ($2::uuid IS NULL OR EXISTS ( \
+                SELECT 1 FROM promotions pr \
+                WHERE pr.id = sc.ref_id AND pr.store_id = $2))",
     )
-    .bind(user.user_id)
+    .bind(store.owner_user_id)
+    .bind(charges_store)
     .fetch_one(pool)
     .await
     .map_err(|e| ApiError::internal("export charges total", e))?;
@@ -458,9 +491,25 @@ fn download_headers(filename: &str) -> HeaderMap {
 pub async fn seller_export_handler(
     State(state): State<AppState>,
     user: AuthUser,
+    Query(scope): Query<crate::access::StoreScopeQuery>,
 ) -> Result<(HeaderMap, Json<Value>), ApiError> {
     let pool = state.require_pool()?;
-    let download = seller_export(pool, &user).await?;
+    // Wave 34: `?store_id=` exports ONE store's document
+    // under `view_finances` (owner or manager); without it,
+    // the caller's whole seller record, as before.
+    let download = match scope.store_id {
+        Some(_) => {
+            let (store, _role) = crate::access::resolve_scoped_store(
+                pool,
+                user.user_id,
+                scope.store_id,
+                domain::STORE_ACTION_VIEW_FINANCES,
+            )
+            .await?;
+            seller_export_scoped(pool, store).await?
+        }
+        None => seller_export(pool, &user).await?,
+    };
     Ok((download_headers(&download.filename), Json(download.document)))
 }
 

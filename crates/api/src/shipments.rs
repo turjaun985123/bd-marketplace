@@ -73,6 +73,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
+use crate::access::{require_role, store_role};
 use crate::auth::AuthUser;
 use crate::{ApiError, AppState};
 
@@ -525,10 +526,18 @@ async fn load_booking_row(
     .await
     .map_err(|e| ApiError::internal("load sub-order for booking", e))?;
     let row = row.ok_or_else(|| ApiError::not_found("sub-order not found"))?;
+    // Wave 34: the owner, or a member whose role carries
+    // `manage_orders` (every member role does). A caller with
+    // no relationship keeps this module's historical 403.
     if row.owner_user_id != user.user_id {
-        return Err(ApiError::forbidden(
-            "you do not own this sub-order's store",
-        ));
+        match store_role(pool, user.user_id, row.store_id).await? {
+            Some(role) => require_role(&role, domain::STORE_ACTION_MANAGE_ORDERS)?,
+            None => {
+                return Err(ApiError::forbidden(
+                    "you do not own this sub-order's store",
+                ))
+            }
+        }
     }
     if row.status != "confirmed" {
         return Err(ApiError::conflict(format!(
@@ -1021,8 +1030,8 @@ pub async fn refresh_shipment_for_participant(
     let pool = state.require_pool()?;
     let shipment = load_shipment(pool, shipment_id).await?;
 
-    let (owner_user_id, buyer_user_id): (Uuid, Uuid) = sqlx::query_as(
-        "SELECT s.owner_user_id, o.buyer_user_id \
+    let (owner_user_id, buyer_user_id, store_id): (Uuid, Uuid, Uuid) = sqlx::query_as(
+        "SELECT s.owner_user_id, o.buyer_user_id, so.store_id \
          FROM sub_orders so \
          JOIN stores s ON s.id = so.store_id \
          JOIN orders o ON o.id = so.order_id \
@@ -1032,7 +1041,16 @@ pub async fn refresh_shipment_for_participant(
     .fetch_one(pool)
     .await
     .map_err(|e| ApiError::internal("load shipment participants", e))?;
-    if user.user_id != owner_user_id && user.user_id != buyer_user_id {
+    // Wave 34: the seller-side participant is the store's
+    // team — the owner or a member whose role carries
+    // `manage_orders` — not the owner alone. The buyer side
+    // is unchanged, and everyone else keeps the 404.
+    let is_seller_side = user.user_id == owner_user_id
+        || match store_role(pool, user.user_id, store_id).await? {
+            Some(role) => domain::store_role_can(&role, domain::STORE_ACTION_MANAGE_ORDERS),
+            None => false,
+        };
+    if !is_seller_side && user.user_id != buyer_user_id {
         return Err(ApiError::not_found("shipment not found"));
     }
 
@@ -1248,8 +1266,8 @@ async fn load_shipment_for_seller(
     shipment_id: Uuid,
 ) -> Result<(Shipment, String), ApiError> {
     let shipment = load_shipment(pool, shipment_id).await?;
-    let (owner_user_id, sub_status): (Uuid, String) = sqlx::query_as(
-        "SELECT s.owner_user_id, so.status \
+    let (owner_user_id, sub_status, store_id): (Uuid, String, Uuid) = sqlx::query_as(
+        "SELECT s.owner_user_id, so.status, so.store_id \
          FROM sub_orders so \
          JOIN stores s ON s.id = so.store_id \
          WHERE so.id = $1",
@@ -1258,10 +1276,18 @@ async fn load_shipment_for_seller(
     .fetch_one(pool)
     .await
     .map_err(|e| ApiError::internal("load shipment owner", e))?;
+    // Wave 34: the owner, or a member whose role carries
+    // `manage_orders`; no relationship keeps the historical
+    // 403 (see `load_booking_row`).
     if owner_user_id != user.user_id {
-        return Err(ApiError::forbidden(
-            "you do not own this shipment's store",
-        ));
+        match store_role(pool, user.user_id, store_id).await? {
+            Some(role) => require_role(&role, domain::STORE_ACTION_MANAGE_ORDERS)?,
+            None => {
+                return Err(ApiError::forbidden(
+                    "you do not own this shipment's store",
+                ))
+            }
+        }
     }
     Ok((shipment, sub_status))
 }

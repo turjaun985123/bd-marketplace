@@ -197,10 +197,23 @@ pub async fn promote_product(
     // no-leak convention for seller surfaces), and only an
     // active product may be sponsored — a draft has no public
     // placement to sell.
+    //
+    // Wave 34: the gate is the store's `manage_marketing`
+    // role, not ownership alone — a manager may sponsor the
+    // store's products. The MONEY still moves from the
+    // CALLER's own earnings balance (the payout store below
+    // is the caller's own, and the charge row names the
+    // caller): a member's purchase is paid from the member's
+    // own balance, never silently from the owner's. In
+    // practice a member without earnings of their own cannot
+    // complete a purchase — the balance gate below refuses.
     let product = get_product_by_id(pool, product_id).await?;
     let store = get_store_by_id(pool, product.store_id).await?;
-    if store.owner_user_id != user.user_id {
-        return Err(ApiError::not_found("product not found"));
+    match crate::access::store_role(pool, user.user_id, store.id).await? {
+        Some(role) => {
+            crate::access::require_role(&role, domain::STORE_ACTION_MANAGE_MARKETING)?;
+        }
+        None => return Err(ApiError::not_found("product not found")),
     }
     if product.status != "active" {
         return Err(ApiError::bad_request(
@@ -308,18 +321,29 @@ pub async fn promote_product(
     })
 }
 
-/// The caller's own promotions, newest first, each with its
-/// product title and derived display status.
+/// The promotions of the stores the caller may do
+/// marketing for (Wave 34: own stores plus member stores
+/// with `manage_marketing`), newest first, each with its
+/// product title and derived display status. Before this
+/// wave the list was scoped by the buying user; for owners
+/// the two scopes are the same set (only the owner could
+/// buy, for their own stores).
 pub async fn list_seller_promotions(
     pool: &PgPool,
     user: &AuthUser,
 ) -> Result<PromotionList, ApiError> {
+    let store_ids = crate::access::accessible_store_ids(
+        pool,
+        user.user_id,
+        domain::STORE_ACTION_MANAGE_MARKETING,
+    )
+    .await?;
     let items: Vec<SellerPromotion> = sqlx::query_as(&format!(
         "SELECT {SELLER_PROMOTION_COLUMNS} FROM promotions pr \
          JOIN products p ON p.id = pr.product_id \
-         WHERE pr.seller_user_id = $1 ORDER BY pr.created_at DESC"
+         WHERE pr.store_id = ANY($1) ORDER BY pr.created_at DESC"
     ))
-    .bind(user.user_id)
+    .bind(&store_ids)
     .fetch_all(pool)
     .await
     .map_err(|e| ApiError::internal("list seller promotions", e))?
@@ -342,16 +366,25 @@ pub async fn cancel_promotion(
     let row: Option<SellerPromotion> = sqlx::query_as(&format!(
         "SELECT {SELLER_PROMOTION_COLUMNS} FROM promotions pr \
          JOIN products p ON p.id = pr.product_id \
-         WHERE pr.id = $1 AND pr.seller_user_id = $2"
+         WHERE pr.id = $1"
     ))
     .bind(promotion_id)
-    .bind(user.user_id)
     .fetch_optional(pool)
     .await
     .map_err(|e| ApiError::internal("load promotion for cancel", e))?;
     let promotion = row
         .map(with_display_status)
         .ok_or_else(|| ApiError::not_found("promotion not found"))?;
+    // Wave 34: cancelling is marketing work on the
+    // promotion's store — the owner or a manager of THAT
+    // store may cancel (whoever bought it); no relationship
+    // keeps the 404 above indistinguishable.
+    match crate::access::store_role(pool, user.user_id, promotion.store_id).await? {
+        Some(role) => {
+            crate::access::require_role(&role, domain::STORE_ACTION_MANAGE_MARKETING)?;
+        }
+        None => return Err(ApiError::not_found("promotion not found")),
+    }
     if promotion.display_status != "active" {
         return Err(ApiError::conflict(format!(
             "only a live promotion can be cancelled (this one is {})",

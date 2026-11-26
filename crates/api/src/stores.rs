@@ -4,19 +4,21 @@
 //! their role).
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
 use chrono::{DateTime, Utc};
 use domain::{
-    is_valid_slug, validate_announcement, validate_branding_url, validate_hex_color,
-    validate_store_description, validate_theme_key,
+    is_valid_slug, mask_phone, normalize_bd_phone, validate_announcement, validate_branding_url,
+    validate_hex_color, validate_store_description, validate_store_role, validate_theme_key,
+    STORE_ACTION_MANAGE_MARKETING, STORE_ACTION_MANAGE_MEMBERS,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
+use crate::access::{require_store_action, resolve_scoped_store, seller_access, StoreScopeQuery};
 use crate::auth::AuthUser;
 use crate::{ApiError, AppState};
 
@@ -185,19 +187,22 @@ pub struct UpdateBrandingRequest {
     pub description: Option<String>,
 }
 
-/// Update the branding of the caller's own store (their
-/// earliest-created store, via [`get_store_by_owner`] — the same
-/// scoping the Facebook link and SIDRA toggle use). Every
-/// provided value passes its domain validator first, so an
-/// invalid write is a 400 and changes nothing; the merged row
-/// is then written in one UPDATE and returned as the shared
-/// store view.
-pub async fn update_store_branding_for_owner(
+/// Update a store's branding. Every provided value passes
+/// its domain validator first, so an invalid write is a 400
+/// and changes nothing; the merged row is then written in
+/// one UPDATE and returned as the shared store view. The
+/// store arrives already resolved by the handler: before
+/// Wave 34 that was always the caller's own earliest store
+/// (via [`get_store_by_owner`]); Wave 34 also lets a manager
+/// brand a store they serve, named by `?store_id=` under a
+/// `manage_marketing` role — this function only merges,
+/// validates and writes.
+pub async fn update_store_branding_for_store(
     pool: &PgPool,
-    user: &AuthUser,
+    existing: &Store,
     patch: UpdateBrandingRequest,
 ) -> Result<Store, ApiError> {
-    let existing = get_store_by_owner(pool, user.user_id).await?;
+    let existing = existing.clone();
 
     let theme_key = match patch.theme_key.as_deref() {
         Some(raw) => validate_theme_key(raw)
@@ -287,10 +292,315 @@ pub async fn get_store(
 pub async fn update_store_branding(
     State(state): State<AppState>,
     user: AuthUser,
+    Query(scope): Query<StoreScopeQuery>,
     Json(req): Json<UpdateBrandingRequest>,
 ) -> Result<Json<Store>, ApiError> {
     let pool = state.require_pool()?;
+    // Wave 34: branding is marketing work — with `?store_id=`
+    // a manager may brand a store they serve; without it the
+    // caller's own store is branded, as before.
+    let (store, _role) = resolve_scoped_store(
+        pool,
+        user.user_id,
+        scope.store_id,
+        STORE_ACTION_MANAGE_MARKETING,
+    )
+    .await?;
     Ok(Json(
-        update_store_branding_for_owner(pool, &user, req).await?,
+        update_store_branding_for_store(pool, &store, req).await?,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Wave 34 — the seller's stores + store members
+// ---------------------------------------------------------------------------
+
+/// One store in the seller's store list: the store basics
+/// plus the role the CALLER holds in it (`owner` for their
+/// own stores, the member role for stores they serve).
+#[derive(Debug, Serialize, FromRow)]
+pub struct SellerStore {
+    pub id: Uuid,
+    pub slug: String,
+    pub name: String,
+    pub status: String,
+    pub verified_tier: String,
+    pub my_role: String,
+}
+
+/// Every store the caller owns or is a member of, owned
+/// stores first (earliest first), then member stores
+/// (earliest membership first). The store switcher and the
+/// members page are driven by this one list.
+pub async fn list_seller_stores(pool: &PgPool, user: &AuthUser) -> Result<Vec<SellerStore>, ApiError> {
+    sqlx::query_as(
+        "SELECT id, slug, name, status, verified_tier, my_role FROM ( \
+           SELECT s.id, s.slug, s.name, s.status, s.verified_tier, \
+                  'owner' AS my_role, 0 AS grp, s.created_at AS sort_at \
+           FROM stores s WHERE s.owner_user_id = $1 \
+           UNION ALL \
+           SELECT s.id, s.slug, s.name, s.status, s.verified_tier, \
+                  m.role AS my_role, 1 AS grp, m.created_at AS sort_at \
+           FROM store_members m JOIN stores s ON s.id = m.store_id \
+           WHERE m.user_id = $1 \
+         ) combined ORDER BY grp, sort_at, id",
+    )
+    .bind(user.user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::internal("list seller stores", e))
+}
+
+/// One member of a store, as the members endpoints return
+/// them: the member's user id, their phone MASKED (the full
+/// number is the member's own data, not the team's), their
+/// role and when they were seated.
+#[derive(Debug, Serialize, FromRow)]
+pub struct StoreMember {
+    pub user_id: Uuid,
+    pub phone_masked: String,
+    pub role: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// One member row before its phone is masked.
+#[derive(Debug, FromRow)]
+struct StoreMemberRow {
+    user_id: Uuid,
+    phone: String,
+    role: String,
+    created_at: DateTime<Utc>,
+}
+
+impl From<StoreMemberRow> for StoreMember {
+    fn from(row: StoreMemberRow) -> Self {
+        StoreMember {
+            user_id: row.user_id,
+            phone_masked: mask_phone(&row.phone),
+            role: row.role,
+            created_at: row.created_at,
+        }
+    }
+}
+
+const MEMBER_COLUMNS: &str = "m.user_id, u.phone, m.role, m.created_at";
+const MEMBER_FROM: &str = "FROM store_members m JOIN users u ON u.id = m.user_id";
+
+/// The members of one store, earliest seated first.
+pub async fn list_store_members(
+    pool: &PgPool,
+    store_id: Uuid,
+) -> Result<Vec<StoreMember>, ApiError> {
+    let rows: Vec<StoreMemberRow> = sqlx::query_as(&format!(
+        "SELECT {MEMBER_COLUMNS} {MEMBER_FROM} \
+         WHERE m.store_id = $1 ORDER BY m.created_at ASC, m.user_id ASC"
+    ))
+    .bind(store_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::internal("list store members", e))?;
+    Ok(rows.into_iter().map(StoreMember::from).collect())
+}
+
+/// Load one member row of a store (404 when the user is not
+/// a member of it).
+async fn load_store_member(
+    pool: &PgPool,
+    store_id: Uuid,
+    member_user_id: Uuid,
+) -> Result<StoreMember, ApiError> {
+    let row: Option<StoreMemberRow> = sqlx::query_as(&format!(
+        "SELECT {MEMBER_COLUMNS} {MEMBER_FROM} WHERE m.store_id = $1 AND m.user_id = $2"
+    ))
+    .bind(store_id)
+    .bind(member_user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ApiError::internal("load store member", e))?;
+    row.map(StoreMember::from)
+        .ok_or_else(|| ApiError::not_found("member not found"))
+}
+
+/// Seat a new member in a store. The target is found by
+/// phone (normalized by the domain rule): an unknown number
+/// is a 404 — membership never creates an account silently,
+/// the person must already be a platform user. Adding the
+/// store's owner is a 400 (they already hold every right,
+/// and `owner` is not a member role), an invalid role is a
+/// 400 from the domain validator, and seating the same user
+/// twice is a 409.
+pub async fn add_store_member(
+    pool: &PgPool,
+    store_id: Uuid,
+    phone: &str,
+    role: &str,
+) -> Result<StoreMember, ApiError> {
+    let role = validate_store_role(role).map_err(ApiError::bad_request)?;
+    let phone = normalize_bd_phone(phone).ok_or_else(|| {
+        ApiError::bad_request("phone must be a valid Bangladeshi mobile number")
+    })?;
+
+    let target: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM users WHERE phone = $1")
+            .bind(&phone)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| ApiError::internal("find member by phone", e))?;
+    let (target_user_id,) = target.ok_or_else(|| {
+        ApiError::not_found("এই নম্বরে কোনো অ্যাকাউন্ট নেই — no account exists for this phone number")
+    })?;
+
+    let store = get_store_by_id(pool, store_id).await?;
+    if store.owner_user_id == target_user_id {
+        return Err(ApiError::bad_request(
+            "the store owner is already on the team with every right — \
+             স্টোরের মালিক নিজে সদস্য হতে পারেন না",
+        ));
+    }
+
+    let existing: Option<String> =
+        sqlx::query_scalar("SELECT role FROM store_members WHERE store_id = $1 AND user_id = $2")
+            .bind(store_id)
+            .bind(target_user_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| ApiError::internal("check existing membership", e))?;
+    if existing.is_some() {
+        return Err(ApiError::conflict(
+            "this user is already a member of the store",
+        ));
+    }
+
+    sqlx::query(
+        "INSERT INTO store_members (store_id, user_id, role) VALUES ($1, $2, $3)",
+    )
+    .bind(store_id)
+    .bind(target_user_id)
+    .bind(role)
+    .execute(pool)
+    .await
+    .map_err(|e| ApiError::internal("add store member", e))?;
+
+    load_store_member(pool, store_id, target_user_id).await
+}
+
+/// Change a member's role (owner only, enforced by the
+/// handler's gate). A user who is not a member is a 404.
+pub async fn update_store_member_role(
+    pool: &PgPool,
+    store_id: Uuid,
+    member_user_id: Uuid,
+    role: &str,
+) -> Result<StoreMember, ApiError> {
+    let role = validate_store_role(role).map_err(ApiError::bad_request)?;
+    load_store_member(pool, store_id, member_user_id).await?;
+    sqlx::query("UPDATE store_members SET role = $3 WHERE store_id = $1 AND user_id = $2")
+        .bind(store_id)
+        .bind(member_user_id)
+        .bind(role)
+        .execute(pool)
+        .await
+        .map_err(|e| ApiError::internal("update store member role", e))?;
+    load_store_member(pool, store_id, member_user_id).await
+}
+
+/// Remove a member from a store (owner only, enforced by the
+/// handler's gate). Removing someone who is not a member is
+/// a 404 — a mistyped id must not look like a success.
+pub async fn remove_store_member(
+    pool: &PgPool,
+    store_id: Uuid,
+    member_user_id: Uuid,
+) -> Result<(), ApiError> {
+    let deleted = sqlx::query("DELETE FROM store_members WHERE store_id = $1 AND user_id = $2")
+        .bind(store_id)
+        .bind(member_user_id)
+        .execute(pool)
+        .await
+        .map_err(|e| ApiError::internal("remove store member", e))?;
+    if deleted.rows_affected() == 0 {
+        return Err(ApiError::not_found("member not found"));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Member handlers (thin)
+// ---------------------------------------------------------------------------
+
+pub async fn list_seller_stores_handler(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Json<Vec<SellerStore>>, ApiError> {
+    let pool = state.require_pool()?;
+    Ok(Json(list_seller_stores(pool, &user).await?))
+}
+
+#[derive(Deserialize)]
+pub struct AddStoreMemberRequest {
+    pub phone: String,
+    pub role: String,
+}
+
+pub async fn add_store_member_handler(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(store_id): Path<Uuid>,
+    Json(req): Json<AddStoreMemberRequest>,
+) -> Result<(StatusCode, Json<StoreMember>), ApiError> {
+    let pool = state.require_pool()?;
+    // Seating people is the owner's alone (manage_members —
+    // even managers are refused, with a 403 from the matrix).
+    require_store_action(pool, user.user_id, store_id, STORE_ACTION_MANAGE_MEMBERS).await?;
+    let member = add_store_member(pool, store_id, &req.phone, &req.role).await?;
+    Ok((StatusCode::CREATED, Json(member)))
+}
+
+pub async fn list_store_members_handler(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(store_id): Path<Uuid>,
+) -> Result<Json<Vec<StoreMember>>, ApiError> {
+    let pool = state.require_pool()?;
+    // Viewing the team list takes a seat at the table: the
+    // owner or a manager (a manager runs the shop and must
+    // know who they work with). Staff hold no such right in
+    // the matrix, so a staff read is a 403 here.
+    let role = seller_access(pool, user.user_id, store_id).await?;
+    if role != "owner" && role != "manager" {
+        return Err(ApiError::forbidden(
+            "only the owner and managers can view the team — \
+             শুধু মালিক ও ম্যানেজাররাই টিমের তালিকা দেখতে পারেন",
+        ));
+    }
+    Ok(Json(list_store_members(pool, store_id).await?))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateStoreMemberRequest {
+    pub role: String,
+}
+
+pub async fn update_store_member_handler(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((store_id, member_user_id)): Path<(Uuid, Uuid)>,
+    Json(req): Json<UpdateStoreMemberRequest>,
+) -> Result<Json<StoreMember>, ApiError> {
+    let pool = state.require_pool()?;
+    require_store_action(pool, user.user_id, store_id, STORE_ACTION_MANAGE_MEMBERS).await?;
+    Ok(Json(
+        update_store_member_role(pool, store_id, member_user_id, &req.role).await?,
+    ))
+}
+
+pub async fn remove_store_member_handler(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((store_id, member_user_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, ApiError> {
+    let pool = state.require_pool()?;
+    require_store_action(pool, user.user_id, store_id, STORE_ACTION_MANAGE_MEMBERS).await?;
+    remove_store_member(pool, store_id, member_user_id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }

@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
+use crate::access::{accessible_store_ids, require_role, store_role_on};
 use crate::admin::require_admin;
 use crate::audit::record_admin_action;
 use crate::auth::AuthUser;
@@ -367,7 +368,9 @@ pub async fn list_return_requests_for_buyer(
 // Seller: list + decisions
 // ---------------------------------------------------------------------------
 
-/// Return requests for stores the caller owns, newest first.
+/// Return requests for the stores the caller may work
+/// orders in (Wave 34: their own stores plus member stores
+/// whose role carries `manage_orders`), newest first.
 pub async fn list_return_requests_for_seller(
     pool: &PgPool,
     user: &AuthUser,
@@ -376,21 +379,22 @@ pub async fn list_return_requests_for_seller(
 ) -> Result<SellerReturnRequestList, ApiError> {
     let (page, limit) = clamp_pagination(page, limit);
     let offset = (page - 1) * limit;
+    let store_ids =
+        accessible_store_ids(pool, user.user_id, domain::STORE_ACTION_MANAGE_ORDERS).await?;
 
     let total: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM return_requests rr \
-         JOIN stores s ON s.id = rr.store_id WHERE s.owner_user_id = $1",
+        "SELECT COUNT(*) FROM return_requests rr WHERE rr.store_id = ANY($1)",
     )
-    .bind(user.user_id)
+    .bind(&store_ids)
     .fetch_one(pool)
     .await
     .map_err(|e| ApiError::internal("count seller return requests", e))?;
 
     let rows: Vec<ReturnRequestRow> = sqlx::query_as(&format!(
-        "SELECT {RETURN_COLUMNS} {RETURN_FROM} WHERE s.owner_user_id = $1 \
+        "SELECT {RETURN_COLUMNS} {RETURN_FROM} WHERE rr.store_id = ANY($1) \
          ORDER BY rr.created_at DESC, rr.id LIMIT $2 OFFSET $3"
     ))
-    .bind(user.user_id)
+    .bind(&store_ids)
     .bind(limit)
     .bind(offset)
     .fetch_all(pool)
@@ -427,20 +431,28 @@ pub async fn decide_return_request(
         .await
         .map_err(|e| ApiError::internal("begin return decision transaction", e))?;
 
-    let current: Option<(String, Uuid)> = sqlx::query_as(
-        "SELECT rr.status, s.owner_user_id FROM return_requests rr \
+    let current: Option<(String, Uuid, Uuid)> = sqlx::query_as(
+        "SELECT rr.status, s.owner_user_id, rr.store_id FROM return_requests rr \
          JOIN stores s ON s.id = rr.store_id WHERE rr.id = $1 FOR UPDATE OF rr",
     )
     .bind(return_id)
     .fetch_optional(&mut *tx)
     .await
     .map_err(|e| ApiError::internal("load return request for decision", e))?;
-    let (current_status, owner_user_id) =
+    let (current_status, owner_user_id, store_id) =
         current.ok_or_else(|| ApiError::not_found("return request not found"))?;
+    // Wave 34: the owner, or a member whose role carries
+    // `manage_orders`; no relationship keeps the historical
+    // 403 (the seller sub-order rule).
     if owner_user_id != user.user_id {
-        return Err(ApiError::forbidden(
-            "you do not own this return request's store",
-        ));
+        match store_role_on(&mut *tx, user.user_id, store_id).await? {
+            Some(role) => require_role(&role, domain::STORE_ACTION_MANAGE_ORDERS)?,
+            None => {
+                return Err(ApiError::forbidden(
+                    "you do not own this return request's store",
+                ))
+            }
+        }
     }
     if !can_transition_return(&current_status, target) {
         return Err(ApiError::conflict(format!(
@@ -489,8 +501,8 @@ pub async fn mark_return_received(
         .await
         .map_err(|e| ApiError::internal("begin return receipt transaction", e))?;
 
-    let current: Option<(String, Uuid, Uuid, i64, i64)> = sqlx::query_as(
-        "SELECT rr.status, s.owner_user_id, rr.sub_order_id, \
+    let current: Option<(String, Uuid, Uuid, Uuid, i64, i64)> = sqlx::query_as(
+        "SELECT rr.status, s.owner_user_id, rr.store_id, rr.sub_order_id, \
          so.goods_subtotal_poisha, so.discount_poisha \
          FROM return_requests rr \
          JOIN stores s ON s.id = rr.store_id \
@@ -501,12 +513,18 @@ pub async fn mark_return_received(
     .fetch_optional(&mut *tx)
     .await
     .map_err(|e| ApiError::internal("load return request for receipt", e))?;
-    let (current_status, owner_user_id, sub_order_id, goods_poisha, discount_poisha) =
+    let (current_status, owner_user_id, store_id, sub_order_id, goods_poisha, discount_poisha) =
         current.ok_or_else(|| ApiError::not_found("return request not found"))?;
+    // Wave 34: same access rule as the decision above.
     if owner_user_id != user.user_id {
-        return Err(ApiError::forbidden(
-            "you do not own this return request's store",
-        ));
+        match store_role_on(&mut *tx, user.user_id, store_id).await? {
+            Some(role) => require_role(&role, domain::STORE_ACTION_MANAGE_ORDERS)?,
+            None => {
+                return Err(ApiError::forbidden(
+                    "you do not own this return request's store",
+                ))
+            }
+        }
     }
     if !can_transition_return(&current_status, "received") {
         return Err(ApiError::conflict(format!(

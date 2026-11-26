@@ -53,7 +53,6 @@ use uuid::Uuid;
 use crate::auth::AuthUser;
 use crate::inventory::{record_stock_adjustment, StockAdjustment, StockMovement};
 use crate::products::{get_product_by_id, Product};
-use crate::stores::get_store_by_id;
 use crate::{ApiError, AppState};
 
 // ---------------------------------------------------------------------------
@@ -149,18 +148,22 @@ impl VariantRow {
 // Loaders + ownership
 // ---------------------------------------------------------------------------
 
-/// Resolve a product the caller owns for the variant
-/// endpoints: missing and someone else's are both a 404
-/// (see the module doc).
+/// Resolve a product the caller may work for the variant
+/// endpoints (Wave 34: the store's owner, or a member whose
+/// role carries `manage_catalog` — every member role does):
+/// missing and someone else's are both a 404 (see the module
+/// doc).
 async fn owned_product(
     pool: &PgPool,
     user: &AuthUser,
     product_id: Uuid,
 ) -> Result<Product, ApiError> {
     let product = get_product_by_id(pool, product_id).await?;
-    let store = get_store_by_id(pool, product.store_id).await?;
-    if store.owner_user_id != user.user_id {
-        return Err(ApiError::not_found("product not found"));
+    match crate::access::store_role(pool, user.user_id, product.store_id).await? {
+        Some(role) => {
+            crate::access::require_role(&role, domain::STORE_ACTION_MANAGE_CATALOG)?;
+        }
+        None => return Err(ApiError::not_found("product not found")),
     }
     Ok(product)
 }
@@ -450,8 +453,15 @@ pub async fn adjust_variant_stock_for_seller(
     .await
     .map_err(|e| ApiError::internal("lock variant for adjust-stock", e))?;
     let row = row.ok_or_else(|| ApiError::not_found("variant not found"))?;
+    // Wave 34: the owner, or a member with `manage_catalog`;
+    // no relationship keeps this module's 404.
     if row.owner_user_id != user.user_id {
-        return Err(ApiError::not_found("variant not found"));
+        match crate::access::store_role_on(&mut *tx, user.user_id, row.store_id).await? {
+            Some(role) => {
+                crate::access::require_role(&role, domain::STORE_ACTION_MANAGE_CATALOG)?;
+            }
+            None => return Err(ApiError::not_found("variant not found")),
+        }
     }
 
     let new_stock = i64::from(row.stock) + delta;

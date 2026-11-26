@@ -51,6 +51,13 @@
 //! the seller orders page, whose shared list function the dashboard
 //! reuses — while earnings and payouts are strictly per payout
 //! store, because money must be exact per store.
+//!
+//! Wave 34 layers team access over this: a store named by
+//! `?store_id=` resolves through the caller's role in it — the
+//! dashboard, balance and payout list read it under
+//! `view_finances`, while the payout account and payout requests
+//! stay `manage_payouts`, a right only the owner holds. The
+//! payout store itself never resolves for a member.
 
 use axum::{
     extract::{Query, State},
@@ -65,8 +72,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
+use crate::access::StoreScopeQuery;
 use crate::auth::AuthUser;
-use crate::orders::{list_seller_sub_orders, SellerSubOrder};
+use crate::orders::SellerSubOrder;
 use crate::products::clamp_pagination;
 use crate::stores::{get_store_by_owner, Store};
 use crate::{ApiError, AppState};
@@ -261,24 +269,47 @@ pub async fn available_balance_poisha(pool: &PgPool, user_id: Uuid) -> Result<i6
 
 /// The seller dashboard: payout store, activity counts, earnings,
 /// and the five most recent sub-orders (the shared seller list).
+/// The default scope is the caller's whole selling activity —
+/// every store they own — with earnings read for the payout
+/// store, exactly as before Wave 34.
 pub async fn get_dashboard(pool: &PgPool, user: &AuthUser) -> Result<SellerDashboard, ApiError> {
     let store = seller_store(pool, user).await?;
+    let owned = crate::access::owned_store_ids(pool, user.user_id).await?;
+    build_dashboard(pool, store, &owned).await
+}
 
+/// The Wave 34 store-scoped dashboard: everything (counts,
+/// earnings, recents, alerts) describes ONE store — the one
+/// the handler resolved through the caller's role in it
+/// (any role may view a dashboard for a store they serve).
+pub async fn get_dashboard_for_store(
+    pool: &PgPool,
+    store: Store,
+) -> Result<SellerDashboard, ApiError> {
+    let scope = [store.id];
+    build_dashboard(pool, store, &scope).await
+}
+
+/// The dashboard assembly shared by both scopes: counts and
+/// alerts over `scope`, earnings over `store` itself.
+async fn build_dashboard(
+    pool: &PgPool,
+    store: Store,
+    scope: &[Uuid],
+) -> Result<SellerDashboard, ApiError> {
     let products: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM products p JOIN stores s ON s.id = p.store_id \
-         WHERE s.owner_user_id = $1",
+        "SELECT COUNT(*) FROM products p WHERE p.store_id = ANY($1)",
     )
-    .bind(user.user_id)
+    .bind(scope)
     .fetch_one(pool)
     .await
     .map_err(|e| ApiError::internal("count seller products", e))?;
 
     let status_rows: Vec<(String, i64)> = sqlx::query_as(
         "SELECT so.status, COUNT(*) FROM sub_orders so \
-         JOIN stores s ON s.id = so.store_id \
-         WHERE s.owner_user_id = $1 GROUP BY so.status",
+         WHERE so.store_id = ANY($1) GROUP BY so.status",
     )
-    .bind(user.user_id)
+    .bind(scope)
     .fetch_all(pool)
     .await
     .map_err(|e| ApiError::internal("count seller sub-orders", e))?;
@@ -303,11 +334,10 @@ pub async fn get_dashboard(pool: &PgPool, user: &AuthUser) -> Result<SellerDashb
     }
 
     let earnings = seller_earnings(pool, store.id).await?;
-    let recent = list_seller_sub_orders(pool, user, Some(1), Some(5)).await?;
-    let low_stock_items =
-        crate::inventory::low_stock_items_for_seller(pool, user.user_id).await?;
-    let unanswered_questions =
-        crate::qna::count_unanswered_questions(pool, user.user_id).await?;
+    let recent =
+        crate::orders::list_seller_sub_orders_scoped(pool, scope, Some(1), Some(5)).await?;
+    let low_stock_items = crate::inventory::low_stock_items_for_seller(pool, scope).await?;
+    let unanswered_questions = crate::qna::count_unanswered_questions(pool, scope).await?;
 
     Ok(SellerDashboard {
         store,
@@ -328,13 +358,16 @@ pub async fn get_balance(pool: &PgPool, user: &AuthUser) -> Result<Earnings, Api
     seller_earnings(pool, store.id).await
 }
 
-/// The caller's payout account, or `None` when they have not saved
-/// one yet.
+/// One store's payout account, or `None` when none is saved
+/// yet. The store arrives resolved by the handler (Wave 34:
+/// the owner's own store by default; a store named by
+/// `?store_id=` only ever resolves for its OWNER here —
+/// payout coordinates are `manage_payouts`, which no member
+/// role carries).
 pub async fn get_payout_account(
     pool: &PgPool,
-    user: &AuthUser,
+    store: &Store,
 ) -> Result<Option<PayoutAccount>, ApiError> {
-    let store = seller_store(pool, user).await?;
     sqlx::query_as(
         "SELECT id, store_id, method, account_name, account_number, created_at, updated_at \
          FROM payout_accounts WHERE store_id = $1",
@@ -345,17 +378,16 @@ pub async fn get_payout_account(
     .map_err(|e| ApiError::internal("load payout account", e))
 }
 
-/// Create or replace the caller's payout account. The domain
+/// Create or replace a store's payout account. The domain
 /// validator decides what a legal account is per method; the
 /// stored fields are trimmed copies of what the seller sent.
 pub async fn save_payout_account(
     pool: &PgPool,
-    user: &AuthUser,
+    store: &Store,
     method: &str,
     account_name: &str,
     account_number: &str,
 ) -> Result<PayoutAccount, ApiError> {
-    let store = seller_store(pool, user).await?;
     validate_payout_account(method, account_name, account_number)
         .map_err(ApiError::bad_request)?;
 
@@ -378,20 +410,22 @@ pub async fn save_payout_account(
     .map_err(|e| ApiError::internal("save payout account", e))
 }
 
-/// Request a payout of `amount_poisha` from the caller's available
+/// Request a payout of `amount_poisha` from a store's available
 /// balance. Requires a saved payout account (its fields are
 /// snapshotted onto the payout row); the domain amount validator
 /// enforces the platform minimum and the balance fit. The minimum
 /// is the EFFECTIVE one (Wave 10): an admin-set platform setting
 /// wins over the built-in [`domain::MIN_PAYOUT_POISHA`].
+///
+/// Wave 34: the store arrives resolved by the handler under
+/// `manage_payouts` — a right only the owner holds — so this
+/// function never runs for a member.
 pub async fn request_payout(
     pool: &PgPool,
     state: &AppState,
-    user: &AuthUser,
+    store: &Store,
     amount_poisha: i64,
 ) -> Result<Payout, ApiError> {
-    let store = seller_store(pool, user).await?;
-
     // Wave 21 — the KYC payout gate: when the platform has
     // turned the `kyc_payout_gate` setting on, an unverified
     // store cannot move money out until its seller verifies
@@ -447,7 +481,8 @@ pub async fn request_payout(
     .map_err(|e| ApiError::internal("create payout", e))
 }
 
-/// The caller's payout requests, newest first.
+/// The caller's payout requests (their payout store's),
+/// newest first.
 pub async fn list_payouts(
     pool: &PgPool,
     user: &AuthUser,
@@ -455,6 +490,19 @@ pub async fn list_payouts(
     limit: Option<i64>,
 ) -> Result<PayoutList, ApiError> {
     let store = seller_store(pool, user).await?;
+    list_payouts_for_store(pool, &store, page, limit).await
+}
+
+/// One store's payout requests, newest first — the shared
+/// body behind [`list_payouts`] and the Wave 34 scoped list
+/// (a manager with `view_finances` may READ a store's payout
+/// history; requesting stays the owner's alone).
+pub async fn list_payouts_for_store(
+    pool: &PgPool,
+    store: &Store,
+    page: Option<i64>,
+    limit: Option<i64>,
+) -> Result<PayoutList, ApiError> {
     let (page, limit) = clamp_pagination(page, limit);
     let offset = (page - 1) * limit;
 
@@ -514,37 +562,84 @@ pub struct ListPayoutsQuery {
 pub async fn dashboard_handler(
     State(state): State<AppState>,
     user: AuthUser,
+    Query(scope): Query<StoreScopeQuery>,
 ) -> Result<Json<SellerDashboard>, ApiError> {
     let pool = state.require_pool()?;
-    Ok(Json(get_dashboard(pool, &user).await?))
+    // Wave 34: `?store_id=` views ONE store's dashboard —
+    // any role the caller holds in it suffices (a dashboard
+    // is a view); without it, the caller's own whole-activity
+    // dashboard, exactly as before.
+    match scope.store_id {
+        Some(store_id) => {
+            crate::access::seller_access(pool, user.user_id, store_id).await?;
+            let store = crate::stores::get_store_by_id(pool, store_id).await?;
+            Ok(Json(get_dashboard_for_store(pool, store).await?))
+        }
+        None => Ok(Json(get_dashboard(pool, &user).await?)),
+    }
 }
 
 pub async fn balance_handler(
     State(state): State<AppState>,
     user: AuthUser,
+    Query(scope): Query<StoreScopeQuery>,
 ) -> Result<Json<Earnings>, ApiError> {
     let pool = state.require_pool()?;
-    Ok(Json(get_balance(pool, &user).await?))
+    // Wave 34: `?store_id=` reads that store's earnings
+    // under `view_finances` (owner or manager); without it,
+    // the caller's own payout-store balance, as before.
+    match scope.store_id {
+        Some(_) => {
+            let (store, _role) = crate::access::resolve_scoped_store(
+                pool,
+                user.user_id,
+                scope.store_id,
+                domain::STORE_ACTION_VIEW_FINANCES,
+            )
+            .await?;
+            Ok(Json(seller_earnings(pool, store.id).await?))
+        }
+        None => Ok(Json(get_balance(pool, &user).await?)),
+    }
 }
 
 pub async fn get_payout_account_handler(
     State(state): State<AppState>,
     user: AuthUser,
+    Query(scope): Query<StoreScopeQuery>,
 ) -> Result<Json<Option<PayoutAccount>>, ApiError> {
     let pool = state.require_pool()?;
-    Ok(Json(get_payout_account(pool, &user).await?))
+    // Wave 34: payout coordinates are `manage_payouts` —
+    // owner-only in the matrix, so a member naming a store
+    // here gets the matrix's 403, and a stranger a 404.
+    let (store, _role) = crate::access::resolve_scoped_store(
+        pool,
+        user.user_id,
+        scope.store_id,
+        domain::STORE_ACTION_MANAGE_PAYOUTS,
+    )
+    .await?;
+    Ok(Json(get_payout_account(pool, &store).await?))
 }
 
 pub async fn save_payout_account_handler(
     State(state): State<AppState>,
     user: AuthUser,
+    Query(scope): Query<StoreScopeQuery>,
     Json(input): Json<SavePayoutAccountInput>,
 ) -> Result<Json<PayoutAccount>, ApiError> {
     let pool = state.require_pool()?;
+    let (store, _role) = crate::access::resolve_scoped_store(
+        pool,
+        user.user_id,
+        scope.store_id,
+        domain::STORE_ACTION_MANAGE_PAYOUTS,
+    )
+    .await?;
     Ok(Json(
         save_payout_account(
             pool,
-            &user,
+            &store,
             &input.method,
             &input.account_name,
             &input.account_number,
@@ -556,10 +651,21 @@ pub async fn save_payout_account_handler(
 pub async fn request_payout_handler(
     State(state): State<AppState>,
     user: AuthUser,
+    Query(scope): Query<StoreScopeQuery>,
     Json(input): Json<RequestPayoutInput>,
 ) -> Result<(StatusCode, Json<Payout>), ApiError> {
     let pool = state.require_pool()?;
-    let payout = request_payout(pool, &state, &user, input.amount_poisha).await?;
+    // Wave 34: requesting a payout is `manage_payouts` —
+    // the owner alone. A manager naming the store is refused
+    // with the matrix's 403 before any money rule runs.
+    let (store, _role) = crate::access::resolve_scoped_store(
+        pool,
+        user.user_id,
+        scope.store_id,
+        domain::STORE_ACTION_MANAGE_PAYOUTS,
+    )
+    .await?;
+    let payout = request_payout(pool, &state, &store, input.amount_poisha).await?;
     Ok((StatusCode::CREATED, Json(payout)))
 }
 
@@ -567,9 +673,27 @@ pub async fn list_payouts_handler(
     State(state): State<AppState>,
     user: AuthUser,
     Query(query): Query<ListPayoutsQuery>,
+    Query(scope): Query<StoreScopeQuery>,
 ) -> Result<Json<PayoutList>, ApiError> {
     let pool = state.require_pool()?;
-    Ok(Json(
-        list_payouts(pool, &user, query.page, query.limit).await?,
-    ))
+    // Wave 34: `?store_id=` lists that store's payouts under
+    // `view_finances` (owner or manager may read); without
+    // it, the caller's own payout-store list, as before.
+    match scope.store_id {
+        Some(_) => {
+            let (store, _role) = crate::access::resolve_scoped_store(
+                pool,
+                user.user_id,
+                scope.store_id,
+                domain::STORE_ACTION_VIEW_FINANCES,
+            )
+            .await?;
+            Ok(Json(
+                list_payouts_for_store(pool, &store, query.page, query.limit).await?,
+            ))
+        }
+        None => Ok(Json(
+            list_payouts(pool, &user, query.page, query.limit).await?,
+        )),
+    }
 }

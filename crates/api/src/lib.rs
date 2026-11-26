@@ -240,6 +240,16 @@
 //! checkout decrements (and restocks restore) the variant
 //! row, with the stock audit trail carrying the variant id.
 //! Variant-less products behave exactly as before.
+//! Wave 34: multi-store access + staff roles (`access`
+//! module, migration 0032) — a store's owner seats managers
+//! and staff as members, and every seller surface resolves
+//! the caller's role through the one access helper and the
+//! domain permission matrix (`store_role_can`): managers run
+//! the shop but cannot seat members or move money out; staff
+//! work catalogue, orders and questions only. Owners resolve
+//! to `owner` and pass every gate, so owner behaviour is
+//! unchanged everywhere; the payout store stays owner-based
+//! by design (money settles to the owner alone).
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -250,6 +260,7 @@
 //! NOT set the API still starts and serves the Wave 1 stateless
 //! endpoints; DB-backed endpoints return a clear 503 instead of panicking.
 
+pub mod access;
 pub mod admin;
 pub mod analytics;
 pub mod audit;
@@ -1071,6 +1082,22 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/v1/stores/:slug/products",
             get(products::list_store_products),
+        )
+        // Wave 34 — multi-store access + staff roles: every
+        // store the caller owns or is a member of (with their
+        // role in it), and the member management endpoints —
+        // seating, re-roling and removing members are the
+        // owner's alone (`manage_members` in the domain
+        // matrix); the list itself is owner + manager.
+        .route("/v1/seller/stores", get(stores::list_seller_stores_handler))
+        .route(
+            "/v1/seller/stores/:id/members",
+            get(stores::list_store_members_handler).post(stores::add_store_member_handler),
+        )
+        .route(
+            "/v1/seller/stores/:id/members/:user_id",
+            patch(stores::update_store_member_handler)
+                .delete(stores::remove_store_member_handler),
         )
         // Wave 2 — products.
         .route(

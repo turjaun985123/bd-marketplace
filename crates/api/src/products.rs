@@ -322,14 +322,22 @@ pub async fn get_public_product(pool: &PgPool, id: Uuid) -> Result<Product, ApiE
     Ok(product)
 }
 
-/// Assert the caller owns the store; 404 if the store does not exist,
-/// 403 if it belongs to someone else.
-async fn require_store_owner(pool: &PgPool, store_id: Uuid, user: &AuthUser) -> Result<(), ApiError> {
-    let store = get_store_by_id(pool, store_id).await?;
-    if store.owner_user_id != user.user_id {
-        return Err(ApiError::forbidden("you do not own this store"));
+/// Assert the caller may work the store's catalogue (Wave
+/// 34): the owner, or a member whose role carries
+/// `manage_catalog` — which every member role does, so in
+/// practice this separates the store's team from strangers.
+/// 404 if the store does not exist, 403 if the caller has no
+/// relationship with it (this module's historical answer).
+async fn require_store_catalog_access(
+    pool: &PgPool,
+    store_id: Uuid,
+    user: &AuthUser,
+) -> Result<(), ApiError> {
+    let _store = get_store_by_id(pool, store_id).await?;
+    match crate::access::store_role(pool, user.user_id, store_id).await? {
+        Some(role) => crate::access::require_role(&role, domain::STORE_ACTION_MANAGE_CATALOG),
+        None => Err(ApiError::forbidden("you do not own this store")),
     }
-    Ok(())
 }
 
 /// Every field of a new product row, including its provenance
@@ -404,7 +412,7 @@ pub async fn create_product_for_owner(
     user: &AuthUser,
     input: CreateProductInput,
 ) -> Result<Product, ApiError> {
-    require_store_owner(pool, input.store_id, user).await?;
+    require_store_catalog_access(pool, input.store_id, user).await?;
     let validated = ProductInput {
         title: input.title.clone(),
         price_poisha: input.price_poisha,
@@ -463,7 +471,7 @@ pub async fn update_product_for_owner(
     patch: UpdateProductInput,
 ) -> Result<Product, ApiError> {
     let existing = get_product_by_id(pool, id).await?;
-    require_store_owner(pool, existing.store_id, user).await?;
+    require_store_catalog_access(pool, existing.store_id, user).await?;
 
     let merged = ProductInput {
         title: patch.title.clone().unwrap_or(existing.title.clone()),
@@ -662,10 +670,16 @@ pub async fn get_product(
     // owner always passes both gates (catalogue management).
     let store = get_store_by_id(pool, product.store_id).await?;
     let viewer = authenticate_optional(&state, &headers);
-    let is_owner = viewer
-        .as_ref()
-        .map(|user| store.owner_user_id == user.user_id)
-        .unwrap_or(false);
+    // Wave 34: the "insider" who may see a non-active product
+    // (or any product of a suspended store) is the store's
+    // team — the owner or any member — not the owner alone:
+    // staff manage the catalogue, drafts included.
+    let is_owner = match viewer.as_ref() {
+        Some(user) => crate::access::store_role(pool, user.user_id, store.id)
+            .await?
+            .is_some(),
+        None => false,
+    };
     if !is_owner && (product.status != "active" || store.status == "suspended") {
         return Err(ApiError::not_found("product not found"));
     }

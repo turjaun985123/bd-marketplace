@@ -1406,9 +1406,112 @@ export function payoutStatusLabel(status: string): string {
   }
 }
 
-/** GET /v1/seller/dashboard — store, counts, earnings, recent orders. */
-export function getSellerDashboard(token: string): Promise<SellerDashboard> {
-  return call("/v1/seller/dashboard", { token });
+/**
+ * GET /v1/seller/dashboard — store, counts, earnings, recent orders.
+ * Wave 34: an optional store id scopes the dashboard to that one
+ * store (the caller's role in it is enough to view); without it the
+ * caller's own whole-activity dashboard comes back, as before.
+ */
+export function getSellerDashboard(
+  token: string,
+  storeId?: string
+): Promise<SellerDashboard> {
+  const query = storeId ? `?store_id=${encodeURIComponent(storeId)}` : "";
+  return call(`/v1/seller/dashboard${query}`, { token });
+}
+
+/** A store the signed-in seller serves, with their role in it (Wave 34). */
+export interface SellerStore {
+  id: string;
+  slug: string;
+  name: string;
+  /** active | suspended */
+  status: string;
+  verified_tier: VerificationTier;
+  /** owner | manager | staff — the caller's role in THIS store. */
+  my_role: string;
+}
+
+/** GET /v1/seller/stores — every store the caller owns or serves on. */
+export function listSellerStores(token: string): Promise<SellerStore[]> {
+  return call("/v1/seller/stores", { token });
+}
+
+/** Bangla label for a store team role (Wave 34). */
+export function storeRoleLabel(role: string): string {
+  switch (role) {
+    case "owner":
+      return "মালিক — Owner";
+    case "manager":
+      return "ম্যানেজার — Manager";
+    case "staff":
+      return "স্টাফ — Staff";
+    default:
+      return role;
+  }
+}
+
+/** One member of a store's team (Wave 34); the phone is masked. */
+export interface StoreMember {
+  store_id: string;
+  user_id: string;
+  phone_masked: string;
+  /** manager | staff — the owner is never a member row. */
+  role: string;
+  created_at: string;
+}
+
+/** GET /v1/seller/stores/{id}/members — the team (owner + manager may view). */
+export function listStoreMembers(
+  token: string,
+  storeId: string
+): Promise<StoreMember[]> {
+  return call(`/v1/seller/stores/${encodeURIComponent(storeId)}/members`, {
+    token,
+  });
+}
+
+/**
+ * POST /v1/seller/stores/{id}/members — seat an EXISTING account
+ * by phone (owner only). A number with no account is a 404 from
+ * the API; there is no invite-by-SMS yet.
+ */
+export function addStoreMember(
+  token: string,
+  storeId: string,
+  phone: string,
+  role: string
+): Promise<StoreMember> {
+  return call(`/v1/seller/stores/${encodeURIComponent(storeId)}/members`, {
+    method: "POST",
+    token,
+    body: { phone, role },
+  });
+}
+
+/** PATCH /v1/seller/stores/{id}/members/{userId} — change a role (owner only). */
+export function updateStoreMemberRole(
+  token: string,
+  storeId: string,
+  userId: string,
+  role: string
+): Promise<StoreMember> {
+  return call(
+    `/v1/seller/stores/${encodeURIComponent(storeId)}/members/${encodeURIComponent(userId)}`,
+    { method: "PATCH", token, body: { role } }
+  );
+}
+
+/** DELETE /v1/seller/stores/{id}/members/{userId} — remove a member (owner only). */
+export function removeStoreMember(
+  token: string,
+  storeId: string,
+  userId: string
+): Promise<void> {
+  return call(
+    `/v1/seller/stores/${encodeURIComponent(storeId)}/members/${encodeURIComponent(userId)}`,
+    { method: "DELETE", token }
+  );
 }
 
 /** GET /v1/seller/balance — the caller's store earnings summary. */
