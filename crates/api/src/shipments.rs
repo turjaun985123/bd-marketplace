@@ -64,8 +64,9 @@ pub struct Shipment {
     /// Unified shipment status (domain crate's set).
     pub status: String,
     /// Cash the courier must collect on delivery, in poisha (the
-    /// sub-order's goods + delivery share for COD orders; 0 when the
-    /// order was paid online).
+    /// sub-order's goods + delivery share for COD orders, net of
+    /// the advance share when the order is `advance_paid`; 0 when
+    /// the order was paid online).
     pub cod_amount_poisha: i64,
     pub note: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -375,9 +376,14 @@ struct SubOrderBookingRow {
     status: String,
     store_id: Uuid,
     owner_user_id: Uuid,
+    order_id: Uuid,
     goods_subtotal_poisha: i64,
     delivery_charge_poisha: i64,
     payment_status: String,
+    /// Wave 17: the parent order's advance snapshot — the
+    /// booking guard and the collection netting read these.
+    advance_required_poisha: i64,
+    advance_paid_poisha: i64,
     delivery_name: String,
     delivery_phone: String,
     delivery_address: String,
@@ -406,9 +412,10 @@ pub async fn create_shipment_for_seller(
     let config = &state.couriers_config;
 
     let row: Option<SubOrderBookingRow> = sqlx::query_as(
-        "SELECT so.status, so.store_id, s.owner_user_id, \
+        "SELECT so.status, so.store_id, s.owner_user_id, o.id AS order_id, \
          so.goods_subtotal_poisha, so.delivery_charge_poisha, \
-         o.payment_status, o.delivery_name, o.delivery_phone, \
+         o.payment_status, o.advance_required_poisha, o.advance_paid_poisha, \
+         o.delivery_name, o.delivery_phone, \
          o.delivery_address, o.delivery_zone \
          FROM sub_orders so \
          JOIN stores s ON s.id = so.store_id \
@@ -430,6 +437,19 @@ pub async fn create_shipment_for_seller(
             "sub-order must be 'confirmed' before booking a courier (currently '{}')",
             row.status
         )));
+    }
+    // Wave 17 guard: an order whose advance is still unpaid must
+    // not ship — the whole point of collecting the advance is
+    // that the parcel only moves once the buyer has money in.
+    // Confirming the sub-order stays allowed (that is how the
+    // seller signals readiness); only the courier booking waits.
+    // A flagged order (advance required but no gateway could
+    // collect it, still `pay_on_delivery`) is NOT blocked: the
+    // platform accepted that risk at checkout, visibly.
+    if row.advance_required_poisha > 0 && row.payment_status == "advance_pending" {
+        return Err(ApiError::conflict(
+            "advance payment pending for this order — the buyer must pay the advance before the parcel can ship",
+        ));
     }
     if load_shipment_for_sub_order(pool, sub_order_id)
         .await?
@@ -467,9 +487,30 @@ pub async fn create_shipment_for_seller(
 
     // The courier collects the sub-order's goods + delivery share
     // only when the order itself is pay-on-delivery; an online-paid
-    // order's parcel collects nothing.
+    // order's parcel collects nothing. Wave 17: an `advance_paid`
+    // order's parcel collects the same share NET of this
+    // sub-order's slice of the advance the buyer already paid
+    // online — the advance is allocated across the order's
+    // sub-orders in proportion to their goods + delivery shares
+    // (integer division; a sub-order never collects below zero).
     let cod_amount_poisha = if row.payment_status == "pay_on_delivery" {
         row.goods_subtotal_poisha + row.delivery_charge_poisha
+    } else if row.payment_status == "advance_paid" {
+        let sub_share = row.goods_subtotal_poisha + row.delivery_charge_poisha;
+        let order_collect_total: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(goods_subtotal_poisha + delivery_charge_poisha), 0)::bigint \
+             FROM sub_orders WHERE order_id = $1",
+        )
+        .bind(row.order_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| ApiError::internal("sum order collection shares", e))?;
+        let advance_share = if order_collect_total > 0 {
+            row.advance_paid_poisha * sub_share / order_collect_total
+        } else {
+            0
+        };
+        (sub_share - advance_share).max(0)
     } else {
         0
     };

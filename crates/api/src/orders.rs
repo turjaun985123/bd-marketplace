@@ -40,6 +40,16 @@
 //! payment amount — comes from the one discounted totals run. The
 //! redemption row and the coupon's `used_count` increment commit
 //! or roll back with the order.
+//!
+//! Wave 17: COD checkout also runs the advance decision (see the
+//! block in `place_order`): the pure domain rule over the
+//! effective policy and the buyer's risk verdict can require a
+//! partial advance, collected online through the same payments
+//! factory before any seller may ship. The receipt's cash-due
+//! figure nets out a collected advance. Cancelling an
+//! `advance_pending` order stays a plain buyer cancel — its
+//! payment row is still `pending` (no money ever moved) and is
+//! left as the audit record of the abandoned advance.
 
 use axum::{
     extract::{Path, Query, State},
@@ -49,11 +59,11 @@ use axum::{
 use chrono::{DateTime, Utc};
 use domain::{
     allocate_discount, build_order_totals, can_buyer_cancel, can_transition_sub_order,
-    compute_coupon_discount, is_valid_sub_order_status, normalize_bd_phone,
-    normalize_coupon_code, parse_delivery_zone, split_cart_by_seller,
+    compute_advance_poisha, compute_coupon_discount, is_valid_sub_order_status,
+    normalize_bd_phone, normalize_coupon_code, parse_delivery_zone, split_cart_by_seller,
     CartItem as DomainCartItem, OrderGroupInput,
 };
-use payments::{payment_adapter_for, parse_payment_method};
+use payments::{payment_adapter_for, parse_payment_method, PaymentMethod};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use std::collections::HashMap;
@@ -63,7 +73,10 @@ use crate::auth::AuthUser;
 use crate::coupons::{
     coupon_rejection_reason, eligible_subtotal_for, Coupon, GroupGoods, COUPON_COLUMNS,
 };
-use crate::payments::{insert_pending_payment, load_latest_payment_summary, PaymentSummary};
+use crate::payments::{
+    advance_gateway_available, insert_pending_payment, load_latest_payment_summary, PaymentSummary,
+};
+use crate::risk::buyer_risk_for_user;
 use crate::products::clamp_pagination;
 use crate::shipments::{load_shipment_summary_for_sub_order, ShipmentSummary};
 use crate::{ApiError, AppState};
@@ -120,7 +133,22 @@ pub struct Order {
     pub payment_method: String,
     /// `pay_on_delivery` for COD; otherwise the latest payment
     /// attempt's lifecycle (`pending`, `paid`, `failed`, `refunded`).
+    /// Wave 17 adds the COD advance states: `advance_pending`
+    /// (an advance is required and not yet collected) and
+    /// `advance_paid` (advance collected; the balance is still
+    /// due in cash on delivery).
     pub payment_status: String,
+    /// Advance this COD order must collect before shipping
+    /// (Wave 17), snapshotted at checkout from the effective
+    /// policy and the buyer's risk verdict; 0 for ordinary COD
+    /// and for all online orders. A positive value with
+    /// `payment_status = 'pay_on_delivery'` is the deliberate
+    /// degradation flag: an advance was required but no gateway
+    /// could collect it (see `place_order`).
+    pub advance_required_poisha: i64,
+    /// Advance actually collected, set ONLY by the signed
+    /// payment callback path when the advance settles (Wave 17).
+    pub advance_paid_poisha: i64,
     /// The latest payment attempt, or `None` for COD orders (which
     /// deliberately have no payment row).
     pub payment: Option<PaymentSummary>,
@@ -172,6 +200,21 @@ pub struct SellerSubOrder {
     /// The courier shipment booked for this sub-order (Wave 6), or
     /// `None` until the seller books one.
     pub shipment: Option<ShipmentSummary>,
+    /// The parent order's payment status (Wave 17 surfaces the
+    /// advance states here: `advance_pending` warns the seller
+    /// that the parcel must not ship yet — booking enforces it).
+    pub order_payment_status: String,
+    /// Advance the parent COD order must collect (Wave 17); a
+    /// positive value while `order_payment_status` is
+    /// `pay_on_delivery` means no gateway could collect it and
+    /// the order proceeded flagged (see `place_order`).
+    pub advance_required_poisha: i64,
+    /// Advance the parent order has collected (Wave 17).
+    pub advance_paid_poisha: i64,
+    /// The buyer's fraud-shield level (`low`, `medium`, `high`)
+    /// from the ONE shared risk aggregate (Wave 17) — the same
+    /// verdict checkout and the buyer-risk endpoint use.
+    pub buyer_risk_level: String,
 }
 
 /// A page of seller sub-orders plus the total count.
@@ -194,6 +237,8 @@ struct OrderRow {
     status: String,
     payment_method: String,
     payment_status: String,
+    advance_required_poisha: i64,
+    advance_paid_poisha: i64,
     delivery_name: String,
     delivery_phone: String,
     delivery_address: String,
@@ -222,6 +267,7 @@ struct SubOrderRow {
 }
 
 const ORDER_COLUMNS: &str = "id, buyer_user_id, status, payment_method, payment_status, \
+    advance_required_poisha, advance_paid_poisha, \
     delivery_name, delivery_phone, delivery_address, delivery_zone, goods_total_poisha, \
     coupon_code, discount_total_poisha, \
     delivery_total_poisha, grand_total_poisha, created_at";
@@ -317,6 +363,8 @@ pub async fn load_order(pool: &PgPool, order_id: Uuid) -> Result<Order, ApiError
         status: row.status,
         payment_method: row.payment_method,
         payment_status: row.payment_status,
+        advance_required_poisha: row.advance_required_poisha,
+        advance_paid_poisha: row.advance_paid_poisha,
         payment,
         delivery_name: row.delivery_name,
         delivery_phone: row.delivery_phone,
@@ -354,6 +402,17 @@ pub struct PlaceOrderInput {
     /// the cart stays intact.
     #[serde(default)]
     pub coupon_code: Option<String>,
+    /// The online method the buyer will pay a COD ADVANCE with
+    /// (Wave 17: bkash, nagad, sslcommerz or shurjopay). Used
+    /// only when this COD order requires an advance — the
+    /// threshold/risk policy in `place_order` decides that from
+    /// the order total and the buyer's history, so the buyer
+    /// cannot know for certain in advance; when an advance is
+    /// required, a gateway can collect it, and no method was
+    /// supplied, checkout fails with a 400 asking for one.
+    /// Ignored for online checkouts and advance-free COD orders.
+    #[serde(default)]
+    pub advance_method: Option<String>,
 }
 
 fn default_payment_method() -> String {
@@ -577,17 +636,79 @@ pub async fn place_order(
     let commission_rate_bps = crate::admin::effective_commission_bps(state).await;
     let totals = build_order_totals(&groups, zone, commission_rate_bps);
 
-    let order_payment_status = if method.is_online() {
+    // Wave 17: the COD advance decision. COD orders only — an
+    // online order prepays in full by construction. The buyer's
+    // risk verdict (the ONE shared aggregate in the `risk`
+    // module, read on the pool: it counts committed history, and
+    // this order is not written yet) can force an advance at any
+    // size; otherwise the effective threshold + rate decide via
+    // the pure domain rule.
+    //
+    // Enforcement needs a gateway that can actually collect the
+    // advance (merchant credentials present, or the DEV
+    // simulator). Three outcomes when an advance is required:
+    //
+    // a gateway can collect + a method was supplied: enforce —
+    // the order is stored `advance_pending` and the advance
+    // payment is initiated below, inside this transaction.
+    // a gateway can collect + NO method supplied: 400 — the
+    // buyer must choose how to pay the advance; the transaction
+    // drops and the cart stays intact.
+    // NO gateway can collect: deliberate degradation — the
+    // order proceeds as plain COD with `advance_required_poisha`
+    // recorded on it as a visible risk flag (seller surfaces
+    // warn that no advance was taken). Nothing claims money was
+    // collected: there is no payment row and `advance_paid`
+    // stays 0. This is a safety valve for a platform whose
+    // gateways are not live yet, not a fake success.
+    let mut advance_required_poisha: i64 = 0;
+    let mut advance_payment_method: Option<PaymentMethod> = None;
+    let mut order_payment_status = if method.is_online() {
         "pending"
     } else {
         "pay_on_delivery"
     };
+    if !method.is_online() {
+        let report = buyer_risk_for_user(pool, user.user_id).await?;
+        let advance = compute_advance_poisha(
+            totals.grand_total_poisha,
+            crate::admin::effective_advance_bps(state).await,
+            crate::admin::effective_advance_threshold(state).await,
+            report.risk.requires_advance,
+        );
+        if advance > 0 {
+            advance_required_poisha = advance;
+            if advance_gateway_available(&state.payments_config) {
+                let raw_method = input
+                    .advance_method
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        ApiError::bad_request(format!(
+                            "this order requires an advance payment of {advance} poisha \
+                             before it can ship — choose an advance payment method \
+                             (advance_method: bkash, nagad, sslcommerz or shurjopay)"
+                        ))
+                    })?;
+                let parsed = parse_payment_method(raw_method).filter(|m| m.is_online());
+                let parsed = parsed.ok_or_else(|| {
+                    ApiError::bad_request(
+                        "advance_method must be one of: bkash, nagad, sslcommerz, shurjopay",
+                    )
+                })?;
+                advance_payment_method = Some(parsed);
+                order_payment_status = "advance_pending";
+            }
+        }
+    }
+
     let order_id: Uuid = sqlx::query_scalar(
         "INSERT INTO orders (buyer_user_id, payment_method, payment_status, \
          delivery_name, delivery_phone, delivery_address, delivery_zone, \
          goods_total_poisha, delivery_total_poisha, grand_total_poisha, \
-         coupon_code, discount_total_poisha) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id",
+         coupon_code, discount_total_poisha, advance_required_poisha) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id",
     )
     .bind(user.user_id)
     .bind(method.as_str())
@@ -601,6 +722,7 @@ pub async fn place_order(
     .bind(totals.grand_total_poisha)
     .bind(applied_coupon.as_ref().map(|coupon| coupon.code.clone()))
     .bind(totals.discount_total_poisha)
+    .bind(advance_required_poisha)
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| ApiError::internal("insert order", e))?;
@@ -631,6 +753,42 @@ pub async fn place_order(
             order_id,
             method.as_str(),
             totals.grand_total_poisha,
+            &intent.reference,
+        )
+        .await?;
+    }
+
+    // Wave 17: an enforced COD advance is initiated exactly like
+    // an online payment — same factory, same pending-row writer —
+    // except the amount is the ADVANCE, not the grand total, and
+    // the order row keeps payment_method 'cod' (only the payment
+    // row carries the advance method). An adapter that cannot
+    // take it (for example, the buyer picked a gateway with no
+    // credentials while another gateway is configured) errors
+    // here: 503, the transaction rolls back, cart intact — the
+    // same honesty rule as online checkout. Settlement arrives
+    // later through the shared callback in the payments module,
+    // which recognises the advance amount and moves the order to
+    // `advance_paid`, never `paid`.
+    if let Some(advance_method) = advance_payment_method {
+        let adapter = payment_adapter_for(advance_method, &state.payments_config);
+        let intent = payments::PaymentAdapter::initiate(
+            &*adapter,
+            &order_id.to_string(),
+            advance_required_poisha,
+        )
+        .await
+        .map_err(|e| {
+            ApiError::service_unavailable(format!(
+                "advance payment method '{}' is not available yet ({e})",
+                advance_method.as_str()
+            ))
+        })?;
+        insert_pending_payment(
+            &mut tx,
+            order_id,
+            advance_method.as_str(),
+            advance_required_poisha,
             &intent.reference,
         )
         .await?;
@@ -925,12 +1083,22 @@ pub struct Receipt {
     pub status: String,
     pub payment_method: String,
     /// The order's payment lifecycle: `pay_on_delivery` for COD,
-    /// otherwise `pending`, `paid`, `failed` or `refunded` (Wave 5).
+    /// otherwise `pending`, `paid`, `failed` or `refunded` (Wave 5);
+    /// Wave 17 adds `advance_pending` / `advance_paid` for COD
+    /// orders with an advance.
     pub payment_status: String,
-    /// Amount the buyer hands over on delivery: the grand total for
-    /// COD orders, zero for online orders (a paid online order has
-    /// nothing due; a pending one is settled online, not in cash).
+    /// Amount the buyer hands over on delivery: the grand total
+    /// minus any advance already collected, for COD orders; zero
+    /// for online orders (a paid online order has nothing due; a
+    /// pending one is settled online, not in cash). With no
+    /// advance this is exactly the Wave 4 behaviour.
     pub cod_amount_due_poisha: i64,
+    /// The advance this COD order required at checkout (Wave 17;
+    /// 0 when none did — including every online order).
+    pub advance_required_poisha: i64,
+    /// The advance actually collected online (Wave 17), set only
+    /// when the advance payment settled.
+    pub advance_paid_poisha: i64,
     pub delivery: ReceiptDelivery,
     pub sub_orders: Vec<ReceiptSubOrder>,
     pub goods_total_poisha: i64,
@@ -971,10 +1139,16 @@ pub fn build_receipt(order: &Order, store_names: &HashMap<Uuid, String>) -> Rece
         payment_method: order.payment_method.clone(),
         payment_status: order.payment_status.clone(),
         cod_amount_due_poisha: if order.payment_method == "cod" {
-            order.grand_total_poisha
+            // Wave 17: a collected advance is money the buyer has
+            // already paid — the courier collects only the rest.
+            // `advance_paid_poisha` is 0 unless the advance
+            // settled, so advance-free receipts are unchanged.
+            order.grand_total_poisha - order.advance_paid_poisha
         } else {
             0
         },
+        advance_required_poisha: order.advance_required_poisha,
+        advance_paid_poisha: order.advance_paid_poisha,
         delivery: ReceiptDelivery {
             name: order.delivery_name.clone(),
             phone: order.delivery_phone.clone(),
@@ -1033,6 +1207,10 @@ struct SellerSubOrderRow {
     delivery_phone: String,
     delivery_address: String,
     delivery_zone: String,
+    buyer_user_id: Uuid,
+    order_payment_status: String,
+    advance_required_poisha: i64,
+    advance_paid_poisha: i64,
 }
 
 /// Sub-orders belonging to stores the caller owns, newest first.
@@ -1058,7 +1236,9 @@ pub async fn list_seller_sub_orders(
         "SELECT so.id, so.order_id, so.store_id, s.slug AS store_slug, so.status, \
          so.goods_subtotal_poisha, so.discount_poisha, so.delivery_charge_poisha, so.commission_poisha, \
          so.seller_payout_poisha, so.created_at, \
-         o.delivery_name, o.delivery_phone, o.delivery_address, o.delivery_zone \
+         o.delivery_name, o.delivery_phone, o.delivery_address, o.delivery_zone, \
+         o.buyer_user_id, o.payment_status AS order_payment_status, \
+         o.advance_required_poisha, o.advance_paid_poisha \
          FROM sub_orders so \
          JOIN stores s ON s.id = so.store_id \
          JOIN orders o ON o.id = so.order_id \
@@ -1076,6 +1256,16 @@ pub async fn list_seller_sub_orders(
     for row in rows {
         let order_items = load_order_items(pool, row.id).await?;
         let shipment = load_shipment_summary_for_sub_order(pool, row.id).await?;
+        // Wave 17: the buyer's risk level, from the ONE shared
+        // aggregate — one call per listed sub-order (pages are
+        // small; correctness over micro-optimisation, and the
+        // verdict is by construction the same one checkout used).
+        let buyer_risk_level = buyer_risk_for_user(pool, row.buyer_user_id)
+            .await?
+            .risk
+            .level
+            .as_str()
+            .to_string();
         items.push(SellerSubOrder {
             id: row.id,
             order_id: row.order_id,
@@ -1094,6 +1284,10 @@ pub async fn list_seller_sub_orders(
             delivery_zone: row.delivery_zone,
             items: order_items,
             shipment,
+            order_payment_status: row.order_payment_status,
+            advance_required_poisha: row.advance_required_poisha,
+            advance_paid_poisha: row.advance_paid_poisha,
+            buyer_risk_level,
         });
     }
     Ok(SellerSubOrderList {

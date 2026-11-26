@@ -1092,6 +1092,162 @@ pub fn parse_setting_i64(raw: &str) -> Option<i64> {
     raw.trim().parse::<i64>().ok()
 }
 
+/// The `platform_settings` key for the COD advance percentage
+/// override (Wave 17). When a row with this key holds a valid
+/// value, it beats the startup `ADVANCE_PERCENT_BPS` at checkout.
+pub const ADVANCE_PERCENT_BPS_KEY: &str = "advance_percent_bps";
+
+/// The `platform_settings` key for the COD advance threshold
+/// override (Wave 17). When a row with this key holds a valid
+/// value, it beats the startup `ADVANCE_THRESHOLD_POISHA` at
+/// checkout. A threshold of 0 disables threshold-based advances
+/// (risk-forced advances still apply).
+pub const ADVANCE_THRESHOLD_KEY: &str = "advance_threshold_poisha";
+
+/// Is `bps` a legal COD advance rate, in basis points? The full
+/// range is legal: 0 means "no advance is ever taken" (a
+/// legitimate platform decision), and 10,000 means the buyer
+/// prepays the whole order (at which point it is barely COD any
+/// more, but it is still the platform's call). Anything outside
+/// 0..=10,000 is a data-entry error. The same rule gates the
+/// admin settings endpoint and the read-back of a stored
+/// setting, so an out-of-range row is ignored rather than
+/// applied.
+pub fn validate_advance_bps(bps: i64) -> bool {
+    (0..=10_000).contains(&bps)
+}
+
+/// Is `threshold` a legal COD advance threshold, in poisha? Any
+/// non-negative amount is legal — including 0, which disables
+/// threshold-based advances. A negative threshold is meaningless
+/// and rejected.
+pub fn validate_advance_threshold(threshold_poisha: i64) -> bool {
+    threshold_poisha >= 0
+}
+
+/// How much advance (prepayment) a COD order must collect before
+/// it ships, in poisha. The pure money rule for Wave 17:
+///
+/// The advance is `bps` basis points of the order's grand total,
+/// rounded UP (a partial poisha of advance is collected whole).
+/// It applies only when the order reaches the threshold — a
+/// grand total strictly below `threshold_poisha` needs no
+/// advance — unless `force` is set (the buyer's risk profile
+/// demands an advance regardless of size, see
+/// [`assess_buyer_risk`]). A threshold of 0 disables the
+/// threshold rule entirely (only forced advances remain), and a
+/// rate of 0 disables advances altogether. The result never
+/// exceeds the grand total and is never negative.
+pub fn compute_advance_poisha(
+    grand_total_poisha: i64,
+    bps: u32,
+    threshold_poisha: i64,
+    force: bool,
+) -> i64 {
+    if grand_total_poisha <= 0 || bps == 0 {
+        return 0;
+    }
+    if !force && (threshold_poisha <= 0 || grand_total_poisha < threshold_poisha) {
+        return 0;
+    }
+    // Ceiling division in i128 so a large total times a large
+    // rate cannot overflow before the division.
+    let advance = (i128::from(grand_total_poisha) * i128::from(bps) + 9_999) / 10_000;
+    advance.min(i128::from(grand_total_poisha)) as i64
+}
+
+/// A buyer's platform track record, counted over their orders
+/// and sub-orders. The single input shape for
+/// [`assess_buyer_risk`]: the API aggregates these counts in one
+/// query, and the pure rule below decides what they mean — the
+/// SQL never embeds the risk policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BuyerRiskInputs {
+    /// Every order the buyer has placed.
+    pub total_orders: i64,
+    /// Sub-orders that reached the buyer (`delivered`).
+    pub delivered: i64,
+    /// Sub-orders that came back (`returned`: courier RTO or a
+    /// received buyer return).
+    pub returned_rto: i64,
+    /// Sub-orders cancelled as part of a buyer-cancelled order.
+    /// (A seller cancelling one sub-order of a live order does
+    /// not count against the buyer.)
+    pub buyer_cancelled: i64,
+}
+
+/// How risky a buyer looks to the COD fraud shield.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuyerRiskLevel {
+    Low,
+    Medium,
+    High,
+}
+
+impl BuyerRiskLevel {
+    /// The snake_case string the API returns and the web app
+    /// renders (`low`, `medium`, `high`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BuyerRiskLevel::Low => "low",
+            BuyerRiskLevel::Medium => "medium",
+            BuyerRiskLevel::High => "high",
+        }
+    }
+}
+
+/// The fraud shield's verdict for one buyer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuyerRisk {
+    pub level: BuyerRiskLevel,
+    /// True when every COD order from this buyer must collect
+    /// an advance, whatever its size.
+    pub requires_advance: bool,
+    /// Returned share of completed sub-orders (delivered +
+    /// returned), in basis points; 0 when nothing completed.
+    pub return_rate_bps: i64,
+}
+
+/// Assess a buyer from their track record. The rules, in order:
+///
+/// `requires_advance` is set when the buyer has at least 2
+/// returned sub-orders AND returns make up at least half of
+/// their completed sub-orders (delivered + returned) — a
+/// pattern of ordering with no intention to accept delivery.
+///
+/// The level is `High` when an advance is required, or when the
+/// buyer has placed at least 3 orders without a single delivery
+/// while racking up at least 2 cancellations/returns (nothing
+/// they order ever arrives, by their own doing). It is `Medium`
+/// when any return or buyer cancellation exists at all, and
+/// `Low` otherwise — a clean record, including a brand-new
+/// buyer's empty one.
+pub fn assess_buyer_risk(inputs: BuyerRiskInputs) -> BuyerRisk {
+    let completed = inputs.delivered + inputs.returned_rto;
+    let return_rate_bps = if completed > 0 {
+        inputs.returned_rto * 10_000 / completed
+    } else {
+        0
+    };
+    let requires_advance = inputs.returned_rto >= 2 && return_rate_bps >= 5_000;
+    let level = if requires_advance
+        || (inputs.total_orders >= 3
+            && inputs.delivered == 0
+            && inputs.buyer_cancelled + inputs.returned_rto >= 2)
+    {
+        BuyerRiskLevel::High
+    } else if inputs.returned_rto > 0 || inputs.buyer_cancelled > 0 {
+        BuyerRiskLevel::Medium
+    } else {
+        BuyerRiskLevel::Low
+    };
+    BuyerRisk {
+        level,
+        requires_advance,
+        return_rate_bps,
+    }
+}
+
 /// Maximum length of a conversation message body, in characters.
 pub const MAX_MESSAGE_BODY_CHARS: usize = 2_000;
 
@@ -2768,6 +2924,156 @@ mod tests {
         // The setting keys are the contract with the settings table.
         assert_eq!(COMMISSION_BPS_KEY, "commission_bps");
         assert_eq!(MIN_PAYOUT_KEY, "min_payout_poisha");
+        assert_eq!(ADVANCE_PERCENT_BPS_KEY, "advance_percent_bps");
+        assert_eq!(ADVANCE_THRESHOLD_KEY, "advance_threshold_poisha");
+    }
+
+    #[test]
+    fn advance_setting_validators_cover_the_legal_ranges() {
+        assert!(validate_advance_bps(0));
+        assert!(validate_advance_bps(2_000));
+        assert!(validate_advance_bps(10_000));
+        assert!(!validate_advance_bps(10_001));
+        assert!(!validate_advance_bps(-1));
+
+        assert!(validate_advance_threshold(0));
+        assert!(validate_advance_threshold(200_000));
+        assert!(!validate_advance_threshold(-1));
+    }
+
+    #[test]
+    fn advance_math_thresholds_ceil_and_caps() {
+        // Below the threshold: no advance.
+        assert_eq!(compute_advance_poisha(106_000, 2_000, 200_000, false), 0);
+        assert_eq!(compute_advance_poisha(199_999, 2_000, 200_000, false), 0);
+        // Exactly AT the threshold the advance applies.
+        assert_eq!(
+            compute_advance_poisha(200_000, 2_000, 200_000, false),
+            40_000
+        );
+        // The Wave 17 worked example: 20% of 206,000.
+        assert_eq!(
+            compute_advance_poisha(206_000, 2_000, 200_000, false),
+            41_200
+        );
+        // Ceiling: a fractional poisha of advance is collected whole.
+        assert_eq!(compute_advance_poisha(101, 2_000, 100, false), 21);
+        assert_eq!(compute_advance_poisha(100_001, 3_333, 1, false), 33_331);
+        // Threshold 0 disables the threshold rule (not forced).
+        assert_eq!(compute_advance_poisha(500_000, 2_000, 0, false), 0);
+        // Rate 0 disables advances entirely, even forced.
+        assert_eq!(compute_advance_poisha(500_000, 0, 200_000, true), 0);
+        // Forced: the threshold is ignored, small orders included.
+        assert_eq!(compute_advance_poisha(50_000, 2_000, 200_000, true), 10_000);
+        assert_eq!(compute_advance_poisha(50_000, 2_000, 0, true), 10_000);
+        // A 100% rate takes the whole total, never more.
+        assert_eq!(
+            compute_advance_poisha(123_456, 10_000, 1, false),
+            123_456
+        );
+        // Nothing to advance on an empty total.
+        assert_eq!(compute_advance_poisha(0, 2_000, 0, true), 0);
+    }
+
+    #[test]
+    fn buyer_risk_rules_cover_each_branch() {
+        // A brand-new buyer: clean, low, no forced advance.
+        let risk = assess_buyer_risk(BuyerRiskInputs::default());
+        assert_eq!(risk.level, BuyerRiskLevel::Low);
+        assert!(!risk.requires_advance);
+        assert_eq!(risk.return_rate_bps, 0);
+
+        // A happy buyer with deliveries only stays low.
+        let risk = assess_buyer_risk(BuyerRiskInputs {
+            total_orders: 5,
+            delivered: 5,
+            returned_rto: 0,
+            buyer_cancelled: 0,
+        });
+        assert_eq!(risk.level, BuyerRiskLevel::Low);
+
+        // One return: medium, but no forced advance.
+        let risk = assess_buyer_risk(BuyerRiskInputs {
+            total_orders: 3,
+            delivered: 2,
+            returned_rto: 1,
+            buyer_cancelled: 0,
+        });
+        assert_eq!(risk.level, BuyerRiskLevel::Medium);
+        assert!(!risk.requires_advance);
+        assert_eq!(risk.return_rate_bps, 3_333);
+
+        // One buyer cancellation alone is also just medium.
+        let risk = assess_buyer_risk(BuyerRiskInputs {
+            total_orders: 2,
+            delivered: 1,
+            returned_rto: 0,
+            buyer_cancelled: 1,
+        });
+        assert_eq!(risk.level, BuyerRiskLevel::Medium);
+        assert!(!risk.requires_advance);
+
+        // Two returns but a minority of completions (2 of 6):
+        // medium, still no forced advance.
+        let risk = assess_buyer_risk(BuyerRiskInputs {
+            total_orders: 6,
+            delivered: 4,
+            returned_rto: 2,
+            buyer_cancelled: 0,
+        });
+        assert_eq!(risk.level, BuyerRiskLevel::Medium);
+        assert!(!risk.requires_advance);
+        assert_eq!(risk.return_rate_bps, 3_333);
+
+        // Two returns at exactly half of completions: the shield
+        // forces an advance and the level is high.
+        let risk = assess_buyer_risk(BuyerRiskInputs {
+            total_orders: 4,
+            delivered: 2,
+            returned_rto: 2,
+            buyer_cancelled: 0,
+        });
+        assert!(risk.requires_advance);
+        assert_eq!(risk.level, BuyerRiskLevel::High);
+        assert_eq!(risk.return_rate_bps, 5_000);
+
+        // All returns, no deliveries: forced advance, high.
+        let risk = assess_buyer_risk(BuyerRiskInputs {
+            total_orders: 2,
+            delivered: 0,
+            returned_rto: 2,
+            buyer_cancelled: 0,
+        });
+        assert!(risk.requires_advance);
+        assert_eq!(risk.level, BuyerRiskLevel::High);
+        assert_eq!(risk.return_rate_bps, 10_000);
+
+        // Three orders, nothing ever delivered, two buyer
+        // cancellations: high even though no advance is forced
+        // (no returns at all).
+        let risk = assess_buyer_risk(BuyerRiskInputs {
+            total_orders: 3,
+            delivered: 0,
+            returned_rto: 0,
+            buyer_cancelled: 2,
+        });
+        assert_eq!(risk.level, BuyerRiskLevel::High);
+        assert!(!risk.requires_advance);
+
+        // The same shape with only two orders stays medium — the
+        // never-delivered rule needs the 3-order history.
+        let risk = assess_buyer_risk(BuyerRiskInputs {
+            total_orders: 2,
+            delivered: 0,
+            returned_rto: 0,
+            buyer_cancelled: 2,
+        });
+        assert_eq!(risk.level, BuyerRiskLevel::Medium);
+
+        // Level strings are the API contract.
+        assert_eq!(BuyerRiskLevel::Low.as_str(), "low");
+        assert_eq!(BuyerRiskLevel::Medium.as_str(), "medium");
+        assert_eq!(BuyerRiskLevel::High.as_str(), "high");
     }
 
     #[test]

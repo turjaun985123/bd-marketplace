@@ -156,6 +156,21 @@ export default function OrderReceiptPage({
           <strong>
             <PriceTag amountPoisha={receipt.grand_total_poisha} />
           </strong>
+          {receipt.advance_required_poisha > 0 && (
+            <>
+              <br />
+              অগ্রিম: <PriceTag amountPoisha={receipt.advance_required_poisha} />
+              {receipt.advance_paid_poisha > 0 ? (
+                <>
+                  {" "}
+                  (পরিশোধিত:{" "}
+                  <PriceTag amountPoisha={receipt.advance_paid_poisha} />)
+                </>
+              ) : (
+                " (এখনো পরিশোধ হয়নি)"
+              )}
+            </>
+          )}
         </p>
         {receipt.cod_amount_due_poisha > 0 && (
           <p>

@@ -9,6 +9,7 @@ import {
   getCouriers,
   listSellerSubOrders,
   refreshShipment,
+  riskLevelLabel,
   shipmentStatusLabel,
   updateSubOrderStatus,
   type CourierEstimates,
@@ -227,6 +228,34 @@ export default function SellerOrdersPage() {
             <p>
               ডেলিভারি: {sub.delivery_name}, {sub.delivery_phone},{" "}
               {sub.delivery_address} ({sub.delivery_zone})
+            </p>
+            <p>
+              ক্রেতার ঝুঁকি:{" "}
+              <strong>{riskLevelLabel(sub.buyer_risk_level)}</strong> (
+              {sub.buyer_risk_level})
+              {sub.order_payment_status === "advance_paid" && (
+                <>
+                  {" "}
+                  · অগ্রিম পরিশোধিত:{" "}
+                  <PriceTag amountPoisha={sub.advance_paid_poisha} />
+                </>
+              )}
+              {sub.order_payment_status === "advance_pending" && (
+                <>
+                  {" "}
+                  · <strong>অগ্রিম বাকি আছে</strong> (
+                  <PriceTag amountPoisha={sub.advance_required_poisha} />)
+                  — ক্রেতা অগ্রিম না দিলে কুরিয়ার বুক করা যাবে না।
+                </>
+              )}
+              {sub.advance_required_poisha > 0 &&
+                sub.order_payment_status === "pay_on_delivery" && (
+                  <>
+                    {" "}
+                    · অগ্রিম নেওয়া হয়নি (কোনো গেটওয়ে চালু নেই) —
+                    অর্ডারটি ঝুঁকিসহ এগিয়েছে।
+                  </>
+                )}
             </p>
             {sub.shipment ? (
               <p>

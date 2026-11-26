@@ -5,11 +5,13 @@ import Link from "next/link";
 import PriceTag from "@/components/PriceTag";
 import {
   devSimulateSuccess,
+  getAdvancePolicy,
   getOrder,
   getPaymentMethods,
   paymentStatusLabel,
   placeOrder,
   previewCoupon,
+  type AdvancePolicy,
   type CartItem,
   type CouponPreview,
   type Order,
@@ -89,6 +91,16 @@ function groupByStore(items: CartItem[]): SellerGroup[] {
  * store's goods share, which only the cart knows) and shown as a
  * discount line; the code rides along with the order and checkout
  * re-validates it — the checkout response remains the authority.
+ *
+ * Wave 17: a COD order at/above the platform threshold (from
+ * GET /v1/payments/advance-policy) may need a partial advance,
+ * so the page warns early and offers an advance-method picker;
+ * a buyer whose history forces an advance cannot be previewed,
+ * so when checkout answers its advance 400 the picker appears
+ * and the buyer simply places the order again with a method.
+ * The success screen then walks the buyer through paying the
+ * advance (the Wave 5 simulate block, reused) before anything
+ * ships.
  */
 export default function CheckoutPage() {
   const { ready, token } = useAuth();
@@ -113,6 +125,13 @@ export default function CheckoutPage() {
   const [couponCode, setCouponCode] = useState("");
   const [coupon, setCoupon] = useState<CouponPreview | null>(null);
   const [applyingCoupon, setApplyingCoupon] = useState(false);
+  // Advance (Wave 17): the public policy, the buyer's chosen
+  // advance method, and whether checkout has told us an advance
+  // method is required (its 400) so the picker must show even
+  // when the preview total is below the threshold.
+  const [policy, setPolicy] = useState<AdvancePolicy | null>(null);
+  const [advanceMethod, setAdvanceMethod] = useState("bkash");
+  const [advanceRequired, setAdvanceRequired] = useState(false);
 
   const groups = useMemo(() => groupByStore(items), [items]);
 
@@ -157,11 +176,43 @@ export default function CheckoutPage() {
     };
   }, []);
 
+  // Load the COD advance policy once (public endpoint).
+  useEffect(() => {
+    let cancelled = false;
+    getAdvancePolicy()
+      .then((loaded) => {
+        if (!cancelled) setPolicy(loaded);
+      })
+      .catch(() => {
+        // No policy: no early warning; the server still decides
+        // at order time and its answer drives the picker.
+        if (!cancelled) setPolicy(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const previewDelivery = groups.reduce(
     (sum, g) => sum + (charges[g.storeSlug] ?? 0),
     0
   );
   const previewKnown = groups.every((g) => charges[g.storeSlug] != null);
+
+  // The grand total the advance threshold is measured against:
+  // goods minus a valid coupon's discount, plus delivery.
+  const previewGrand =
+    goodsTotalPoisha - (coupon?.valid ? coupon.discount_poisha : 0) + previewDelivery;
+  // Show the advance picker when the preview says an advance is
+  // likely (COD + threshold reached) or checkout already asked
+  // for a method (a risk-forced advance below the threshold).
+  const showAdvancePicker =
+    method === "cod" &&
+    (advanceRequired ||
+      (policy !== null &&
+        policy.threshold_poisha > 0 &&
+        previewKnown &&
+        previewGrand >= policy.threshold_poisha));
 
   // A coupon preview is priced against the cart it was applied to;
   // when the cart's goods total changes, the preview is stale.
@@ -216,11 +267,23 @@ export default function CheckoutPage() {
         // Only a preview-valid code is sent; checkout re-checks it
         // and its response is the final authority either way.
         coupon_code: coupon?.valid ? coupon.code : undefined,
+        // The advance method rides along whenever the picker is
+        // shown for a COD order; the server ignores it when no
+        // advance is required.
+        advance_method:
+          method === "cod" && showAdvancePicker ? advanceMethod : undefined,
       });
       setPlaced(order);
       await refresh(); // the server cleared the cart
     } catch (err) {
-      setError(err instanceof Error ? err.message : "অর্ডার করা যায়নি।");
+      const message = err instanceof Error ? err.message : "অর্ডার করা যায়নি।";
+      // Wave 17: checkout's advance 400 is the signal to show the
+      // advance-method picker — the cart is intact, so the buyer
+      // picks a method below and places the order again.
+      if (message.toLowerCase().includes("advance")) {
+        setAdvanceRequired(true);
+      }
+      setError(message);
     } finally {
       setPlacing(false);
     }
@@ -295,8 +358,49 @@ export default function CheckoutPage() {
           {placed.payment_status === "pay_on_delivery" &&
             " (ডেলিভারির সময় পরিশোধ করতে হবে)"}
         </p>
+        {placed.advance_required_poisha > 0 && (
+          <p>
+            অগ্রিম:{" "}
+            <PriceTag amountPoisha={placed.advance_required_poisha} />
+            {placed.advance_paid_poisha > 0 ? (
+              <>
+                {" "}
+                — পরিশোধিত:{" "}
+                <PriceTag amountPoisha={placed.advance_paid_poisha} /> ·
+                ডেলিভারিতে বাকি:{" "}
+                <strong>
+                  <PriceTag
+                    amountPoisha={
+                      placed.grand_total_poisha - placed.advance_paid_poisha
+                    }
+                  />
+                </strong>
+              </>
+            ) : placed.payment_status === "pay_on_delivery" ? (
+              " — কোনো পেমেন্ট গেটওয়ে চালু না থাকায় অগ্রিম নেওয়া হয়নি; পুরো টাকা ডেলিভারির সময় দিতে হবে। (No gateway is live yet, so no advance was collected.)"
+            ) : (
+              " — এখনো পরিশোধ হয়নি।"
+            )}
+          </p>
+        )}
+        {placed.payment_status === "advance_pending" && (
+          <article className="card">
+            <h3>অগ্রিম পরিশোধ করুন — Pay the advance</h3>
+            <p>
+              এই অর্ডারটি পাঠানোর আগে অগ্রিম{" "}
+              <PriceTag amountPoisha={placed.advance_required_poisha} />{" "}
+              পরিশোধ করতে হবে
+              {placed.payment
+                ? ` (${METHOD_LABELS[placed.payment.method] ?? placed.payment.method} দিয়ে)`
+                : ""}
+              । অগ্রিম পরিশোধ হলেই বিক্রেতা কুরিয়ার বুক করতে পারবেন;
+              বাকি টাকা ডেলিভারির সময় দিতে হবে।
+            </p>
+          </article>
+        )}
         {error && <p role="alert">{error}</p>}
-        {placed.payment_status === "pending" &&
+        {(placed.payment_status === "pending" ||
+          placed.payment_status === "advance_pending") &&
           placed.payment?.dev_redirect_url && (
             <article className="card">
               <h3>ডেভ মোড (পরীক্ষামূলক) — DEV payment simulator</h3>
@@ -504,6 +608,50 @@ export default function CheckoutPage() {
                     " — ডেভ মোড (পরীক্ষামূলক)"}
                 </label>
               ))
+            )}
+
+            {method === "cod" &&
+              policy !== null &&
+              policy.threshold_poisha > 0 &&
+              previewKnown &&
+              previewGrand >= policy.threshold_poisha && (
+                <p>
+                  এই অর্ডারের মোট{" "}
+                  <PriceTag amountPoisha={policy.threshold_poisha} /> বা তার
+                  বেশি — COD অর্ডারে {policy.percent_bps / 100}% অগ্রিম
+                  লাগতে পারে। সার্ভারই চূড়ান্ত সিদ্ধান্ত নেয় (আপনার
+                  আগের অর্ডারের ইতিহাসও দেখা হয়)। (Orders at or above
+                  the threshold may need a {policy.percent_bps / 100}%
+                  advance; the server decides.)
+                </p>
+              )}
+            {showAdvancePicker && (
+              <>
+                <h3>অগ্রিম পেমেন্টের মাধ্যম — Advance payment method</h3>
+                <p>
+                  এই অর্ডারে অগ্রিম লাগবে — কোন মাধ্যমে অগ্রিম দেবেন
+                  বেছে নিন। অগ্রিম ছাড়া অর্ডার পাঠানো যাবে না।
+                </p>
+                {(methods ?? [])
+                  .filter((info) => info.method !== "cod")
+                  .map((info) => (
+                    <label key={info.method}>
+                      <input
+                        type="radio"
+                        name="advance-method"
+                        value={info.method}
+                        disabled={!info.available}
+                        checked={advanceMethod === info.method}
+                        onChange={() => setAdvanceMethod(info.method)}
+                      />{" "}
+                      {METHOD_LABELS[info.method] ?? info.method}
+                      {!info.available && " — এখনো চালু হয়নি"}
+                      {info.available &&
+                        info.mode === "dev" &&
+                        " — ডেভ মোড (পরীক্ষামূলক)"}
+                    </label>
+                  ))}
+              </>
             )}
 
             <p>

@@ -79,6 +79,19 @@
 //! no gateway refund API is wired), and the RTO fix: a
 //! courier-driven return applied by shipment refresh now
 //! restocks the sub-order's items in the same transaction.
+//! Wave 17: partial advance for COD + the COD fraud shield
+//! (`risk` module, checkout in `orders`, a branch in the shared
+//! payment callback) — a COD order at/above the platform
+//! threshold (default 2,000 taka) or from a buyer whose return
+//! history trips the pure domain shield must collect a
+//! percentage advance (default 20%) online before any seller
+//! may ship; the advance settles through the same signed
+//! callback as a full payment, moving the order to
+//! `advance_paid` (the balance stays COD). When NO gateway can
+//! collect an advance (none configured, dev mode off), checkout
+//! deliberately degrades: the order proceeds as plain COD with
+//! the required advance recorded on it as a visible risk flag
+//! — never a claim that money was collected.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -101,6 +114,7 @@ pub mod payouts;
 pub mod products;
 pub mod returns;
 pub mod reviews;
+pub mod risk;
 pub mod search;
 pub mod shipments;
 pub mod stores;
@@ -141,6 +155,19 @@ pub struct AppState {
     /// function, and an admin-set platform setting (Wave 10) wins
     /// over this value.
     pub commission_rate_bps: u32,
+    /// COD advance rate in basis points (2,000 = 20%), read once
+    /// at startup from `ADVANCE_PERCENT_BPS` (see `from_env`).
+    /// This is the FALLBACK rate: checkout asks
+    /// `admin::effective_advance_bps` for the rate to use, and an
+    /// admin-set platform setting (Wave 17) wins over this value.
+    pub advance_percent_bps: u32,
+    /// COD advance threshold in poisha (200,000 = 2,000 taka),
+    /// read once at startup from `ADVANCE_THRESHOLD_POISHA`. A
+    /// COD order at or above this grand total must collect an
+    /// advance before shipping; 0 disables threshold-based
+    /// advances (risk-forced advances still apply). The FALLBACK
+    /// value: `admin::effective_advance_threshold` wins over it.
+    pub advance_threshold_poisha: i64,
     /// Payment configuration (Wave 5): the DEV simulator switch and
     /// secret, plus one merchant credential set per gateway. Built
     /// from the environment in `from_env`; tests set it explicitly
@@ -206,6 +233,13 @@ impl FacebookConfig {
 /// Default commission rate: 8% (matches the MVP plan's worked example).
 pub const DEFAULT_COMMISSION_RATE_BPS: u32 = 800;
 
+/// Default COD advance rate: 20% of the grand total (Wave 17).
+pub const DEFAULT_ADVANCE_PERCENT_BPS: u32 = 2_000;
+
+/// Default COD advance threshold: 2,000 taka (Wave 17). COD orders
+/// at or above this grand total collect an advance before shipping.
+pub const DEFAULT_ADVANCE_THRESHOLD_POISHA: i64 = 200_000;
+
 impl AppState {
     pub fn new(pool: Option<PgPool>, jwt_secret: String, sms_dev_mode: bool) -> Self {
         AppState {
@@ -213,6 +247,8 @@ impl AppState {
             jwt_secret,
             sms_dev_mode,
             commission_rate_bps: DEFAULT_COMMISSION_RATE_BPS,
+            advance_percent_bps: DEFAULT_ADVANCE_PERCENT_BPS,
+            advance_threshold_poisha: DEFAULT_ADVANCE_THRESHOLD_POISHA,
             payments_config: PaymentsConfig::default(),
             couriers_config: CouriersConfig::default(),
             facebook_config: FacebookConfig::default(),
@@ -277,6 +313,33 @@ impl AppState {
                 _ => eprintln!(
                     "WARNING: COMMISSION_RATE_BPS='{raw}' is invalid — \
                      using the default {DEFAULT_COMMISSION_RATE_BPS} bps"
+                ),
+            }
+        }
+        // ADVANCE_PERCENT_BPS / ADVANCE_THRESHOLD_POISHA are read
+        // once, here at startup, under the same discipline as the
+        // commission rate: invalid or out-of-range values keep the
+        // default rather than breaking checkout maths later. Admin
+        // platform settings (Wave 17) override both at read time.
+        if let Ok(raw) = std::env::var("ADVANCE_PERCENT_BPS") {
+            match raw.parse::<i64>() {
+                Ok(rate) if domain::validate_advance_bps(rate) => {
+                    state.advance_percent_bps = rate as u32
+                }
+                _ => eprintln!(
+                    "WARNING: ADVANCE_PERCENT_BPS='{raw}' is invalid — \
+                     using the default {DEFAULT_ADVANCE_PERCENT_BPS} bps"
+                ),
+            }
+        }
+        if let Ok(raw) = std::env::var("ADVANCE_THRESHOLD_POISHA") {
+            match raw.parse::<i64>() {
+                Ok(threshold) if domain::validate_advance_threshold(threshold) => {
+                    state.advance_threshold_poisha = threshold
+                }
+                _ => eprintln!(
+                    "WARNING: ADVANCE_THRESHOLD_POISHA='{raw}' is invalid — \
+                     using the default {DEFAULT_ADVANCE_THRESHOLD_POISHA} poisha"
                 ),
             }
         }
@@ -654,6 +717,13 @@ pub fn build_app(state: AppState) -> Router {
         // Wave 5 — payments: availability, gateway webhook, retry,
         // and the dev simulator helper (404s when dev mode is off).
         .route("/v1/payments/methods", get(payments::list_methods))
+        // Wave 17 — the public COD advance policy (effective
+        // percent + threshold), so checkout can warn the buyer
+        // before the server decides.
+        .route(
+            "/v1/payments/advance-policy",
+            get(payments::advance_policy),
+        )
         .route("/v1/payments/webhook/:method", post(payments::webhook))
         .route("/v1/payments/:id/retry", post(payments::retry))
         .route(
@@ -818,6 +888,9 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/admin/coupons/:id",
             patch(coupons::set_admin_coupon_active_handler),
         )
+        // Wave 17 — the seller's buyer-risk lookup (the fraud
+        // shield's verdict for one phone number).
+        .route("/v1/seller/buyer-risk", get(risk::buyer_risk_handler))
         // Wave 16 — public tracking: NO auth by design; the
         // order's delivery phone is the credential and every
         // failure is the same 404 (see the tracking module).

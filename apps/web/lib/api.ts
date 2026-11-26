@@ -281,6 +281,10 @@ export function paymentStatusLabel(paymentStatus: string): string {
       return "পেমেন্ট ব্যর্থ হয়েছে";
     case "refunded":
       return "ফেরত দেওয়া হয়েছে";
+    case "advance_pending":
+      return "অগ্রিম বাকি আছে";
+    case "advance_paid":
+      return "অগ্রিম পরিশোধিত (বাকি ডেলিভারিতে)";
     default:
       return "ডেলিভারিতে পেমেন্ট";
   }
@@ -291,8 +295,21 @@ export interface Order {
   buyer_user_id: string;
   status: string;
   payment_method: string;
-  /** pay_on_delivery | pending | paid | failed | refunded (Wave 5). */
+  /**
+   * pay_on_delivery | pending | paid | failed | refunded (Wave 5),
+   * plus advance_pending | advance_paid for COD orders with an
+   * advance (Wave 17).
+   */
   payment_status: string;
+  /**
+   * Advance this COD order must collect before shipping (Wave 17);
+   * 0 when none. Positive while payment_status is pay_on_delivery
+   * means no gateway could collect it and the order proceeded
+   * flagged — no money was taken.
+   */
+  advance_required_poisha: number;
+  /** Advance actually collected online (Wave 17). */
+  advance_paid_poisha: number;
   /** Latest payment attempt; null for COD orders. */
   payment: PaymentSummary | null;
   delivery_name: string;
@@ -338,6 +355,17 @@ export interface SellerSubOrder {
   items: OrderItem[];
   /** Courier shipment (Wave 6); null until the seller books one. */
   shipment: ShipmentSummary | null;
+  /**
+   * The parent order's payment status (Wave 17) — advance_pending
+   * means the parcel must not ship yet (booking enforces it).
+   */
+  order_payment_status: string;
+  /** Advance the parent COD order must collect (Wave 17). */
+  advance_required_poisha: number;
+  /** Advance the parent order has collected (Wave 17). */
+  advance_paid_poisha: number;
+  /** The buyer's fraud-shield level: low | medium | high (Wave 17). */
+  buyer_risk_level: string;
 }
 
 export interface SellerSubOrderList {
@@ -357,6 +385,13 @@ export interface PlaceOrderInput {
   payment_method: string;
   /** Optional coupon code (Wave 14); checkout re-validates it. */
   coupon_code?: string;
+  /**
+   * The online method for a COD advance (Wave 17). Needed only
+   * when checkout decides this order requires an advance; when
+   * it does and no method was sent, checkout answers 400 and the
+   * checkout page asks for one and retries.
+   */
+  advance_method?: string;
 }
 
 function apiBase(): string {
@@ -743,10 +778,20 @@ export interface Receipt {
   created_at: string;
   status: string;
   payment_method: string;
-  /** pay_on_delivery | pending | paid | failed | refunded (Wave 5). */
+  /**
+   * pay_on_delivery | pending | paid | failed | refunded (Wave 5),
+   * plus advance_pending | advance_paid (Wave 17).
+   */
   payment_status: string;
-  /** Grand total for COD orders; 0 when nothing is due on delivery. */
+  /**
+   * Cash due on delivery: grand total minus any advance already
+   * collected, for COD orders; 0 when nothing is due on delivery.
+   */
   cod_amount_due_poisha: number;
+  /** Advance this COD order required at checkout (Wave 17). */
+  advance_required_poisha: number;
+  /** Advance collected online (Wave 17). */
+  advance_paid_poisha: number;
   delivery: {
     name: string;
     phone: string;
@@ -1063,6 +1108,10 @@ export interface AdminUserList {
 export interface AdminSettings {
   commission_bps: number;
   min_payout_poisha: number;
+  /** COD advance rate in basis points (Wave 17). */
+  advance_percent_bps: number;
+  /** COD advance threshold in poisha; 0 disables it (Wave 17). */
+  advance_threshold_poisha: number;
   platform_name: string;
 }
 
@@ -1310,7 +1359,12 @@ export function runImport(
  */
 export function updateAdminSettings(
   token: string,
-  patch: { commission_bps?: number; min_payout_poisha?: number }
+  patch: {
+    commission_bps?: number;
+    min_payout_poisha?: number;
+    advance_percent_bps?: number;
+    advance_threshold_poisha?: number;
+  }
 ): Promise<AdminSettings> {
   return call("/v1/admin/settings", { method: "PUT", token, body: patch });
 }
@@ -1907,4 +1961,59 @@ export function markRefundDone(
     `/v1/admin/return-requests/${encodeURIComponent(returnId)}/refund-done`,
     { method: "POST", token }
   );
+}
+
+// ---------------------------------------------------------------------------
+// Wave 17 — COD advance policy + buyer risk (fraud shield)
+// ---------------------------------------------------------------------------
+
+/**
+ * The public COD advance policy (GET /v1/payments/advance-policy):
+ * the effective rate and threshold checkout applies. A threshold
+ * of 0 disables threshold-based advances. A buyer's personal
+ * risk-forced advance is never visible here — only the server
+ * knows a buyer's history.
+ */
+export interface AdvancePolicy {
+  percent_bps: number;
+  threshold_poisha: number;
+}
+
+/** GET /v1/payments/advance-policy — public, no token. */
+export function getAdvancePolicy(): Promise<AdvancePolicy> {
+  return call("/v1/payments/advance-policy");
+}
+
+/**
+ * One phone number's fraud-shield report (GET /v1/seller/buyer-risk).
+ * `found` false means the phone has no account; the counts are
+ * then all zero and the level low.
+ */
+export interface BuyerRisk {
+  found: boolean;
+  total_orders: number;
+  delivered: number;
+  returned_rto: number;
+  buyer_cancelled: number;
+  /** low | medium | high */
+  risk_level: string;
+  requires_advance: boolean;
+}
+
+/** GET /v1/seller/buyer-risk?phone= — sellers (store owners) only. */
+export function getBuyerRisk(token: string, phone: string): Promise<BuyerRisk> {
+  const search = new URLSearchParams({ phone });
+  return call(`/v1/seller/buyer-risk?${search.toString()}`, { token });
+}
+
+/** Bangla label for a buyer risk level (display only). */
+export function riskLevelLabel(level: string): string {
+  switch (level) {
+    case "high":
+      return "উচ্চ ঝুঁকি";
+    case "medium":
+      return "মাঝারি ঝুঁকি";
+    default:
+      return "নিম্ন ঝুঁকি";
+  }
 }

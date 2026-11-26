@@ -11,6 +11,18 @@
 //! crate, the single implementation shared by signer and verifier.
 //! COD orders have no payment row at all: their
 //! `orders.payment_status` stays `pay_on_delivery`.
+//!
+//! Wave 17: a COD order can carry ONE payment row after all —
+//! its advance (see the checkout block in the `orders` module).
+//! The advance settles through this same callback path: the
+//! branch inside [`apply_payment_callback`] recognises an
+//! advance payment (a COD order whose required advance equals
+//! the payment amount, still `advance_pending`) and moves the
+//! order to `advance_paid` with `advance_paid_poisha` set —
+//! never to `paid`, because the balance is still collected in
+//! cash on delivery. A failed advance attempt leaves the order
+//! `advance_pending`: the advance is still owed, and the buyer
+//! retries the same payment row.
 
 use axum::{
     extract::{Path, State},
@@ -187,6 +199,45 @@ pub fn payment_methods(config: &PaymentsConfig) -> Vec<MethodAvailability> {
     methods
 }
 
+/// Can any gateway collect a COD advance right now (Wave 17)?
+/// True when at least one online method has complete merchant
+/// credentials, or the DEV simulator is on (it serves every
+/// method). Checkout's advance decision reads this ONE rule: no
+/// available gateway means the advance cannot be enforced and
+/// the order degrades to flagged plain COD (see `orders`).
+pub fn advance_gateway_available(config: &PaymentsConfig) -> bool {
+    config.dev_mode
+        || [
+            PaymentMethod::Bkash,
+            PaymentMethod::Nagad,
+            PaymentMethod::SslCommerz,
+            PaymentMethod::ShurjoPay,
+        ]
+        .iter()
+        .any(|method| config.credentials_present(*method))
+}
+
+/// The public COD advance policy (Wave 17): the EFFECTIVE rate
+/// and threshold checkout will apply (admin setting over startup
+/// value over built-in default — the `admin` module's readers).
+/// Public because checkout shows it to buyers before they order;
+/// it carries no secrets, only the platform's published terms.
+/// A buyer's personal risk-forced advance is NOT visible here —
+/// only the server knows a buyer's history.
+#[derive(Debug, Serialize)]
+pub struct AdvancePolicy {
+    pub percent_bps: u32,
+    pub threshold_poisha: i64,
+}
+
+/// Read the effective advance policy.
+pub async fn advance_policy_view(state: &AppState) -> AdvancePolicy {
+    AdvancePolicy {
+        percent_bps: crate::admin::effective_advance_bps(state).await,
+        threshold_poisha: crate::admin::effective_advance_threshold(state).await,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Webhook callback application — THE one code path (webhook + dev
 // simulate both end here; there is no second apply implementation)
@@ -314,12 +365,55 @@ pub async fn apply_payment_callback(
     .execute(pool)
     .await
     .map_err(|e| ApiError::internal("update payment status", e))?;
-    sqlx::query("UPDATE orders SET payment_status = $2 WHERE id = $1")
+
+    // Wave 17 branch: is this payment the ADVANCE on a COD order?
+    // The recognition rule is deliberately narrow — the order is
+    // a COD order, it required an advance, this payment's amount
+    // is exactly that advance, and the order is still waiting for
+    // it. A full online payment can never match (online orders
+    // require no advance), and neither can a stale callback for
+    // an order whose advance already settled (its status has
+    // moved on, and the duplicate-delivery return above has
+    // already handled a repeat of the same result).
+    let order_facts: (String, String, i64) = sqlx::query_as(
+        "SELECT payment_method, payment_status, advance_required_poisha \
+         FROM orders WHERE id = $1",
+    )
+    .bind(payment.order_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::internal("load order for payment status", e))?;
+    let is_advance_payment = order_facts.0 == "cod"
+        && order_facts.2 > 0
+        && payment.amount_poisha == order_facts.2
+        && order_facts.1 == "advance_pending";
+
+    if target == "paid" && is_advance_payment {
+        // The advance settled; the order is NOT paid — the
+        // balance is still COD. Record what was collected so the
+        // receipt and the courier's collection both net it out.
+        sqlx::query(
+            "UPDATE orders SET payment_status = 'advance_paid', \
+             advance_paid_poisha = $2 WHERE id = $1",
+        )
         .bind(payment.order_id)
-        .bind(target)
+        .bind(payment.amount_poisha)
         .execute(pool)
         .await
-        .map_err(|e| ApiError::internal("update order payment status", e))?;
+        .map_err(|e| ApiError::internal("update order advance status", e))?;
+    } else if target == "failed" && is_advance_payment {
+        // The advance ATTEMPT failed; the advance itself is
+        // still owed, so the order stays `advance_pending` (the
+        // buyer retries the same payment row) instead of wearing
+        // a bare `failed` that would hide the obligation.
+    } else {
+        sqlx::query("UPDATE orders SET payment_status = $2 WHERE id = $1")
+            .bind(payment.order_id)
+            .bind(target)
+            .execute(pool)
+            .await
+            .map_err(|e| ApiError::internal("update order payment status", e))?;
+    }
 
     load_payment(pool, payment.id).await
 }
@@ -366,8 +460,26 @@ pub async fn retry_payment_for_buyer(
         .execute(pool)
         .await
         .map_err(|e| ApiError::internal("retry payment", e))?;
-    sqlx::query("UPDATE orders SET payment_status = 'pending' WHERE id = $1")
+    // Wave 17: retrying an ADVANCE payment restores the order to
+    // `advance_pending` (the advance is owed again), not the
+    // generic `pending` — the same recognition rule as the
+    // callback branch: a COD order whose required advance equals
+    // this payment's amount.
+    let advance_required: Option<i64> = sqlx::query_scalar(
+        "SELECT advance_required_poisha FROM orders \
+         WHERE id = $1 AND payment_method = 'cod'",
+    )
+    .bind(payment.order_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ApiError::internal("load order advance for retry", e))?;
+    let order_status = match advance_required {
+        Some(required) if required > 0 && required == payment.amount_poisha => "advance_pending",
+        _ => "pending",
+    };
+    sqlx::query("UPDATE orders SET payment_status = $2 WHERE id = $1")
         .bind(payment.order_id)
+        .bind(order_status)
         .execute(pool)
         .await
         .map_err(|e| ApiError::internal("retry order payment status", e))?;
@@ -430,6 +542,10 @@ pub async fn dev_simulate_success(
 
 pub async fn list_methods(State(state): State<AppState>) -> Json<Vec<MethodAvailability>> {
     Json(payment_methods(&state.payments_config))
+}
+
+pub async fn advance_policy(State(state): State<AppState>) -> Json<AdvancePolicy> {
+    Json(advance_policy_view(&state).await)
 }
 
 #[derive(serde::Deserialize)]

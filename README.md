@@ -799,6 +799,87 @@ Buyers cannot cancel into a return — undelivered parcels go
 through cancellation or the courier's RTO path, never a
 return request (`can_request_return` demands `delivered`).
 
+Wave 17 (partial advance for COD + COD fraud shield):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| GET | `/v1/payments/advance-policy` | PUBLIC. The effective advance policy: `{percent_bps, threshold_poisha}` (admin setting over `ADVANCE_PERCENT_BPS` / `ADVANCE_THRESHOLD_POISHA` over the defaults 2000 / 200000). Checkout shows it as an early warning; a buyer's personal risk-forced advance is never visible here |
+| GET | `/v1/seller/buyer-risk?phone=` | Bearer, store owners only (403 otherwise). The fraud shield's verdict for one phone: `{found, total_orders, delivered, returned_rto, buyer_cancelled, risk_level, requires_advance}`. An unknown phone answers `found: false` with zeroed counts |
+| PUT | `/v1/admin/settings` | Admin. Now also accepts `advance_percent_bps` (0–10000) and `advance_threshold_poisha` (≥ 0), stored as `platform_settings` rows that beat the startup values at read time |
+| POST | `/v1/orders` | Checkout gains `advance_method` (bkash / nagad / sslcommerz / shurjopay): the online method for a COD advance, when one is required (see the decision below) |
+| POST | `/v1/seller/sub-orders/{id}/shipment` | Booking gains a guard: a sub-order whose parent order is `advance_pending` answers 409 "advance payment pending" until the advance settles |
+
+**The advance decision (checkout, COD only):** the buyer's
+risk verdict comes from the ONE aggregate in the `risk`
+module (`buyer_risk_for_user` — checkout, the buyer-risk
+endpoint and the seller sub-order list all read it), and the
+pure domain rule `compute_advance_poisha` turns the effective
+policy into an amount: the rate's share of the grand total,
+rounded up, owed only when the total reaches the threshold —
+or at ANY size when the shield forces it. When an advance is
+required, exactly one of three things happens:
+
+- **A gateway can collect it** (merchant credentials present,
+  or the DEV simulator) **and the buyer named a method:** the
+  order is stored `advance_pending`, and a `pending` payment
+  row for the ADVANCE amount is initiated through the same
+  payments factory as a full online checkout. A method whose
+  adapter cannot take it fails the whole checkout with a 503
+  (cart intact), the same honesty rule as online checkout.
+- **A gateway can collect it but NO method was named:** 400,
+  telling the buyer to choose an advance payment method. The
+  checkout page turns that 400 into the method picker and a
+  re-place.
+- **NO gateway can collect it** (the platform today, without
+  credentials): the order proceeds as plain COD with
+  `advance_required_poisha` recorded on it — a visible risk
+  flag the seller surfaces show ("অগ্রিম নেওয়া হয়নি"). This
+  is a deliberate safety valve, NOT a fake success: no payment
+  row exists, `advance_paid_poisha` stays 0, and no surface
+  claims money was collected. It is also what keeps checkouts
+  working in deployments (and test suites) where gateways are
+  not configured yet.
+
+**Settlement:** the advance settles through the ONE shared
+callback (`apply_payment_callback`) — a branch recognises an
+advance payment (COD order, payment amount exactly the
+required advance, order still `advance_pending`) and moves
+the order to `advance_paid` with `advance_paid_poisha` set —
+never to `paid`, because the balance is still COD. A failed
+advance attempt leaves the order `advance_pending` (the
+advance is still owed), and retrying the payment restores
+`advance_pending` rather than the generic `pending`. The
+receipt's cash-due is `grand_total − advance_paid`, and a
+shipment booked after settlement tells the courier to
+collect the sub-order's share net of its slice of the
+advance. Cancelling an `advance_pending` order is a plain
+buyer cancel; its payment row stays `pending` as the audit
+record (no money ever moved).
+
+**The fraud shield (pure domain, `assess_buyer_risk`):**
+
+| Signal | Rule |
+| --- | --- |
+| `requires_advance` | ≥ 2 returned sub-orders AND returns ≥ half of completed (delivered + returned) |
+| `high` | `requires_advance`, OR ≥ 3 orders with 0 delivered and ≥ 2 buyer-cancellations/returns |
+| `medium` | any return or buyer cancellation at all |
+| `low` | otherwise (including a brand-new buyer) |
+
+`returned_rto` counts every sub-order in the `returned`
+state (courier RTO and received buyer returns alike);
+`buyer_cancelled` counts only sub-orders of orders the buyer
+cancelled wholesale — a seller cancelling one sub-order of a
+live order never counts against the buyer.
+
+**Limits (stated, not hidden):** the advance is collected
+through the same credential-gated gateways as full payments,
+so until merchant credentials exist the only ways to actually
+collect one are the DEV simulator or the degradation path
+above. Risk stats count this platform's history only — a
+buyer who burned other platforms starts here with a clean
+record. The shield never blocks an order outright; it only
+prices the risk into an advance.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -1402,6 +1483,39 @@ admin `/admin/returns` refund queue, with track/returns nav
 links on the marketplace home, the checkout success screen,
 the seller dashboard and the admin shell.
 
+**Real (Wave 17):** partial advance for COD + the COD fraud
+shield — migration 0019 (`orders.advance_required_poisha` /
+`advance_paid_poisha` snapshots, the `advance_pending` /
+`advance_paid` payment states); the pure domain rules
+(`compute_advance_poisha` with the threshold/force/ceiling
+rules, `assess_buyer_risk` with the risk table, the advance
+setting validators and keys); the effective advance readers
+in `admin` under the same DB > env > default precedence as
+commission, with the admin settings view extended; the ONE
+risk aggregate (`risk::buyer_risk_for_user`) feeding
+checkout's force flag, the seller buyer-risk endpoint and
+the seller sub-order list's `buyer_risk_level`; checkout's
+three-way advance decision (enforce / 400 / flagged-proceed
+degradation — see the Wave 17 section); the advance branch
+inside the ONE payment callback (settlement to
+`advance_paid`, failure leaves `advance_pending`, retry
+restores it); the shipment booking guard (409 while
+`advance_pending`) and the courier collection netting after
+settlement; the receipt's advance lines and netted cash-due;
+an integration test (`crates/api/tests/wave17.rs`, same
+`DATABASE_URL` gate) covering below-threshold COD untouched,
+the 400 without a method, the enforced advance end-to-end
+(41,200 of 206,000; booking 409 then 201 collecting
+164,800), the seeded high-risk buyer's forced advance on a
+small order, the buyer-risk endpoint's agreement with the
+seed, the admin threshold switch (with settings cleanup),
+and the no-gateway degradation on a bare app; the Next.js
+checkout advance warning + method picker + 400 retry flow
+and success-screen advance walkthrough, the receipt advance
+lines, the seller orders risk badge + advance warnings, the
+seller dashboard buyer-risk lookup, and the two new admin
+settings fields.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters. Manual Phase 2 couriers (Sundarban,
@@ -1436,13 +1550,13 @@ the external service at the other end of it, configured by
   /admin/returns).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
-  (domain 65, courier 31, payments 8 unit tests; the `DATABASE_URL`-
+  (domain 68, courier 31, payments 8 unit tests; the `DATABASE_URL`-
   gated integration tests skip cleanly without a database). The API
   binary was also smoke-tested locally without a database: routes
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
   (including the Wave 13 messaging endpoints), and the SIDRA
   callback answers 503 without a database.
-- **Rust integration + clippy: CI-only** — the Wave 2–16 integration
+- **Rust integration + clippy: CI-only** — the Wave 2–17 integration
   tests against a real Postgres 16 service and clippy `-D warnings`
   are verified via **GitHub Actions CI** (`.github/workflows/ci.yml`)
-  on push. Waves 1–15 are green there; Wave 16 awaits its first CI run.
+  on push. Waves 1–16 are green there; Wave 17 awaits its first CI run.

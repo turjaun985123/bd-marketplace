@@ -4,12 +4,15 @@ import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import PriceTag from "@/components/PriceTag";
 import {
+  getBuyerRisk,
   getPayoutAccount,
   getSellerDashboard,
   listPayouts,
   payoutStatusLabel,
   requestPayout,
+  riskLevelLabel,
   savePayoutAccount,
+  type BuyerRisk,
   type Payout,
   type PayoutAccount,
   type SellerDashboard,
@@ -54,6 +57,11 @@ export default function SellerDashboardPage() {
   // Payout request form state (amount typed in taka).
   const [amountTaka, setAmountTaka] = useState("");
   const [payoutBusy, setPayoutBusy] = useState(false);
+
+  // Buyer-risk lookup state (Wave 17 fraud shield).
+  const [riskPhone, setRiskPhone] = useState("");
+  const [risk, setRisk] = useState<BuyerRisk | null>(null);
+  const [riskBusy, setRiskBusy] = useState(false);
 
   const load = useCallback(async () => {
     if (!token) return;
@@ -121,6 +129,21 @@ export default function SellerDashboardPage() {
       setMessage(err instanceof Error ? err.message : "অনুরোধ করা যায়নি।");
     } finally {
       setPayoutBusy(false);
+    }
+  }
+
+  async function onLookupRisk(e: React.FormEvent) {
+    e.preventDefault();
+    if (!token || !riskPhone.trim()) return;
+    setRiskBusy(true);
+    setMessage(null);
+    try {
+      setRisk(await getBuyerRisk(token, riskPhone.trim()));
+    } catch (err) {
+      setRisk(null);
+      setMessage(err instanceof Error ? err.message : "ঝুঁকি দেখা যায়নি।");
+    } finally {
+      setRiskBusy(false);
     }
   }
 
@@ -333,6 +356,53 @@ export default function SellerDashboardPage() {
                 ))}
               </>
             )}
+          </section>
+
+          <section>
+            <h2>ক্রেতার ঝুঁকি যাচাই — Buyer risk check</h2>
+            <p>
+              COD জালিয়াতি শিল্ড: ক্রেতার মোবাইল নম্বর দিয়ে তার আগের
+              অর্ডারের ইতিহাস দেখুন — কতটি ডেলিভারি হয়েছে, কতটি ফেরত
+              এসেছে। উচ্চ-ঝুঁকির ক্রেতার অর্ডারে সার্ভার নিজে থেকেই
+              অগ্রিম বাধ্যতামূলক করে।
+            </p>
+            <form onSubmit={(e) => void onLookupRisk(e)}>
+              <label>
+                ক্রেতার মোবাইল নম্বর (buyer phone)
+                <input
+                  value={riskPhone}
+                  onChange={(e) => setRiskPhone(e.target.value)}
+                  placeholder="01712345678"
+                  inputMode="tel"
+                  required
+                />
+              </label>{" "}
+              <button type="submit" disabled={riskBusy}>
+                {riskBusy ? "দেখা হচ্ছে…" : "ঝুঁকি দেখুন"}
+              </button>
+            </form>
+            {risk &&
+              (risk.found ? (
+                <div className="card">
+                  <p>
+                    ঝুঁকির মাত্রা:{" "}
+                    <strong>{riskLevelLabel(risk.risk_level)}</strong> (
+                    {risk.risk_level})
+                    {risk.requires_advance &&
+                      " · এই ক্রেতার সব COD অর্ডারে অগ্রিম বাধ্যতামূলক"}
+                  </p>
+                  <p>
+                    মোট অর্ডার: {risk.total_orders} · ডেলিভারি হয়েছে:{" "}
+                    {risk.delivered} · ফেরত এসেছে: {risk.returned_rto} ·
+                    ক্রেতা বাতিল করেছে: {risk.buyer_cancelled}
+                  </p>
+                </div>
+              ) : (
+                <p>
+                  এই নম্বরে কোনো অ্যাকাউন্ট পাওয়া যায়নি — নতুন ক্রেতা
+                  হিসেবে ঝুঁকি নিম্ন ধরা হয়েছে।
+                </p>
+              ))}
           </section>
         </>
       )}

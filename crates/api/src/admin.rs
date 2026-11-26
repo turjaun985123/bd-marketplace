@@ -22,11 +22,15 @@
 //! Settings: rows in `platform_settings` override startup values
 //! at read time — `commission_bps` beats the startup
 //! `COMMISSION_RATE_BPS`, and `min_payout_poisha` beats the domain
-//! constant. The two effective-value helpers below are the ONLY
-//! readers; checkout and payout creation call them, never the raw
-//! values, so the precedence (setting, then startup, then
-//! built-in default) lives in exactly one place. A stored value
-//! that no longer parses or is out of range is ignored on read.
+//! constant. Wave 17 adds the COD advance pair under the same
+//! discipline: `advance_percent_bps` beats `ADVANCE_PERCENT_BPS`
+//! and `advance_threshold_poisha` beats
+//! `ADVANCE_THRESHOLD_POISHA`. The effective-value helpers below
+//! are the ONLY readers; checkout and payout creation call them,
+//! never the raw values, so the precedence (setting, then
+//! startup, then built-in default) lives in exactly one place. A
+//! stored value that no longer parses or is out of range is
+//! ignored on read.
 
 use axum::{
     extract::{Path, Query, State},
@@ -34,7 +38,8 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use domain::{
-    can_transition_payout, parse_setting_i64, validate_commission_bps, COMMISSION_BPS_KEY,
+    can_transition_payout, parse_setting_i64, validate_advance_bps, validate_advance_threshold,
+    validate_commission_bps, ADVANCE_PERCENT_BPS_KEY, ADVANCE_THRESHOLD_KEY, COMMISSION_BPS_KEY,
     MIN_PAYOUT_KEY, MIN_PAYOUT_POISHA,
 };
 use serde::{Deserialize, Serialize};
@@ -108,6 +113,37 @@ pub async fn effective_commission_bps(state: &AppState) -> u32 {
         }
     }
     state.commission_rate_bps
+}
+
+/// The COD advance rate checkout must use right now (Wave 17):
+/// the admin setting when one is stored and valid, else the
+/// startup value (`ADVANCE_PERCENT_BPS`, itself defaulting to
+/// 2,000). Mirrors [`effective_commission_bps`] exactly.
+pub async fn effective_advance_bps(state: &AppState) -> u32 {
+    if let Some(pool) = &state.pool {
+        if let Some(value) = platform_setting_i64(pool, ADVANCE_PERCENT_BPS_KEY).await {
+            if validate_advance_bps(value) {
+                return value as u32;
+            }
+        }
+    }
+    state.advance_percent_bps
+}
+
+/// The COD advance threshold checkout must use right now
+/// (Wave 17): the admin setting when one is stored and valid,
+/// else the startup value (`ADVANCE_THRESHOLD_POISHA`, itself
+/// defaulting to 200,000). A stored 0 is valid and disables
+/// threshold-based advances.
+pub async fn effective_advance_threshold(state: &AppState) -> i64 {
+    if let Some(pool) = &state.pool {
+        if let Some(value) = platform_setting_i64(pool, ADVANCE_THRESHOLD_KEY).await {
+            if validate_advance_threshold(value) {
+                return value;
+            }
+        }
+    }
+    state.advance_threshold_poisha
 }
 
 /// The minimum payout for new requests right now: the admin
@@ -570,6 +606,11 @@ pub async fn set_user_admin(
 pub struct AdminSettings {
     pub commission_bps: i64,
     pub min_payout_poisha: i64,
+    /// COD advance rate in basis points (Wave 17).
+    pub advance_percent_bps: i64,
+    /// COD advance threshold in poisha (Wave 17); 0 disables
+    /// threshold-based advances.
+    pub advance_threshold_poisha: i64,
     pub platform_name: &'static str,
 }
 
@@ -578,6 +619,8 @@ pub async fn get_settings(state: &AppState) -> AdminSettings {
     AdminSettings {
         commission_bps: i64::from(effective_commission_bps(state).await),
         min_payout_poisha: effective_min_payout(state).await,
+        advance_percent_bps: i64::from(effective_advance_bps(state).await),
+        advance_threshold_poisha: effective_advance_threshold(state).await,
         platform_name: PLATFORM_NAME,
     }
 }
@@ -621,6 +664,22 @@ pub async fn update_settings(
             ));
         }
         save_setting(pool, MIN_PAYOUT_KEY, min_payout).await?;
+    }
+    if let Some(advance_bps) = input.advance_percent_bps {
+        if !validate_advance_bps(advance_bps) {
+            return Err(ApiError::bad_request(
+                "advance_percent_bps must be between 0 and 10000",
+            ));
+        }
+        save_setting(pool, ADVANCE_PERCENT_BPS_KEY, advance_bps).await?;
+    }
+    if let Some(advance_threshold) = input.advance_threshold_poisha {
+        if !validate_advance_threshold(advance_threshold) {
+            return Err(ApiError::bad_request(
+                "advance_threshold_poisha must be 0 or more",
+            ));
+        }
+        save_setting(pool, ADVANCE_THRESHOLD_KEY, advance_threshold).await?;
     }
     Ok(get_settings(state).await)
 }
@@ -676,6 +735,10 @@ pub struct SetUserAdminInput {
 pub struct UpdateSettingsInput {
     pub commission_bps: Option<i64>,
     pub min_payout_poisha: Option<i64>,
+    /// Wave 17: COD advance rate override (basis points).
+    pub advance_percent_bps: Option<i64>,
+    /// Wave 17: COD advance threshold override (poisha).
+    pub advance_threshold_poisha: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
