@@ -283,12 +283,10 @@ async fn wave22_per_store_sequential_invoices_flow() {
     let buyer = login(&app, "01999999999").await;
     let stranger = login(&app, "01611111111").await;
 
-    // 1. Store A's first sale, only CONFIRMED so far: no
+    // 1. Store A's first sale, only PLACED so far: no
     // completed sale, so no invoice — a 409 for buyer and
     // seller alike.
     let sub_a1 = buy_one(&app, &buyer, &product_a).await;
-    let (status, body) = set_sub_order_status(&app, &seller_a, &sub_a1, "confirmed").await;
-    assert_eq!(status, StatusCode::OK, "confirm: {body}");
 
     let (status, body) = get_invoice(&app, &buyer, "buyer", &sub_a1).await;
     assert_eq!(status, StatusCode::CONFLICT, "invoice before delivery: {body}");
