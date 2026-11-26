@@ -154,6 +154,8 @@ export default function SellerDashboardPage() {
         <Link href="/seller/products">আমার পণ্য — My products</Link>
         {" · "}
         <Link href="/seller/orders">আমার বিক্রির অর্ডার — Seller orders</Link>
+        {" · "}
+        <Link href="/seller/import">Facebook থেকে ইমপোর্ট — Import</Link>
       </p>
       {message && <p role="status">{message}</p>}
       {dashboard === null ? (

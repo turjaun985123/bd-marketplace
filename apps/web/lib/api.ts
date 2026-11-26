@@ -23,6 +23,10 @@ export interface Store {
   description: string | null;
   /** active | suspended (Wave 10 admin kill switch). */
   status: string;
+  /** Linked Facebook Page id (Wave 12); null when no page is linked. */
+  facebook_page_id: string | null;
+  /** Linked Facebook Page display name (Wave 12). */
+  facebook_page_name: string | null;
   created_at: string;
 }
 
@@ -39,6 +43,10 @@ export interface Product {
   status: string;
   /** Weight of one unit in grams (Wave 4 — drives delivery charges). */
   weight_grams: number;
+  /** manual | facebook — where the product came from (Wave 12). */
+  source: string;
+  /** The origin's id for imports (the Facebook post id); null otherwise. */
+  source_ref: string | null;
   /** Mean review rating, one decimal (Wave 8); null when unreviewed. */
   rating_avg: number | null;
   /** Number of reviews (Wave 8). */
@@ -1089,6 +1097,119 @@ export function setUserAdmin(
 /** GET /v1/admin/settings — the effective platform settings. */
 export function getAdminSettings(token: string): Promise<AdminSettings> {
   return call("/v1/admin/settings", { token });
+}
+
+// ---------------------------------------------------------------------------
+// Wave 12 — Facebook Page link + post import
+// ---------------------------------------------------------------------------
+
+/**
+ * The seller's Facebook status: whether a Page is linked (and
+ * which), plus whether the platform's Meta app credentials exist.
+ * The two are independent — a page can be linked long before the
+ * Graph API can fetch from it.
+ */
+export interface FacebookStatus {
+  linked: boolean;
+  page_id: string | null;
+  page_name: string | null;
+  /** "configured" | "not_configured" */
+  graph_api: string;
+}
+
+/** One pasted Facebook post, keyed by the id the seller gives it. */
+export interface FbPostInput {
+  source_ref: string;
+  text: string;
+}
+
+/** One editable product draft parsed from a pasted post. */
+export interface ImportDraft {
+  source_ref: string;
+  title: string;
+  title_bn: string | null;
+  description: string | null;
+  price_poisha: number | null;
+  weight_grams: number;
+  stock: number;
+  valid: boolean;
+  errors: string[];
+}
+
+/** One draft as sent to the import endpoint (price always set). */
+export interface ImportDraftInput {
+  source_ref: string;
+  title: string;
+  title_bn?: string;
+  description?: string;
+  price_poisha: number;
+  weight_grams?: number;
+  stock: number;
+}
+
+/** One draft the import skipped, with the reason. */
+export interface SkippedImport {
+  source_ref: string;
+  reason: string;
+}
+
+export interface ImportResult {
+  created: Product[];
+  skipped: SkippedImport[];
+}
+
+/** GET /v1/seller/facebook/status — link state + Graph API state. */
+export function getFacebookStatus(token: string): Promise<FacebookStatus> {
+  return call("/v1/seller/facebook/status", { token });
+}
+
+/** PUT /v1/seller/store/facebook — link (or re-link) the seller's Page. */
+export function linkFacebookPage(
+  token: string,
+  pageId: string,
+  pageName: string
+): Promise<Store> {
+  return call("/v1/seller/store/facebook", {
+    method: "PUT",
+    token,
+    body: { page_id: pageId, page_name: pageName },
+  });
+}
+
+/** DELETE /v1/seller/store/facebook — remove the Page link. */
+export function unlinkFacebookPage(token: string): Promise<Store> {
+  return call("/v1/seller/store/facebook", { method: "DELETE", token });
+}
+
+/**
+ * POST /v1/seller/products/import-preview — parse pasted posts
+ * into editable drafts. Writes nothing on the server.
+ */
+export function previewImport(
+  token: string,
+  posts: FbPostInput[]
+): Promise<{ drafts: ImportDraft[] }> {
+  return call("/v1/seller/products/import-preview", {
+    method: "POST",
+    token,
+    body: { posts },
+  });
+}
+
+/**
+ * POST /v1/seller/products/import — create products from the
+ * reviewed drafts. Invalid or already-imported drafts come back
+ * in `skipped` with reasons; the rest are created.
+ */
+export function runImport(
+  token: string,
+  drafts: ImportDraftInput[]
+): Promise<ImportResult> {
+  return call("/v1/seller/products/import", {
+    method: "POST",
+    token,
+    body: { drafts },
+  });
 }
 
 /**

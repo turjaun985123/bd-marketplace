@@ -453,6 +453,66 @@ unadapted is only the manual couriers — Sundarban, SA Paribahan,
 Karatoa, Carrybee — which have no merchant APIs and are Phase 2
 manual workflow by design, not a gap.
 
+Wave 12 (Facebook Page linking + post-to-product import):
+
+Bangladeshi sellers run their shops as Facebook Pages: the
+catalogue already exists as Page posts. This wave builds the
+whole import pipeline around that fact — a seller links their
+Page, pastes post texts, reviews the parsed drafts, and imports
+them as real products.
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| PUT | `/v1/seller/store/facebook` | Bearer, own store. Link a Facebook Page: `{page_id, page_name}` (page id 1–64 letters/digits, name 1–120 chars). Returns the store view |
+| DELETE | `/v1/seller/store/facebook` | Bearer, own store. Unlink (both fields nulled) |
+| GET | `/v1/seller/facebook/status` | Bearer. `{linked, page_id, page_name, graph_api}` — the link state and the Graph API state are reported independently |
+| POST | `/v1/seller/products/import-preview` | Bearer. Parse up to 50 pasted posts into editable drafts. Writes NOTHING |
+| POST | `/v1/seller/products/import` | Bearer. Create products from the reviewed drafts; invalid or already-imported drafts come back in `skipped` with reasons |
+| POST | `/v1/seller/products/import-from-page` | Bearer. The Graph API source — honestly a 503 / 501 stub (see below) |
+
+**The parser** (pure domain functions `bn_to_en_digits`,
+`extract_price_poisha`, `draft_from_fb_post`, all unit-tested):
+Bengali digits are converted to ASCII first. A price is a number
+carrying a currency marker — `৳`, `টাকা`, `tk` or `BDT` adjacent
+to the number on either side — or the first number on a line
+that opens with দাম / "price". Numbers may group thousands with
+commas and carry a decimal part. When several labelled prices
+exist, the FIRST one wins. A bare number with no marker is
+NEVER a price: phone numbers, stock counts and dates must not
+turn into prices, and a labelled candidate above a sanity
+ceiling (100,000,000 taka) is skipped as implausible. The draft
+title is the post's first non-empty line (max 120 chars); the
+description is the whole post (max 2000 chars). A draft is valid
+when it passes the shared product validator AND names a real
+price — a missing price, or a price of zero, is an error the
+seller fixes in the preview, never a guessed number.
+
+**The import** validates every draft before writing anything,
+then inserts the survivors in ONE transaction through the same
+`insert_product` service function the create endpoint uses,
+stamped `source = 'facebook'` and created `active` (importing
+is an explicit publish action — the seller reviewed each draft
+first). Products carry provenance from this wave on:
+`source` (`manual` / `facebook`) and `source_ref` (for imports,
+the post id the seller supplied). **Re-import is idempotent:**
+a draft whose `source_ref` the store already has is skipped as
+"already imported", and a partial UNIQUE index on
+`(store_id, source_ref)` (migration 0014) backstops the rule in
+the database.
+
+**Graph API status (honesty):** linking stores only the Page's
+identity — no tokens exist anywhere in this wave. Fetching a
+seller's posts directly needs a registered Meta app (with Meta's
+app review) plus a page access token from an OAuth flow; neither
+exists yet. `GET /v1/seller/facebook/status` reports
+`graph_api: "configured"` only when both `FACEBOOK_APP_ID` and
+`FACEBOOK_APP_SECRET` are present in the API's environment
+(presence only — the values are never stored or returned), and
+`import-from-page` answers 503 while they are absent and 501
+while the page-token OAuth flow is still missing. It never
+returns posts it did not fetch; the paste pipeline above is the
+real import source until that later wave lands.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -721,8 +781,9 @@ NEXT_PUBLIC_API_BASE_URL=http://localhost:8080 npm run dev   # http://localhost:
 # /products/{id} (product detail + reviews, Wave 8), /{store}
 # (storefront, same shared grid), /cart, /checkout, /orders (buyer),
 # /orders/{id} (printable receipt), /seller, /seller/products
-# (seller catalogue + create form, with a weight-in-grams field)
-# and /seller/orders (sub-orders)
+# (seller catalogue + create form, with a weight-in-grams field),
+# /seller/orders (sub-orders) and /seller/import (Facebook Page
+# link + post import, Wave 12)
 ```
 
 ## Scope — what is real, stubbed and TODO
@@ -940,12 +1001,33 @@ an eCourier-only config reporting eCourier `live` and Paperfly
 `not_configured`, the estimate endpoint pricing and recommending
 the only available courier, and DEV bookings under both new names.
 
+**Real (Wave 12):** Facebook Page linking and the post-to-product
+import pipeline — migration 0014 (`stores.facebook_page_id` /
+`facebook_page_name`, product provenance `source` / `source_ref`
+with the partial UNIQUE index that makes re-import idempotent);
+the pure domain post parser (Bengali-digit conversion, labelled
+price extraction where a bare number is never a price, draft
+building); the link/unlink/status endpoints (Graph API state
+reported from credential PRESENCE only); preview with no writes;
+the import validating every draft up front and creating the
+survivors in one transaction through the shared `insert_product`
+path extracted from the create endpoint; an integration test
+(`crates/api/tests/wave12.rs`, same `DATABASE_URL` gate) covering
+link validation, preview correctness with an unchanged product
+count, the 2-created / 1-skipped import, idempotent re-import,
+and unlink; the Next.js seller import page (`/seller/import`)
+linked from the seller dashboard and products page.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters. Manual Phase 2 couriers (Sundarban,
 SA Paribahan, Karatoa, Carrybee) have no APIs and join later as a
 manual workflow behind the same trait. SMS sending has only the
 dev-mode log implementation (see the dev OTP flow above).
+Fetching Facebook posts through the Meta Graph API is stubbed
+honestly (503 without app credentials, 501 without the
+page-token OAuth flow — see the Wave 12 section); the paste
+import pipeline is the real source.
 
 **TODO / not wired:** live gateway calls and real-gateway webhook
 signature verification (need merchant credentials + each gateway's
@@ -958,15 +1040,16 @@ exposes (the worker still logs its planned jobs and exits cleanly).
 
 - **Next.js: verified on this machine** — `npm ci && npm run build`
   passes (Wave 10 admin pages included: /admin, /admin/stores,
-  /admin/payouts, /admin/users, /admin/settings).
+  /admin/payouts, /admin/users, /admin/settings; Wave 12 adds
+  /seller/import).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
-  (domain 46, courier 31, payments 8 unit tests; the `DATABASE_URL`-
+  (domain 51, courier 31, payments 8 unit tests; the `DATABASE_URL`-
   gated integration tests skip cleanly without a database). The API
   binary was also smoke-tested locally without a database: routes
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
   (including the Wave 10 admin endpoints).
-- **Rust integration + clippy: CI-only** — the Wave 2–11 integration
+- **Rust integration + clippy: CI-only** — the Wave 2–12 integration
   tests against a real Postgres 16 service and clippy `-D warnings`
   are verified via **GitHub Actions CI** (`.github/workflows/ci.yml`)
-  on push. Waves 1–10 are green there; Wave 11 awaits its first CI run.
+  on push. Waves 1–11 are green there; Wave 12 awaits its first CI run.

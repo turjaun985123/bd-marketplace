@@ -43,6 +43,13 @@ pub struct Product {
     pub status: String,
     /// Weight of one unit in grams (Wave 4 — drives delivery charges).
     pub weight_grams: i32,
+    /// Where the product came from (Wave 12): `manual` for the
+    /// seller form, `facebook` for a post import.
+    pub source: String,
+    /// The origin's own id (Wave 12): for Facebook imports, the
+    /// post id the seller supplied — the key that makes
+    /// re-importing the same post a no-op. Null for manual rows.
+    pub source_ref: Option<String>,
     /// Mean review rating rounded to one decimal (Wave 8); null when
     /// the product has no reviews. Computed live by the aggregate in
     /// `PRODUCT_RATING_JOIN` — there is no cached counter to drift.
@@ -55,7 +62,8 @@ pub struct Product {
 
 const PRODUCT_COLUMNS: &str = "p.id, p.store_id, s.slug AS store_slug, p.title, p.title_bn, \
     p.description, p.price_poisha, p.compare_at_poisha, p.stock, p.status, \
-    p.weight_grams, rv.rating_avg, rv.rating_count, p.created_at, p.updated_at";
+    p.weight_grams, p.source, p.source_ref, rv.rating_avg, rv.rating_count, \
+    p.created_at, p.updated_at";
 
 /// Rating summary aggregate (Wave 8): THE one place ratings are
 /// summarised. Every query that selects `PRODUCT_COLUMNS` joins this,
@@ -174,6 +182,57 @@ async fn require_store_owner(pool: &PgPool, store_id: Uuid, user: &AuthUser) -> 
     Ok(())
 }
 
+/// Every field of a new product row, including its provenance
+/// (Wave 12): `source` is `manual` for the seller form or
+/// `facebook` for a post import, and `source_ref` is the origin's
+/// own id (for Facebook, the post id the seller supplied) or null.
+#[derive(Debug, Clone)]
+pub struct NewProduct {
+    pub store_id: Uuid,
+    pub title: String,
+    pub title_bn: Option<String>,
+    pub description: Option<String>,
+    pub price_poisha: i64,
+    pub compare_at_poisha: Option<i64>,
+    pub stock: i32,
+    pub status: String,
+    pub weight_grams: i32,
+    pub source: String,
+    pub source_ref: Option<String>,
+}
+
+/// Insert one product row and return its id. THE insert path: the
+/// create endpoint and the Facebook import both write product rows
+/// through here, so a row is built in exactly one way. Takes any
+/// sqlx executor — the pool for a single create, a transaction for
+/// the import batch. Callers validate first (the domain validator
+/// plus their own rules); this function only writes.
+pub async fn insert_product<'e, E>(executor: E, input: &NewProduct) -> Result<Uuid, ApiError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query_scalar(
+        "INSERT INTO products (store_id, title, title_bn, description, \
+         price_poisha, compare_at_poisha, stock, status, weight_grams, \
+         source, source_ref) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id",
+    )
+    .bind(input.store_id)
+    .bind(input.title.trim())
+    .bind(&input.title_bn)
+    .bind(&input.description)
+    .bind(input.price_poisha)
+    .bind(input.compare_at_poisha)
+    .bind(input.stock)
+    .bind(&input.status)
+    .bind(input.weight_grams)
+    .bind(&input.source)
+    .bind(&input.source_ref)
+    .fetch_one(executor)
+    .await
+    .map_err(|e| ApiError::internal("create product", e))
+}
+
 /// Create a product in a store the caller owns. Input rules come from
 /// the pure domain validator — the same function the update path uses.
 pub async fn create_product_for_owner(
@@ -200,23 +259,23 @@ pub async fn create_product_for_owner(
     let weight_grams = i32::try_from(validated.weight_grams)
         .map_err(|_| ApiError::bad_request("weight_grams out of range"))?;
 
-    let id: Uuid = sqlx::query_scalar(
-        "INSERT INTO products (store_id, title, title_bn, description, \
-         price_poisha, compare_at_poisha, stock, status, weight_grams) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
+    let id = insert_product(
+        pool,
+        &NewProduct {
+            store_id: input.store_id,
+            title: input.title.clone(),
+            title_bn: input.title_bn.clone(),
+            description: input.description.clone(),
+            price_poisha: input.price_poisha,
+            compare_at_poisha: input.compare_at_poisha,
+            stock: input.stock,
+            status: input.status.clone(),
+            weight_grams,
+            source: "manual".to_string(),
+            source_ref: None,
+        },
     )
-    .bind(input.store_id)
-    .bind(input.title.trim())
-    .bind(&input.title_bn)
-    .bind(&input.description)
-    .bind(input.price_poisha)
-    .bind(input.compare_at_poisha)
-    .bind(input.stock)
-    .bind(&input.status)
-    .bind(weight_grams)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| ApiError::internal("create product", e))?;
+    .await?;
 
     get_product_by_id(pool, id).await
 }

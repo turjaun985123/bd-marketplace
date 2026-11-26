@@ -41,6 +41,15 @@
 //! gated pattern) complete all five API couriers; availability,
 //! estimates and smart routing cover them through the one shared
 //! per-courier credential rule, with no new endpoints.
+//! Wave 12: Facebook Page linking and post-to-product import
+//! (`facebook` module) — a seller links their Page (identity
+//! only, no tokens stored) and pastes post texts; the pure
+//! domain parser drafts products from the posts, and the import
+//! creates the approved drafts through the one product insert
+//! path, idempotently by the post's `source_ref`. Fetching posts
+//! through the Meta Graph API stays honestly unconfigured (503)
+//! or unimplemented (501) until a Meta app and the page-token
+//! OAuth flow exist — nothing fakes a fetched post.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -54,6 +63,7 @@
 pub mod admin;
 pub mod auth;
 pub mod cart;
+pub mod facebook;
 pub mod orders;
 pub mod payments;
 pub mod payouts;
@@ -65,7 +75,7 @@ pub mod stores;
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, patch, post},
+    routing::{get, patch, post, put},
     Json, Router,
 };
 use ::courier::{
@@ -109,6 +119,28 @@ pub struct AppState {
     /// `from_env`; tests set it explicitly via
     /// `with_couriers_config`.
     pub couriers_config: CouriersConfig,
+    /// Facebook configuration (Wave 12): only the PRESENCE of the
+    /// platform's Meta app credentials. The credential values
+    /// themselves are never stored on state, logged or returned by
+    /// any endpoint; presence alone drives the `graph_api` field
+    /// of the seller Facebook status.
+    pub facebook_config: FacebookConfig,
+}
+
+/// Facebook app credential presence (Wave 12). The Graph API
+/// reports `configured` only when BOTH the app id and the app
+/// secret are present; the page-token OAuth flow that would make
+/// the credentials usable lands in a later wave.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FacebookConfig {
+    pub app_id_present: bool,
+    pub app_secret_present: bool,
+}
+
+impl FacebookConfig {
+    pub fn graph_api_configured(&self) -> bool {
+        self.app_id_present && self.app_secret_present
+    }
 }
 
 /// Default commission rate: 8% (matches the MVP plan's worked example).
@@ -123,6 +155,7 @@ impl AppState {
             commission_rate_bps: DEFAULT_COMMISSION_RATE_BPS,
             payments_config: PaymentsConfig::default(),
             couriers_config: CouriersConfig::default(),
+            facebook_config: FacebookConfig::default(),
         }
     }
 
@@ -137,6 +170,13 @@ impl AppState {
     /// tests that need the DEV courier simulator on or off).
     pub fn with_couriers_config(mut self, couriers_config: CouriersConfig) -> Self {
         self.couriers_config = couriers_config;
+        self
+    }
+
+    /// Replace the Facebook configuration (used by `from_env` and
+    /// by tests that need the Graph API to report `configured`).
+    pub fn with_facebook_config(mut self, facebook_config: FacebookConfig) -> Self {
+        self.facebook_config = facebook_config;
         self
     }
 
@@ -173,6 +213,7 @@ impl AppState {
         }
         state.payments_config = payments_config_from_env();
         state.couriers_config = couriers_config_from_env();
+        state.facebook_config = facebook_config_from_env();
         state
     }
 
@@ -376,6 +417,17 @@ fn couriers_config_from_env() -> CouriersConfig {
     }
 }
 
+/// Build the Wave 12 Facebook configuration from the environment:
+/// only whether `FACEBOOK_APP_ID` and `FACEBOOK_APP_SECRET` are
+/// present. The values are read here solely for that presence
+/// check and are dropped immediately — never stored, never logged.
+fn facebook_config_from_env() -> FacebookConfig {
+    FacebookConfig {
+        app_id_present: env_value("FACEBOOK_APP_ID").is_some(),
+        app_secret_present: env_value("FACEBOOK_APP_SECRET").is_some(),
+    }
+}
+
 /// Run the embedded workspace migrations (SQLx migrate format, in
 /// `migrations/` at the workspace root) against a pool.
 pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
@@ -555,6 +607,27 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/v1/seller/payouts",
             post(payouts::request_payout_handler).get(payouts::list_payouts_handler),
+        )
+        // Wave 12 — Facebook Page link + post import: link/unlink
+        // the seller's Page, read the link + Graph API status,
+        // preview parsed drafts from pasted posts, import the
+        // approved drafts, and the honest Graph source stub.
+        .route(
+            "/v1/seller/store/facebook",
+            put(facebook::link_facebook_page).delete(facebook::unlink_facebook_page),
+        )
+        .route("/v1/seller/facebook/status", get(facebook::facebook_status))
+        .route(
+            "/v1/seller/products/import-preview",
+            post(facebook::import_preview_handler),
+        )
+        .route(
+            "/v1/seller/products/import",
+            post(facebook::import_products_handler),
+        )
+        .route(
+            "/v1/seller/products/import-from-page",
+            post(facebook::import_from_page),
         )
         // Wave 10 — platform admin: every route behind require_admin.
         .route("/v1/admin/overview", get(admin::overview_handler))

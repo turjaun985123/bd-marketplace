@@ -1055,6 +1055,203 @@ pub fn parse_setting_i64(raw: &str) -> Option<i64> {
     raw.trim().parse::<i64>().ok()
 }
 
+/// Maximum length of a Facebook-import draft title, in characters.
+pub const MAX_FB_TITLE_CHARS: usize = 120;
+
+/// Maximum length of a Facebook-import draft description, in
+/// characters.
+pub const MAX_FB_DESCRIPTION_CHARS: usize = 2_000;
+
+/// Sanity ceiling for a price extracted from free text, in poisha
+/// (100,000,000 taka). A labelled number above this is far more
+/// likely a reference or account number than a product price, so
+/// the extractor skips it instead of inventing an absurd price.
+pub const MAX_EXTRACTED_PRICE_POISHA: i64 = 10_000_000_000;
+
+/// Convert Bengali digits (০-৯) in `text` to ASCII digits (0-9);
+/// every other character is left untouched. Bangladeshi sellers
+/// write prices with Bengali digits in Facebook posts, so the
+/// text parsers in this module run their input through here first.
+pub fn bn_to_en_digits(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '০' => '0',
+            '১' => '1',
+            '২' => '2',
+            '৩' => '3',
+            '৪' => '4',
+            '৫' => '5',
+            '৬' => '6',
+            '৭' => '7',
+            '৮' => '8',
+            '৯' => '9',
+            other => other,
+        })
+        .collect()
+}
+
+/// Does `text` end with a currency marker (`tk` / `bdt`, ASCII
+/// case-insensitive) at a word boundary — the character before the
+/// marker, when there is one, must not be an ASCII letter, so a
+/// word that merely ENDS in the marker's letters does not count?
+fn ends_with_ascii_marker(text: &str, marker: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    if !lower.ends_with(marker) {
+        return false;
+    }
+    let before = &lower[..lower.len() - marker.len()];
+    before.chars().last().is_none_or(|c| !c.is_ascii_alphabetic())
+}
+
+/// Does `text` start with a currency marker (`tk` / `bdt`, ASCII
+/// case-insensitive) at a word boundary — the character after the
+/// marker, when there is one, must not be an ASCII letter?
+fn starts_with_ascii_marker(text: &str, marker: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    if !lower.starts_with(marker) {
+        return false;
+    }
+    lower[marker.len()..]
+        .chars()
+        .next()
+        .is_none_or(|c| !c.is_ascii_alphabetic())
+}
+
+/// Is the number token at `start..end` in `text` labelled as a
+/// price? A token is labelled when a currency marker sits directly
+/// before or after it (whitespace between marker and number is
+/// allowed), or when its line opens with a price label — দাম or
+/// "price" — followed only by separators. A bare number with no
+/// marker is NEVER a price: phone numbers, stock counts and dates
+/// must not turn into prices.
+fn is_labelled_price(text: &str, start: usize, end: usize) -> bool {
+    let before = text[..start].trim_end();
+    if before.ends_with('৳') || before.ends_with("টাকা") {
+        return true;
+    }
+    if ends_with_ascii_marker(before, "tk") || ends_with_ascii_marker(before, "bdt") {
+        return true;
+    }
+    let after = text[end..].trim_start();
+    if after.starts_with('৳') || after.starts_with("টাকা") {
+        return true;
+    }
+    if starts_with_ascii_marker(after, "tk") || starts_with_ascii_marker(after, "bdt") {
+        return true;
+    }
+    // Line-leading label: the text from the start of this line up
+    // to the number is exactly দাম or "price" plus separators.
+    let line_start = text[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let prefix = text[line_start..start].trim_end_matches([' ', '\t', ':', 'ঃ', '-', '=']);
+    prefix == "দাম" || prefix.eq_ignore_ascii_case("price")
+}
+
+/// Extract a price, in poisha, from free post text. Bengali digits
+/// are converted first. A price is a number carrying a currency
+/// marker — `৳`, `টাকা`, `tk` or `BDT` adjacent to the number on
+/// either side — or the first number on a line that opens with
+/// দাম / "price". Numbers may group thousands with commas
+/// (`1,500`) and may carry a one- or two-digit decimal part
+/// (`1250.50`). When several labelled prices exist, the FIRST one
+/// in the text wins. Labelled candidates above
+/// [`MAX_EXTRACTED_PRICE_POISHA`] are skipped as implausible.
+/// Returns `None` when the text has no labelled price.
+pub fn extract_price_poisha(text: &str) -> Option<i64> {
+    let converted = bn_to_en_digits(text);
+    let bytes = converted.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        // One number token: digits and commas, then an optional
+        // decimal point with one or two fraction digits.
+        let start = i;
+        let mut end = i;
+        while end < bytes.len() && (bytes[end].is_ascii_digit() || bytes[end] == b',') {
+            end += 1;
+        }
+        let mut int_end = end;
+        while int_end > start && bytes[int_end - 1] == b',' {
+            int_end -= 1;
+        }
+        let mut token_end = int_end;
+        let mut fraction_poisha: i64 = 0;
+        if int_end < bytes.len() && bytes[int_end] == b'.' {
+            let frac_start = int_end + 1;
+            let mut frac_end = frac_start;
+            while frac_end < bytes.len()
+                && bytes[frac_end].is_ascii_digit()
+                && frac_end - frac_start < 2
+            {
+                frac_end += 1;
+            }
+            if frac_end > frac_start {
+                token_end = frac_end;
+                let digits = &converted[frac_start..frac_end];
+                if let Ok(value) = digits.parse::<i64>() {
+                    fraction_poisha = if digits.len() == 1 { value * 10 } else { value };
+                }
+            }
+        }
+        let int_digits: String = converted[start..int_end]
+            .chars()
+            .filter(|c| *c != ',')
+            .collect();
+        let candidate = int_digits
+            .parse::<i64>()
+            .ok()
+            .and_then(|taka| taka.checked_mul(100))
+            .and_then(|poisha| poisha.checked_add(fraction_poisha));
+        if let Some(poisha) = candidate {
+            if poisha <= MAX_EXTRACTED_PRICE_POISHA
+                && is_labelled_price(&converted, start, token_end)
+            {
+                return Some(poisha);
+            }
+        }
+        i = token_end.max(end);
+    }
+    None
+}
+
+/// Truncate `text` to at most `max_chars` Unicode characters.
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
+/// A product draft parsed from one Facebook post (Wave 12). The
+/// title is the post's first non-empty line; the description is
+/// the whole post; the price comes from
+/// [`extract_price_poisha`] and is `None` when the post names no
+/// labelled price — the seller then fills it in before import.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FbProductDraft {
+    pub title: String,
+    pub description: String,
+    pub price_poisha: Option<i64>,
+}
+
+/// Parse one Facebook post's text into a product draft. Pure: the
+/// import preview and its tests run this without any database.
+/// Title and description are truncated to
+/// [`MAX_FB_TITLE_CHARS`] / [`MAX_FB_DESCRIPTION_CHARS`]
+/// characters so a pasted post can never exceed the draft shape.
+pub fn draft_from_fb_post(text: &str) -> FbProductDraft {
+    let title = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| truncate_chars(line, MAX_FB_TITLE_CHARS))
+        .unwrap_or_default();
+    FbProductDraft {
+        title,
+        description: truncate_chars(text.trim(), MAX_FB_DESCRIPTION_CHARS),
+        price_poisha: extract_price_poisha(text),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1942,5 +2139,102 @@ mod tests {
         // The setting keys are the contract with the settings table.
         assert_eq!(COMMISSION_BPS_KEY, "commission_bps");
         assert_eq!(MIN_PAYOUT_KEY, "min_payout_poisha");
+    }
+
+    #[test]
+    fn bengali_digits_convert_to_ascii() {
+        assert_eq!(bn_to_en_digits("দাম ১,৫০০ টাকা"), "দাম 1,500 টাকা");
+        assert_eq!(bn_to_en_digits("০১২৩৪৫৬৭৮৯"), "0123456789");
+        assert_eq!(bn_to_en_digits("a১b২"), "a1b2");
+        assert_eq!(bn_to_en_digits("no digits here"), "no digits here");
+        assert_eq!(bn_to_en_digits(""), "");
+    }
+
+    #[test]
+    fn price_extraction_labelled_forms() {
+        // Bengali digits + টাকা after the number.
+        assert_eq!(extract_price_poisha("দামঃ ১,৫০০ টাকা"), Some(150_000));
+        // English label + tk after.
+        assert_eq!(extract_price_poisha("Price: 1200 tk"), Some(120_000));
+        // Taka sign before, no space.
+        assert_eq!(extract_price_poisha("৳950"), Some(95_000));
+        // Decimal taka.
+        assert_eq!(extract_price_poisha("1250.50 টাকা"), Some(125_050));
+        // BDT on either side.
+        assert_eq!(extract_price_poisha("BDT 2000 only"), Some(200_000));
+        assert_eq!(extract_price_poisha("2000 BDT"), Some(200_000));
+        // Bengali digits glued to the marker.
+        assert_eq!(extract_price_poisha("৯৫০টাকা"), Some(95_000));
+        // A line opening with the price label needs no currency word.
+        assert_eq!(extract_price_poisha("দাম 500"), Some(50_000));
+        assert_eq!(extract_price_poisha("price 750"), Some(75_000));
+    }
+
+    #[test]
+    fn price_extraction_ignores_bare_numbers() {
+        // A phone number is not a price.
+        assert_eq!(extract_price_poisha("যোগাযোগ: 01712345678"), None);
+        assert_eq!(
+            extract_price_poisha("Call 01712345678 to order"),
+            None
+        );
+        // Counts and dates are not prices either.
+        assert_eq!(extract_price_poisha("Only 3 left in stock"), None);
+        assert_eq!(extract_price_poisha("Offer ends 2026-11-30"), None);
+        assert_eq!(extract_price_poisha(""), None);
+        // A labelled candidate above the sanity ceiling is skipped.
+        assert_eq!(extract_price_poisha("BDT 999999999999"), None);
+    }
+
+    #[test]
+    fn price_extraction_first_labelled_wins() {
+        // The bare 2 is skipped; the labelled 800 is the price.
+        assert_eq!(
+            extract_price_poisha("2 pcs available, দাম 800 টাকা"),
+            Some(80_000)
+        );
+        // Two labelled prices: the first in the text wins.
+        assert_eq!(
+            extract_price_poisha("আগে ৳100 ছিল, এখন দাম 800 টাকা"),
+            Some(10_000)
+        );
+        // An unlabelled phone number before the price changes nothing.
+        assert_eq!(
+            extract_price_poisha("Hotline 01712345678, Price: 450 tk"),
+            Some(45_000)
+        );
+    }
+
+    #[test]
+    fn fb_post_draft_shape() {
+        let post = "নতুন শাড়ি এসেছে!\nদামঃ ১,৫০০ টাকা\nঅর্ডার করতে ইনবক্স করুন";
+        let draft = draft_from_fb_post(post);
+        assert_eq!(draft.title, "নতুন শাড়ি এসেছে!");
+        assert_eq!(draft.description, post);
+        assert_eq!(draft.price_poisha, Some(150_000));
+
+        // Leading blank lines are skipped for the title.
+        let draft = draft_from_fb_post("\n\n  Cotton Panjabi  \nPrice: 1200 tk");
+        assert_eq!(draft.title, "Cotton Panjabi");
+        assert_eq!(draft.price_poisha, Some(120_000));
+
+        // No labelled price -> None, never a guessed number.
+        let draft = draft_from_fb_post("Coming soon!\nযোগাযোগ: 01812345678");
+        assert_eq!(draft.title, "Coming soon!");
+        assert_eq!(draft.price_poisha, None);
+
+        // Empty input drafts empty.
+        let draft = draft_from_fb_post("   ");
+        assert_eq!(draft.title, "");
+        assert_eq!(draft.description, "");
+        assert_eq!(draft.price_poisha, None);
+
+        // Over-long titles and descriptions are truncated by chars.
+        let long_line = "x".repeat(250);
+        let draft = draft_from_fb_post(&long_line);
+        assert_eq!(draft.title.chars().count(), MAX_FB_TITLE_CHARS);
+        let long_post = "y".repeat(2_500);
+        let draft = draft_from_fb_post(&long_post);
+        assert_eq!(draft.description.chars().count(), MAX_FB_DESCRIPTION_CHARS);
     }
 }

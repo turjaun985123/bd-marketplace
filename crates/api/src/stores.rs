@@ -21,6 +21,10 @@ use crate::{ApiError, AppState};
 /// `status` (Wave 10) is `active` or `suspended` — suspension is
 /// the admin kill switch enforced in the product listing, product
 /// detail and checkout paths (see the `admin` module).
+/// `facebook_page_id` / `facebook_page_name` (Wave 12) are the
+/// seller's linked Facebook Page identity, or null when no page
+/// is linked; no page tokens are ever stored (see the `facebook`
+/// module).
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct Store {
     pub id: Uuid,
@@ -29,20 +33,26 @@ pub struct Store {
     pub name: String,
     pub description: Option<String>,
     pub status: String,
+    pub facebook_page_id: Option<String>,
+    pub facebook_page_name: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
 const INSERT_STORE_SQL: &str = "INSERT INTO stores (owner_user_id, slug, name, description) \
     VALUES ($1, $2, $3, $4) \
-    RETURNING id, owner_user_id, slug, name, description, status, created_at";
+    RETURNING id, owner_user_id, slug, name, description, status, \
+    facebook_page_id, facebook_page_name, created_at";
 const SELECT_STORE_BY_SLUG_SQL: &str =
-    "SELECT id, owner_user_id, slug, name, description, status, created_at \
+    "SELECT id, owner_user_id, slug, name, description, status, \
+     facebook_page_id, facebook_page_name, created_at \
      FROM stores WHERE slug = $1";
 const SELECT_STORE_BY_ID_SQL: &str =
-    "SELECT id, owner_user_id, slug, name, description, status, created_at \
+    "SELECT id, owner_user_id, slug, name, description, status, \
+     facebook_page_id, facebook_page_name, created_at \
      FROM stores WHERE id = $1";
 const SELECT_STORE_BY_OWNER_SQL: &str = "SELECT id, owner_user_id, slug, name, description, \
-    status, created_at FROM stores WHERE owner_user_id = $1 ORDER BY created_at ASC LIMIT 1";
+    status, facebook_page_id, facebook_page_name, created_at \
+    FROM stores WHERE owner_user_id = $1 ORDER BY created_at ASC LIMIT 1";
 
 /// Create a store for the authenticated user. Validates the slug with
 /// the pure domain function, maps a duplicate slug to 409, and upgrades

@@ -108,6 +108,10 @@ export default function SellerProductsPage() {
   return (
     <main>
       <h1>আমার পণ্য — My products</h1>
+      <p>
+        Facebook Page-এর পোস্ট থেকে পণ্য আনতে{" "}
+        <Link href="/seller/import">ইমপোর্ট পেজে যান — Import from Facebook</Link>
+      </p>
       <form
         onSubmit={(e) => {
           e.preventDefault();
