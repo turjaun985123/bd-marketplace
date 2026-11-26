@@ -613,7 +613,7 @@ pub async fn cancel_order_for_buyer(
         .map_err(|e| ApiError::internal("cancel sub-orders", e))?;
 
     for (sub_order_id, _) in &sub_orders {
-        restock_sub_order_items(&mut *tx, *sub_order_id).await?;
+        restock_sub_order_items(&mut tx, *sub_order_id).await?;
     }
 
     tx.commit()
@@ -870,7 +870,7 @@ pub async fn update_sub_order_status(
     }
 
     if new_status == "cancelled" && current_status != "cancelled" {
-        restock_sub_order_items(&mut *tx, sub_order_id).await?;
+        restock_sub_order_items(&mut tx, sub_order_id).await?;
     }
 
     sqlx::query("UPDATE sub_orders SET status = $2 WHERE id = $1")
