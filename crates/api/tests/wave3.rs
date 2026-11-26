@@ -281,7 +281,9 @@ async fn wave3_cart_split_checkout_flow() {
         Some(&buyer),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Since Wave 5, an online method with no configured gateway (and
+    // dev mode off) is rejected 503 (not available yet), not 400.
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     let (status, _) = call(&app, Method::DELETE, "/v1/cart", None, Some(&buyer)).await;
     assert_eq!(status, StatusCode::OK);
 
