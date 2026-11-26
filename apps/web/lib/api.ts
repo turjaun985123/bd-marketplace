@@ -1980,6 +1980,106 @@ export function cancelPromotion(
 }
 
 // ---------------------------------------------------------------------------
+// Wave 36 — seller subscription plans. A plan is prepaid from
+// the earnings balance for a 30-day period (no separate
+// payment), discounts the store's checkout commission, and
+// raises its product cap. Subscribing and cancelling renewal
+// are owner-only on the API; managers may view.
+// ---------------------------------------------------------------------------
+
+/** One plan in the catalogue (GET /v1/seller/subscription/plans). */
+export interface SubscriptionPlan {
+  /** free | pro | business */
+  key: string;
+  /** Poisha per 30-day period (0 on free). */
+  price_poisha: number;
+  /** Basis points off the store's commission rate. */
+  commission_discount_bps: number;
+  /** Max products for a store on this plan; a huge sentinel = unlimited. */
+  product_cap: number;
+  period_days: number;
+}
+
+/** A store's subscription as the API reports it (effective plan). */
+export interface SubscriptionView {
+  store_id: string;
+  /** The plan whose benefits apply right now. */
+  plan: string;
+  /** Stored status: active | cancelled | expired | free (no row). */
+  status: string;
+  started_at: string | null;
+  expires_at: string | null;
+  auto_renew: boolean;
+  commission_discount_bps: number;
+  product_cap: number;
+  price_poisha: number;
+}
+
+/** The subscribe receipt: the new view + what was charged. */
+export interface SubscribeResult {
+  subscription: SubscriptionView;
+  charged_poisha: number;
+  available_after_poisha: number;
+}
+
+/** Bangla label for a subscription plan key (Wave 36). */
+export function planLabel(plan: string): string {
+  switch (plan) {
+    case "pro":
+      return "প্রো — Pro";
+    case "business":
+      return "বিজনেস — Business";
+    case "free":
+      return "ফ্রি — Free";
+    default:
+      return plan;
+  }
+}
+
+/** Is this product cap the unlimited sentinel (business plan)? */
+export function isUnlimitedCap(cap: number): boolean {
+  return cap >= Number.MAX_SAFE_INTEGER;
+}
+
+export function getSubscriptionPlans(
+  token: string
+): Promise<{ items: SubscriptionPlan[] }> {
+  return call("/v1/seller/subscription/plans", { token });
+}
+
+export function getMySubscription(
+  token: string,
+  storeId?: string
+): Promise<SubscriptionView> {
+  const query = storeId ? `?store_id=${encodeURIComponent(storeId)}` : "";
+  return call(`/v1/seller/subscription${query}`, { token });
+}
+
+export function subscribePlan(
+  token: string,
+  plan: string,
+  storeId?: string
+): Promise<SubscribeResult> {
+  const query = storeId ? `?store_id=${encodeURIComponent(storeId)}` : "";
+  return call(`/v1/seller/subscription${query}`, {
+    method: "POST",
+    token,
+    body: { plan },
+  });
+}
+
+export function cancelSubscription(
+  token: string,
+  storeId?: string
+): Promise<SubscriptionView> {
+  const query = storeId ? `?store_id=${encodeURIComponent(storeId)}` : "";
+  return call(`/v1/seller/subscription/cancel${query}`, {
+    method: "POST",
+    token,
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Wave 10 — platform admin. Every call needs an admin token; the API
 // answers 403 for everyone else (the pages also gate on /v1/auth/me).
 // ---------------------------------------------------------------------------

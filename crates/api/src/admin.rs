@@ -31,7 +31,13 @@
 //! exactly `on`. Wave 26 adds the sponsored-promotion price:
 //! `promotion_price_per_day_poisha` beats the startup
 //! `PROMOTION_PRICE_PER_DAY_POISHA` (itself defaulting to the
-//! domain's 100 taka a day) for NEW promotions. The effective-value helpers below
+//! domain's 100 taka a day) for NEW promotions. Wave 36 adds
+//! the subscription knobs under the same discipline: the two
+//! plan prices (`subscription_price_pro_poisha`,
+//! `subscription_price_business_poisha`) beat their startup
+//! values for NEW subscriptions and renewals, and
+//! `plan_free_product_cap` beats `PLAN_FREE_PRODUCT_CAP` for
+//! stores on the free plan. The effective-value helpers below
 //! are the ONLY readers; checkout and payout creation call them,
 //! never the raw values, so the precedence (setting, then
 //! startup, then built-in default) lives in exactly one place. A
@@ -51,9 +57,11 @@ use axum::{
 use chrono::{DateTime, Utc};
 use domain::{
     can_transition_payout, parse_setting_i64, validate_advance_bps, validate_advance_threshold,
-    validate_commission_bps, validate_promotion_price_per_day, ADVANCE_PERCENT_BPS_KEY,
-    ADVANCE_THRESHOLD_KEY, COMMISSION_BPS_KEY, KYC_PAYOUT_GATE_KEY, MIN_PAYOUT_KEY,
-    MIN_PAYOUT_POISHA, PROMOTION_PRICE_PER_DAY_KEY,
+    validate_commission_bps, validate_plan_free_product_cap, validate_promotion_price_per_day,
+    validate_subscription_price, ADVANCE_PERCENT_BPS_KEY, ADVANCE_THRESHOLD_KEY, COMMISSION_BPS_KEY,
+    KYC_PAYOUT_GATE_KEY, MIN_PAYOUT_KEY, MIN_PAYOUT_POISHA, PLAN_BUSINESS, PLAN_FREE_PRODUCT_CAP_KEY,
+    PLAN_PRO, PROMOTION_PRICE_PER_DAY_KEY, SUBSCRIPTION_PRICE_BUSINESS_KEY,
+    SUBSCRIPTION_PRICE_PRO_KEY,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
@@ -222,6 +230,55 @@ pub async fn effective_promotion_price_per_day(state: &AppState) -> i64 {
         }
     }
     state.promotion_price_per_day_poisha
+}
+
+/// The price of one subscription period of `plan` right now
+/// (Wave 36): the admin setting for that plan when one is
+/// stored and valid, else the startup value
+/// (`SUBSCRIPTION_PRICE_PRO_POISHA` /
+/// `SUBSCRIPTION_PRICE_BUSINESS_POISHA`, themselves defaulting
+/// to the domain's 499 / 1,499 taka). The free plan costs
+/// nothing and never reaches the charge paths. Mirrors
+/// [`effective_promotion_price_per_day`] exactly. The price
+/// applies to NEW subscriptions and renewals — a period
+/// already bought keeps the price it was charged.
+pub async fn effective_subscription_price(state: &AppState, plan: &str) -> i64 {
+    let (key, fallback) = match plan {
+        PLAN_PRO => (
+            SUBSCRIPTION_PRICE_PRO_KEY,
+            state.subscription_price_pro_poisha,
+        ),
+        PLAN_BUSINESS => (
+            SUBSCRIPTION_PRICE_BUSINESS_KEY,
+            state.subscription_price_business_poisha,
+        ),
+        _ => return 0,
+    };
+    if let Some(pool) = &state.pool {
+        if let Some(value) = platform_setting_i64(pool, key).await {
+            if validate_subscription_price(value) {
+                return value;
+            }
+        }
+    }
+    fallback
+}
+
+/// The free plan's product cap right now (Wave 36): the admin
+/// setting when one is stored and valid, else the startup
+/// value (`PLAN_FREE_PRODUCT_CAP`, itself defaulting to the
+/// domain's 50). Only the FREE cap is tunable — the paid caps
+/// are part of what the plans sell, so they stay domain
+/// constants ([`domain::plan_product_cap`]).
+pub async fn effective_plan_free_product_cap(state: &AppState) -> i64 {
+    if let Some(pool) = &state.pool {
+        if let Some(value) = platform_setting_i64(pool, PLAN_FREE_PRODUCT_CAP_KEY).await {
+            if validate_plan_free_product_cap(value) {
+                return value;
+            }
+        }
+    }
+    state.plan_free_product_cap
 }
 
 // ---------------------------------------------------------------------------
@@ -750,6 +807,16 @@ pub struct AdminSettings {
     /// charged to NEW promotions — see
     /// [`effective_promotion_price_per_day`].
     pub promotion_price_per_day_poisha: i64,
+    /// Pro plan price per 30-day period in poisha (Wave 36),
+    /// charged to NEW subscriptions and renewals — see
+    /// [`effective_subscription_price`].
+    pub subscription_price_pro_poisha: i64,
+    /// Business plan price per 30-day period in poisha
+    /// (Wave 36). See [`AdminSettings::subscription_price_pro_poisha`].
+    pub subscription_price_business_poisha: i64,
+    /// The free plan's product cap (Wave 36) — see
+    /// [`effective_plan_free_product_cap`].
+    pub plan_free_product_cap: i64,
     pub platform_name: &'static str,
 }
 
@@ -762,6 +829,10 @@ pub async fn get_settings(state: &AppState) -> AdminSettings {
         advance_threshold_poisha: effective_advance_threshold(state).await,
         kyc_payout_gate: effective_kyc_payout_gate(state).await,
         promotion_price_per_day_poisha: effective_promotion_price_per_day(state).await,
+        subscription_price_pro_poisha: effective_subscription_price(state, PLAN_PRO).await,
+        subscription_price_business_poisha: effective_subscription_price(state, PLAN_BUSINESS)
+            .await,
+        plan_free_product_cap: effective_plan_free_product_cap(state).await,
         platform_name: PLATFORM_NAME,
     }
 }
@@ -871,6 +942,33 @@ pub async fn update_settings(
         save_setting(&mut *tx, PROMOTION_PRICE_PER_DAY_KEY, promotion_price).await?;
         changed_keys.push(PROMOTION_PRICE_PER_DAY_KEY);
     }
+    if let Some(pro_price) = input.subscription_price_pro_poisha {
+        if !validate_subscription_price(pro_price) {
+            return Err(ApiError::bad_request(
+                "subscription_price_pro_poisha must be between 1 and 10000000",
+            ));
+        }
+        save_setting(&mut *tx, SUBSCRIPTION_PRICE_PRO_KEY, pro_price).await?;
+        changed_keys.push(SUBSCRIPTION_PRICE_PRO_KEY);
+    }
+    if let Some(business_price) = input.subscription_price_business_poisha {
+        if !validate_subscription_price(business_price) {
+            return Err(ApiError::bad_request(
+                "subscription_price_business_poisha must be between 1 and 10000000",
+            ));
+        }
+        save_setting(&mut *tx, SUBSCRIPTION_PRICE_BUSINESS_KEY, business_price).await?;
+        changed_keys.push(SUBSCRIPTION_PRICE_BUSINESS_KEY);
+    }
+    if let Some(free_cap) = input.plan_free_product_cap {
+        if !validate_plan_free_product_cap(free_cap) {
+            return Err(ApiError::bad_request(
+                "plan_free_product_cap must be between 0 and 1000000",
+            ));
+        }
+        save_setting(&mut *tx, PLAN_FREE_PRODUCT_CAP_KEY, free_cap).await?;
+        changed_keys.push(PLAN_FREE_PRODUCT_CAP_KEY);
+    }
     if !changed_keys.is_empty() {
         record_admin_action(
             &mut *tx,
@@ -949,6 +1047,15 @@ pub struct UpdateSettingsInput {
     /// Wave 26: per-day sponsored-promotion price override
     /// (poisha), validated by the domain rule.
     pub promotion_price_per_day_poisha: Option<i64>,
+    /// Wave 36: pro plan price override (poisha per 30-day
+    /// period), validated by the domain rule.
+    pub subscription_price_pro_poisha: Option<i64>,
+    /// Wave 36: business plan price override (poisha per
+    /// 30-day period), validated by the domain rule.
+    pub subscription_price_business_poisha: Option<i64>,
+    /// Wave 36: free plan product cap override, validated by
+    /// the domain rule.
+    pub plan_free_product_cap: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------

@@ -261,6 +261,18 @@
 //! the commission basis never see the discount, and the
 //! stored grand total is the reduced payable every money
 //! surface reads.
+//! Wave 36: seller subscription plans (`subscriptions`
+//! module, migration 0034) — a store's plan (free / pro /
+//! business) is prepaid from the seller's earnings balance
+//! for 30-day periods through the same `seller_charges`
+//! ledger as promotions; a live paid plan discounts that
+//! store's checkout commission (resolved per seller group,
+//! so a split order can charge each store its own rate) and
+//! raises its product cap. Renewals and expiry are the
+//! worker's sweep (`process_subscriptions`), not an
+//! endpoint: auto-renew charges extend from the old expiry,
+//! and a period the balance cannot cover lapses the store
+//! back to free.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -299,6 +311,7 @@ pub mod risk;
 pub mod search;
 pub mod shipments;
 pub mod stores;
+pub mod subscriptions;
 pub mod tracking;
 pub mod variants;
 pub mod verification;
@@ -361,6 +374,24 @@ pub struct AppState {
     /// value: `admin::effective_promotion_price_per_day` wins
     /// over it, and it prices NEW promotions only.
     pub promotion_price_per_day_poisha: i64,
+    /// Pro subscription price per 30-day period in poisha
+    /// (49,900 = 499 taka), read once at startup from
+    /// `SUBSCRIPTION_PRICE_PRO_POISHA` (Wave 36). The FALLBACK
+    /// value: `admin::effective_subscription_price` wins over
+    /// it, and it prices NEW subscriptions and renewals only.
+    pub subscription_price_pro_poisha: i64,
+    /// Business subscription price per 30-day period in poisha
+    /// (149,900 = 1,499 taka), read once at startup from
+    /// `SUBSCRIPTION_PRICE_BUSINESS_POISHA` (Wave 36). The
+    /// FALLBACK value: see
+    /// [`AppState::subscription_price_pro_poisha`].
+    pub subscription_price_business_poisha: i64,
+    /// The free plan's product cap, read once at startup from
+    /// `PLAN_FREE_PRODUCT_CAP` (Wave 36). The FALLBACK value:
+    /// `admin::effective_plan_free_product_cap` wins over it.
+    /// Only the free cap is tunable; the paid caps are domain
+    /// constants (part of what the plans sell).
+    pub plan_free_product_cap: i64,
     /// Payment configuration (Wave 5): the DEV simulator switch and
     /// secret, plus one merchant credential set per gateway. Built
     /// from the environment in `from_env`; tests set it explicitly
@@ -446,6 +477,21 @@ pub const DEFAULT_ADVANCE_THRESHOLD_POISHA: i64 = 200_000;
 pub const DEFAULT_PROMOTION_PRICE_PER_DAY_POISHA: i64 =
     domain::DEFAULT_PROMOTION_PRICE_PER_DAY_POISHA;
 
+/// Default pro subscription price: 499 taka per 30-day period
+/// (Wave 36) — the domain constant, re-exported like the
+/// promotion default above.
+pub const DEFAULT_SUBSCRIPTION_PRICE_PRO_POISHA: i64 =
+    domain::DEFAULT_SUBSCRIPTION_PRICE_PRO_POISHA;
+
+/// Default business subscription price: 1,499 taka per 30-day
+/// period (Wave 36). See [`DEFAULT_SUBSCRIPTION_PRICE_PRO_POISHA`].
+pub const DEFAULT_SUBSCRIPTION_PRICE_BUSINESS_POISHA: i64 =
+    domain::DEFAULT_SUBSCRIPTION_PRICE_BUSINESS_POISHA;
+
+/// Default free-plan product cap: 50 products (Wave 36) — the
+/// domain constant, re-exported like the defaults above.
+pub const DEFAULT_PLAN_FREE_PRODUCT_CAP: i64 = domain::DEFAULT_FREE_PLAN_PRODUCT_CAP;
+
 /// The one origin allowed by CORS when `CORS_ORIGINS` is not set
 /// (Wave 20): the local Next.js dev server. A real deployment
 /// sets `CORS_ORIGINS` to its deployed web origin(s).
@@ -509,6 +555,9 @@ impl AppState {
             advance_percent_bps: DEFAULT_ADVANCE_PERCENT_BPS,
             advance_threshold_poisha: DEFAULT_ADVANCE_THRESHOLD_POISHA,
             promotion_price_per_day_poisha: DEFAULT_PROMOTION_PRICE_PER_DAY_POISHA,
+            subscription_price_pro_poisha: DEFAULT_SUBSCRIPTION_PRICE_PRO_POISHA,
+            subscription_price_business_poisha: DEFAULT_SUBSCRIPTION_PRICE_BUSINESS_POISHA,
+            plan_free_product_cap: DEFAULT_PLAN_FREE_PRODUCT_CAP,
             payments_config: PaymentsConfig::default(),
             couriers_config: CouriersConfig::default(),
             facebook_config: FacebookConfig::default(),
@@ -629,6 +678,47 @@ impl AppState {
                 _ => eprintln!(
                     "WARNING: PROMOTION_PRICE_PER_DAY_POISHA='{raw}' is invalid — \
                      using the default {DEFAULT_PROMOTION_PRICE_PER_DAY_POISHA} poisha"
+                ),
+            }
+        }
+        // SUBSCRIPTION_PRICE_PRO_POISHA /
+        // SUBSCRIPTION_PRICE_BUSINESS_POISHA /
+        // PLAN_FREE_PRODUCT_CAP are read once, here at startup,
+        // under the same discipline as the promotion price: an
+        // invalid or out-of-range value keeps the default
+        // rather than breaking plan pricing later. Admin
+        // platform settings (Wave 36) override all three at
+        // read time.
+        if let Ok(raw) = std::env::var("SUBSCRIPTION_PRICE_PRO_POISHA") {
+            match raw.parse::<i64>() {
+                Ok(price) if domain::validate_subscription_price(price) => {
+                    state.subscription_price_pro_poisha = price
+                }
+                _ => eprintln!(
+                    "WARNING: SUBSCRIPTION_PRICE_PRO_POISHA='{raw}' is invalid — \
+                     using the default {DEFAULT_SUBSCRIPTION_PRICE_PRO_POISHA} poisha"
+                ),
+            }
+        }
+        if let Ok(raw) = std::env::var("SUBSCRIPTION_PRICE_BUSINESS_POISHA") {
+            match raw.parse::<i64>() {
+                Ok(price) if domain::validate_subscription_price(price) => {
+                    state.subscription_price_business_poisha = price
+                }
+                _ => eprintln!(
+                    "WARNING: SUBSCRIPTION_PRICE_BUSINESS_POISHA='{raw}' is invalid — \
+                     using the default {DEFAULT_SUBSCRIPTION_PRICE_BUSINESS_POISHA} poisha"
+                ),
+            }
+        }
+        if let Ok(raw) = std::env::var("PLAN_FREE_PRODUCT_CAP") {
+            match raw.parse::<i64>() {
+                Ok(cap) if domain::validate_plan_free_product_cap(cap) => {
+                    state.plan_free_product_cap = cap
+                }
+                _ => eprintln!(
+                    "WARNING: PLAN_FREE_PRODUCT_CAP='{raw}' is invalid — \
+                     using the default {DEFAULT_PLAN_FREE_PRODUCT_CAP}"
                 ),
             }
         }
@@ -1543,6 +1633,27 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/seller/promotions/:id/cancel",
             post(promotions::cancel_promotion_handler),
         )
+        // Wave 36 — seller subscription plans: the public
+        // catalogue (prices are effective values), the
+        // caller's current subscription on their payout store,
+        // subscribing / switching (owner only, prepaid from
+        // the earnings balance), and cancelling renewal
+        // (benefits run to the paid period's end). Renewals
+        // and expiry are the worker's sweep over the same
+        // service functions — there is no renewal endpoint.
+        .route(
+            "/v1/seller/subscription/plans",
+            get(subscriptions::list_plans_handler),
+        )
+        .route(
+            "/v1/seller/subscription",
+            get(subscriptions::get_subscription_handler)
+                .post(subscriptions::subscribe_handler),
+        )
+        .route(
+            "/v1/seller/subscription/cancel",
+            post(subscriptions::cancel_subscription_handler),
+        )
         // Wave 24 — wishlist: the caller's server-side
         // saved-for-later list. Add/remove are idempotent
         // and answer with the resulting state; the ids read
@@ -1619,7 +1730,9 @@ fn log_config_summary(state: &AppState) {
         "config summary: sms_dev_mode={} payments_dev_mode={} couriers_dev_mode={} \
          payment gateways configured={}/4 couriers live={}/5 sidra_configured={} \
          facebook_app_configured={} cors_origins={} commission={}bps \
-         advance={}bps at/above {} poisha promotion_price={} poisha/day",
+         advance={}bps at/above {} poisha promotion_price={} poisha/day \
+         subscription_pro={} subscription_business={} poisha/period \
+         free_plan_cap={}",
         state.sms_dev_mode,
         state.payments_config.dev_mode,
         state.couriers_config.dev_mode,
@@ -1632,6 +1745,9 @@ fn log_config_summary(state: &AppState) {
         state.advance_percent_bps,
         state.advance_threshold_poisha,
         state.promotion_price_per_day_poisha,
+        state.subscription_price_pro_poisha,
+        state.subscription_price_business_poisha,
+        state.plan_free_product_cap,
     );
 }
 

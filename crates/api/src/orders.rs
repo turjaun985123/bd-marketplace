@@ -796,6 +796,7 @@ pub async fn place_order(
             items: sub.items.clone(),
             discount_poisha: 0,
             commission_on_discounted: false,
+            commission_rate_bps: None,
         })
         .collect();
 
@@ -809,6 +810,19 @@ pub async fn place_order(
 
     // The commission rate is the EFFECTIVE one (Wave 10): an
     // admin-set platform setting wins over the startup value.
+    // Wave 36: each group ALSO carries its own store's rate —
+    // the effective rate minus the discount of the store's
+    // live subscription plan, resolved per store — and the
+    // totals function applies the group's rate when present,
+    // so every sub-order below snapshots the commission its
+    // own store's plan actually charges. The order-wide rate
+    // remains the fallback for any group without one.
+    for group in groups.iter_mut() {
+        let store_id = Uuid::parse_str(&group.store_id)
+            .map_err(|_| ApiError::internal("parse store id", sqlx::Error::RowNotFound))?;
+        group.commission_rate_bps =
+            Some(crate::subscriptions::effective_commission_bps_for_store(state, store_id).await?);
+    }
     let commission_rate_bps = crate::admin::effective_commission_bps(state).await;
     let totals = build_order_totals(&groups, zone, commission_rate_bps);
 

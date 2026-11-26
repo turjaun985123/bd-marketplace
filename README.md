@@ -2145,6 +2145,111 @@ by re-running the order's redemption; the allocation
 remainder stays with the platform (above). Points are
 worth money only inside checkout — there is no cash-out.
 
+Wave 36 (seller subscription plans — prepaid from the earnings balance):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| GET | `/v1/seller/subscription/plans` | Bearer. The plan catalogue with EFFECTIVE prices, commission discounts and product caps |
+| GET | `/v1/seller/subscription` | Bearer, `view_finances` role (owner or manager). The scoped store's plan view — effective plan (free unless a live paid row exists), stored status, expiry, auto-renew, discount, cap and price |
+| POST | `/v1/seller/subscription` | Bearer, OWNER only (`manage_payouts`). Body `{ "plan": "pro" }`. Subscribe or switch; 201 with the charge and the balance after. Paid plans are charged in ONE transaction; `plan: "free"` cancels a paid plan at once |
+| POST | `/v1/seller/subscription/cancel` | Bearer, OWNER only. Stops auto-renewal; the plan stays active until its expiry. 400 when there is no live paid plan |
+
+**The plans** (pure domain rules; prices and the free cap
+are platform settings, DB > env > const, in the usual
+`effective_*` style):
+
+| Plan | Price / 30 days | Commission discount | Product cap |
+| --- | --- | --- | --- |
+| free | ৳0 | 0 bps | 50 (tunable: `plan_free_product_cap`) |
+| pro | ৳499 (`subscription_price_pro_poisha`) | 100 bps (1%) | 500 |
+| business | ৳1,499 (`subscription_price_business_poisha`) | 200 bps (2%) | unlimited |
+
+**The billing model is prepaid from the earnings
+balance** — the same honesty rules as Wave 26
+promotions: there is NO external payment rail for
+platform billing. Subscribing locks the seller's payout
+store row `FOR UPDATE`, computes the available balance
+through the one shared `available_balance_poisha`
+(earned − paid out − pending − charges), refuses with a
+400 and no writes when the price exceeds it, and on
+success writes a `seller_charges` row (kind
+`subscription`, ref = the subscription id — migration
+0034 widens the kind CHECK) and upserts the store's one
+subscription row (`store_subscriptions`, UNIQUE per
+store) as active for 30 days from now with auto-renew
+on. Switching plans charges the new plan's FULL price
+and starts a fresh 30-day period from now — **no
+proration, no refunds**, stated in the UI before
+purchase. Switching to free takes effect immediately:
+the row is marked cancelled and the store's benefits
+stop at once (also no refund). Cancelling renewal is
+different: `auto_renew` goes false and the plan keeps
+its benefits until `expires_at`.
+
+**Per-store commission.** A plan is ACTIVE for benefits
+only while its row says `active` AND `expires_at` is in
+the future — one rule (`live_plan`) behind the view, the
+discount and the cap. Checkout resolves the commission
+rate PER STORE GROUP: `effective_commission_bps_for_store`
+is the base effective rate minus the store's live plan
+discount, floored at zero, and `build_order_totals`
+takes it through the additive per-group
+`commission_rate_bps` override (absent = the order-wide
+rate, so every pre-W36 caller and test is unchanged).
+Each sub-order's commission and `seller_payout_poisha`
+snapshots therefore use its own store's rate — a pro
+store in a mixed cart pays 700 bps while a free store
+beside it pays the full 800.
+
+**The product cap.** Creating a product counts the
+store's product ROWS — products are never hard-deleted
+(the lifecycle is draft/active/archived), so every row
+counts and archiving does not free a slot — against the
+store's effective cap; at the cap the create is a 403
+naming the cap in English and Bangla. The count is taken
+on the pool just before the insert, so two creates in
+flight at once can overshoot by the number in flight;
+the cap is a plan boundary, not a money rule.
+
+**Renewal is worker-driven.** Each worker cycle also
+runs `process_subscriptions` (the Wave 30 poller shape:
+`{ checked, renewed, expired }`, per-store transactions,
+errors logged and counted, never fatal). A lapsed active
+paid subscription renews when auto-renew is on and the
+owner's available balance covers the CURRENT effective
+price: the charge lands and `expires_at` extends by 30
+days FROM THE OLD EXPIRY — no paid days are lost to a
+late sweep. Otherwise the row becomes `expired` and the
+store falls back to the free plan (full commission, free
+cap) until the owner subscribes again. Free-plan rows
+never expire.
+
+**Web.** `/seller/subscription` shows the current plan
+(expiry, auto-renew state, discount, cap, the store's
+available balance), the three plan cards with
+subscribe / switch / return-to-free buttons and the
+cancel-renewal button; subscribing is owner-only —
+managers and staff see the plan but the buttons are
+disabled with an explanation. The page states the model
+in plain Bangla before any button: ব্যালেন্স থেকে কাটা
+হবে — আলাদা পেমেন্ট লাগবে না (charged from the balance —
+no separate payment needed), switching is full price
+with no proration, and switching to free is immediate
+with no refund. The seller dashboard carries a plan
+badge linking to the page, and the seller nav links it.
+
+**Honest limits:** subscription charges produce no
+invoice beyond the charges ledger and the Wave 31 seller
+export's charges total; there are no free trials, no
+per-seat pricing (a plan covers the whole store,
+including its Wave 34 team), and no way to pay for a
+plan except the earnings balance — a brand-new seller
+with no delivered orders cannot subscribe until they
+have earned at least the plan price. Renewal depends on
+the worker running; a stopped worker means plans lapse
+to `expired` at the next sweep rather than renewing,
+never a silent extension.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -3413,6 +3518,36 @@ platform-funded payout proof, the advance reading the
 reduced payable, the cancel refund, the return clawback,
 the courier collection netting and the full ledger order.
 
+**Real (Wave 36):** seller subscription plans —
+migration 0034 (`store_subscriptions`, one row per
+store; the `seller_charges` kind CHECK widened to
+`('promotion','subscription')`); the pure domain plan
+rules (keys, commission discounts 0/100/200 bps,
+product caps 50/500/unlimited, 30-day period) with
+prices and the free cap as platform settings (DB > env
+> const); subscribing prepaid from the earnings balance
+through the one shared balance function in
+`crates/api/src/subscriptions.rs` (owner-only,
+payout-store lock, charge + upsert in one transaction,
+switch = full price no proration, free switch =
+immediate cancel, cancel = renewal off only); per-store
+commission resolution at checkout via the additive
+per-group rate in `build_order_totals`; the product cap
+enforced at create (403, all product rows counted); the
+worker-driven renewal sweep extending from the old
+expiry or expiring to free. Web: /seller/subscription,
+the dashboard plan badge and the seller nav link. An
+integration test (`crates/api/tests/wave36.rs`, same
+`DATABASE_URL` gate) covers the catalogue + free
+default, subscribe-from-balance (184_000 -> 134_100
+after the 49_900 charge), the 700 bps delivered earning
+(186_000), the tuned free cap (2 -> third create 403,
+pro unaffected), the manager's subscribe refusal (403),
+cancel-then-resubscribe, and the sweep renewing from
+the old expiry (a third charge) then expiring the store
+back to full commission when the price outruns the
+balance.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters, and the four manual couriers run
@@ -3473,7 +3608,8 @@ the external service at the other end of it, configured by
   role badge next to the store name; Wave 35 adds no page —
   it adds the checkout loyalty block, the orders-page
   loyalty card, and loyalty discount lines on the order
-  and receipt views).
+  and receipt views; Wave 36 adds /seller/subscription,
+  the dashboard plan badge and the seller nav link).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
   (domain 118, courier 31, payments 8 unit tests, plus the API

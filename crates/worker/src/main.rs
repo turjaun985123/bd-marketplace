@@ -33,6 +33,19 @@
 //! triggered here (the worker serves no HTTP and issues no
 //! tokens).
 //!
+//! Wave 36 gives the worker its third real job: the
+//! subscription renewal sweep. Each cycle also runs
+//! `api::subscriptions::process_subscriptions` over the same
+//! service state: a live paid plan whose period has ended
+//! renews from the seller's earnings balance when
+//! auto-renew is on and the balance covers the current
+//! price (extending 30 days from the OLD expiry, so a late
+//! sweep never steals paid days), and otherwise lapses to
+//! `expired`, dropping the store back to the free plan. Like
+//! the other two jobs it calls the same service function the
+//! API's rules live in — there is no second implementation
+//! of the money rules here.
+//!
 //! The worker runs the same embedded migrations as the API
 //! at startup (idempotent — whichever process starts first
 //! applies them). Poll interval: `WORKER_POLL_SECONDS`
@@ -47,8 +60,9 @@ use std::time::Duration;
 use sqlx::postgres::PgPoolOptions;
 
 /// Jobs this worker will own in later waves (the notification
-/// outbox, Wave 29, and courier status polling, Wave 30, are
-/// implemented below).
+/// outbox, Wave 29, courier status polling, Wave 30, and the
+/// subscription renewal sweep, Wave 36, are implemented
+/// below).
 const PLANNED_JOBS: &[&str] = &[
     "payout_jobs (compute_commission-based seller payouts on schedule)",
     "cod_reconciliation (match courier COD collections to orders)",
@@ -170,12 +184,13 @@ async fn main() {
     let sender = notify::sender_from_env(dev_mode);
     let seconds = poll_seconds();
     let stale_minutes = shipment_poll_stale_minutes();
-    // Service state for the shipment poller, built from the
-    // environment exactly as the API server builds its own
-    // (courier credentials + DEV simulator flag), around a
-    // clone of the worker's pool. `from_env` performs no
-    // startup gate — the JWT-secret gate lives in `api::run`,
-    // which this process never calls.
+    // Service state for the shipment poller and the
+    // subscription sweep, built from the environment exactly
+    // as the API server builds its own (courier credentials +
+    // DEV simulator flag + the plan price/cap fallbacks),
+    // around a clone of the worker's pool. `from_env`
+    // performs no startup gate — the JWT-secret gate lives
+    // in `api::run`, which this process never calls.
     let state = api::AppState::from_env(Some(pool.clone()));
     println!(
         "bd-marketplace worker starting: notification outbox every {seconds}s \
@@ -187,6 +202,7 @@ async fn main() {
         "shipment polling every {seconds}s (stale after {stale_minutes} min, \
          batch {SHIPMENT_POLL_BATCH})"
     );
+    println!("subscription renewal sweep every {seconds}s");
     println!("planned jobs (still TODO, not yet implemented):");
     for job in PLANNED_JOBS {
         println!("  - {job}");
@@ -217,6 +233,18 @@ async fn main() {
             Ok(_) => {}
             Err(error) => {
                 eprintln!("worker: shipment poll failed: {}", error.message);
+            }
+        }
+        match api::subscriptions::process_subscriptions(&state).await {
+            Ok(report) if report.renewed + report.expired > 0 => {
+                println!(
+                    "subscription sweep: checked {} renewed {} expired {}",
+                    report.checked, report.renewed, report.expired
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("worker: subscription sweep failed: {}", error.message);
             }
         }
         tokio::select! {

@@ -250,6 +250,15 @@ pub struct OrderGroupInput {
     /// The API decides this from the coupon's scope; the totals
     /// function only applies the arithmetic.
     pub commission_on_discounted: bool,
+    /// This group's own commission rate in basis points (Wave 36),
+    /// when it differs from the order-wide rate handed to
+    /// [`build_order_totals`]: a store on a paid subscription plan
+    /// earns a plan discount off the platform rate, and each
+    /// seller group in a split order may sit on a different plan.
+    /// `None` means "the order-wide rate" — every pre-Wave-36
+    /// caller and test constructs groups this way and is
+    /// unaffected.
+    pub commission_rate_bps: Option<u32>,
 }
 
 /// Money breakdown for one seller's sub-order, all in poisha.
@@ -300,6 +309,14 @@ pub struct OrderTotals {
 /// when the platform bears it (a platform coupon). The buyer pays
 /// goods − discount + delivery: the discount reduces the grand
 /// total no matter who bears it.
+///
+/// Commission rates (Wave 36): `commission_rate_bps` is the
+/// order-wide rate, and a group carrying its own
+/// `commission_rate_bps` (a subscription plan discount resolved
+/// per store by the API) pays THAT rate instead — in a split
+/// order each store's slice is charged at its own plan's rate,
+/// snapshotted into its sub-order exactly like the single-rate
+/// case.
 pub fn build_order_totals(
     groups: &[OrderGroupInput],
     zone: DeliveryZone,
@@ -330,8 +347,12 @@ pub fn build_order_totals(
         } else {
             goods_subtotal_poisha
         };
+        // Wave 36: a group may carry its own rate (a subscription
+        // plan discount resolved per store by the API); without
+        // one it pays the order-wide rate, exactly as before.
+        let group_rate_bps = group.commission_rate_bps.unwrap_or(commission_rate_bps);
         let commission_poisha =
-            compute_commission(commission_base_poisha, commission_rate_bps).commission_poisha;
+            compute_commission(commission_base_poisha, group_rate_bps).commission_poisha;
         goods_total_poisha += goods_subtotal_poisha;
         discount_total_poisha += discount_poisha;
         delivery_total_poisha += delivery_charge_poisha;
@@ -1341,6 +1362,131 @@ pub fn promotion_is_active(
     now_unix: i64,
 ) -> bool {
     status == "active" && starts_at_unix <= now_unix && now_unix < ends_at_unix
+}
+
+/// Seller subscription plans (Wave 36): three tiers a store can
+/// sit on. `free` is the default every store starts on (and
+/// falls back to when a paid plan lapses); `pro` and `business`
+/// are prepaid from the seller's earnings balance for a
+/// 30-day period — the same balance promotions draw on, through
+/// the same `seller_charges` ledger, so a plan can never be
+/// spent twice. A plan buys two things: a discount off the
+/// platform commission rate for that store's sub-orders, and a
+/// higher product cap for the store's catalogue.
+pub const PLAN_FREE: &str = "free";
+/// See [`PLAN_FREE`].
+pub const PLAN_PRO: &str = "pro";
+/// See [`PLAN_FREE`].
+pub const PLAN_BUSINESS: &str = "business";
+
+/// Every subscription plan key, cheapest first. The plans
+/// catalogue endpoint iterates this; tests iterate it so a new
+/// plan can never silently miss a price, discount or cap row.
+pub const SUBSCRIPTION_PLANS: [&str; 3] = [PLAN_FREE, PLAN_PRO, PLAN_BUSINESS];
+
+/// One subscription period, in days: a purchase (or a renewal)
+/// covers the store for this many days from its start (or, for
+/// a renewal, from the previous period's end — no paid day is
+/// ever lost to a late sweep).
+pub const SUBSCRIPTION_PERIOD_DAYS: i64 = 30;
+
+/// Is this a subscription plan key the platform sells? Returns
+/// the key unchanged on success. `free` is a legal target for
+/// the subscribe endpoint: choosing it cancels the paid plan
+/// (effective immediately, no refund — see the API module).
+pub fn validate_plan_key(plan: &str) -> Result<&str, &'static str> {
+    match plan.trim() {
+        PLAN_FREE => Ok(PLAN_FREE),
+        PLAN_PRO => Ok(PLAN_PRO),
+        PLAN_BUSINESS => Ok(PLAN_BUSINESS),
+        _ => Err("plan must be 'free', 'pro' or 'business'"),
+    }
+}
+
+/// The commission discount a plan earns, in basis points off
+/// the platform's effective rate: pro takes 100 bps (one
+/// percentage point) off, business 200. Unknown keys earn no
+/// discount — the function fails closed, like the role matrix,
+/// so a garbled stored plan can never mint a discount.
+pub fn plan_commission_discount_bps(plan: &str) -> i64 {
+    match plan {
+        PLAN_PRO => 100,
+        PLAN_BUSINESS => 200,
+        _ => 0,
+    }
+}
+
+/// The built-in product cap of the free plan, used when
+/// neither a platform setting nor the startup
+/// `PLAN_FREE_PRODUCT_CAP` provides one. The free cap is the
+/// one tunable cap (see [`PLAN_FREE_PRODUCT_CAP_KEY`]): it is
+/// the platform's main free-tier lever, so ops may need to
+/// move it without a redeploy.
+pub const DEFAULT_FREE_PLAN_PRODUCT_CAP: i64 = 50;
+
+/// How many products a store on `plan` may hold. The count
+/// rule itself lives with the API (every product row counts —
+/// products are never hard-deleted, so drafts and archived
+/// products hold their slot; see the API's products module).
+/// Business is unlimited, expressed as `i64::MAX` so the
+/// comparison `count >= cap` simply never fires. Unknown keys
+/// get the free cap — failing closed again.
+pub fn plan_product_cap(plan: &str) -> i64 {
+    match plan {
+        PLAN_PRO => 500,
+        PLAN_BUSINESS => i64::MAX,
+        _ => DEFAULT_FREE_PLAN_PRODUCT_CAP,
+    }
+}
+
+/// The built-in monthly price of the pro plan, in poisha
+/// (499 taka), used when neither a platform setting nor the
+/// startup `SUBSCRIPTION_PRICE_PRO_POISHA` provides one. The
+/// effective price resolution (setting, then startup, then
+/// this constant) lives in the API's `admin` module, mirroring
+/// the promotion price.
+pub const DEFAULT_SUBSCRIPTION_PRICE_PRO_POISHA: i64 = 49_900;
+
+/// The built-in monthly price of the business plan, in poisha
+/// (1,499 taka). See [`DEFAULT_SUBSCRIPTION_PRICE_PRO_POISHA`].
+pub const DEFAULT_SUBSCRIPTION_PRICE_BUSINESS_POISHA: i64 = 149_900;
+
+/// The `platform_settings` key for the pro plan's price
+/// override (Wave 36). When a row with this key holds a valid
+/// value, it beats the startup `SUBSCRIPTION_PRICE_PRO_POISHA`
+/// for NEW subscriptions and renewals; a period already bought
+/// keeps the price it was charged.
+pub const SUBSCRIPTION_PRICE_PRO_KEY: &str = "subscription_price_pro_poisha";
+
+/// The `platform_settings` key for the business plan's price
+/// override (Wave 36). See [`SUBSCRIPTION_PRICE_PRO_KEY`].
+pub const SUBSCRIPTION_PRICE_BUSINESS_KEY: &str = "subscription_price_business_poisha";
+
+/// The `platform_settings` key for the free plan's product cap
+/// override (Wave 36). When a row with this key holds a valid
+/// value, it beats the startup `PLAN_FREE_PRODUCT_CAP` (and
+/// the built-in [`DEFAULT_FREE_PLAN_PRODUCT_CAP`]) for stores
+/// on the free plan.
+pub const PLAN_FREE_PRODUCT_CAP_KEY: &str = "plan_free_product_cap";
+
+/// Is `price` a legal subscription price, in poisha? Positive
+/// — a paid plan at zero would hand out commission discounts
+/// for nothing — and at most 100,000 taka a month, far above
+/// any plausible tier; anything past it is a data-entry error.
+/// The same rule gates the admin settings endpoint, the
+/// startup values and the read-back of a stored setting, so an
+/// out-of-range row is ignored rather than applied.
+pub fn validate_subscription_price(price_poisha: i64) -> bool {
+    (1..=10_000_000).contains(&price_poisha)
+}
+
+/// Is `cap` a legal free-plan product cap? Zero is allowed (a
+/// deliberate freeze on new free-plan products); the ceiling
+/// is a million products, far beyond any real catalogue, so
+/// anything past it is a data-entry error. Same gating
+/// discipline as [`validate_subscription_price`].
+pub fn validate_plan_free_product_cap(cap: i64) -> bool {
+    (0..=1_000_000).contains(&cap)
 }
 
 /// The `platform_settings` key for the commission rate override
@@ -3485,6 +3631,7 @@ mod tests {
             items,
             discount_poisha: 0,
             commission_on_discounted: false,
+            commission_rate_bps: None,
         }
     }
 
@@ -3499,6 +3646,7 @@ mod tests {
             items,
             discount_poisha,
             commission_on_discounted,
+            commission_rate_bps: None,
         }
     }
 
@@ -4314,6 +4462,84 @@ mod tests {
         assert!(!promotion_is_active(1_000, 2_000, "active", 5_000));
         // A cancelled promotion is never active, even in-window.
         assert!(!promotion_is_active(1_000, 2_000, "cancelled", 1_500));
+    }
+
+    #[test]
+    fn subscription_plan_keys_and_discounts() {
+        assert_eq!(validate_plan_key("free"), Ok("free"));
+        assert_eq!(validate_plan_key(" pro "), Ok("pro"));
+        assert_eq!(validate_plan_key("business"), Ok("business"));
+        assert!(validate_plan_key("enterprise").is_err());
+        assert!(validate_plan_key("").is_err());
+        // Every plan in the catalogue validates and has a row
+        // in each of the plan tables below.
+        for plan in SUBSCRIPTION_PLANS {
+            assert_eq!(validate_plan_key(plan), Ok(plan));
+        }
+        assert_eq!(plan_commission_discount_bps("free"), 0);
+        assert_eq!(plan_commission_discount_bps("pro"), 100);
+        assert_eq!(plan_commission_discount_bps("business"), 200);
+        // Unknown keys fail closed: no discount.
+        assert_eq!(plan_commission_discount_bps("enterprise"), 0);
+        assert_eq!(plan_commission_discount_bps(""), 0);
+    }
+
+    #[test]
+    fn subscription_plan_caps_and_prices() {
+        assert_eq!(plan_product_cap("free"), DEFAULT_FREE_PLAN_PRODUCT_CAP);
+        assert_eq!(plan_product_cap("free"), 50);
+        assert_eq!(plan_product_cap("pro"), 500);
+        // Business is unlimited, via the documented sentinel.
+        assert_eq!(plan_product_cap("business"), i64::MAX);
+        // Unknown keys get the free cap — failing closed.
+        assert_eq!(plan_product_cap("enterprise"), 50);
+        assert_eq!(DEFAULT_SUBSCRIPTION_PRICE_PRO_POISHA, 49_900);
+        assert_eq!(DEFAULT_SUBSCRIPTION_PRICE_BUSINESS_POISHA, 149_900);
+        assert_eq!(SUBSCRIPTION_PERIOD_DAYS, 30);
+        // The setting keys are the contract with the settings table.
+        assert_eq!(SUBSCRIPTION_PRICE_PRO_KEY, "subscription_price_pro_poisha");
+        assert_eq!(
+            SUBSCRIPTION_PRICE_BUSINESS_KEY,
+            "subscription_price_business_poisha"
+        );
+        assert_eq!(PLAN_FREE_PRODUCT_CAP_KEY, "plan_free_product_cap");
+    }
+
+    #[test]
+    fn subscription_setting_validators_cover_the_legal_ranges() {
+        assert!(validate_subscription_price(1));
+        assert!(validate_subscription_price(49_900));
+        assert!(validate_subscription_price(10_000_000));
+        assert!(!validate_subscription_price(0));
+        assert!(!validate_subscription_price(-1));
+        assert!(!validate_subscription_price(10_000_001));
+
+        assert!(validate_plan_free_product_cap(0));
+        assert!(validate_plan_free_product_cap(2));
+        assert!(validate_plan_free_product_cap(1_000_000));
+        assert!(!validate_plan_free_product_cap(-1));
+        assert!(!validate_plan_free_product_cap(1_000_001));
+    }
+
+    #[test]
+    fn order_totals_group_rate_overrides_order_rate() {
+        // Two stores with identical goods: one group carries
+        // its own (plan-discounted) rate, the other falls back
+        // to the order-wide rate. 200_000 poisha of goods at
+        // 800 bps pays 16_000 commission; at 700 bps, 14_000.
+        let mut discounted = group("store-pro", vec![item("store-pro", "p1", 1, 2_000)]);
+        discounted.commission_rate_bps = Some(700);
+        let groups = vec![
+            group("store-free", vec![item("store-free", "p2", 1, 2_000)]),
+            discounted,
+        ];
+        let totals = build_order_totals(&groups, DeliveryZone::InsideDhaka, 800);
+        assert_eq!(totals.sub_orders[0].commission_poisha, 16_000);
+        assert_eq!(totals.sub_orders[0].seller_payout_poisha, 184_000);
+        assert_eq!(totals.sub_orders[1].commission_poisha, 14_000);
+        assert_eq!(totals.sub_orders[1].seller_payout_poisha, 186_000);
+        // The order-wide figures are the plain sums either way.
+        assert_eq!(totals.goods_total_poisha, 400_000);
     }
 
     #[test]

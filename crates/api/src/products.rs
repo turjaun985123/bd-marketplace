@@ -407,7 +407,20 @@ fn normalize_category(category: Option<&str>) -> Option<String> {
 
 /// Create a product in a store the caller owns. Input rules come from
 /// the pure domain validator — the same function the update path uses.
+///
+/// Wave 36: the store's subscription plan caps its catalogue.
+/// The count is EVERY product row the store holds — products
+/// are never hard-deleted (the lifecycle is draft / active /
+/// archived), so each row keeps its slot until... forever;
+/// archiving does not free a slot. The cap itself is the live
+/// plan's (see the `subscriptions` module): the free cap is
+/// tunable, the paid caps are part of what the plans sell.
+/// The check is a count-then-insert on the pool, so two
+/// creates racing in the same instant can overshoot the cap
+/// by the number in flight — the cap is a plan boundary, not
+/// a money rule, and the overshoot is bounded by concurrency.
 pub async fn create_product_for_owner(
+    state: &AppState,
     pool: &PgPool,
     user: &AuthUser,
     input: CreateProductInput,
@@ -431,6 +444,26 @@ pub async fn create_product_for_owner(
     // The domain validator has already proven 1..=50,000, so this fits.
     let weight_grams = i32::try_from(validated.weight_grams)
         .map_err(|_| ApiError::bad_request("weight_grams out of range"))?;
+
+    // Wave 36: the plan cap gate (see the function doc). At
+    // the cap the create is refused with the plan's numbers
+    // named, in both languages, so the seller hears the one
+    // thing that fixes it: upgrade the store's plan.
+    let cap = crate::subscriptions::product_cap_for_store(state, input.store_id).await?;
+    let product_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM products WHERE store_id = $1")
+            .bind(input.store_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| ApiError::internal("count store products for plan cap", e))?;
+    if product_count >= cap {
+        return Err(ApiError::forbidden(format!(
+            "your store's current plan allows at most {cap} products — \
+             upgrade the store's subscription to add more — \
+             আপনার স্টোরের বর্তমান প্ল্যানে সর্বোচ্চ {cap}টি পণ্য রাখা যাবে, \
+             আরও যোগ করতে সাবস্ক্রিপশন আপগ্রেড করুন"
+        )));
+    }
 
     let id = insert_product(
         pool,
@@ -612,7 +645,7 @@ pub async fn create_product(
     Json(input): Json<CreateProductInput>,
 ) -> Result<(StatusCode, Json<Product>), ApiError> {
     let pool = state.require_pool()?;
-    let product = create_product_for_owner(pool, &user, input).await?;
+    let product = create_product_for_owner(&state, pool, &user, input).await?;
     Ok((StatusCode::CREATED, Json(product)))
 }
 

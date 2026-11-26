@@ -7,11 +7,13 @@ import StoreSwitcher from "@/components/StoreSwitcher";
 import {
   downloadSellerExport,
   getBuyerRisk,
+  getMySubscription,
   getPayoutAccount,
   getSellerDashboard,
   listPayouts,
   listSellerStores,
   payoutStatusLabel,
+  planLabel,
   requestPayout,
   riskLevelLabel,
   savePayoutAccount,
@@ -22,6 +24,7 @@ import {
   type PayoutAccount,
   type SellerDashboard,
   type SellerStore,
+  type SubscriptionView,
 } from "@/lib/api";
 import { parseTakaToPoisha } from "@/lib/format";
 import { useAuth } from "@/hooks/useAuth";
@@ -51,6 +54,11 @@ const STATUS_LABELS: Record<string, string> = {
  * (GET /v1/seller/export) as one JSON file — the portability
  * export, fetched as a Blob with the auth header and saved via
  * an object URL, the Wave 27 CSV pattern.
+ *
+ * Wave 36: a plan badge under the store switcher shows the
+ * store's current subscription plan (GET /v1/seller/subscription)
+ * and links to the subscription page; the badge is best-effort
+ * and never blocks the dashboard.
  */
 export default function SellerDashboardPage() {
   const { ready, token } = useAuth();
@@ -118,8 +126,21 @@ export default function SellerDashboardPage() {
   // Data export state (Wave 31 portability).
   const [exportBusy, setExportBusy] = useState(false);
 
+  // Subscription plan badge (Wave 36): the plan of the store
+  // on screen, fetched beside the dashboard; a failure here
+  // never blocks the dashboard itself.
+  const [subscription, setSubscription] = useState<SubscriptionView | null>(
+    null
+  );
+
   const load = useCallback(async () => {
     if (!token || !selectionReady) return;
+    // Wave 36: the plan badge for the store on screen (the
+    // selected store, or the payout store in the default
+    // view). Best-effort: the badge hides on any failure.
+    void getMySubscription(token, selectedStoreId || undefined)
+      .then(setSubscription)
+      .catch(() => setSubscription(null));
     try {
       if (selectedStoreId) {
         // Scoped view: the dashboard for one served store.
@@ -273,6 +294,17 @@ export default function SellerDashboardPage() {
         value={selectedStoreId}
         onChange={onSelectStore}
       />
+      {subscription && (
+        <p>
+          বর্তমান প্ল্যান: <strong>{planLabel(subscription.plan)}</strong>
+          {subscription.plan !== "free" && subscription.expires_at
+            ? ` · মেয়াদ শেষ ${new Date(
+                subscription.expires_at
+              ).toLocaleDateString("bn-BD")}`
+            : ""}{" "}
+          · <Link href="/seller/subscription">প্ল্যান দেখুন — View plan</Link>
+        </p>
+      )}
       <p>
         <Link href="/seller/products">আমার পণ্য — My products</Link>
         {" · "}
@@ -289,6 +321,8 @@ export default function SellerDashboardPage() {
         <Link href="/seller/coupons">কুপন — Coupons</Link>
         {" · "}
         <Link href="/seller/promotions">প্রমোশন — Promotions</Link>
+        {" · "}
+        <Link href="/seller/subscription">সাবস্ক্রিপশন — Subscription</Link>
         {" · "}
         <Link href="/seller/analytics">অ্যানালিটিক্স — Analytics</Link>
         {" · "}
