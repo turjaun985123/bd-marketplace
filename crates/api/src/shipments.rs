@@ -834,7 +834,7 @@ async fn sync_sub_order_with_shipment_status(
         .await
         .map_err(|e| ApiError::internal("sync sub-order status", e))?;
     if target == "returned" {
-        crate::orders::restock_sub_order_items(conn, sub_order_id).await?;
+        crate::orders::restock_sub_order_items(conn, sub_order_id, "rto_restock").await?;
     }
     Ok(())
 }

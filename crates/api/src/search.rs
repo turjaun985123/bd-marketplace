@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
-use crate::products::{Product, PRODUCT_COLUMNS, PRODUCT_RATING_JOIN};
+use crate::products::{with_stock_status, Product, PRODUCT_COLUMNS, PRODUCT_RATING_JOIN};
 use crate::{ApiError, AppState};
 
 /// One page of search results plus the total match count. The
@@ -136,7 +136,10 @@ pub async fn search_products(
     .bind(offset)
     .fetch_all(pool)
     .await
-    .map_err(|e| ApiError::internal("search products", e))?;
+    .map_err(|e| ApiError::internal("search products", e))?
+    .into_iter()
+    .map(with_stock_status)
+    .collect();
 
     Ok(SearchResults {
         items,

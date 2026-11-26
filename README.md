@@ -1139,6 +1139,66 @@ deliberately does not invent one. Invoice corrections are
 not modelled either: a wrong invoice is a support matter
 today, not a credit-note flow.
 
+Wave 23 (inventory management & the stock audit trail):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| GET | `/v1/seller/inventory` | Bearer. Every product of the caller's stores with its stock, thresholds and health, plus summary counts |
+| POST | `/v1/seller/products/{id}/adjust-stock` | Bearer, owner. One manual stock move `{delta, reason, note?}`; 400 on an invalid delta/reason or a move below zero (nothing written); the response carries the product and the audit row |
+| GET | `/v1/seller/products/{id}/stock-history?page=&per_page=` | Bearer, owner. The product's audit trail, newest first |
+| PUT | `/v1/seller/products/{id}/low-stock-threshold` | Bearer, owner. Set the product's warning level, or clear it with `{"threshold": null}` |
+
+**The audit rule:** from migration 0024 on, every change
+to a product's stock writes a `stock_adjustments` row in
+the SAME transaction as the stock update itself — the two
+commit or roll back together, so the trail can never claim
+a move the stock did not make (or miss one it did). Each
+row records who moved it (`actor`: `system` for platform
+movements, `seller` for manual ones, with the seller's user
+id), the signed `delta`, a `new_stock` snapshot of the
+on-hand count right after the move, and a `reason`. System
+reasons are `order` (checkout), `cancel_restock` (buyer
+and seller cancels, through the one shared restock helper),
+`return_restock` (a received buyer return) and
+`rto_restock` (a courier-driven return). Seller reasons
+are a fixed vocabulary — `restock`, `correction`,
+`damage`, `count_fix`, `other` — validated by the domain,
+and a seller can never write a system reason. Product
+CREATION writes no row: the history starts at the creation
+stock.
+
+**The product-update stock decision:** the product PATCH
+endpoint used to accept a `stock` field and write it
+silently. Wave 23 REMOVES `stock` from the PATCH payload —
+adjust-stock is now the only way a seller changes stock,
+so no unaudited write path remains. (No client used the
+PATCH field: the web app has no product-edit call, and
+stock was set at creation or not at all.)
+
+**Thresholds:** a product's low-stock warning level is its
+own `low_stock_threshold` when set, else the platform
+default of 5 (domain `LOW_STOCK_DEFAULT`). Health is the
+domain rule: stock ≤ 0 is `out_of_stock`, stock at or
+below the threshold is `low`, anything above is
+`in_stock`. The product view carries both the threshold
+and the computed `stock_status`; the seller dashboard
+gains `low_stock_items` (up to ten, out-of-stock first)
+behind its alert strip, and the seller inventory page
+(/seller/inventory) shows summary counts (মোট পণ্য /
+স্টক শেষ / কম স্টক — the low count excludes out-of-stock,
+which is its own number), per-product adjust forms and
+threshold editors, and expandable per-product history.
+
+**Honest limits:** there are no warehouses or
+multi-location stock and no SKU variants — stock is one
+number per product row, shared by every channel that sells
+it. There is no reservation system either: a buyer's cart
+does not hold stock, and the checkout transaction's row
+lock (plus its in-transaction audit row) is the whole
+concurrency story. Movements from before migration 0024
+are not backfilled — the trail honestly starts with this
+wave.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -2073,6 +2133,36 @@ invoice filename as the document title), linked from the
 buyer orders page and the seller orders page for
 delivered/returned sub-orders.
 
+**Real (Wave 23):** inventory management & the stock
+audit trail — migration 0024 (`products.low_stock_threshold`
+plus the `stock_adjustments` table with a
+(product, created_at) index); the domain inventory rules
+(`stock_status` over an own-or-default threshold,
+`validate_stock_adjustment` — non-zero delta capped at
+±100_000 and the five-reason seller vocabulary,
+`validate_low_stock_threshold`); the `inventory` API
+module with ONE audit writer (`record_stock_adjustment`)
+that checkout, the shared restock helper (now threaded
+with `cancel_restock` / `return_restock` / `rto_restock`
+by its callers) and the adjust-stock endpoint all record
+through, each in the movement's own transaction; the
+seller endpoints for the inventory overview, manual
+adjustments (row-locked, below-zero refused with nothing
+written), per-product history and thresholds — another
+seller's product is a 404 throughout; the product view's
+additive `low_stock_threshold` + computed `stock_status`;
+the dashboard's `low_stock_items`; the product PATCH's
+`stock` field removed so no unaudited write path remains;
+an integration test (`crates/api/tests/wave23.rs`, same
+`DATABASE_URL` gate) covering manual adjustments, the
+refused below-zero move, checkout/cancel system rows,
+threshold default/override/clear across the product view,
+inventory summary and dashboard alerts, and foreign-seller
+404s; and the Next.js seller inventory page at
+/seller/inventory (summary cards, health badges, adjust
+forms, threshold editors, expandable history) plus the
+dashboard's low-stock alert strip and nav link.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters, and the four manual couriers run
@@ -2107,19 +2197,20 @@ the external service at the other end of it, configured by
   /admin/returns; Wave 18 adds /seller/branding; Wave 19 extends
   /seller/orders and /track with the manual-courier workflow;
   Wave 21 adds /seller/verification and /admin/verifications;
-  Wave 22 adds /invoice/[subOrderId]).
+  Wave 22 adds /invoice/[subOrderId]; Wave 23 adds
+  /seller/inventory and the dashboard low-stock strip).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
-  (domain 85, courier 31, payments 8 unit tests; the `DATABASE_URL`-
+  (domain 91, courier 31, payments 8 unit tests; the `DATABASE_URL`-
   gated integration tests skip cleanly without a database). The API
   binary was also smoke-tested locally without a database: routes
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
   (including the Wave 13 messaging endpoints), and the SIDRA
   callback answers 503 without a database.
-- **Rust integration + clippy: CI-only** — the Wave 2–22 integration
+- **Rust integration + clippy: CI-only** — the Wave 2–23 integration
   tests against a real Postgres 16 service and clippy `-D warnings`
   are verified via **GitHub Actions CI** (`.github/workflows/ci.yml`)
-  on push. Waves 1–21 are green there; Wave 22 awaits its first CI run.
+  on push. Waves 1–22 are green there; Wave 23 awaits its first CI run.
 - **Docker images: CI-only** — Docker is not installed on the
   development machine, so `Dockerfile.api`, `Dockerfile.worker`
   and `apps/web/Dockerfile` are verified by the CI `docker` job

@@ -838,14 +838,32 @@ pub async fn place_order(
             .await
             .map_err(|e| ApiError::internal("insert order item", e))?;
 
-            sqlx::query(
-                "UPDATE products SET stock = stock - $2, updated_at = now() WHERE id = $1",
+            // Wave 23: the decrement and its audit row commit
+            // together — `RETURNING stock` gives the exact
+            // post-move count for the trail's snapshot.
+            let new_stock: i32 = sqlx::query_scalar(
+                "UPDATE products SET stock = stock - $2, updated_at = now() \
+                 WHERE id = $1 RETURNING stock",
             )
             .bind(product_id)
             .bind(item.quantity as i32)
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| ApiError::internal("decrement stock", e))?;
+            crate::inventory::record_stock_adjustment(
+                &mut tx,
+                &crate::inventory::StockMovement {
+                    product_id,
+                    store_id,
+                    actor: "system",
+                    actor_user_id: None,
+                    delta: -(item.quantity as i32),
+                    new_stock,
+                    reason: "order",
+                    note: None,
+                },
+            )
+            .await?;
         }
     }
 
@@ -956,10 +974,23 @@ pub async fn get_order_for_buyer(
 /// by the shipment refresh path — returned goods re-enter stock
 /// exactly once, inside whichever transaction moves the sub-order to
 /// `returned`.
+///
+/// Wave 23: every restocked unit also writes its `stock_adjustments`
+/// audit row in the same transaction, under the `reason` the caller
+/// threads in — `cancel_restock` (buyer and seller cancels),
+/// `return_restock` (a received buyer return) or `rto_restock`
+/// (a courier-driven return). The reason is a caller-supplied
+/// constant, never request data.
 pub(crate) async fn restock_sub_order_items(
     conn: &mut sqlx::PgConnection,
     sub_order_id: Uuid,
+    reason: &str,
 ) -> Result<(), ApiError> {
+    let store_id: Uuid = sqlx::query_scalar("SELECT store_id FROM sub_orders WHERE id = $1")
+        .bind(sub_order_id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| ApiError::internal("load sub-order store for restock", e))?;
     let items: Vec<(Uuid, i32)> =
         sqlx::query_as("SELECT product_id, quantity FROM order_items WHERE sub_order_id = $1")
             .bind(sub_order_id)
@@ -967,12 +998,29 @@ pub(crate) async fn restock_sub_order_items(
             .await
             .map_err(|e| ApiError::internal("load items for restock", e))?;
     for (product_id, quantity) in items {
-        sqlx::query("UPDATE products SET stock = stock + $2, updated_at = now() WHERE id = $1")
-            .bind(product_id)
-            .bind(quantity)
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| ApiError::internal("restock product", e))?;
+        let new_stock: i32 = sqlx::query_scalar(
+            "UPDATE products SET stock = stock + $2, updated_at = now() \
+             WHERE id = $1 RETURNING stock",
+        )
+        .bind(product_id)
+        .bind(quantity)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| ApiError::internal("restock product", e))?;
+        crate::inventory::record_stock_adjustment(
+            conn,
+            &crate::inventory::StockMovement {
+                product_id,
+                store_id,
+                actor: "system",
+                actor_user_id: None,
+                delta: quantity,
+                new_stock,
+                reason,
+                note: None,
+            },
+        )
+        .await?;
     }
     Ok(())
 }
@@ -1033,7 +1081,7 @@ pub async fn cancel_order_for_buyer(
         .map_err(|e| ApiError::internal("cancel sub-orders", e))?;
 
     for (sub_order_id, _) in &sub_orders {
-        restock_sub_order_items(&mut tx, *sub_order_id).await?;
+        restock_sub_order_items(&mut tx, *sub_order_id, "cancel_restock").await?;
     }
 
     tx.commit()
@@ -1342,7 +1390,7 @@ pub async fn update_sub_order_status(
     }
 
     if new_status == "cancelled" && current_status != "cancelled" {
-        restock_sub_order_items(&mut tx, sub_order_id).await?;
+        restock_sub_order_items(&mut tx, sub_order_id, "cancel_restock").await?;
     }
 
     sqlx::query("UPDATE sub_orders SET status = $2 WHERE id = $1")

@@ -19,7 +19,7 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use domain::{validate_category, validate_product_input, ProductInput};
+use domain::{stock_status, validate_category, validate_product_input, ProductInput};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
@@ -44,6 +44,15 @@ pub struct Product {
     pub price_poisha: i64,
     pub compare_at_poisha: Option<i64>,
     pub stock: i32,
+    /// The seller's per-product low-stock warning level
+    /// (Wave 23); null means the platform default applies.
+    pub low_stock_threshold: Option<i32>,
+    /// Stock health from the domain rule (`in_stock`, `low`,
+    /// `out_of_stock`), computed in Rust by
+    /// `with_stock_status` after the row loads — it is not a
+    /// stored column, so it can never drift from the rule.
+    #[sqlx(default)]
+    pub stock_status: String,
     pub status: String,
     /// Weight of one unit in grams (Wave 4 — drives delivery charges).
     pub weight_grams: i32,
@@ -65,9 +74,23 @@ pub struct Product {
 }
 
 pub(crate) const PRODUCT_COLUMNS: &str = "p.id, p.store_id, s.slug AS store_slug, p.title, p.title_bn, \
-    p.description, p.category, p.price_poisha, p.compare_at_poisha, p.stock, p.status, \
+    p.description, p.category, p.price_poisha, p.compare_at_poisha, p.stock, \
+    p.low_stock_threshold, p.status, \
     p.weight_grams, p.source, p.source_ref, rv.rating_avg, rv.rating_count, \
     p.created_at, p.updated_at";
+
+/// Fill a loaded product's computed `stock_status` from the
+/// domain rule (Wave 23). Every query site that materialises
+/// a `Product` runs its rows through here, so the field is
+/// always the rule's answer for the row's stock and threshold.
+pub(crate) fn with_stock_status(mut product: Product) -> Product {
+    product.stock_status = stock_status(
+        i64::from(product.stock),
+        product.low_stock_threshold.map(i64::from),
+    )
+    .to_string();
+    product
+}
 
 /// Rating summary aggregate (Wave 8): THE one place ratings are
 /// summarised. Every query that selects `PRODUCT_COLUMNS` joins this,
@@ -152,7 +175,10 @@ pub async fn list_products(
     .bind(offset)
     .fetch_all(pool)
     .await
-    .map_err(|e| ApiError::internal("list products", e))?;
+    .map_err(|e| ApiError::internal("list products", e))?
+    .into_iter()
+    .map(with_stock_status)
+    .collect();
 
     Ok(ProductList {
         items,
@@ -164,7 +190,7 @@ pub async fn list_products(
 
 /// Fetch one product by id (joined with its store slug).
 pub async fn get_product_by_id(pool: &PgPool, id: Uuid) -> Result<Product, ApiError> {
-    sqlx::query_as(&format!(
+    let product = sqlx::query_as(&format!(
         "SELECT {PRODUCT_COLUMNS} FROM products p JOIN stores s ON s.id = p.store_id \
          {PRODUCT_RATING_JOIN} \
          WHERE p.id = $1"
@@ -173,7 +199,8 @@ pub async fn get_product_by_id(pool: &PgPool, id: Uuid) -> Result<Product, ApiEr
     .fetch_optional(pool)
     .await
     .map_err(|e| ApiError::internal("load product", e))?
-    .ok_or_else(|| ApiError::not_found("product not found"))
+    .ok_or_else(|| ApiError::not_found("product not found"))?;
+    Ok(with_stock_status(product))
 }
 
 /// Assert the caller owns the store; 404 if the store does not exist,
@@ -302,6 +329,14 @@ pub async fn create_product_for_owner(
 
 /// Update a product the caller owns. Provided fields override the stored
 /// ones; the merged result must pass the same domain validator as create.
+///
+/// Wave 23: the PATCH payload no longer carries `stock`. Stock
+/// only ever moves through the audited paths (checkout, the
+/// restock helper, and the adjust-stock endpoint in the
+/// `inventory` module), each writing its `stock_adjustments`
+/// row in the same transaction; a silent PATCH write would be
+/// an unaudited hole in that trail. The merged validator input
+/// therefore always carries the stored stock, unchanged.
 pub async fn update_product_for_owner(
     pool: &PgPool,
     user: &AuthUser,
@@ -314,7 +349,7 @@ pub async fn update_product_for_owner(
     let merged = ProductInput {
         title: patch.title.clone().unwrap_or(existing.title.clone()),
         price_poisha: patch.price_poisha.unwrap_or(existing.price_poisha),
-        stock: patch.stock.unwrap_or(existing.stock),
+        stock: existing.stock,
         status: patch.status.clone().unwrap_or(existing.status.clone()),
         weight_grams: patch
             .weight_grams
@@ -396,7 +431,8 @@ pub struct UpdateProductInput {
     pub category: Option<String>,
     pub price_poisha: Option<i64>,
     pub compare_at_poisha: Option<i64>,
-    pub stock: Option<i32>,
+    /// No `stock` field (Wave 23): stock changes go through
+    /// the audited adjust-stock endpoint, never this PATCH.
     pub status: Option<String>,
     pub weight_grams: Option<i64>,
 }

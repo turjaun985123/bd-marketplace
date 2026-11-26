@@ -525,7 +525,7 @@ pub async fn mark_return_received(
         .await
         .map_err(|e| ApiError::internal("mark sub-order returned", e))?;
 
-    restock_sub_order_items(&mut tx, sub_order_id).await?;
+    restock_sub_order_items(&mut tx, sub_order_id, "return_restock").await?;
 
     tx.commit()
         .await

@@ -40,6 +40,16 @@ label { display: block; margin: 10px 0 4px; font-size: 0.9rem; }
 .verification-badge-basic { background: #e8f5e9; color: #1b5e20; border: 1px solid #81c784; }
 .verification-badge-verified { background: #e3f2fd; color: #0d47a1; border: 1px solid #64b5f6; }
 
+/* Wave 23: stock health badges on the seller inventory page.
+   Same pill shape as the verification badge: green when the
+   shelf is healthy, amber when low, red when empty. */
+.stock-badge { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 0.85rem; font-weight: 600; }
+.stock-badge-in_stock { background: #e8f5e9; color: #1b5e20; border: 1px solid #81c784; }
+.stock-badge-low { background: #fff8e1; color: #e65100; border: 1px solid #ffcc02; }
+.stock-badge-out_of_stock { background: #ffebee; color: #b71c1c; border: 1px solid #e57373; }
+.inventory-table { width: 100%; border-collapse: collapse; }
+.inventory-table th, .inventory-table td { border-bottom: 1px solid #ddd; padding: 8px; text-align: left; vertical-align: top; }
+
 /* Wave 4: receipt layout + print rules. */
 .receipt { border: 1px solid #ccc; border-radius: 8px; padding: 20px; }
 .receipt h1 { margin-top: 0; }

@@ -72,6 +72,10 @@ export interface Product {
   price_poisha: number;
   compare_at_poisha: number | null;
   stock: number;
+  /** Per-product low-stock warning level (Wave 23); null = platform default. */
+  low_stock_threshold: number | null;
+  /** in_stock | low | out_of_stock — computed by the API (Wave 23). */
+  stock_status: string;
   status: string;
   /** Weight of one unit in grams (Wave 4 — drives delivery charges). */
   weight_grams: number;
@@ -1136,6 +1140,8 @@ export interface SellerDashboard {
   };
   earnings: Earnings;
   recent_sub_orders: SellerSubOrder[];
+  /** Low-stock alerts (Wave 23), worst first, at most ten. */
+  low_stock_items: LowStockItem[];
 }
 
 /** Where a store's payout money goes (Wave 9). */
@@ -1234,6 +1240,170 @@ export function listPayouts(
   if (params?.limit) search.set("limit", String(params.limit));
   const qs = search.toString();
   return call(`/v1/seller/payouts${qs ? `?${qs}` : ""}`, { token });
+}
+
+// ---------------------------------------------------------------------------
+// Wave 23 — inventory & the stock audit trail. Every stock change
+// (checkout, cancel/return restock, or a manual adjustment here)
+// writes an audit row on the API side; these types mirror it.
+
+/** One audited stock movement (Wave 23). */
+export interface StockAdjustment {
+  id: string;
+  product_id: string;
+  store_id: string;
+  /** seller | system */
+  actor: string;
+  /** The adjusting seller for manual moves; null for system moves. */
+  actor_user_id: string | null;
+  delta: number;
+  /** On-hand stock right after the movement. */
+  new_stock: number;
+  /** restock | correction | damage | count_fix | other (seller),
+   * or order | cancel_restock | return_restock | rto_restock (system). */
+  reason: string;
+  note: string | null;
+  created_at: string;
+}
+
+export interface StockHistory {
+  items: StockAdjustment[];
+  total: number;
+  page: number;
+  per_page: number;
+}
+
+/** The adjust-stock answer: the product after the move + its audit row. */
+export interface AdjustStockResult {
+  product: Product;
+  adjustment: StockAdjustment;
+}
+
+/** One product in the seller inventory overview (Wave 23). */
+export interface InventoryItem {
+  product_id: string;
+  title: string;
+  store_slug: string;
+  stock: number;
+  /** The seller's own threshold; null when the default applies. */
+  low_stock_threshold: number | null;
+  /** The threshold actually applied (own value or the default 5). */
+  effective_threshold: number;
+  /** in_stock | low | out_of_stock */
+  stock_status: string;
+}
+
+export interface Inventory {
+  items: InventoryItem[];
+  summary: {
+    products: number;
+    out_of_stock: number;
+    /** Only the `low` state; out-of-stock is counted separately. */
+    low_stock: number;
+  };
+}
+
+/** One dashboard low-stock alert row (Wave 23). */
+export interface LowStockItem {
+  product_id: string;
+  title: string;
+  stock: number;
+  /** low | out_of_stock */
+  stock_status: string;
+}
+
+/** Bangla label for a stock health status (Wave 23). */
+export function stockStatusLabel(status: string): string {
+  switch (status) {
+    case "in_stock":
+      return "স্টক আছে";
+    case "low":
+      return "কম আছে";
+    case "out_of_stock":
+      return "স্টক শেষ";
+    default:
+      return status;
+  }
+}
+
+/** Bangla label for a stock movement reason (Wave 23). */
+export function stockReasonLabel(reason: string): string {
+  switch (reason) {
+    case "restock":
+      return "নতুন স্টক এসেছে";
+    case "correction":
+      return "সংশোধন";
+    case "damage":
+      return "নষ্ট / ক্ষতি";
+    case "count_fix":
+      return "গণনা মিলানো";
+    case "other":
+      return "অন্যান্য";
+    case "order":
+      return "অর্ডার";
+    case "cancel_restock":
+      return "বাতিলে ফেরত";
+    case "return_restock":
+      return "রিটার্নে ফেরত";
+    case "rto_restock":
+      return "কুরিয়ার ফেরতে ফেরত";
+    default:
+      return reason;
+  }
+}
+
+/** GET /v1/seller/inventory — every own product with its stock health. */
+export function getSellerInventory(token: string): Promise<Inventory> {
+  return call("/v1/seller/inventory", { token });
+}
+
+/**
+ * POST /v1/seller/products/{id}/adjust-stock — one manual,
+ * audited stock move. The API validates the delta and reason,
+ * refuses a move below zero, and returns the audit row.
+ */
+export function adjustStock(
+  token: string,
+  productId: string,
+  input: { delta: number; reason: string; note?: string }
+): Promise<AdjustStockResult> {
+  return call(`/v1/seller/products/${encodeURIComponent(productId)}/adjust-stock`, {
+    method: "POST",
+    token,
+    body: input,
+  });
+}
+
+/** GET /v1/seller/products/{id}/stock-history — the audit trail, newest first. */
+export function getStockHistory(
+  token: string,
+  productId: string,
+  params?: { page?: number; per_page?: number }
+): Promise<StockHistory> {
+  const search = new URLSearchParams();
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.per_page) search.set("per_page", String(params.per_page));
+  const qs = search.toString();
+  return call(
+    `/v1/seller/products/${encodeURIComponent(productId)}/stock-history${qs ? `?${qs}` : ""}`,
+    { token }
+  );
+}
+
+/**
+ * PUT /v1/seller/products/{id}/low-stock-threshold — set the
+ * product's warning level, or clear it (null) back to the
+ * platform default.
+ */
+export function setLowStockThreshold(
+  token: string,
+  productId: string,
+  threshold: number | null
+): Promise<Product> {
+  return call(
+    `/v1/seller/products/${encodeURIComponent(productId)}/low-stock-threshold`,
+    { method: "PUT", token, body: { threshold } }
+  );
 }
 
 // ---------------------------------------------------------------------------

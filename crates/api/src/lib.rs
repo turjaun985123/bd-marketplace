@@ -119,6 +119,18 @@
 //! with the money block scoped to the sub-order's own stored
 //! snapshots and any collected COD advance allocated by the
 //! sub-order's share of the order grand total.
+//! Wave 23: inventory & the stock audit trail (`inventory`
+//! module) — from migration 0024 on, every change to a
+//! product's stock writes a `stock_adjustments` row in the
+//! same transaction: checkout decrements (system / `order`),
+//! the shared restock helper under a caller-threaded reason
+//! (`cancel_restock`, `return_restock`, `rto_restock`), and
+//! the seller's own adjust-stock endpoint (seller actor, the
+//! domain reason vocabulary). The product PATCH no longer
+//! accepts a stock field, so no unaudited write path remains.
+//! Sellers also get per-product low-stock thresholds (null =
+//! the domain default), a stock-history view, an inventory
+//! overview, and low-stock alerts on the dashboard.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -134,6 +146,7 @@ pub mod auth;
 pub mod cart;
 pub mod coupons;
 pub mod facebook;
+pub mod inventory;
 pub mod invoices;
 pub mod messaging;
 pub mod orders;
@@ -1134,6 +1147,23 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/v1/admin/sub-orders/:id/invoice",
             get(invoices::get_admin_invoice),
+        )
+        // Wave 23 — inventory: the seller's stock overview,
+        // manual adjustments (each one audited), the per-product
+        // movement history, and low-stock thresholds. All
+        // seller-scoped: another seller's product is a 404.
+        .route("/v1/seller/inventory", get(inventory::inventory_handler))
+        .route(
+            "/v1/seller/products/:id/adjust-stock",
+            post(inventory::adjust_stock_handler),
+        )
+        .route(
+            "/v1/seller/products/:id/stock-history",
+            get(inventory::stock_history_handler),
+        )
+        .route(
+            "/v1/seller/products/:id/low-stock-threshold",
+            put(inventory::set_low_stock_threshold_handler),
         )
         .layer(cors)
         .with_state(state)

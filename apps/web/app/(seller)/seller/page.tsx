@@ -12,6 +12,7 @@ import {
   requestPayout,
   riskLevelLabel,
   savePayoutAccount,
+  stockStatusLabel,
   type BuyerRisk,
   type Payout,
   type PayoutAccount,
@@ -176,6 +177,8 @@ export default function SellerDashboardPage() {
       <p>
         <Link href="/seller/products">আমার পণ্য — My products</Link>
         {" · "}
+        <Link href="/seller/inventory">ইনভেন্টরি — Inventory</Link>
+        {" · "}
         <Link href="/seller/orders">আমার বিক্রির অর্ডার — Seller orders</Link>
         {" · "}
         <Link href="/seller/import">Facebook থেকে ইমপোর্ট — Import</Link>
@@ -191,6 +194,28 @@ export default function SellerDashboardPage() {
         <Link href="/seller/verification">স্টোর যাচাইকরণ — Verification</Link>
       </p>
       {message && <p role="status">{message}</p>}
+      {dashboard !== null && dashboard.low_stock_items.length > 0 && (
+        <section>
+          <div className="card">
+            <h2>স্টক সতর্কতা — Low stock</h2>
+            {dashboard.low_stock_items.map((item) => (
+              <p key={item.product_id}>
+                <span
+                  className={`stock-badge stock-badge-${item.stock_status}`}
+                >
+                  {stockStatusLabel(item.stock_status)}
+                </span>{" "}
+                {item.title} — স্টক মাত্র {item.stock}টি
+              </p>
+            ))}
+            <p>
+              <Link href="/seller/inventory">
+                ইনভেন্টরিতে গিয়ে স্টক ঠিক করুন — Fix stock in inventory
+              </Link>
+            </p>
+          </div>
+        </section>
+      )}
       {dashboard === null ? (
         <p>লোড হচ্ছে…</p>
       ) : (

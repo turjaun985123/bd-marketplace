@@ -2282,6 +2282,89 @@ pub fn invoice_filename(store_slug: &str, store_seq: i64) -> String {
     format!("invoice-{store_slug}-{store_seq:06}")
 }
 
+// ---------------------------------------------------------------------------
+// Inventory & stock audit (Wave 23)
+// ---------------------------------------------------------------------------
+
+/// The low-stock threshold a product uses when the seller has
+/// not set a per-product one (migration 0024 leaves
+/// `products.low_stock_threshold` NULL in that case): at or
+/// below this many units on hand, the product counts as low.
+pub const LOW_STOCK_DEFAULT: i64 = 5;
+
+/// The stock health of one product, from its on-hand count and
+/// its low-stock threshold (the seller's own, or
+/// [`LOW_STOCK_DEFAULT`] when unset):
+///
+/// - `out_of_stock` — nothing on hand (zero or, defensively,
+///   a negative count, which the write paths refuse to create);
+/// - `low` — on hand but at or below the threshold;
+/// - `in_stock` — comfortably above the threshold.
+pub fn stock_status(stock: i64, threshold: Option<i64>) -> &'static str {
+    if stock <= 0 {
+        "out_of_stock"
+    } else if stock <= threshold.unwrap_or(LOW_STOCK_DEFAULT) {
+        "low"
+    } else {
+        "in_stock"
+    }
+}
+
+/// The largest single manual stock adjustment a seller may
+/// make in one call (either direction). Bigger corrections
+/// are almost certainly typos, and a seller can always make
+/// two adjustments — each one is individually audited.
+pub const MAX_STOCK_ADJUSTMENT: i64 = 100_000;
+
+/// The reasons a SELLER may give for a manual stock
+/// adjustment. System movements use their own vocabulary
+/// (`order`, `cancel_restock`, `return_restock`,
+/// `rto_restock`) written by the checkout / cancel / return
+/// code paths themselves; those are never accepted from a
+/// seller payload, so a seller can never forge a system row.
+pub const STOCK_ADJUSTMENT_REASONS: [&str; 5] =
+    ["restock", "correction", "damage", "count_fix", "other"];
+
+/// Validate one manual stock adjustment: the delta must be
+/// non-zero and within ±[`MAX_STOCK_ADJUSTMENT`], and the
+/// reason must be one of [`STOCK_ADJUSTMENT_REASONS`]
+/// (matched case-insensitively). On success the canonical
+/// (lowercase) reason is returned for storage.
+pub fn validate_stock_adjustment(delta: i64, reason: &str) -> Result<&'static str, &'static str> {
+    if delta == 0 {
+        return Err("stock adjustment delta must not be zero");
+    }
+    if delta.abs() > MAX_STOCK_ADJUSTMENT {
+        return Err("stock adjustment delta is too large");
+    }
+    let lowered = reason.trim().to_lowercase();
+    STOCK_ADJUSTMENT_REASONS
+        .iter()
+        .find(|known| **known == lowered)
+        .copied()
+        .ok_or("stock adjustment reason must be one of: restock, correction, damage, count_fix, other")
+}
+
+/// The highest low-stock threshold a seller may set on one
+/// product. The threshold is a warning level, not a stock
+/// figure, so it stays small; zero is allowed and means
+/// "only warn me when the product is actually out".
+pub const MAX_LOW_STOCK_THRESHOLD: i64 = 10_000;
+
+/// Validate a per-product low-stock threshold: `None` clears
+/// the override (the product falls back to
+/// [`LOW_STOCK_DEFAULT`]); a value must lie in
+/// 0..=[`MAX_LOW_STOCK_THRESHOLD`].
+pub fn validate_low_stock_threshold(
+    threshold: Option<i64>,
+) -> Result<Option<i64>, &'static str> {
+    match threshold {
+        None => Ok(None),
+        Some(value) if (0..=MAX_LOW_STOCK_THRESHOLD).contains(&value) => Ok(Some(value)),
+        Some(_) => Err("low-stock threshold must be between 0 and 10000"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4057,5 +4140,72 @@ mod tests {
             "invoice-rahim-store-000007"
         );
         assert_eq!(invoice_filename("a", 123_456), "invoice-a-123456");
+    }
+
+    #[test]
+    fn stock_status_uses_default_threshold_when_unset() {
+        // Out of stock wins over every threshold.
+        assert_eq!(stock_status(0, None), "out_of_stock");
+        assert_eq!(stock_status(-3, None), "out_of_stock");
+        assert_eq!(stock_status(0, Some(0)), "out_of_stock");
+        // At or below the default of 5 is low; above is fine.
+        assert_eq!(stock_status(1, None), "low");
+        assert_eq!(stock_status(LOW_STOCK_DEFAULT, None), "low");
+        assert_eq!(stock_status(LOW_STOCK_DEFAULT + 1, None), "in_stock");
+        assert_eq!(stock_status(500, None), "in_stock");
+    }
+
+    #[test]
+    fn stock_status_honours_a_custom_threshold() {
+        assert_eq!(stock_status(3, Some(3)), "low");
+        assert_eq!(stock_status(4, Some(3)), "in_stock");
+        // A zero threshold means only an empty shelf warns.
+        assert_eq!(stock_status(1, Some(0)), "in_stock");
+        // A high threshold can flag a well-stocked product.
+        assert_eq!(stock_status(50, Some(100)), "low");
+    }
+
+    #[test]
+    fn stock_adjustment_needs_a_real_delta_and_a_known_reason() {
+        assert_eq!(validate_stock_adjustment(5, "restock").unwrap(), "restock");
+        assert_eq!(
+            validate_stock_adjustment(-2, "Damage").unwrap(),
+            "damage"
+        );
+        assert_eq!(
+            validate_stock_adjustment(1, "  COUNT_FIX ").unwrap(),
+            "count_fix"
+        );
+        assert_eq!(validate_stock_adjustment(-1, "other").unwrap(), "other");
+        assert_eq!(
+            validate_stock_adjustment(3, "correction").unwrap(),
+            "correction"
+        );
+
+        // Zero moves nothing and audits nothing.
+        assert!(validate_stock_adjustment(0, "restock").is_err());
+        // The cap applies in both directions, boundary included.
+        assert!(validate_stock_adjustment(MAX_STOCK_ADJUSTMENT, "restock").is_ok());
+        assert!(validate_stock_adjustment(MAX_STOCK_ADJUSTMENT + 1, "restock").is_err());
+        assert!(validate_stock_adjustment(-MAX_STOCK_ADJUSTMENT, "restock").is_ok());
+        assert!(validate_stock_adjustment(-MAX_STOCK_ADJUSTMENT - 1, "restock").is_err());
+        // System reasons are not a seller's to claim.
+        assert!(validate_stock_adjustment(5, "order").is_err());
+        assert!(validate_stock_adjustment(5, "cancel_restock").is_err());
+        assert!(validate_stock_adjustment(5, "").is_err());
+        assert!(validate_stock_adjustment(5, "whatever").is_err());
+    }
+
+    #[test]
+    fn low_stock_threshold_allows_clearing_and_bounds_values() {
+        assert_eq!(validate_low_stock_threshold(None).unwrap(), None);
+        assert_eq!(validate_low_stock_threshold(Some(0)).unwrap(), Some(0));
+        assert_eq!(validate_low_stock_threshold(Some(7)).unwrap(), Some(7));
+        assert_eq!(
+            validate_low_stock_threshold(Some(MAX_LOW_STOCK_THRESHOLD)).unwrap(),
+            Some(MAX_LOW_STOCK_THRESHOLD)
+        );
+        assert!(validate_low_stock_threshold(Some(-1)).is_err());
+        assert!(validate_low_stock_threshold(Some(MAX_LOW_STOCK_THRESHOLD + 1)).is_err());
     }
 }
