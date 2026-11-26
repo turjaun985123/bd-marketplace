@@ -896,6 +896,24 @@ pub async fn place_order(
         .await
         .map_err(|e| ApiError::internal("clear cart after checkout", e))?;
 
+    // Wave 29: the order-placed notification joins the same
+    // transaction (the outbox rule) — one row per ORDER,
+    // addressed to the buyer at the delivery phone, carrying
+    // the grand total. A rolled-back checkout queues nothing.
+    let notice_payload = serde_json::json!({
+        "order_id": order_id.to_string(),
+        "amount_poisha": totals.grand_total_poisha,
+    });
+    notify::enqueue(
+        &mut *tx,
+        user.user_id,
+        &delivery_phone,
+        domain::NOTIFICATION_ORDER_PLACED,
+        &notice_payload,
+    )
+    .await
+    .map_err(|e| ApiError::internal("enqueue order notification", e))?;
+
     tx.commit()
         .await
         .map_err(|e| ApiError::internal("commit checkout", e))?;
@@ -1399,6 +1417,23 @@ pub async fn update_sub_order_status(
         .execute(&mut *tx)
         .await
         .map_err(|e| ApiError::internal("update sub-order status", e))?;
+
+    // Wave 29: notify the buyer of the moves they care
+    // about, in the same transaction. The transition table
+    // has no self-moves, so reaching this point always means
+    // the status really changed — no no-op notification is
+    // possible. Delivered can also arrive via the shipment
+    // sync; a sub-order reaches it exactly once, so the two
+    // paths never both fire (see the `notices` module doc).
+    let notice_kind = match new_status {
+        "shipped" => Some(domain::NOTIFICATION_SUB_ORDER_SHIPPED),
+        "delivered" => Some(domain::NOTIFICATION_SUB_ORDER_DELIVERED),
+        "cancelled" => Some(domain::NOTIFICATION_SUB_ORDER_CANCELLED),
+        _ => None,
+    };
+    if let Some(kind) = notice_kind {
+        crate::notices::enqueue_sub_order_notice(&mut tx, sub_order_id, kind).await?;
+    }
 
     tx.commit()
         .await

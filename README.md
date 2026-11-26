@@ -80,7 +80,7 @@ crates/api/             Axum API — thin handlers over service functions
   tests/wave4.rs        weight / cancel / receipt integration test
   tests/wave5.rs        online payments integration test (same gate)
   tests/wave9.rs        dashboard / earnings / payouts test (same gate)
-crates/worker/          Tokio worker binary (jobs listed, implementation TODO)
+crates/worker/          Tokio worker binary (drains the Wave 29 notification outbox; further jobs listed)
 migrations/             SQLx migrations (users, stores, otp_codes, products,
                         carts, orders, sub_orders, order_items, payments,
                         payment_events, shipments, reviews, payout_accounts,
@@ -1571,6 +1571,71 @@ seller-side and buyer-side actions are not in it (their
 own histories — stock adjustments, payment events —
 already exist from earlier waves).
 
+**Real (Wave 29):** the notification outbox + a real
+worker. A new workspace crate (`crates/notify`) owns the
+`SmsSender` trait (moved out of `auth.rs`; the OTP path
+uses it unchanged), the sender selection rule and the
+outbox itself. Selection lives in ONE function,
+`sender_from_env(dev_mode)`: dev mode → the log sender
+(prints `[dev SMS] to <phone>: <message>` to stderr);
+anything else → the unconfigured sender, whose every send
+fails with `sms_not_configured` until a real gateway is
+integrated. Message bodies are rendered by a pure,
+unit-tested domain function (`render_body` over seven
+kinds, taka amounts formatted by `format_taka` — whole
+taka when evenly divisible, else two decimals) **at
+enqueue time** and stored rendered, so a queued message
+can never change wording after the fact. Enqueue happens
+in the SAME transaction as the state change (migration
+0029: `notifications` with status
+pending/sending/sent/failed, `attempts`, `last_error`,
+rendered `body`, JSON payload, an index on
+`(status, created_at)`) at exactly one funnel per event:
+checkout success → `order_placed` (once per order, to the
+buyer at the order's DELIVERY phone, body carries the
+grand total); the seller status PATCH →
+`sub_order_shipped` / `sub_order_delivered` /
+`sub_order_cancelled`; an API-courier or manual booking
+(which itself moves the sub-order to shipped) →
+`sub_order_shipped`; the shared shipment sync (courier
+refresh + manual status updates) → `sub_order_delivered`
+/ `sub_order_returned` (RTO) — each sub-order reaches
+delivered exactly once, so no funnel pair can
+double-notify; the payout transition to paid →
+`payout_paid` (to the seller at their ACCOUNT phone,
+with the amount); return approve / reject / received →
+`return_update` (buyer, account phone; a platform return
+is not an RTO and never produces `sub_order_returned`).
+The **worker is real now**: it connects to `DATABASE_URL`
+(absent → clear stderr error, exit 2), runs the same
+embedded migrations as the API (idempotent), then loops
+every `WORKER_POLL_SECONDS` (default 10): claim a batch
+of 20 pending rows in one transaction
+(`FOR UPDATE SKIP LOCKED`, flipped to `sending`,
+committed BEFORE any send, so no row lock is held across
+the network), send each, and write the outcome back —
+success → `sent` + `sent_at`; failure → `attempts + 1`
+and `last_error`, back to `pending` while attempts
+remain, `failed` after 3 attempts (`MAX_ATTEMPTS`).
+Batches are logged only when something was processed;
+Ctrl-C / SIGTERM stops the loop gracefully. Admins watch
+all of it at `GET /v1/admin/notifications` (counts per
+status + recent rows with masked phones) and
+`/admin/notifications`.
+
+**Honest limits:** SMS is STILL dev-only — there is no
+real SMS gateway, so in production without one every
+notification is attempted 3 times and lands in `failed`
+with `sms_not_configured`, VISIBLE in the admin page,
+never silently dropped; OTP requests outside dev mode
+still 503 before anything is stored. The biggest launch
+blocker remains a real SMS gateway. A worker that dies
+mid-batch leaves its claimed rows in `sending` — counted
+in the admin view, but there is no automatic reaper yet.
+No email or push channels exist yet; courier polling,
+payout jobs and COD reconciliation remain planned worker
+jobs, printed at worker startup.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -2691,7 +2756,9 @@ none among the couriers — all five API couriers have real
 credential-gated adapters, and the four manual couriers run
 the Wave 19 seller-driven workflow (they have no APIs to
 adapt, and none is faked). SMS sending has only the
-dev-mode log implementation (see the dev OTP flow above).
+dev-mode log implementation in the `notify` crate since
+Wave 29 (the unconfigured sender errors `sms_not_configured`
+outside dev mode — see the Wave 29 section).
 Fetching Facebook posts through the Meta Graph API is stubbed
 honestly (503 without app credentials, 501 without the
 page-token OAuth flow — see the Wave 12 section); the paste
@@ -2702,9 +2769,10 @@ signature verification (need merchant credentials + each gateway's
 integration docs), gateway refund APIs (Wave 16 refunds are
 recorded off-platform obligations instead — see the Wave 16
 section), Redis, a real SMS gateway,
-worker jobs — including automatic courier status
-polling, which will call the same refresh service function the API
-exposes (the worker still logs its planned jobs and exits cleanly).
+the REMAINING worker jobs — automatic courier status
+polling (which will call the same refresh service function
+the API exposes), payout jobs and COD reconciliation; the
+notification outbox drain IS wired since Wave 29.
 (The SIDRA bridge contract IS wired in Wave 13 — SIDRA itself is
 the external service at the other end of it, configured by
 `SIDRA_API_URL` / `SIDRA_WEBHOOK_SECRET`.)
@@ -2730,20 +2798,23 @@ the external service at the other end of it, configured by
   /seller/promotions, the স্পন্সরড badge on the shared
   ProductCard, and the admin settings promotion price;
   Wave 27 adds /seller/analytics and /admin/analytics;
-  Wave 28 adds /admin/audit).
+  Wave 28 adds /admin/audit; Wave 29 adds
+  /admin/notifications).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
-  (domain 102, courier 31, payments 8 unit tests, plus the API
+  (domain 104, courier 31, payments 8 unit tests, plus the API
   crate's JWT-secret unit tests; the `DATABASE_URL`-
   gated integration tests skip cleanly without a database). The API
   binary was also smoke-tested locally without a database: routes
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
   (including the Wave 13 messaging endpoints), and the SIDRA
   callback answers 503 without a database.
-- **Rust integration + clippy: CI-only** — the Wave 2–28 integration
-  tests against a real Postgres 16 service and clippy `-D warnings`
-  are verified via **GitHub Actions CI** (`.github/workflows/ci.yml`)
-  on push. Waves 1–27 are green there; Wave 28 awaits its first CI run.
+- **Rust integration + clippy: CI-only** — the Wave 2–29 integration
+  tests (including the Wave 29 outbox test in the `notify`
+  crate) against a real Postgres 16 service and clippy
+  `-D warnings` are verified via **GitHub Actions CI**
+  (`.github/workflows/ci.yml`)
+  on push. Waves 1–28 are green there; Wave 29 awaits its first CI run.
 - **Docker images: CI-only** — Docker is not installed on the
   development machine, so `Dockerfile.api`, `Dockerfile.worker`
   and `apps/web/Dockerfile` are verified by the CI `docker` job

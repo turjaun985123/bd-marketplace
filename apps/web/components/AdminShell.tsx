@@ -105,6 +105,8 @@ export default function AdminShell({
         {" · "}
         <Link href="/admin/audit">অডিট লগ</Link>
         {" · "}
+        <Link href="/admin/notifications">নোটিফিকেশন</Link>
+        {" · "}
         <Link href="/">মার্কেটপ্লেস</Link>
       </p>
       {children}

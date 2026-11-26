@@ -192,6 +192,21 @@
 //! admin Q&A moderation, refund completion — writes an
 //! audit row inside its own transaction via the one
 //! writer in the `audit` module.
+//! Wave 29: the notification outbox + a real worker (the
+//! `notify` crate, the `notices` helpers, the
+//! `notifications` admin view) — every state-changing
+//! funnel (order placed, sub-order shipped / delivered /
+//! cancelled / returned, payout paid, return updates)
+//! enqueues an SMS row inside its own transaction via
+//! `notify::enqueue`; the worker claims pending rows
+//! `FOR UPDATE SKIP LOCKED`, sends them through the one
+//! shared sender selection (`notify::sender_from_env` —
+//! the log sender in dev mode, the honestly-unconfigured
+//! sender otherwise), and retries each row up to 3
+//! attempts before it stays `failed` in the admin view.
+//! The `SmsSender` trait and its senders moved from
+//! `auth` into the `notify` crate, so OTP codes and
+//! notifications can never disagree about delivery.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -212,6 +227,8 @@ pub mod facebook;
 pub mod inventory;
 pub mod invoices;
 pub mod messaging;
+pub mod notices;
+pub mod notifications;
 pub mod orders;
 pub mod payments;
 pub mod payouts;
@@ -1269,6 +1286,14 @@ pub fn build_app(state: AppState) -> Router {
         // rows the audited admin actions write inside their
         // own transactions (see the `audit` module).
         .route("/v1/admin/audit-log", get(audit::list_audit_log_handler))
+        // Wave 29 — the admin notifications view: outbox
+        // counts (pending / sending / sent / failed) plus the
+        // newest rows with masked phones (see the
+        // `notifications` module).
+        .route(
+            "/v1/admin/notifications",
+            get(notifications::list_notifications_handler),
+        )
         // Coupons (Wave 14): stateless preview for buyers, seller
         // CRUD for store coupons, admin CRUD for platform coupons.
         .route("/v1/coupons/preview", post(coupons::preview_handler))

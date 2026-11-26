@@ -3,10 +3,12 @@
 //! Individually callable pieces, composed by the two thin handlers:
 //! - `generate_otp` / `hash_otp` — pure OTP helpers (only the HASH of a
 //!   code is ever stored, in `otp_codes`).
-//! - `SmsSender` trait — how a code reaches the phone. The only
-//!   implementation in Wave 2 is `LogSmsSender` (dev mode). In production
-//!   mode with no real gateway configured, requesting an OTP returns a
-//!   typed error — an SMS is never silently "sent" to nowhere.
+//! - SMS delivery — the `notify` crate's `SmsSender` (Wave 29 moved
+//!   the trait and its senders there, so OTP codes and outbox
+//!   notifications share the ONE selection rule,
+//!   `notify::sender_from_env`). In production mode with no real
+//!   gateway configured, requesting an OTP returns a typed error —
+//!   an SMS is never silently "sent" to nowhere.
 //! - `issue_token` / `authenticate` — JWT (HS256) issue and verification.
 //! - `request_otp_code` / `verify_otp_code` — the service functions that
 //!   talk to the database; the handlers below only call them.
@@ -61,30 +63,15 @@ pub fn hash_otp(phone: &str, code: &str) -> String {
 // SMS delivery
 // ---------------------------------------------------------------------------
 
-/// How an OTP message reaches a phone. One method, individually callable;
-/// a real Bangladeshi SMS gateway joins later as another implementation.
-pub trait SmsSender {
-    fn send_sms(&self, phone: &str, message: &str) -> Result<(), ApiError>;
-}
-
-/// Dev-mode sender: logs the message (including the code) to stderr.
-/// Only ever constructed when dev mode is explicitly enabled — see
-/// `request_otp_code`.
-pub struct LogSmsSender;
-
-impl SmsSender for LogSmsSender {
-    fn send_sms(&self, phone: &str, message: &str) -> Result<(), ApiError> {
-        eprintln!("[dev SMS] to {phone}: {message}");
-        Ok(())
-    }
-}
-
-/// Pick the SMS sender for this state, or fail honestly: outside dev mode
-/// no real gateway is configured in Wave 2, so OTP delivery is a typed
-/// 503 — we never pretend an SMS was sent.
-fn sms_sender(state: &AppState) -> Result<LogSmsSender, ApiError> {
+/// Pick the SMS sender for this state, or fail honestly: outside
+/// dev mode no real gateway is configured, so OTP delivery is a
+/// typed 503 — we never pretend an SMS was sent. The sender
+/// itself is the `notify` crate's (Wave 29): `sender_from_env`
+/// is the one selection rule the API and the worker share, and
+/// in dev mode it yields the log sender.
+fn sms_sender(state: &AppState) -> Result<Box<dyn notify::SmsSender>, ApiError> {
     if state.sms_dev_mode {
-        Ok(LogSmsSender)
+        Ok(notify::sender_from_env(true))
     } else {
         Err(ApiError::service_unavailable(
             "SMS delivery is not configured (no gateway; dev mode is off)",
@@ -285,7 +272,10 @@ pub async fn request_otp_code(
         .await
         .map_err(|e| ApiError::internal("store OTP", e))?;
 
-    sender.send_sms(&phone, &format!("Your BD Marketplace login code is {code}"))?;
+    sender
+        .send_sms(&phone, &format!("Your BD Marketplace login code is {code}"))
+        .await
+        .map_err(|e| ApiError::service_unavailable(format!("SMS delivery failed: {e}")))?;
 
     let dev_otp = if state.sms_dev_mode {
         Some(code)

@@ -460,6 +460,11 @@ pub async fn decide_return_request(
     .await
     .map_err(|e| ApiError::internal("decide return request", e))?;
 
+    // Wave 29: the buyer's return_update notification, in
+    // the same transaction (the helper reads the just-updated
+    // row, so the body reports the decided status).
+    crate::notices::enqueue_return_notice(&mut tx, return_id).await?;
+
     tx.commit()
         .await
         .map_err(|e| ApiError::internal("commit return decision", e))?;
@@ -527,6 +532,11 @@ pub async fn mark_return_received(
         .map_err(|e| ApiError::internal("mark sub-order returned", e))?;
 
     restock_sub_order_items(&mut tx, sub_order_id, "return_restock").await?;
+
+    // Wave 29: the buyer's return_update notification
+    // (received — with the refund snapshot the helper reads
+    // from the just-updated row), in the same transaction.
+    crate::notices::enqueue_return_notice(&mut tx, return_id).await?;
 
     tx.commit()
         .await

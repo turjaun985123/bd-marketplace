@@ -3088,3 +3088,49 @@ export function getAdminAuditLog(
   const qs = search.toString();
   return call(`/v1/admin/audit-log${qs ? `?${qs}` : ""}`, { token });
 }
+
+/**
+ * Notification outbox counts (Wave 29): how many queued SMS
+ * notifications sit in each status. `failed` is the health
+ * signal — rows that exhausted their 3 send attempts (in a
+ * deployment without an SMS gateway, every row lands there
+ * with `sms_not_configured` recorded).
+ */
+export interface NotificationCounts {
+  pending: number;
+  sending: number;
+  sent: number;
+  failed: number;
+}
+
+/**
+ * One outbox row as the admin sees it (Wave 29). The phone is
+ * MASKED — the API never returns the full number here.
+ */
+export interface AdminNotification {
+  id: string;
+  kind: string;
+  phone_masked: string;
+  status: string;
+  attempts: number;
+  last_error: string | null;
+  created_at: string;
+  sent_at: string | null;
+}
+
+export interface AdminNotificationList {
+  counts: NotificationCounts;
+  items: AdminNotification[];
+}
+
+/** GET /v1/admin/notifications — admin only (the API answers 403 otherwise). */
+export function getAdminNotifications(
+  token: string,
+  params?: { status?: string; limit?: number }
+): Promise<AdminNotificationList> {
+  const search = new URLSearchParams();
+  if (params?.status) search.set("status", params.status);
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/admin/notifications${qs ? `?${qs}` : ""}`, { token });
+}

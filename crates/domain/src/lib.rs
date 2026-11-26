@@ -2625,6 +2625,132 @@ pub fn otp_request_allowed(recent_requests: i64) -> bool {
     recent_requests < OTP_REQUEST_LIMIT_PER_HOUR
 }
 
+// ---------------------------------------------------------------------------
+// Wave 29 — notification bodies (pure rendering; delivery is the
+// notify crate's outbox + the worker)
+// ---------------------------------------------------------------------------
+
+/// Format a poisha amount as taka for human-facing text
+/// (Wave 29): whole taka when the amount divides evenly
+/// (`৳2060`), otherwise two decimal places (`৳10.50`). No
+/// thousands grouping — the string appears in SMS bodies,
+/// where plain digits are the least ambiguous.
+pub fn format_taka(poisha: i64) -> String {
+    let sign = if poisha < 0 { "-" } else { "" };
+    let abs = poisha.unsigned_abs();
+    let taka = abs / 100;
+    let remainder = abs % 100;
+    if remainder == 0 {
+        format!("{sign}৳{taka}")
+    } else {
+        format!("{sign}৳{taka}.{remainder:02}")
+    }
+}
+
+/// The notification kinds (Wave 29). The string values are
+/// stored on `notifications.kind` and are the vocabulary the
+/// admin notifications view groups by.
+pub const NOTIFICATION_ORDER_PLACED: &str = "order_placed";
+pub const NOTIFICATION_SUB_ORDER_SHIPPED: &str = "sub_order_shipped";
+pub const NOTIFICATION_SUB_ORDER_DELIVERED: &str = "sub_order_delivered";
+pub const NOTIFICATION_SUB_ORDER_CANCELLED: &str = "sub_order_cancelled";
+pub const NOTIFICATION_SUB_ORDER_RETURNED: &str = "sub_order_returned";
+pub const NOTIFICATION_PAYOUT_PAID: &str = "payout_paid";
+pub const NOTIFICATION_RETURN_UPDATE: &str = "return_update";
+
+/// The values a notification template renders (Wave 29).
+/// Every field is optional in effect: a kind uses the fields
+/// it names and ignores the rest, so one struct serves all
+/// kinds. `order_id` is the full order UUID as text; the
+/// templates print only its first 8 characters (the short
+/// display form buyers and sellers already see in invoices).
+#[derive(Debug, Clone, Default)]
+pub struct NotificationVars {
+    pub order_id: String,
+    pub store_name: String,
+    pub amount_poisha: Option<i64>,
+    /// Lifecycle status for the kinds that report one
+    /// (`return_update` reads `approved` / `rejected` /
+    /// `received`).
+    pub status: String,
+}
+
+/// The short display form of an order id: its first 8
+/// characters, matching the invoice consignment prefix the
+/// platform already prints.
+fn short_order_id(order_id: &str) -> &str {
+    let end = order_id
+        .char_indices()
+        .nth(8)
+        .map(|(index, _)| index)
+        .unwrap_or(order_id.len());
+    &order_id[..end]
+}
+
+/// Render the SMS body for one notification (Wave 29). Pure:
+/// the notify crate's `enqueue` calls this at write time and
+/// stores the rendered body, so a queued message can never
+/// change wording after the fact. Templates are Bangla and
+/// deliberately short — one SMS segment-ish each. An unknown
+/// kind renders a generic update line rather than panicking:
+/// a body must exist for every queued row.
+pub fn render_body(kind: &str, vars: &NotificationVars) -> String {
+    let short = short_order_id(&vars.order_id);
+    let store = vars.store_name.as_str();
+    match kind {
+        NOTIFICATION_ORDER_PLACED => match vars.amount_poisha {
+            Some(amount) => format!(
+                "BD Marketplace: আপনার অর্ডার #{short} সফলভাবে গৃহীত হয়েছে। মোট {}। ধন্যবাদ!",
+                format_taka(amount)
+            ),
+            None => format!(
+                "BD Marketplace: আপনার অর্ডার #{short} সফলভাবে গৃহীত হয়েছে। ধন্যবাদ!"
+            ),
+        },
+        NOTIFICATION_SUB_ORDER_SHIPPED => format!(
+            "BD Marketplace: {store} থেকে আপনার অর্ডার #{short}-এর পণ্য পাঠানো হয়েছে।"
+        ),
+        NOTIFICATION_SUB_ORDER_DELIVERED => format!(
+            "BD Marketplace: আপনার অর্ডার #{short} ডেলিভারি সম্পন্ন হয়েছে। {store} থেকে কেনাকাটার জন্য ধন্যবাদ!"
+        ),
+        NOTIFICATION_SUB_ORDER_CANCELLED => format!(
+            "BD Marketplace: দুঃখিত, {store} আপনার অর্ডার #{short} বাতিল করেছে।"
+        ),
+        NOTIFICATION_SUB_ORDER_RETURNED => format!(
+            "BD Marketplace: আপনার অর্ডার #{short}-এর পণ্য {store}-তে ফেরত এসেছে।"
+        ),
+        NOTIFICATION_PAYOUT_PAID => match vars.amount_poisha {
+            Some(amount) => format!(
+                "BD Marketplace: আপনার {} পে-আউট পাঠানো হয়েছে।",
+                format_taka(amount)
+            ),
+            None => "BD Marketplace: আপনার পে-আউট পাঠানো হয়েছে।".to_string(),
+        },
+        NOTIFICATION_RETURN_UPDATE => match vars.status.as_str() {
+            "approved" => format!(
+                "BD Marketplace: আপনার রিটার্ন অনুমোদিত হয়েছে ({store}, অর্ডার #{short})। পণ্যটি ফেরত পাঠিয়ে দিন।"
+            ),
+            "rejected" => format!(
+                "BD Marketplace: আপনার রিটার্ন অনুরোধটি গৃহীত হয়নি ({store}, অর্ডার #{short})।"
+            ),
+            "received" => match vars.amount_poisha {
+                Some(amount) => format!(
+                    "BD Marketplace: আপনার ফেরত পণ্য {store} পেয়েছে (অর্ডার #{short})। রিফান্ড {} প্রক্রিয়াধীন।",
+                    format_taka(amount)
+                ),
+                None => format!(
+                    "BD Marketplace: আপনার ফেরত পণ্য {store} পেয়েছে (অর্ডার #{short})। রিফান্ড প্রক্রিয়াধীন।"
+                ),
+            },
+            _ => format!(
+                "BD Marketplace: আপনার রিটার্ন অনুরোধের হালনাগাদ অবস্থা: {} ({store}, অর্ডার #{short})।",
+                vars.status
+            ),
+        },
+        _ => format!("BD Marketplace: অর্ডার #{short} সম্পর্কে একটি আপডেট আছে।"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4644,5 +4770,63 @@ mod tests {
         assert!(!otp_request_allowed(20));
         assert!(!otp_request_allowed(21));
         assert!(!otp_request_allowed(1_000));
+    }
+
+    #[test]
+    fn format_taka_whole_and_fractional() {
+        assert_eq!(format_taka(0), "৳0");
+        assert_eq!(format_taka(206_000), "৳2060");
+        assert_eq!(format_taka(100), "৳1");
+        assert_eq!(format_taka(1_050), "৳10.50");
+        assert_eq!(format_taka(99), "৳0.99");
+        assert_eq!(format_taka(-150), "-৳1.50");
+    }
+
+    #[test]
+    fn notification_bodies_render_their_key_contents() {
+        let vars = NotificationVars {
+            order_id: "12345678-9abc-def0-1234-56789abcdef0".to_string(),
+            store_name: "ঢাকা গ্যাজেট".to_string(),
+            amount_poisha: Some(206_000),
+            status: String::new(),
+        };
+        // The short order id (first 8 chars) is what prints.
+        let placed = render_body(NOTIFICATION_ORDER_PLACED, &vars);
+        assert!(placed.contains("#12345678"), "{placed}");
+        assert!(placed.contains("৳2060"), "{placed}");
+        assert!(!placed.contains("12345678-9abc"), "{placed}");
+
+        let shipped = render_body(NOTIFICATION_SUB_ORDER_SHIPPED, &vars);
+        assert!(shipped.contains("ঢাকা গ্যাজেট"), "{shipped}");
+        assert!(shipped.contains("#12345678"), "{shipped}");
+
+        let delivered = render_body(NOTIFICATION_SUB_ORDER_DELIVERED, &vars);
+        assert!(delivered.contains("ডেলিভারি সম্পন্ন"), "{delivered}");
+
+        let cancelled = render_body(NOTIFICATION_SUB_ORDER_CANCELLED, &vars);
+        assert!(cancelled.contains("বাতিল"), "{cancelled}");
+
+        let returned = render_body(NOTIFICATION_SUB_ORDER_RETURNED, &vars);
+        assert!(returned.contains("ফেরত এসেছে"), "{returned}");
+
+        let payout = render_body(NOTIFICATION_PAYOUT_PAID, &vars);
+        assert!(payout.contains("৳2060"), "{payout}");
+        assert!(payout.contains("পে-আউট"), "{payout}");
+
+        // return_update reads its status var.
+        let mut return_vars = vars.clone();
+        return_vars.status = "approved".to_string();
+        let approved = render_body(NOTIFICATION_RETURN_UPDATE, &return_vars);
+        assert!(approved.contains("অনুমোদিত"), "{approved}");
+        return_vars.status = "rejected".to_string();
+        let rejected = render_body(NOTIFICATION_RETURN_UPDATE, &return_vars);
+        assert!(rejected.contains("গৃহীত হয়নি"), "{rejected}");
+        return_vars.status = "received".to_string();
+        let received = render_body(NOTIFICATION_RETURN_UPDATE, &return_vars);
+        assert!(received.contains("রিফান্ড ৳2060"), "{received}");
+
+        // Unknown kinds still render a body.
+        let other = render_body("some_future_kind", &vars);
+        assert!(other.contains("#12345678"), "{other}");
     }
 }

@@ -616,6 +616,13 @@ pub async fn transition_payout(
         Some(detail),
     )
     .await?;
+    // Wave 29: a payout that reaches `paid` also queues the
+    // seller's payout_paid SMS in the same transaction (the
+    // outbox rule — see the `notices` module).
+    if target_status == "paid" {
+        crate::notices::enqueue_payout_paid_notice(&mut tx, payout.store_id, payout.amount_poisha)
+            .await?;
+    }
     tx.commit()
         .await
         .map_err(|e| ApiError::internal("commit payout transition", e))?;

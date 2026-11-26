@@ -4,6 +4,7 @@ members = [
     "crates/domain",
     "crates/courier",
     "crates/payments",
+    "crates/notify",
     "crates/api",
     "crates/worker",
 ]

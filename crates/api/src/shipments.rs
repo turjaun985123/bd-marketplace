@@ -702,6 +702,17 @@ pub async fn create_shipment_for_seller(
         .await
         .map_err(|e| ApiError::internal("mark sub-order shipped", e))?;
 
+    // Wave 29: booking IS the sub-order's shipped move, so
+    // the shipped notification is queued here, in the same
+    // transaction — one of the mutually exclusive shipped
+    // funnels (see the `notices` module doc).
+    crate::notices::enqueue_sub_order_notice(
+        &mut tx,
+        sub_order_id,
+        domain::NOTIFICATION_SUB_ORDER_SHIPPED,
+    )
+    .await?;
+
     tx.commit()
         .await
         .map_err(|e| ApiError::internal("commit booking", e))?;
@@ -791,6 +802,17 @@ pub async fn create_manual_shipment_for_seller(
         .await
         .map_err(|e| ApiError::internal("mark sub-order shipped", e))?;
 
+    // Wave 29: the shipped notification, in the same
+    // transaction — the manual booking is one of the mutually
+    // exclusive shipped funnels (see the `notices` module
+    // doc).
+    crate::notices::enqueue_sub_order_notice(
+        &mut tx,
+        sub_order_id,
+        domain::NOTIFICATION_SUB_ORDER_SHIPPED,
+    )
+    .await?;
+
     tx.commit()
         .await
         .map_err(|e| ApiError::internal("commit manual booking", e))?;
@@ -812,7 +834,10 @@ pub async fn create_manual_shipment_for_seller(
 /// request and NO refund: whether money goes back is a separate
 /// platform decision (a COD parcel was never paid for; a
 /// prepaid one is refunded manually), never an automatic side
-/// effect of a shipment status.
+/// effect of a shipment status. Wave 29: an applied sync also
+/// queues the buyer's `sub_order_delivered` /
+/// `sub_order_returned` notification in the same transaction
+/// (see the `notices` module).
 async fn sync_sub_order_with_shipment_status(
     conn: &mut sqlx::PgConnection,
     sub_order_id: Uuid,
@@ -836,6 +861,19 @@ async fn sync_sub_order_with_shipment_status(
     if target == "returned" {
         crate::orders::restock_sub_order_items(conn, sub_order_id, "rto_restock").await?;
     }
+    // Wave 29: the sync is THE funnel for courier-driven
+    // delivered / returned moves (refresh and manual status
+    // both land here), so the buyer's notification is queued
+    // here, inside the caller's transaction. Reaching this
+    // line means the transition really applied — the guards
+    // above return early otherwise — so a repeat poll can
+    // never queue a duplicate.
+    let kind = if target == "delivered" {
+        domain::NOTIFICATION_SUB_ORDER_DELIVERED
+    } else {
+        domain::NOTIFICATION_SUB_ORDER_RETURNED
+    };
+    crate::notices::enqueue_sub_order_notice(conn, sub_order_id, kind).await?;
     Ok(())
 }
 
