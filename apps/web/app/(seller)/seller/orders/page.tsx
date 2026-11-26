@@ -4,12 +4,15 @@ import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import PriceTag from "@/components/PriceTag";
 import {
+  createManualShipment,
   createShipment,
   getCourierEstimates,
   getCouriers,
   listSellerSubOrders,
   refreshShipment,
   riskLevelLabel,
+  setManualShipmentStatus,
+  setManualTracking,
   shipmentStatusLabel,
   updateSubOrderStatus,
   type CourierEstimates,
@@ -31,6 +34,30 @@ const STATUSES = [
 ];
 
 /**
+ * Legal next statuses for a MANUAL shipment (Wave 19), mirroring
+ * the API's domain transition table (can_transition_shipment):
+ * the forward walk, the partial-delivery branch, the return
+ * path, and cancelling a parcel that has not reached a final
+ * state. Display only — the API re-checks every move and a
+ * disagreement surfaces as its 409 message.
+ */
+const SHIPMENT_NEXT_STATUSES: Record<string, string[]> = {
+  created: ["picked_up", "cancelled"],
+  picked_up: ["in_transit", "cancelled"],
+  in_transit: ["out_for_delivery", "cancelled"],
+  out_for_delivery: ["delivered", "partial_delivered", "cancelled"],
+  partial_delivered: ["delivered", "returned", "cancelled"],
+  delivered: ["return_in_transit"],
+  return_in_transit: ["returned", "cancelled"],
+  returned: [],
+  cancelled: [],
+  unknown: [],
+};
+
+/** The select value prefix marking a manual courier pick. */
+const MANUAL_PREFIX = "manual:";
+
+/**
  * Seller sub-orders: every sub-order belonging to the signed-in
  * seller's stores, with items, the money split (including their
  * payout), the buyer's delivery details, and a status control that
@@ -50,6 +77,14 @@ const STATUSES = [
  * parcel: they are the platform tariff's estimates for orientation,
  * not live courier quotes, and each booking is priced by the API
  * from the sub-order's real zone and weight.
+ *
+ * Wave 19: the select gains a "ম্যানুয়াল কুরিয়ার" group —
+ * Sundarban, SA Paribahan, Karatoa, Carrybee have no APIs, so a
+ * manual booking just records the shipment (with the counter
+ * receipt number when the seller has it). A manual shipment's
+ * card replaces the refresh button with seller-entered status
+ * buttons (only the legal next statuses) and a receipt-number
+ * edit field: the seller IS the tracking feed for these.
  */
 export default function SellerOrdersPage() {
   const { ready, token } = useAuth();
@@ -58,6 +93,15 @@ export default function SellerOrdersPage() {
   const [couriers, setCouriers] = useState<CourierInfo[]>([]);
   const [estimates, setEstimates] = useState<CourierEstimates | null>(null);
   const [courierChoices, setCourierChoices] = useState<Record<string, string>>({});
+  // Wave 19: the receipt number typed into a manual booking form
+  // (per sub-order) and into a manual shipment's edit field (per
+  // shipment).
+  const [manualTrackingInputs, setManualTrackingInputs] = useState<
+    Record<string, string>
+  >({});
+  const [manualTrackingEdits, setManualTrackingEdits] = useState<
+    Record<string, string>
+  >({});
   const [busyId, setBusyId] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
 
@@ -133,11 +177,72 @@ export default function SellerOrdersPage() {
     setBusyId(sub.id);
     setMessage(null);
     try {
-      await createShipment(token, sub.id, chosenCourier(sub));
-      setMessage("কুরিয়ার বুক হয়েছে। (Courier booked.)");
+      const chosen = chosenCourier(sub);
+      if (chosen.startsWith(MANUAL_PREFIX)) {
+        // Wave 19: a manual booking records the shipment
+        // directly — the key after the prefix names the courier
+        // and the receipt number goes along when already known.
+        const receipt = manualTrackingInputs[sub.id]?.trim();
+        await createManualShipment(
+          token,
+          sub.id,
+          chosen.slice(MANUAL_PREFIX.length),
+          receipt ? receipt : undefined
+        );
+        setMessage(
+          "ম্যানুয়াল কুরিয়ার বুকিং রেকর্ড হয়েছে। (Manual booking recorded.)"
+        );
+      } else {
+        await createShipment(token, sub.id, chosen);
+        setMessage("কুরিয়ার বুক হয়েছে। (Courier booked.)");
+      }
       await load();
     } catch (err) {
       setMessage(err instanceof Error ? err.message : "বুক করা যায়নি।");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  /** Wave 19: record one seller-entered status for a manual
+   * shipment; the API validates the move and syncs the
+   * sub-order, then the list reloads from the server. */
+  async function onManualStatus(sub: SellerSubOrder, next: string) {
+    if (!token || !sub.shipment) return;
+    setBusyId(sub.id);
+    setMessage(null);
+    try {
+      await setManualShipmentStatus(token, sub.shipment.id, next);
+      setMessage("শিপমেন্টের অবস্থা আপডেট হয়েছে। (Shipment status updated.)");
+      await load();
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "আপডেট করা যায়নি।");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  /** Wave 19: save the counter receipt number typed on a manual
+   * shipment's card. */
+  async function onSaveManualTracking(sub: SellerSubOrder) {
+    if (!token || !sub.shipment) return;
+    const value = (
+      manualTrackingEdits[sub.shipment.id] ??
+      sub.shipment.manual_tracking_id ??
+      ""
+    ).trim();
+    if (!value) {
+      setMessage("আগে রসিদ নম্বরটি লিখুন। (Enter the receipt number first.)");
+      return;
+    }
+    setBusyId(sub.id);
+    setMessage(null);
+    try {
+      await setManualTracking(token, sub.shipment.id, value);
+      setMessage("রসিদ নম্বর সেভ হয়েছে। (Receipt number saved.)");
+      await load();
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "সেভ করা যায়নি।");
     } finally {
       setBusyId(null);
     }
@@ -193,6 +298,12 @@ export default function SellerOrdersPage() {
       </main>
     );
   }
+
+  // Wave 19: GET /v1/couriers mixes API couriers with the four
+  // manual ones (mode "manual"); the booking select renders them
+  // in separate groups because they book completely differently.
+  const apiCouriers = couriers.filter((c) => c.mode !== "manual");
+  const manualCouriers = couriers.filter((c) => c.mode === "manual");
 
   return (
     <main>
@@ -258,23 +369,83 @@ export default function SellerOrdersPage() {
                 )}
             </p>
             {sub.shipment ? (
-              <p>
-                কুরিয়ার: {sub.shipment.courier} · কনসাইনমেন্ট:{" "}
-                <code>{sub.shipment.consignment_id}</code> · অবস্থা:{" "}
-                {shipmentStatusLabel(sub.shipment.status)} (
-                {sub.shipment.status}){" "}
-                {!["delivered", "returned", "cancelled"].includes(
-                  sub.shipment.status
-                ) && (
-                  <button
-                    type="button"
-                    disabled={busyId === sub.id}
-                    onClick={() => void onRefreshShipment(sub)}
+              sub.shipment.courier === "manual" ? (
+                <div>
+                  <p>
+                    ম্যানুয়াল কুরিয়ার:{" "}
+                    {sub.shipment.manual_courier_name ?? "manual"} ·
+                    রসিদ নম্বর:{" "}
+                    {sub.shipment.manual_tracking_id ? (
+                      <code>{sub.shipment.manual_tracking_id}</code>
+                    ) : (
+                      "এখনো দেওয়া হয়নি"
+                    )}{" "}
+                    · অবস্থা: {shipmentStatusLabel(sub.shipment.status)} (
+                    {sub.shipment.status})
+                  </p>
+                  <p>
+                    এই কুরিয়ারের কোনো API নেই — পার্সেলের অবস্থা
+                    নিজে আপডেট করুন:
+                  </p>
+                  {(SHIPMENT_NEXT_STATUSES[sub.shipment.status] ?? []).map(
+                    (next) => (
+                      <button
+                        key={next}
+                        type="button"
+                        disabled={busyId === sub.id}
+                        onClick={() => void onManualStatus(sub, next)}
+                      >
+                        {shipmentStatusLabel(next)} ({next})
+                      </button>
+                    )
+                  )}{" "}
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      void onSaveManualTracking(sub);
+                    }}
                   >
-                    {busyId === sub.id ? "রিফ্রেশ হচ্ছে…" : "স্ট্যাটাস রিফ্রেশ"}
-                  </button>
-                )}
-              </p>
+                    <label>
+                      কাউন্টার রসিদ নম্বর (receipt number)
+                      <input
+                        value={
+                          manualTrackingEdits[sub.shipment.id] ??
+                          sub.shipment.manual_tracking_id ??
+                          ""
+                        }
+                        onChange={(e) =>
+                          setManualTrackingEdits((prev) => ({
+                            ...prev,
+                            [sub.shipment!.id]: e.target.value,
+                          }))
+                        }
+                        placeholder="যেমন: SB-12345"
+                      />
+                    </label>{" "}
+                    <button type="submit" disabled={busyId === sub.id}>
+                      রসিদ নম্বর সেভ করুন
+                    </button>
+                  </form>
+                </div>
+              ) : (
+                <p>
+                  কুরিয়ার: {sub.shipment.courier} · কনসাইনমেন্ট:{" "}
+                  <code>{sub.shipment.consignment_id}</code> · অবস্থা:{" "}
+                  {shipmentStatusLabel(sub.shipment.status)} (
+                  {sub.shipment.status}){" "}
+                  {!["delivered", "returned", "cancelled"].includes(
+                    sub.shipment.status
+                  ) && (
+                    <button
+                      type="button"
+                      disabled={busyId === sub.id}
+                      onClick={() => void onRefreshShipment(sub)}
+                    >
+                      {busyId === sub.id ? "রিফ্রেশ হচ্ছে…" : "স্ট্যাটাস রিফ্রেশ"}
+                    </button>
+                  )}
+                </p>
+              )
             ) : sub.status === "confirmed" ? (
               <form
                 onSubmit={(e) => {
@@ -299,7 +470,7 @@ export default function SellerOrdersPage() {
                         ? ` — সুপারিশ: ${estimates.recommended}${estimateText(estimates.recommended)}`
                         : ""}
                     </option>
-                    {couriers.map((c) => (
+                    {apiCouriers.map((c) => (
                       <option
                         key={c.courier}
                         value={c.courier}
@@ -312,8 +483,35 @@ export default function SellerOrdersPage() {
                         {c.available ? estimateText(c.courier) : ""}
                       </option>
                     ))}
+                    {manualCouriers.length > 0 && (
+                      <optgroup label="ম্যানুয়াল কুরিয়ার — কাউন্টারে বুকিং (API নেই)">
+                        {manualCouriers.map((c) => (
+                          <option
+                            key={c.courier}
+                            value={`${MANUAL_PREFIX}${c.courier}`}
+                          >
+                            {c.display_name ?? c.courier}
+                          </option>
+                        ))}
+                      </optgroup>
+                    )}
                   </select>
                 </label>{" "}
+                {chosenCourier(sub).startsWith(MANUAL_PREFIX) && (
+                  <label>
+                    কাউন্টার রসিদ নম্বর (থাকলে)
+                    <input
+                      value={manualTrackingInputs[sub.id] ?? ""}
+                      onChange={(e) =>
+                        setManualTrackingInputs((prev) => ({
+                          ...prev,
+                          [sub.id]: e.target.value,
+                        }))
+                      }
+                      placeholder="যেমন: SB-12345"
+                    />
+                  </label>
+                )}{" "}
                 <button
                   type="submit"
                   disabled={

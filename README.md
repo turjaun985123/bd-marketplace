@@ -448,10 +448,11 @@ Paperfly — have real adapters behind the one trait, coded to their
 documented API shapes with fixture-tested parsers. NONE of the five
 can be verified against its live service until platform merchant
 accounts exist; without complete credentials every network
-operation returns `NotConfigured` and nothing is sent. What remains
-unadapted is only the manual couriers — Sundarban, SA Paribahan,
-Karatoa, Carrybee — which have no merchant APIs and are Phase 2
-manual workflow by design, not a gap.
+operation returns `NotConfigured` and nothing is sent. The manual
+couriers — Sundarban, SA Paribahan, Karatoa, Carrybee — have no
+merchant APIs to adapt; since Wave 19 they run as a seller-driven
+manual workflow behind the same shipment system (see the Wave 19
+section), not as adapters and never as a faked API.
 
 Wave 12 (Facebook Page linking + post-to-product import):
 
@@ -932,6 +933,72 @@ anywhere, by design — branding values are data the platform
 renders, never markup a seller injects. The marketplace
 home has no public store listing (products only), so logos
 appear on the storefront itself, not on marketplace cards.
+
+Wave 19 (manual couriers — Sundarban, SA Paribahan, Karatoa,
+Carrybee):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| POST | `/v1/seller/sub-orders/{id}/shipment` | The Wave 6 booking endpoint, extended: with `{ "courier": "manual", "manual_courier": "<key>", "manual_tracking_id": "<receipt>" }` (receipt optional) it books a MANUAL courier — no adapter, no network call; the shipment row is written directly. Every Wave 6/17 guard applies identically (own store, confirmed sub-order, advance settled, one shipment per sub-order) and the COD collection amount is the shared booking computation |
+| POST | `/v1/seller/shipments/{id}/manual-status` | Bearer, owner of the shipment's store. Record one seller-entered status for a manual shipment: a non-status is a 400, a move the domain transition table forbids is a 409, and a non-manual shipment is a 409. The move, its event and the sub-order sync commit in one transaction |
+| POST | `/v1/seller/shipments/{id}/manual-tracking` | Bearer, same ownership. Record or correct the counter receipt number after booking; it also becomes the consignment id. A blank number is a 400 — a recorded receipt is an audit reference and is never cleared |
+
+**Why manual at all:** these four couriers have NO public
+merchant APIs — there is nothing to write an adapter against,
+and this platform never fakes one. The operating model is the
+one Bangladeshi sellers already use: the platform holds a
+master account at each courier, the seller drops the parcel
+at the counter, and the counter hands back a paper receipt.
+Wave 19 puts that workflow behind the SAME shipment system as
+the five API couriers: one `shipments` table (migration 0021
+adds `manual_courier_name` / `manual_tracking_id`; the row's
+`courier` is the literal `manual`), the same unified status
+set, the same transition table, the same sub-order sync —
+delivery earns and a return restocks through the identical
+shared code paths, including the Wave 17 advance netting in
+the collection amount. Refresh on a manual shipment is an
+honest no-op: there is no API to poll, so the stored
+seller-entered status is returned unchanged.
+
+**The keys and the mapping:** the domain crate owns
+`MANUAL_COURIERS` — `sundarban` (Sundarban Courier),
+`sa_paribahan` (SA Paribahan), `karatoa` (Karatoa Courier),
+`carrybee` (Carrybee) — and the pure validators
+`validate_manual_courier` (trimmed, case-insensitive on the
+KEY; display names are not accepted) and
+`validate_manual_tracking_id` (optional; when present, 4–64
+characters, no whitespace). `GET /v1/couriers` appends one
+entry per manual courier — `courier` is the key, `available`
+is always true (no credentials exist to lack), `mode` is
+`manual`, and `display_name` carries the human name. Booking
+posts `courier: "manual"` plus `manual_courier: <key>` —
+never the key as the courier name. `GET /v1/couriers/estimate`
+lists the manual couriers too, always with `price_poisha:
+null` and a note: the counter sets the charge, so the
+platform tariff does not invent one. Smart routing is
+untouched: `choose_courier` only ever sees adapter quotes,
+so `auto` can never resolve to a manual courier.
+
+**The trust model:** for an API courier the platform learns
+statuses from the courier; for a manual courier the SELLER is
+the tracking feed, and the system is honest about that —
+every manual event is stored with raw status `manual`, the
+buyer's public tracking view names the courier as a manual
+counter booking, and the counter RECEIPT NUMBER is the
+verifiable reference both sides can quote (it is what the
+tracking view shows, and what support checks against the
+paper receipt). A booking made before the seller has the
+receipt stores a generated `MANUAL-…` placeholder in
+`consignment_id` (the column is NOT NULL), visibly different
+from a real number until the seller records one.
+
+**Limits (stated, not hidden):** no label printing and no
+bulk booking — each manual booking is one parcel at one
+counter, recorded one at a time. Statuses are only as timely
+as the seller entering them. A recorded receipt number can
+be corrected but never cleared. Partial-item and split
+manual shipments do not exist: one sub-order, one parcel,
+one receipt.
 
 Wave 8 (reviews, ratings and seller replies):
 
@@ -1594,11 +1661,35 @@ page (theme cards, colour picker + hex, URL previews,
 char-counted announcement and description), and a branding
 link on the seller dashboard.
 
+**Real (Wave 19):** manual couriers — migration 0021 (the
+`manual_courier_name` / `manual_tracking_id` columns on
+`shipments`); the pure domain manual-courier validators
+(canonical keys + display names, receipt-number shape);
+booking with `courier = "manual"` on the Wave 6 route
+through the SAME guard path and COD computation as API
+bookings (the booking internals were factored so both call
+one guard loader and one amount function), writing the
+shipment row directly — no adapter, no network call; the
+seller-entered status and receipt-number endpoints, with
+the sub-order sync extracted into ONE function shared by
+courier refresh and manual entry (delivery earns, return
+restocks, identically); refresh on a manual shipment as an
+honest no-op; the courier list and estimates carrying the
+manual entries (always available, never priced, never
+routed to); an integration test (`crates/api/tests/wave19.rs`,
+same `DATABASE_URL` gate) covering the list/estimate shape,
+the full manual walk to delivered + earnings, the return
+walk + restock, every 400/403/409, the placeholder
+consignment and its later replacement, public tracking, and
+`auto` never choosing manual; the Next.js seller orders
+page manual booking group, status buttons and receipt edit,
+and the public tracking view's manual courier line.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
-credential-gated adapters. Manual Phase 2 couriers (Sundarban,
-SA Paribahan, Karatoa, Carrybee) have no APIs and join later as a
-manual workflow behind the same trait. SMS sending has only the
+credential-gated adapters, and the four manual couriers run
+the Wave 19 seller-driven workflow (they have no APIs to
+adapt, and none is faked). SMS sending has only the
 dev-mode log implementation (see the dev OTP flow above).
 Fetching Facebook posts through the Meta Graph API is stubbed
 honestly (503 without app credentials, 501 without the
@@ -1625,16 +1716,17 @@ the external service at the other end of it, configured by
   /seller/import; Wave 13 adds /messages, /messages/[id] and
   /seller/inbox; Wave 14 adds /seller/coupons and /admin/coupons;
   Wave 15 adds /search; Wave 16 adds /track, /seller/returns and
-  /admin/returns; Wave 18 adds /seller/branding).
+  /admin/returns; Wave 18 adds /seller/branding; Wave 19 extends
+  /seller/orders and /track with the manual-courier workflow).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
-  (domain 75, courier 31, payments 8 unit tests; the `DATABASE_URL`-
+  (domain 77, courier 31, payments 8 unit tests; the `DATABASE_URL`-
   gated integration tests skip cleanly without a database). The API
   binary was also smoke-tested locally without a database: routes
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
   (including the Wave 13 messaging endpoints), and the SIDRA
   callback answers 503 without a database.
-- **Rust integration + clippy: CI-only** — the Wave 2–18 integration
+- **Rust integration + clippy: CI-only** — the Wave 2–19 integration
   tests against a real Postgres 16 service and clippy `-D warnings`
   are verified via **GitHub Actions CI** (`.github/workflows/ci.yml`)
-  on push. Waves 1–17 are green there; Wave 18 awaits its first CI run.
+  on push. Waves 1–18 are green there; Wave 19 awaits its first CI run.

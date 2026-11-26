@@ -117,11 +117,23 @@ export default function TrackPage() {
               ))}
               {sub.shipment ? (
                 <>
-                  <p>
-                    কুরিয়ার: {sub.shipment.courier} · কনসাইনমেন্ট:{" "}
-                    <code>{sub.shipment.consignment_id}</code> · অবস্থা:{" "}
-                    {shipmentStatusLabel(sub.shipment.status)}
-                  </p>
+                  {sub.shipment.manual_courier_name ? (
+                    <p>
+                      কুরিয়ার: {sub.shipment.manual_courier_name}{" "}
+                      (ম্যানুয়াল — কাউন্টার বুকিং) · রসিদ নম্বর:{" "}
+                      <code>
+                        {sub.shipment.manual_tracking_id ??
+                          sub.shipment.consignment_id}
+                      </code>{" "}
+                      · অবস্থা: {shipmentStatusLabel(sub.shipment.status)}
+                    </p>
+                  ) : (
+                    <p>
+                      কুরিয়ার: {sub.shipment.courier} · কনসাইনমেন্ট:{" "}
+                      <code>{sub.shipment.consignment_id}</code> · অবস্থা:{" "}
+                      {shipmentStatusLabel(sub.shipment.status)}
+                    </p>
+                  )}
                   <h4>যাত্রার বিবরণ — Timeline</h4>
                   <ol>
                     {sub.shipment.events.map((event, idx) => (

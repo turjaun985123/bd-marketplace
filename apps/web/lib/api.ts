@@ -148,6 +148,14 @@ export interface ShipmentSummary {
   consignment_id: string;
   /** Unified shipment status (created, picked_up, in_transit, …). */
   status: string;
+  /**
+   * Wave 19: for a manual shipment (`courier === "manual"`), the
+   * courier's display name and the counter receipt number the
+   * seller recorded (null until they do). Both null for API
+   * couriers.
+   */
+  manual_courier_name: string | null;
+  manual_tracking_id: string | null;
 }
 
 /** One courier booking (booking / refresh responses, Wave 6). */
@@ -161,6 +169,9 @@ export interface Shipment {
   /** Cash the courier collects on delivery, in poisha. */
   cod_amount_poisha: number;
   note: string | null;
+  /** Wave 19: manual courier display name / receipt number. */
+  manual_courier_name: string | null;
+  manual_tracking_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -169,11 +180,18 @@ export interface Shipment {
 export interface CourierInfo {
   courier: string;
   available: boolean;
-  /** "live" | "dev" | null — "dev" means the DEV simulator. */
+  /**
+   * "live" | "dev" | "manual" | null — "dev" means the DEV
+   * simulator; "manual" (Wave 19) marks a manual courier, whose
+   * `courier` is the manual KEY (booking posts courier "manual"
+   * plus this key as `manual_courier`).
+   */
   mode: string | null;
   /** Machine-readable reason when unavailable, e.g. "not_configured". */
   reason: string | null;
   is_default: boolean;
+  /** Human-facing name for manual couriers; null for API couriers. */
+  display_name: string | null;
 }
 
 /**
@@ -184,11 +202,17 @@ export interface CourierInfo {
 export interface CourierEstimate {
   courier: string;
   available: boolean;
-  /** "live" | "dev" | null — "dev" means the DEV simulator. */
+  /** "live" | "dev" | "manual" | null — "dev" means the DEV simulator. */
   mode: string | null;
   /** Machine-readable reason when unavailable, e.g. "not_configured". */
   reason: string | null;
   price_poisha: number | null;
+  /**
+   * Wave 19: explanation when there is no price to show — the
+   * manual couriers carry one (booked at the counter, priced
+   * there). Null for API couriers.
+   */
+  note: string | null;
 }
 
 /**
@@ -937,6 +961,68 @@ export function refreshShipment(token: string, shipmentId: string): Promise<Ship
     method: "POST",
     token,
   });
+}
+
+/**
+ * POST /v1/seller/sub-orders/{id}/shipment with a manual courier
+ * (Wave 19) — Sundarban, SA Paribahan, Karatoa and Carrybee have
+ * no APIs, so the booking writes the shipment directly: the
+ * seller books at the counter under the platform's master
+ * account and records the receipt number (`manualTrackingId`,
+ * when already in hand). `manualCourier` is the KEY from the
+ * manual entries of GET /v1/couriers ("sundarban", …).
+ */
+export function createManualShipment(
+  token: string,
+  subOrderId: string,
+  manualCourier: string,
+  manualTrackingId?: string
+): Promise<Shipment> {
+  const body: {
+    courier: string;
+    manual_courier: string;
+    manual_tracking_id?: string;
+  } = { courier: "manual", manual_courier: manualCourier };
+  if (manualTrackingId) body.manual_tracking_id = manualTrackingId;
+  return call(`/v1/seller/sub-orders/${encodeURIComponent(subOrderId)}/shipment`, {
+    method: "POST",
+    token,
+    body,
+  });
+}
+
+/**
+ * POST /v1/seller/shipments/{id}/manual-status — record one
+ * seller-entered status for a manual shipment (Wave 19). The
+ * API checks the move against the domain transition table and
+ * syncs the sub-order (delivery / return + restock) exactly
+ * like a courier-reported status; an illegal move is a 409.
+ */
+export function setManualShipmentStatus(
+  token: string,
+  shipmentId: string,
+  status: string
+): Promise<Shipment> {
+  return call(
+    `/v1/seller/shipments/${encodeURIComponent(shipmentId)}/manual-status`,
+    { method: "POST", token, body: { status } }
+  );
+}
+
+/**
+ * POST /v1/seller/shipments/{id}/manual-tracking — record (or
+ * correct) the counter receipt number of a manual shipment
+ * after booking (Wave 19). It becomes the consignment id too.
+ */
+export function setManualTracking(
+  token: string,
+  shipmentId: string,
+  trackingId: string
+): Promise<Shipment> {
+  return call(
+    `/v1/seller/shipments/${encodeURIComponent(shipmentId)}/manual-tracking`,
+    { method: "POST", token, body: { tracking_id: trackingId } }
+  );
 }
 
 /** A store's money summary (Wave 9): earnings from DELIVERED
@@ -1785,6 +1871,13 @@ export interface TrackedShipment {
   courier: string;
   consignment_id: string;
   status: string;
+  /**
+   * Wave 19: for a manual shipment, the courier's display name
+   * and the counter receipt number (null until the seller
+   * records it). Both null for API couriers.
+   */
+  manual_courier_name: string | null;
+  manual_tracking_id: string | null;
   events: TrackedShipmentEvent[];
 }
 

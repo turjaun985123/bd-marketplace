@@ -92,6 +92,15 @@
 //! deliberately degrades: the order proceeds as plain COD with
 //! the required advance recorded on it as a visible risk flag
 //! — never a claim that money was collected.
+//! Wave 19: manual couriers (`shipments` module) — Sundarban,
+//! SA Paribahan, Karatoa and Carrybee have no public APIs, so
+//! they join as a seller-driven workflow behind the same
+//! shipment system: booking with `courier = "manual"` writes
+//! the shipment row directly (no adapter, no network call),
+//! the seller records the counter receipt number and every
+//! status move by hand, and the moves are checked against the
+//! same domain transition table and synced to the sub-order by
+//! the same shared sync function as courier-reported ones.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -749,6 +758,18 @@ pub fn build_app(state: AppState) -> Router {
             post(shipments::create_shipment),
         )
         .route("/v1/shipments/:id/refresh", post(shipments::refresh))
+        // Wave 19 — manual couriers: seller-entered statuses and
+        // the counter receipt number for manual shipments (the
+        // booking itself goes through the Wave 6 booking route
+        // with `courier = "manual"`).
+        .route(
+            "/v1/seller/shipments/:id/manual-status",
+            post(shipments::set_manual_status),
+        )
+        .route(
+            "/v1/seller/shipments/:id/manual-tracking",
+            post(shipments::set_manual_tracking),
+        )
         // Wave 8 — reviews: buyers review products they received,
         // edit/delete their own; store owners reply once per review.
         .route(

@@ -25,8 +25,10 @@
 //! parsers — all five API couriers (Tier 1 Steadfast / Pathao /
 //! RedX, Tier 1b eCourier / Paperfly) now have adapters. The manual
 //! Phase 2 couriers (Sundarban, SA Paribahan, Karatoa, Carrybee)
-//! have no APIs to adapt to and join later as a manual workflow,
-//! by design.
+//! have no APIs to adapt to; since Wave 19 they run as a
+//! seller-driven manual workflow in the API's shipments module —
+//! deliberately NOT as adapters here, since there is no API for
+//! an adapter to call.
 //! [`DevCourierAdapter`] is a clearly-labelled SIMULATOR for local
 //! and CI use only, reachable only through [`courier_adapter_for`]
 //! when `CouriersConfig::dev_mode` is true. Platform master accounts

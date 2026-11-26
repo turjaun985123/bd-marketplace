@@ -463,6 +463,74 @@ pub fn can_transition_shipment(from: &str, to: &str) -> bool {
     )
 }
 
+/// The manual couriers (Wave 19): Sundarban, SA Paribahan,
+/// Karatoa and Carrybee. These couriers have NO public merchant
+/// API — a seller books at the counter of the platform's master
+/// account and carries the parcel there physically — so they can
+/// never be adapter-backed like the five API couriers. Instead
+/// they join the same shipment system as a seller-driven manual
+/// workflow: the seller records the booking, the counter receipt
+/// number and every status move by hand. Each entry is the
+/// canonical key the API stores and accepts, paired with the
+/// display name shown to buyers and sellers.
+pub const MANUAL_COURIERS: [(&str, &str); 4] = [
+    ("sundarban", "Sundarban Courier"),
+    ("sa_paribahan", "SA Paribahan"),
+    ("karatoa", "Karatoa Courier"),
+    ("carrybee", "Carrybee"),
+];
+
+/// The display name of one manual courier key, or `None` when
+/// the key is not a manual courier.
+pub fn manual_courier_display_name(key: &str) -> Option<&'static str> {
+    MANUAL_COURIERS
+        .iter()
+        .find(|(known, _)| *known == key)
+        .map(|(_, display)| *display)
+}
+
+/// Validate a seller-supplied manual courier name and return its
+/// canonical key. Matching is on the KEY, trimmed and
+/// case-insensitive (`Sundarban`, `SUNdarban` and `sundarban`
+/// are the same courier); display names are NOT accepted — the
+/// key is the one identifier, so what the seller picks in the UI
+/// is exactly what gets stored.
+pub fn validate_manual_courier(input: &str) -> Result<&'static str, &'static str> {
+    let normalized = input.trim().to_ascii_lowercase();
+    MANUAL_COURIERS
+        .iter()
+        .map(|(key, _)| *key)
+        .find(|key| *key == normalized)
+        .ok_or("unknown manual courier")
+}
+
+/// Validate a manual courier's counter receipt / tracking id.
+/// The receipt number is the ONLY verifiable reference a manual
+/// booking has — the paper receipt from the courier counter —
+/// so it is kept verbatim (trimmed) and held to a shape a real
+/// receipt number can take: 4 to 64 characters with no
+/// whitespace inside. `None` or a blank string means the seller
+/// has not recorded one yet and validates to `None`.
+pub fn validate_manual_tracking_id(
+    input: Option<&str>,
+) -> Result<Option<String>, &'static str> {
+    let trimmed = match input {
+        None => return Ok(None),
+        Some(raw) => raw.trim(),
+    };
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let char_count = trimmed.chars().count();
+    if !(4..=64).contains(&char_count) {
+        return Err("tracking id must be 4 to 64 characters");
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err("tracking id must not contain whitespace");
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
 /// Normalize a courier's raw status string for mapping: trim
 /// surrounding whitespace, lowercase, fold spaces, hyphens and
 /// underscores into single underscores, and split camelCase word
@@ -2702,6 +2770,55 @@ mod tests {
         ] {
             assert!(!can_transition_shipment(from, to), "{from} -> {to}");
         }
+    }
+
+    #[test]
+    fn manual_courier_validation() {
+        // Every canonical key validates to itself, with its
+        // display name attached.
+        for (key, display) in MANUAL_COURIERS {
+            assert_eq!(validate_manual_courier(key), Ok(key));
+            assert_eq!(manual_courier_display_name(key), Some(display));
+        }
+        // Trimmed and case-insensitive on the key.
+        assert_eq!(validate_manual_courier("  Sundarban "), Ok("sundarban"));
+        assert_eq!(validate_manual_courier("SA_PARIBAHAN"), Ok("sa_paribahan"));
+        assert_eq!(validate_manual_courier("Karatoa"), Ok("karatoa"));
+        assert_eq!(validate_manual_courier("CARRYBEE"), Ok("carrybee"));
+        // API couriers, display names, blanks and unknowns are
+        // not manual couriers.
+        assert!(validate_manual_courier("steadfast").is_err());
+        assert!(validate_manual_courier("Sundarban Courier").is_err());
+        assert!(validate_manual_courier("").is_err());
+        assert!(validate_manual_courier("   ").is_err());
+        assert!(validate_manual_courier("sundarbans").is_err());
+        assert_eq!(manual_courier_display_name("steadfast"), None);
+        assert_eq!(manual_courier_display_name("bogus"), None);
+    }
+
+    #[test]
+    fn manual_tracking_id_validation() {
+        // Absent and blank both mean "not recorded yet".
+        assert_eq!(validate_manual_tracking_id(None), Ok(None));
+        assert_eq!(validate_manual_tracking_id(Some("")), Ok(None));
+        assert_eq!(validate_manual_tracking_id(Some("   ")), Ok(None));
+        // A real receipt number is kept verbatim, trimmed.
+        assert_eq!(
+            validate_manual_tracking_id(Some("SB-12345")),
+            Ok(Some("SB-12345".to_string()))
+        );
+        assert_eq!(
+            validate_manual_tracking_id(Some("  KT-9999  ")),
+            Ok(Some("KT-9999".to_string()))
+        );
+        // Boundary lengths: 4 and 64 pass, 3 and 65 fail.
+        assert!(validate_manual_tracking_id(Some("A1B2")).is_ok());
+        assert!(validate_manual_tracking_id(Some(&"X".repeat(64))).is_ok());
+        assert!(validate_manual_tracking_id(Some("A1B")).is_err());
+        assert!(validate_manual_tracking_id(Some(&"X".repeat(65))).is_err());
+        // No whitespace inside, however it is written.
+        assert!(validate_manual_tracking_id(Some("SB 12345")).is_err());
+        assert!(validate_manual_tracking_id(Some("SB\t12345")).is_err());
     }
 
     #[test]

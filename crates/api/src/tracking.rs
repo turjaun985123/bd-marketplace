@@ -54,6 +54,15 @@ pub struct TrackedShipment {
     pub consignment_id: String,
     /// Unified shipment status (domain crate's set).
     pub status: String,
+    /// Wave 19: for a manual shipment, the courier's display
+    /// name (e.g. `Sundarban Courier`) and the counter receipt
+    /// number the seller recorded — the reference the recipient
+    /// can quote at the counter. Both `None` for API couriers;
+    /// the receipt number is also `None` until the seller
+    /// records it (the consignment id then still carries the
+    /// generated `MANUAL-…` placeholder).
+    pub manual_courier_name: Option<String>,
+    pub manual_tracking_id: Option<String>,
     pub events: Vec<TrackedShipmentEvent>,
 }
 
@@ -168,6 +177,8 @@ pub async fn track_order(
                     courier: shipment.courier,
                     consignment_id: shipment.consignment_id,
                     status: shipment.status,
+                    manual_courier_name: shipment.manual_courier_name,
+                    manual_tracking_id: shipment.manual_tracking_id,
                     events: event_rows
                         .into_iter()
                         .map(|(status, note, at)| TrackedShipmentEvent { status, note, at })
