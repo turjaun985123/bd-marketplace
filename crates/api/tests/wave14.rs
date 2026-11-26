@@ -145,6 +145,7 @@ async fn create_product(
             "title": title,
             "price_poisha": price_poisha,
             "stock": stock,
+            "status": "active",
         })),
     )
     .await;
