@@ -36,7 +36,7 @@ use domain::{
     calculate_delivery_charge, compute_commission, split_cart_by_seller, CartItem,
     CommissionQuote, DeliveryZone, SellerSubOrder,
 };
-use payments::{GatewayConfig, PaymentsConfig};
+use ::payments::{GatewayConfig, PaymentsConfig};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tower_http::cors::CorsLayer;
