@@ -51,6 +51,7 @@ use uuid::Uuid;
 use crate::auth::AuthUser;
 use crate::payments::{insert_pending_payment, load_latest_payment_summary, PaymentSummary};
 use crate::products::clamp_pagination;
+use crate::shipments::{load_shipment_summary_for_sub_order, ShipmentSummary};
 use crate::{ApiError, AppState};
 
 // ---------------------------------------------------------------------------
@@ -83,6 +84,9 @@ pub struct SubOrder {
     pub seller_payout_poisha: i64,
     pub created_at: DateTime<Utc>,
     pub items: Vec<OrderItem>,
+    /// The courier shipment booked for this sub-order (Wave 6), or
+    /// `None` until the seller books one.
+    pub shipment: Option<ShipmentSummary>,
 }
 
 /// The buyer's unified order, with its per-seller sub-orders.
@@ -137,6 +141,9 @@ pub struct SellerSubOrder {
     pub delivery_address: String,
     pub delivery_zone: String,
     pub items: Vec<OrderItem>,
+    /// The courier shipment booked for this sub-order (Wave 6), or
+    /// `None` until the seller books one.
+    pub shipment: Option<ShipmentSummary>,
 }
 
 /// A page of seller sub-orders plus the total count.
@@ -204,6 +211,7 @@ async fn load_order_items(pool: &PgPool, sub_order_id: Uuid) -> Result<Vec<Order
 
 async fn sub_order_from_row(pool: &PgPool, row: SubOrderRow) -> Result<SubOrder, ApiError> {
     let items = load_order_items(pool, row.id).await?;
+    let shipment = load_shipment_summary_for_sub_order(pool, row.id).await?;
     Ok(SubOrder {
         id: row.id,
         order_id: row.order_id,
@@ -216,6 +224,7 @@ async fn sub_order_from_row(pool: &PgPool, row: SubOrderRow) -> Result<SubOrder,
         seller_payout_poisha: row.seller_payout_poisha,
         created_at: row.created_at,
         items,
+        shipment,
     })
 }
 
@@ -868,6 +877,7 @@ pub async fn list_seller_sub_orders(
     let mut items = Vec::with_capacity(rows.len());
     for row in rows {
         let order_items = load_order_items(pool, row.id).await?;
+        let shipment = load_shipment_summary_for_sub_order(pool, row.id).await?;
         items.push(SellerSubOrder {
             id: row.id,
             order_id: row.order_id,
@@ -884,6 +894,7 @@ pub async fn list_seller_sub_orders(
             delivery_address: row.delivery_address,
             delivery_zone: row.delivery_zone,
             items: order_items,
+            shipment,
         });
     }
     Ok(SellerSubOrderList {

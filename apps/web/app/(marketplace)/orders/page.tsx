@@ -7,8 +7,11 @@ import {
   cancelOrder,
   listOrders,
   paymentStatusLabel,
+  refreshShipment,
   retryPayment,
+  shipmentStatusLabel,
   type Order,
+  type SubOrder,
 } from "@/lib/api";
 import { useAuth } from "@/hooks/useAuth";
 
@@ -25,6 +28,29 @@ export default function BuyerOrdersPage() {
   const [error, setError] = useState<string | null>(null);
   const [cancellingId, setCancellingId] = useState<string | null>(null);
   const [retryingId, setRetryingId] = useState<string | null>(null);
+  const [refreshingId, setRefreshingId] = useState<string | null>(null);
+
+  // Refresh one sub-order's courier tracking (Wave 6): the API polls
+  // the courier and applies any legal status change; the list is
+  // then reloaded so what is shown is the server's state.
+  async function onRefreshShipment(sub: SubOrder) {
+    if (!token || !sub.shipment) return;
+    setRefreshingId(sub.shipment.id);
+    setError(null);
+    try {
+      await refreshShipment(token, sub.shipment.id);
+      const list = await listOrders(token, { limit: 50 });
+      setOrders(list.items);
+    } catch (err) {
+      setError(
+        `ট্র্যাকিং রিফ্রেশ করা যায়নি। ${
+          err instanceof Error ? err.message : ""
+        }`.trim()
+      );
+    } finally {
+      setRefreshingId(null);
+    }
+  }
 
   // Retry a failed online payment (Wave 5): the API moves it back to
   // pending; the list is then reloaded so the status shown is the
@@ -139,6 +165,26 @@ export default function BuyerOrdersPage() {
                   ডেলিভারি:{" "}
                   <PriceTag amountPoisha={sub.delivery_charge_poisha} />
                 </p>
+                {sub.shipment && (
+                  <p>
+                    কুরিয়ার: {sub.shipment.courier} · কনসাইনমেন্ট:{" "}
+                    <code>{sub.shipment.consignment_id}</code> · অবস্থা:{" "}
+                    {shipmentStatusLabel(sub.shipment.status)}{" "}
+                    {!["delivered", "returned", "cancelled"].includes(
+                      sub.shipment.status
+                    ) && (
+                      <button
+                        type="button"
+                        disabled={refreshingId === sub.shipment.id}
+                        onClick={() => void onRefreshShipment(sub)}
+                      >
+                        {refreshingId === sub.shipment.id
+                          ? "রিফ্রেশ হচ্ছে…"
+                          : "স্ট্যাটাস রিফ্রেশ"}
+                      </button>
+                    )}
+                  </p>
+                )}
               </div>
             ))}
             <p>

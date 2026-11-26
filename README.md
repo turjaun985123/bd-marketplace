@@ -227,6 +227,65 @@ TODO: it cannot be implemented without each gateway's credentials
 and documented signature scheme, so callbacks for non-dev payments
 are logged and rejected (401) rather than trusted.
 
+Wave 6 (courier shipments):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| GET | `/v1/couriers` | Per-courier availability (public): Steadfast available with mode `live` when its merchant credentials are set, any known courier available with mode `dev` when the DEV courier simulator is on; otherwise `available: false, reason: "not_configured"`. The seller page renders exactly this answer |
+| POST | `/v1/seller/sub-orders/{id}/shipment` | Book a courier shipment for one of your CONFIRMED sub-orders (409 while `placed`, 409 if already booked, 503 when the courier is unavailable). Body `{ "courier": "steadfast" }` is optional — the configured default (`DEFAULT_COURIER`) is used otherwise. On success the shipment row, its `create` event and the sub-order's move to `shipped` commit in one transaction |
+| POST | `/v1/shipments/{id}/refresh` | Poll the courier for the shipment's current status (the sub-order's seller or the order's buyer only; anyone else gets a 404). A legal change is applied, logged in `shipment_events` with the courier's raw status, and syncs the sub-order on `delivered` / `returned` |
+
+**Courier availability rule:** Steadfast is bookable only when its
+platform merchant credentials are set (`STEADFAST_API_KEY` +
+`STEADFAST_SECRET_KEY`; `STEADFAST_BASE_URL` overrides the API base
+URL, default `https://portal.packzy.com/api/v1`) or when the DEV
+courier simulator is on. Platform master accounts are the model:
+sellers never need a courier account of their own.
+
+**Steadfast adapter** (the first real courier adapter): booking is
+`POST /create_order` with `Api-Key` / `Secret-Key` headers and an
+invoice, recipient name/phone/address, a note, and the COD amount —
+Steadfast's API takes taka, so integer poisha is converted at that
+boundary only (`poisha_to_taka`, 4,690 poisha = 46.90); money stays
+integer poisha everywhere else. Tracking is
+`GET /status_by_cid/{consignment_id}`; the raw `delivery_status` is
+mapped by the single domain function `map_steadfast_status`
+(`pending` → `created`, `hold` → `in_transit`,
+`partial_delivered` keeps its own status, anything unrecognised →
+`unknown`). Two honest limits: Steadfast's basic API has **no cancel
+endpoint** for a created consignment, so the adapter's `cancel`
+returns `Unsupported` rather than pretending; and `price_estimate`
+is a purely local estimate from the domain delivery-charge function
+under our own tariff — no network call, and not a quote from
+Steadfast. Pathao, RedX, eCourier and Paperfly remain
+`NotConfigured` stubs behind the same trait (Pathao/RedX are
+Wave 7).
+
+**DEV courier simulator** (`COURIER_DEV_MODE=true`, local/CI only —
+NEVER in production): booking mints a
+`DEV-<courier>-<sub_order_id>` consignment id, and each tracking
+poll advances the parcel one step — `picked_up`, `in_transit`,
+`out_for_delivery`, `delivered`. The poll counts are in-memory,
+process-wide state (adapters are built per call), so progression
+resets when the API restarts. Simulated shipments are not real
+bookings; the seller UI labels dev couriers as such.
+
+**Shipment state machine** (pure domain function
+`can_transition_shipment`, unit-tested): `created → picked_up →
+in_transit → out_for_delivery → delivered`, plus
+`out_for_delivery → partial_delivered → delivered | returned`, the
+return path `delivered → return_in_transit → returned`, and
+cancellation from any non-final state (`delivered` itself is not
+cancellable — the return path is the only way back). `unknown`
+never transitions automatically: a refresh that reports an
+unrecognised or backwards status leaves the stored shipment
+untouched and writes no event. **One shipment per sub-order** is a
+hard rule (UNIQUE on `shipments.sub_order_id`): the COD amount the
+courier collects is the sub-order's goods + delivery share for
+pay-on-delivery orders, and 0 for online-paid orders. Order and
+seller sub-order views now embed a `shipment` summary (`id`,
+`courier`, `consignment_id`, `status`) per sub-order.
+
 Auth rules that matter: only a SHA-256 hash of an OTP is ever stored;
 ownership is checked on every seller mutation (403 for non-owners);
 every product query is scoped by store. Listing visibility: public
@@ -381,25 +440,56 @@ the cart left intact; the checkout page rendering the methods
 endpoint (unavailable methods disabled, dev methods labelled) and
 the orders/receipt pages showing payment status in Bangla.
 
+**Real (Wave 6):** courier shipments — migration 0010 (`shipments`
+with a UNIQUE one-per-sub-order rule, `shipment_events` audit
+trail); the pure domain shipment transition table and the single
+Steadfast raw-status mapping; the real Steadfast adapter behind the
+`courier_adapter_for` factory (credential-gated `create_order` /
+`status_by_cid` calls with defensive response parsing, honest
+`Unsupported` cancel, local domain price estimate); the DEV courier
+simulator (dev flag only, `DEV-` consignment ids, poll-by-poll
+status progression, labelled in API responses, UI and this README);
+seller booking for confirmed sub-orders with the sub-order moving
+to `shipped` in the same transaction; tracking refresh for the
+seller or the buyer that applies only legal unified-status moves
+and syncs the sub-order on delivery/return; courier availability
+(`GET /v1/couriers`) as the single source the seller page renders;
+shipment summaries embedded in the buyer order and seller sub-order
+views; an end-to-end integration test (`crates/api/tests/wave6.rs`,
+same `DATABASE_URL` gate) covering availability on and off, booking
+while placed (409), non-owner booking (403), the DEV booking with
+its COD share, duplicate booking (409), the four-refresh progression
+to delivered with the sub-order sync, stranger refresh (404), and
+the production-mode 503; the seller orders page (courier select +
+"কুরিয়ার বুক করুন" booking, shipment status + refresh) and the
+buyer orders page (per-sub-order shipment block with Bangla status
+labels + refresh).
+
 **Stubbed (typed errors — never fake success, no network calls):**
-Steadfast / Pathao / RedX courier adapters. Tier 1b couriers
-(eCourier, Paperfly) and manual Phase 2 couriers (Sundarban, SA Paribahan,
-Karatoa, Carrybee) join behind the same traits later. SMS sending has
-only the dev-mode log implementation (see the dev OTP flow above).
+Pathao / RedX / eCourier / Paperfly courier adapters (Pathao and
+RedX land as real adapters in Wave 7). Manual Phase 2 couriers
+(Sundarban, SA Paribahan, Karatoa, Carrybee) join behind the same
+trait later. SMS sending has only the dev-mode log implementation
+(see the dev OTP flow above).
 
 **TODO / not wired:** live gateway calls and real-gateway webhook
 signature verification (need merchant credentials + each gateway's
-integration docs), refunds and payouts, Redis, courier booking, a
-real SMS gateway, SIDRA calls, worker jobs (the worker logs its
-planned jobs and exits cleanly).
+integration docs), refunds and payouts, Redis, a real SMS gateway,
+SIDRA calls, worker jobs — including automatic courier status
+polling, which will call the same refresh service function the API
+exposes (the worker still logs its planned jobs and exits cleanly).
 
 ## Verification status
 
 - **Next.js: verified on this machine** — `npm ci && npm run build`
-  passes (Wave 5 checkout / orders / receipt changes included).
-- **Rust: NOT compiled locally** — this development VM has no `cargo`
-  installed, by design. Rust compilation, `cargo test --workspace`
-  (including the Wave 2 + Wave 3 + Wave 4 + Wave 5 integration tests
-  against CI's Postgres service) and clippy `-D warnings` are
-  verified via **GitHub Actions CI** (`.github/workflows/ci.yml`) on
-  push. Waves 1–4 are green there; Wave 5 awaits its first CI run.
+  passes (Wave 6 seller/buyer orders changes included).
+- **Rust unit tests: verified on this machine** — cargo 1.100.0 is
+  installed here after all; `cargo test --workspace` passes locally
+  (domain 26, courier 10, payments 8 unit tests; the `DATABASE_URL`-
+  gated integration tests skip cleanly without a database). The API
+  binary was also smoke-tested locally without a database: routes
+  build, `/v1/couriers` answers, auth rejects unauthenticated calls.
+- **Rust integration + clippy: CI-only** — the Wave 2–6 integration
+  tests against a real Postgres 16 service and clippy `-D warnings`
+  are verified via **GitHub Actions CI** (`.github/workflows/ci.yml`)
+  on push. Waves 1–5 are green there; Wave 6 awaits its first CI run.

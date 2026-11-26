@@ -371,6 +371,89 @@ pub fn validate_callback_amount(expected_poisha: i64, reported_poisha: i64) -> b
     expected_poisha == reported_poisha
 }
 
+/// Shipment (courier parcel) statuses — the unified set every
+/// courier's raw statuses are mapped onto, so buyers, sellers and the
+/// worker never learn courier-specific strings. Mirrors the DB CHECK
+/// constraint on `shipments.status` (migration 0010).
+pub fn is_valid_shipment_status(status: &str) -> bool {
+    matches!(
+        status,
+        "created"
+            | "picked_up"
+            | "in_transit"
+            | "out_for_delivery"
+            | "delivered"
+            | "partial_delivered"
+            | "return_in_transit"
+            | "returned"
+            | "cancelled"
+            | "unknown"
+    )
+}
+
+/// May a shipment move from `from` to `to`? The single shipment
+/// transition table (Wave 6): the forward flow created → picked_up →
+/// in_transit → out_for_delivery → delivered; a partial delivery
+/// (`out_for_delivery → partial_delivered`) may still complete
+/// (`→ delivered`) or come back (`→ returned`); a delivered parcel
+/// can only move again on the return path (`→ return_in_transit →
+/// returned`); any parcel that has not reached a final state may be
+/// cancelled, but `delivered` is NOT cancellable (the goods arrived —
+/// the return path is the only way back) and `returned` / `cancelled`
+/// are final. `unknown` never transitions automatically, in either
+/// direction: it is the "courier said something we do not recognise"
+/// marker, and callers treat it as no change. Same-state moves are
+/// rejected here too — callers treat an unchanged poll result as a
+/// no-op BEFORE consulting this table.
+pub fn can_transition_shipment(from: &str, to: &str) -> bool {
+    matches!(
+        (from, to),
+        ("created", "picked_up")
+            | ("picked_up", "in_transit")
+            | ("in_transit", "out_for_delivery")
+            | ("out_for_delivery", "delivered")
+            | ("out_for_delivery", "partial_delivered")
+            | ("partial_delivered", "delivered")
+            | ("partial_delivered", "returned")
+            | ("delivered", "return_in_transit")
+            | ("return_in_transit", "returned")
+            | ("created", "cancelled")
+            | ("picked_up", "cancelled")
+            | ("in_transit", "cancelled")
+            | ("out_for_delivery", "cancelled")
+            | ("partial_delivered", "cancelled")
+            | ("return_in_transit", "cancelled")
+    )
+}
+
+/// Map one Steadfast `delivery_status` value onto the unified
+/// shipment status set (see [`is_valid_shipment_status`]). This is
+/// the single Steadfast mapping: the courier crate's adapter calls
+/// it, so the mapping exists in exactly one place.
+///
+/// Steadfast's documented values and the choices made here:
+/// `pending` (consignment created, awaiting pickup) maps to
+/// `created`; `delivered` maps to `delivered`; `partial_delivered`
+/// keeps its own unified status — only part of the parcel was handed
+/// over, so calling it `delivered` would overstate the truth;
+/// `cancelled` maps to `cancelled`; `returned` maps to `returned`;
+/// `hold` (parcel held at a hub) maps to `in_transit` — the parcel
+/// is still inside the delivery pipeline, just paused. Anything else
+/// (values Steadfast adds later, typos, empty strings) maps to
+/// `unknown`, which the transition table treats as no change.
+/// Matching ignores surrounding whitespace and letter case.
+pub fn map_steadfast_status(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "pending" => "created",
+        "delivered" => "delivered",
+        "partial_delivered" => "partial_delivered",
+        "cancelled" => "cancelled",
+        "returned" => "returned",
+        "hold" => "in_transit",
+        _ => "unknown",
+    }
+}
+
 /// Validate a Bangladeshi mobile number in local form: exactly 11 ASCII
 /// digits, starting with `01`, third digit in 3..=9 (operator prefixes
 /// 013–019). Pure helper — the single source of truth for phone rules.
@@ -891,5 +974,114 @@ mod tests {
         assert!(is_valid_sub_order_status("placed"));
         assert!(is_valid_sub_order_status("returned"));
         assert!(!is_valid_sub_order_status("bogus"));
+    }
+
+    #[test]
+    fn shipment_status_set() {
+        for status in [
+            "created",
+            "picked_up",
+            "in_transit",
+            "out_for_delivery",
+            "delivered",
+            "partial_delivered",
+            "return_in_transit",
+            "returned",
+            "cancelled",
+            "unknown",
+        ] {
+            assert!(is_valid_shipment_status(status), "{status}");
+        }
+        assert!(!is_valid_shipment_status("pending"));
+        assert!(!is_valid_shipment_status("shipped"));
+        assert!(!is_valid_shipment_status("bogus"));
+        assert!(!is_valid_shipment_status(""));
+    }
+
+    #[test]
+    fn shipment_transition_table() {
+        // The allowed moves: forward flow, partial delivery, the
+        // return path, and cancellation of any non-final parcel.
+        for (from, to) in [
+            ("created", "picked_up"),
+            ("picked_up", "in_transit"),
+            ("in_transit", "out_for_delivery"),
+            ("out_for_delivery", "delivered"),
+            ("out_for_delivery", "partial_delivered"),
+            ("partial_delivered", "delivered"),
+            ("partial_delivered", "returned"),
+            ("delivered", "return_in_transit"),
+            ("return_in_transit", "returned"),
+            ("created", "cancelled"),
+            ("picked_up", "cancelled"),
+            ("in_transit", "cancelled"),
+            ("out_for_delivery", "cancelled"),
+            ("partial_delivered", "cancelled"),
+            ("return_in_transit", "cancelled"),
+        ] {
+            assert!(can_transition_shipment(from, to), "{from} -> {to}");
+        }
+        // Everything else is rejected: skips, backwards, same-state,
+        // cancelling a delivered parcel, moves out of the final
+        // states, and anything touching `unknown`.
+        for (from, to) in [
+            ("created", "in_transit"),
+            ("created", "delivered"),
+            ("created", "returned"),
+            ("created", "created"),
+            ("picked_up", "delivered"),
+            ("picked_up", "created"),
+            ("in_transit", "delivered"),
+            ("in_transit", "picked_up"),
+            ("out_for_delivery", "in_transit"),
+            ("out_for_delivery", "returned"),
+            ("delivered", "cancelled"),
+            ("delivered", "delivered"),
+            ("delivered", "returned"),
+            ("partial_delivered", "in_transit"),
+            ("return_in_transit", "delivered"),
+            ("returned", "cancelled"),
+            ("returned", "return_in_transit"),
+            ("cancelled", "picked_up"),
+            ("cancelled", "cancelled"),
+            ("unknown", "picked_up"),
+            ("unknown", "cancelled"),
+            ("created", "unknown"),
+            ("delivered", "unknown"),
+            ("bogus", "picked_up"),
+            ("created", "bogus"),
+        ] {
+            assert!(!can_transition_shipment(from, to), "{from} -> {to}");
+        }
+    }
+
+    #[test]
+    fn steadfast_status_mapping() {
+        // Every documented Steadfast delivery_status value.
+        assert_eq!(map_steadfast_status("pending"), "created");
+        assert_eq!(map_steadfast_status("delivered"), "delivered");
+        assert_eq!(map_steadfast_status("partial_delivered"), "partial_delivered");
+        assert_eq!(map_steadfast_status("cancelled"), "cancelled");
+        assert_eq!(map_steadfast_status("returned"), "returned");
+        assert_eq!(map_steadfast_status("hold"), "in_transit");
+        // Unrecognised values are honestly unknown, never guessed.
+        assert_eq!(map_steadfast_status("in_review"), "unknown");
+        assert_eq!(map_steadfast_status(""), "unknown");
+        assert_eq!(map_steadfast_status("bogus"), "unknown");
+        // Whitespace and case do not change the answer.
+        assert_eq!(map_steadfast_status(" Delivered "), "delivered");
+        assert_eq!(map_steadfast_status("PENDING"), "created");
+        // Every mapping result is a member of the unified set.
+        for raw in [
+            "pending",
+            "delivered",
+            "partial_delivered",
+            "cancelled",
+            "returned",
+            "hold",
+            "whatever",
+        ] {
+            assert!(is_valid_shipment_status(map_steadfast_status(raw)), "{raw}");
+        }
     }
 }

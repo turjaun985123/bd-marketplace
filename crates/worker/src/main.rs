@@ -7,7 +7,7 @@
 
 /// Jobs this worker will own in later waves.
 const PLANNED_JOBS: &[&str] = &[
-    "courier_status_polling (poll Steadfast/Pathao/RedX, map to common ShipmentStatus)",
+    "courier_status_polling (poll couriers, apply unified shipment statuses via the shipments refresh service)",
     "payout_jobs (compute_commission-based seller payouts on schedule)",
     "notifications (SMS/order notifications to buyers and sellers)",
     "cod_reconciliation (match courier COD collections to orders)",

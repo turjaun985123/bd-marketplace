@@ -9,6 +9,10 @@
 //! Wave 5: the online payments foundation (`payments` module) —
 //! method availability, dev-simulated gateway checkout, signed
 //! webhook callbacks and payment retry.
+//! Wave 6: courier shipments (`shipments` module) — the real
+//! Steadfast adapter behind merchant credentials (or the DEV courier
+//! simulator behind its flag), one shipment per sub-order, tracking
+//! refresh that syncs sub-order status, and courier availability.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -24,6 +28,7 @@ pub mod cart;
 pub mod orders;
 pub mod payments;
 pub mod products;
+pub mod shipments;
 pub mod stores;
 
 use axum::{
@@ -32,6 +37,7 @@ use axum::{
     routing::{get, patch, post},
     Json, Router,
 };
+use ::courier::{CourierConfig, CouriersConfig};
 use domain::{
     calculate_delivery_charge, compute_commission, split_cart_by_seller, CartItem,
     CommissionQuote, DeliveryZone, SellerSubOrder,
@@ -60,6 +66,11 @@ pub struct AppState {
     /// from the environment in `from_env`; tests set it explicitly
     /// via `with_payments_config`.
     pub payments_config: PaymentsConfig,
+    /// Courier configuration (Wave 6): the DEV simulator switch,
+    /// Steadfast's merchant credentials, and the default courier.
+    /// Built from the environment in `from_env`; tests set it
+    /// explicitly via `with_couriers_config`.
+    pub couriers_config: CouriersConfig,
 }
 
 /// Default commission rate: 8% (matches the MVP plan's worked example).
@@ -73,6 +84,7 @@ impl AppState {
             sms_dev_mode,
             commission_rate_bps: DEFAULT_COMMISSION_RATE_BPS,
             payments_config: PaymentsConfig::default(),
+            couriers_config: CouriersConfig::default(),
         }
     }
 
@@ -80,6 +92,13 @@ impl AppState {
     /// tests that need the DEV payment simulator on or off).
     pub fn with_payments_config(mut self, payments_config: PaymentsConfig) -> Self {
         self.payments_config = payments_config;
+        self
+    }
+
+    /// Replace the couriers configuration (used by `from_env` and by
+    /// tests that need the DEV courier simulator on or off).
+    pub fn with_couriers_config(mut self, couriers_config: CouriersConfig) -> Self {
+        self.couriers_config = couriers_config;
         self
     }
 
@@ -115,6 +134,7 @@ impl AppState {
             }
         }
         state.payments_config = payments_config_from_env();
+        state.couriers_config = couriers_config_from_env();
         state
     }
 
@@ -246,6 +266,37 @@ fn payments_config_from_env() -> PaymentsConfig {
             api_key: None,
             secret: env_value("SHURJOPAY_PASSWORD"),
         },
+    }
+}
+
+/// Build the Wave 6 couriers configuration from the environment:
+/// `COURIER_DEV_MODE` gates the DEV courier simulator (with a loud
+/// startup warning — it must never be on in production),
+/// `STEADFAST_API_KEY` / `STEADFAST_SECRET_KEY` are the platform's
+/// Steadfast merchant credentials, `STEADFAST_BASE_URL` overrides
+/// the production API base URL (sandbox/testing), and
+/// `DEFAULT_COURIER` names the courier sellers get by default.
+fn couriers_config_from_env() -> CouriersConfig {
+    let dev_mode = std::env::var("COURIER_DEV_MODE")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    if dev_mode {
+        eprintln!(
+            "WARNING: COURIER_DEV_MODE is ON — the DEV courier simulator is \
+             enabled. Simulated shipments are not real bookings. NEVER \
+             enable this in production."
+        );
+    }
+    CouriersConfig {
+        dev_mode,
+        steadfast: CourierConfig {
+            api_key: env_value("STEADFAST_API_KEY"),
+            secret_key: env_value("STEADFAST_SECRET_KEY"),
+            base_url: env_value("STEADFAST_BASE_URL")
+                .unwrap_or_else(|| ::courier::DEFAULT_STEADFAST_BASE_URL.to_string()),
+        },
+        default_courier: env_value("DEFAULT_COURIER")
+            .unwrap_or_else(|| "steadfast".to_string()),
     }
 }
 
@@ -390,6 +441,14 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/seller/sub-orders/:id/status",
             patch(orders::update_sub_order_status_handler),
         )
+        // Wave 6 — couriers + shipments: availability, booking a
+        // shipment for a confirmed sub-order, tracking refresh.
+        .route("/v1/couriers", get(shipments::list_couriers))
+        .route(
+            "/v1/seller/sub-orders/:id/shipment",
+            post(shipments::create_shipment),
+        )
+        .route("/v1/shipments/:id/refresh", post(shipments::refresh))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }

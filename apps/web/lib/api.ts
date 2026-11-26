@@ -100,6 +100,67 @@ export interface OrderItem {
   line_total_poisha: number;
 }
 
+/** The courier shipment on a sub-order (Wave 6). */
+export interface ShipmentSummary {
+  id: string;
+  courier: string;
+  consignment_id: string;
+  /** Unified shipment status (created, picked_up, in_transit, …). */
+  status: string;
+}
+
+/** One courier booking (booking / refresh responses, Wave 6). */
+export interface Shipment {
+  id: string;
+  sub_order_id: string;
+  courier: string;
+  consignment_id: string;
+  tracking_code: string | null;
+  status: string;
+  /** Cash the courier collects on delivery, in poisha. */
+  cod_amount_poisha: number;
+  note: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Availability of one courier (GET /v1/couriers, Wave 6). */
+export interface CourierInfo {
+  courier: string;
+  available: boolean;
+  /** "live" | "dev" | null — "dev" means the DEV simulator. */
+  mode: string | null;
+  /** Machine-readable reason when unavailable, e.g. "not_configured". */
+  reason: string | null;
+  is_default: boolean;
+}
+
+/** Bangla label for a unified shipment status (display only). */
+export function shipmentStatusLabel(status: string): string {
+  switch (status) {
+    case "created":
+      return "তৈরি হয়েছে";
+    case "picked_up":
+      return "পিক হয়েছে";
+    case "in_transit":
+      return "পথে আছে";
+    case "out_for_delivery":
+      return "ডেলিভারির জন্য বেরিয়েছে";
+    case "delivered":
+      return "ডেলিভারি হয়েছে";
+    case "partial_delivered":
+      return "আংশিক ডেলিভারি হয়েছে";
+    case "return_in_transit":
+      return "ফেরত আসছে";
+    case "returned":
+      return "ফেরত হয়েছে";
+    case "cancelled":
+      return "বাতিল";
+    default:
+      return "অজানা";
+  }
+}
+
 export interface SubOrder {
   id: string;
   order_id: string;
@@ -112,6 +173,8 @@ export interface SubOrder {
   seller_payout_poisha: number;
   created_at: string;
   items: OrderItem[];
+  /** Courier shipment (Wave 6); null until the seller books one. */
+  shipment: ShipmentSummary | null;
 }
 
 /** The latest payment attempt on an order (Wave 5). */
@@ -207,6 +270,8 @@ export interface SellerSubOrder {
   delivery_address: string;
   delivery_zone: string;
   items: OrderItem[];
+  /** Courier shipment (Wave 6); null until the seller books one. */
+  shipment: ShipmentSummary | null;
 }
 
 export interface SellerSubOrderList {
@@ -463,5 +528,40 @@ export function updateSubOrderStatus(
     method: "PATCH",
     token,
     body: { status },
+  });
+}
+
+/** GET /v1/couriers — which couriers can be booked right now. */
+export function getCouriers(): Promise<CourierInfo[]> {
+  return call("/v1/couriers");
+}
+
+/**
+ * POST /v1/seller/sub-orders/{id}/shipment — book a courier shipment
+ * for a confirmed sub-order (Wave 6). Omitting `courier` books the
+ * platform's default courier. One shipment per sub-order: a second
+ * booking is a 409, and with no courier configured it is a 503.
+ */
+export function createShipment(
+  token: string,
+  subOrderId: string,
+  courier?: string
+): Promise<Shipment> {
+  return call(`/v1/seller/sub-orders/${encodeURIComponent(subOrderId)}/shipment`, {
+    method: "POST",
+    token,
+    body: courier ? { courier } : {},
+  });
+}
+
+/**
+ * POST /v1/shipments/{id}/refresh — poll the courier for the latest
+ * tracking status (Wave 6). The shipment's seller and the order's
+ * buyer may call this; anyone else gets a 404.
+ */
+export function refreshShipment(token: string, shipmentId: string): Promise<Shipment> {
+  return call(`/v1/shipments/${encodeURIComponent(shipmentId)}/refresh`, {
+    method: "POST",
+    token,
   });
 }
