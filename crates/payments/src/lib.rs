@@ -544,7 +544,7 @@ mod tests {
     async fn unconfigured_adapter_never_fakes_success() {
         let adapter = BkashAdapter::default();
         let err = adapter
-            .initiate("order-1", 100_00)
+            .initiate("order-1", 10_000)
             .await
             .expect_err("no credentials, no success");
         assert!(matches!(err, PaymentError::NotConfigured(_)), "{err}");
@@ -554,7 +554,7 @@ mod tests {
     async fn configured_adapter_reports_not_implemented() {
         let adapter = BkashAdapter::new(complete_bkash());
         let err = adapter
-            .initiate("order-1", 100_00)
+            .initiate("order-1", 10_000)
             .await
             .expect_err("live calls are not implemented yet");
         assert!(matches!(err, PaymentError::NotImplemented(_)), "{err}");
