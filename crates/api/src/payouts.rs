@@ -166,13 +166,13 @@ pub fn available_balance(earnings: &Earnings) -> i64 {
 pub async fn seller_earnings(pool: &PgPool, store_id: Uuid) -> Result<Earnings, ApiError> {
     let row: (i64, i64, i64) = sqlx::query_as(
         "SELECT \
-           (SELECT COALESCE(SUM(goods_subtotal_poisha - commission_poisha), 0) \
+           (SELECT COALESCE(SUM(goods_subtotal_poisha - commission_poisha), 0)::bigint \
               FROM sub_orders \
              WHERE store_id = $1 AND status = 'delivered') AS earned_poisha, \
-           (SELECT COALESCE(SUM(amount_poisha), 0) \
+           (SELECT COALESCE(SUM(amount_poisha), 0)::bigint \
               FROM payouts \
              WHERE store_id = $1 AND status IN ('approved', 'paid')) AS paid_out_poisha, \
-           (SELECT COALESCE(SUM(amount_poisha), 0) \
+           (SELECT COALESCE(SUM(amount_poisha), 0)::bigint \
               FROM payouts \
              WHERE store_id = $1 AND status = 'requested') AS pending_poisha",
     )
