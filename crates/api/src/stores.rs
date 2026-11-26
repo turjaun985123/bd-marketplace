@@ -24,7 +24,10 @@ use crate::{ApiError, AppState};
 /// `facebook_page_id` / `facebook_page_name` (Wave 12) are the
 /// seller's linked Facebook Page identity, or null when no page
 /// is linked; no page tokens are ever stored (see the `facebook`
-/// module).
+/// module). `sidra_auto_reply` (Wave 13) is the store's SIDRA
+/// mode: when true, SIDRA's AI replies enter the conversation
+/// directly; when false, they wait as suggestions for the seller
+/// (see the `messaging` module).
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct Store {
     pub id: Uuid,
@@ -35,23 +38,24 @@ pub struct Store {
     pub status: String,
     pub facebook_page_id: Option<String>,
     pub facebook_page_name: Option<String>,
+    pub sidra_auto_reply: bool,
     pub created_at: DateTime<Utc>,
 }
 
 const INSERT_STORE_SQL: &str = "INSERT INTO stores (owner_user_id, slug, name, description) \
     VALUES ($1, $2, $3, $4) \
     RETURNING id, owner_user_id, slug, name, description, status, \
-    facebook_page_id, facebook_page_name, created_at";
+    facebook_page_id, facebook_page_name, sidra_auto_reply, created_at";
 const SELECT_STORE_BY_SLUG_SQL: &str =
     "SELECT id, owner_user_id, slug, name, description, status, \
-     facebook_page_id, facebook_page_name, created_at \
+     facebook_page_id, facebook_page_name, sidra_auto_reply, created_at \
      FROM stores WHERE slug = $1";
 const SELECT_STORE_BY_ID_SQL: &str =
     "SELECT id, owner_user_id, slug, name, description, status, \
-     facebook_page_id, facebook_page_name, created_at \
+     facebook_page_id, facebook_page_name, sidra_auto_reply, created_at \
      FROM stores WHERE id = $1";
 const SELECT_STORE_BY_OWNER_SQL: &str = "SELECT id, owner_user_id, slug, name, description, \
-    status, facebook_page_id, facebook_page_name, created_at \
+    status, facebook_page_id, facebook_page_name, sidra_auto_reply, created_at \
     FROM stores WHERE owner_user_id = $1 ORDER BY created_at ASC LIMIT 1";
 
 /// Create a store for the authenticated user. Validates the slug with

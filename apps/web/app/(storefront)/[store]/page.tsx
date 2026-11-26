@@ -1,3 +1,4 @@
+import MessageStoreButton from "@/components/MessageStoreButton";
 import ProductGrid from "@/components/ProductGrid";
 
 /**
@@ -19,6 +20,7 @@ export default function StorefrontPage({
         এটি <strong>{params.store}</strong>-এর নিজস্ব স্টোরফ্রন্ট — একই পণ্য
         কেন্দ্রীয় মার্কেটপ্লেসেও পাওয়া যায়।
       </p>
+      <MessageStoreButton slug={params.store} />
       <h2>পণ্য — Products</h2>
       <ProductGrid storeSlug={params.store} />
     </main>

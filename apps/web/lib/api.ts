@@ -27,6 +27,11 @@ export interface Store {
   facebook_page_id: string | null;
   /** Linked Facebook Page display name (Wave 12). */
   facebook_page_name: string | null;
+  /**
+   * SIDRA mode (Wave 13): true = AI replies post directly into the
+   * conversation; false = they wait as seller-approved suggestions.
+   */
+  sidra_auto_reply: boolean;
   created_at: string;
 }
 
@@ -1222,4 +1227,199 @@ export function updateAdminSettings(
   patch: { commission_bps?: number; min_payout_poisha?: number }
 ): Promise<AdminSettings> {
   return call("/v1/admin/settings", { method: "PUT", token, body: patch });
+}
+
+// ---------------------------------------------------------------------------
+// Wave 13 — messaging + SIDRA bridge
+// ---------------------------------------------------------------------------
+
+/** One message in a conversation thread. */
+export interface Message {
+  id: string;
+  conversation_id: string;
+  /** buyer | seller | ai */
+  sender_type: string;
+  /** The sending user; null for AI messages. */
+  sender_id: string | null;
+  body: string;
+  created_at: string;
+}
+
+/**
+ * One conversation as the caller sees it: `role` is the caller's
+ * side (buyer | seller) and `unread_count` counts the OTHER side's
+ * messages the caller has not read yet.
+ */
+export interface Conversation {
+  id: string;
+  store: { id: string; name: string; slug: string };
+  buyer_id: string;
+  /** Buyer name, or the masked phone when no name is set. */
+  buyer_display: string;
+  product_id: string | null;
+  product_title: string | null;
+  /** buyer | seller — the caller's role in this conversation. */
+  role: string;
+  /** open | closed */
+  status: string;
+  last_message_at: string;
+  /** First 80 chars of the newest message; null while empty. */
+  last_message_preview: string | null;
+  unread_count: number;
+  created_at: string;
+}
+
+/** A thread read: the conversation view plus its messages. */
+export interface ConversationThread {
+  conversation: Conversation;
+  messages: Message[];
+}
+
+/** One SIDRA reply suggestion in the seller's queue. */
+export interface SidraSuggestion {
+  id: string;
+  conversation_id: string;
+  in_reply_to_message_id: string;
+  body: string;
+  /** pending | sent | dismissed */
+  status: string;
+  created_at: string;
+  decided_at: string | null;
+  /** Who SIDRA was answering (name or masked phone). */
+  buyer_display: string;
+}
+
+/**
+ * The seller's SIDRA status: whether the platform bridge is
+ * configured at all, and this store's auto-reply mode. The two
+ * are independent — the toggle exists even while unconfigured.
+ */
+export interface SidraStatus {
+  configured: boolean;
+  auto_reply: boolean;
+}
+
+/** Bangla label for a message sender (display only). */
+export function senderTypeLabel(senderType: string): string {
+  switch (senderType) {
+    case "buyer":
+      return "ক্রেতা";
+    case "seller":
+      return "বিক্রেতা";
+    case "ai":
+      return "SIDRA (AI)";
+    default:
+      return senderType;
+  }
+}
+
+/**
+ * POST /v1/conversations — find the caller's open conversation
+ * with a store (optionally about one product), or create it.
+ */
+export function createConversation(
+  token: string,
+  storeId: string,
+  productId?: string
+): Promise<Conversation> {
+  return call("/v1/conversations", {
+    method: "POST",
+    token,
+    body: { store_id: storeId, product_id: productId ?? null },
+  });
+}
+
+/** GET /v1/conversations — every conversation the caller is in. */
+export function listConversations(token: string): Promise<Conversation[]> {
+  return call("/v1/conversations", { token });
+}
+
+/**
+ * GET /v1/conversations/{id} — read a thread. Reading stamps the
+ * caller's read marker, so the returned unread count is 0.
+ */
+export function getConversation(
+  token: string,
+  conversationId: string
+): Promise<ConversationThread> {
+  return call(`/v1/conversations/${encodeURIComponent(conversationId)}`, {
+    token,
+  });
+}
+
+/** POST /v1/conversations/{id}/messages — post as your own side. */
+export function sendMessage(
+  token: string,
+  conversationId: string,
+  body: string
+): Promise<Message> {
+  return call(
+    `/v1/conversations/${encodeURIComponent(conversationId)}/messages`,
+    { method: "POST", token, body: { body } }
+  );
+}
+
+/** POST /v1/conversations/{id}/close — close (history stays readable). */
+export function closeConversation(
+  token: string,
+  conversationId: string
+): Promise<Conversation> {
+  return call(
+    `/v1/conversations/${encodeURIComponent(conversationId)}/close`,
+    { method: "POST", token }
+  );
+}
+
+/** GET /v1/seller/sidra/suggestions — the pending AI reply queue. */
+export function listSidraSuggestions(
+  token: string
+): Promise<SidraSuggestion[]> {
+  return call("/v1/seller/sidra/suggestions", { token });
+}
+
+/**
+ * POST /v1/seller/sidra/suggestions/{id}/send — approve a
+ * suggestion: its words enter the thread as an AI message.
+ */
+export function sendSidraSuggestion(
+  token: string,
+  suggestionId: string
+): Promise<SidraSuggestion> {
+  return call(
+    `/v1/seller/sidra/suggestions/${encodeURIComponent(suggestionId)}/send`,
+    { method: "POST", token }
+  );
+}
+
+/** POST /v1/seller/sidra/suggestions/{id}/dismiss — reject a suggestion. */
+export function dismissSidraSuggestion(
+  token: string,
+  suggestionId: string
+): Promise<SidraSuggestion> {
+  return call(
+    `/v1/seller/sidra/suggestions/${encodeURIComponent(
+      suggestionId
+    )}/dismiss`,
+    { method: "POST", token }
+  );
+}
+
+/** GET /v1/seller/sidra/status — bridge configuration + store mode. */
+export function getSidraStatus(token: string): Promise<SidraStatus> {
+  return call("/v1/seller/sidra/status", { token });
+}
+
+/**
+ * PUT /v1/seller/store/sidra — set the store's auto-reply mode.
+ * Returns the full store view (which carries the flag).
+ */
+export function setSidraAutoReply(
+  token: string,
+  autoReply: boolean
+): Promise<Store> {
+  return call("/v1/seller/store/sidra", {
+    method: "PUT",
+    token,
+    body: { auto_reply: autoReply },
+  });
 }

@@ -50,6 +50,15 @@
 //! through the Meta Graph API stays honestly unconfigured (503)
 //! or unimplemented (501) until a Meta app and the page-token
 //! OAuth flow exist — nothing fakes a fetched post.
+//! Wave 13: buyer <-> store messaging and the SIDRA bridge
+//! (`messaging` module) — conversations with per-side read
+//! markers and unread counts, a best-effort signed notification
+//! to the external SIDRA service when a buyer writes, and a
+//! signature-verified callback through which SIDRA returns an
+//! AI reply: posted directly when the store enabled auto-reply,
+//! held as a seller-approved suggestion otherwise. SIDRA is an
+//! external service and is never reimplemented here; with no
+//! SIDRA configuration the inbox is a complete human chat.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -64,6 +73,7 @@ pub mod admin;
 pub mod auth;
 pub mod cart;
 pub mod facebook;
+pub mod messaging;
 pub mod orders;
 pub mod payments;
 pub mod payouts;
@@ -125,6 +135,32 @@ pub struct AppState {
     /// any endpoint; presence alone drives the `graph_api` field
     /// of the seller Facebook status.
     pub facebook_config: FacebookConfig,
+    /// SIDRA bridge configuration (Wave 13): the external SIDRA
+    /// service's notify URL and the shared webhook secret. The
+    /// secret is held in memory only — never stored in the
+    /// database, logged or returned by any endpoint. The bridge
+    /// is `configured` only when BOTH values are present; without
+    /// them messaging works as a plain human inbox and the SIDRA
+    /// callback endpoint answers 503.
+    pub sidra_config: SidraConfig,
+}
+
+/// SIDRA bridge configuration (Wave 13). See [`AppState::sidra_config`].
+#[derive(Debug, Clone, Default)]
+pub struct SidraConfig {
+    /// Where buyer-message notifications are POSTed.
+    pub api_url: Option<String>,
+    /// Shared secret for the bridge's HMAC signatures (both the
+    /// outbound notify header and the inbound callback body).
+    pub webhook_secret: Option<String>,
+}
+
+impl SidraConfig {
+    /// The bridge is live only with a URL to notify AND a secret
+    /// to sign with; half a configuration is no configuration.
+    pub fn configured(&self) -> bool {
+        self.api_url.is_some() && self.webhook_secret.is_some()
+    }
 }
 
 /// Facebook app credential presence (Wave 12). The Graph API
@@ -156,6 +192,7 @@ impl AppState {
             payments_config: PaymentsConfig::default(),
             couriers_config: CouriersConfig::default(),
             facebook_config: FacebookConfig::default(),
+            sidra_config: SidraConfig::default(),
         }
     }
 
@@ -177,6 +214,14 @@ impl AppState {
     /// by tests that need the Graph API to report `configured`).
     pub fn with_facebook_config(mut self, facebook_config: FacebookConfig) -> Self {
         self.facebook_config = facebook_config;
+        self
+    }
+
+    /// Replace the SIDRA bridge configuration (used by `from_env`
+    /// and by tests that need the bridge configured with a known
+    /// secret, or deliberately unconfigured).
+    pub fn with_sidra_config(mut self, sidra_config: SidraConfig) -> Self {
+        self.sidra_config = sidra_config;
         self
     }
 
@@ -214,6 +259,7 @@ impl AppState {
         state.payments_config = payments_config_from_env();
         state.couriers_config = couriers_config_from_env();
         state.facebook_config = facebook_config_from_env();
+        state.sidra_config = sidra_config_from_env();
         state
     }
 
@@ -428,6 +474,29 @@ fn facebook_config_from_env() -> FacebookConfig {
     }
 }
 
+/// Build the Wave 13 SIDRA bridge configuration from the
+/// environment: `SIDRA_API_URL` (where buyer-message
+/// notifications go) and `SIDRA_WEBHOOK_SECRET` (the shared HMAC
+/// secret). The secret value is held in memory only. A
+/// half-configuration (only one of the two) is reported with a
+/// startup warning and treated as unconfigured by the bridge.
+fn sidra_config_from_env() -> SidraConfig {
+    let config = SidraConfig {
+        api_url: env_value("SIDRA_API_URL"),
+        webhook_secret: env_value("SIDRA_WEBHOOK_SECRET"),
+    };
+    if config.configured() {
+        println!("SIDRA bridge configured (notify URL + webhook secret present)");
+    } else if config.api_url.is_some() || config.webhook_secret.is_some() {
+        eprintln!(
+            "WARNING: SIDRA bridge is half-configured — both SIDRA_API_URL and \
+             SIDRA_WEBHOOK_SECRET are required; the bridge is treated as \
+             unconfigured and messaging runs as a human-only inbox."
+        );
+    }
+    config
+}
+
 /// Run the embedded workspace migrations (SQLx migrate format, in
 /// `migrations/` at the workspace root) against a pool.
 pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
@@ -628,6 +697,48 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/v1/seller/products/import-from-page",
             post(facebook::import_from_page),
+        )
+        // Wave 13 — messaging: buyer <-> store conversations
+        // (find-or-create, thread with read markers, close), the
+        // SIDRA reply callback, and the seller's SIDRA controls
+        // (suggestions queue, auto-reply toggle, bridge status).
+        .route(
+            "/v1/conversations",
+            post(messaging::create_conversation_handler)
+                .get(messaging::list_conversations_handler),
+        )
+        .route(
+            "/v1/conversations/:id",
+            get(messaging::get_conversation_handler),
+        )
+        .route(
+            "/v1/conversations/:id/messages",
+            post(messaging::post_message_handler),
+        )
+        .route(
+            "/v1/conversations/:id/close",
+            post(messaging::close_conversation_handler),
+        )
+        .route("/v1/sidra/reply", post(messaging::sidra_reply_handler))
+        .route(
+            "/v1/seller/sidra/suggestions",
+            get(messaging::list_suggestions_handler),
+        )
+        .route(
+            "/v1/seller/sidra/suggestions/:id/send",
+            post(messaging::send_suggestion_handler),
+        )
+        .route(
+            "/v1/seller/sidra/suggestions/:id/dismiss",
+            post(messaging::dismiss_suggestion_handler),
+        )
+        .route(
+            "/v1/seller/store/sidra",
+            put(messaging::set_sidra_auto_reply_handler),
+        )
+        .route(
+            "/v1/seller/sidra/status",
+            get(messaging::sidra_status_handler),
         )
         // Wave 10 — platform admin: every route behind require_admin.
         .route("/v1/admin/overview", get(admin::overview_handler))

@@ -513,6 +513,81 @@ while the page-token OAuth flow is still missing. It never
 returns posts it did not fetch; the paste pipeline above is the
 real import source until that later wave lands.
 
+Wave 13 (buyer <-> store messaging + the SIDRA bridge):
+
+Buyers ask questions before they buy — on Facebook, that is a
+Page inbox; here it is a real in-platform inbox, plus the bridge
+that lets the external SIDRA AI salesperson answer inside it.
+SIDRA itself is a separate service and is NOT reimplemented
+here; this wave is the platform side of the contract only.
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| POST | `/v1/conversations` | Bearer. Find-or-create the caller's OPEN conversation with `{store_id, product_id?}`: 201 when created, 200 when the open one is reused. A suspended store is a 404 |
+| GET | `/v1/conversations` | Bearer. Every conversation the caller takes part in — as buyer and as seller — merged, newest activity first; each carries the caller's `role`, an 80-char preview of the newest message, and the caller's unread count |
+| GET | `/v1/conversations/{id}` | Bearer, participants only (anyone else: 404). The thread (newest 200 messages, oldest first). Reading stamps the caller's read marker |
+| POST | `/v1/conversations/{id}/messages` | Bearer, participants only. Post as your own side (the sender type comes from your role, never the request); body 1–2000 chars. A closed conversation is a 409 |
+| POST | `/v1/conversations/{id}/close` | Bearer, participants only. Close the conversation (idempotent; history stays readable) |
+| POST | `/v1/sidra/reply` | Public, signature-verified (see the bridge contract). 503 while the bridge is unconfigured, 401 on a bad signature |
+| GET | `/v1/seller/sidra/suggestions` | Bearer, own store. The pending SIDRA suggestions, oldest first |
+| POST | `/v1/seller/sidra/suggestions/{id}/send` | Bearer, own store. Approve: the suggestion's words enter the thread as an `ai` message. A decided suggestion is a 409 |
+| POST | `/v1/seller/sidra/suggestions/{id}/dismiss` | Bearer, own store. Reject a pending suggestion (409 once decided) |
+| PUT | `/v1/seller/store/sidra` | Bearer, own store. `{auto_reply: bool}` — set the store's SIDRA mode; returns the store view |
+| GET | `/v1/seller/sidra/status` | Bearer. `{configured, auto_reply}` — the platform bridge state and the store's mode, reported independently |
+
+**The messaging model:** one OPEN conversation per (store,
+buyer, product) triple, enforced by the find-or-create service
+function (the nullable `product_id` keeps a database unique
+index from expressing the rule — see migration 0015). Closing a
+conversation ends the triple's reuse: the next find-or-create
+starts a fresh one. Read state is two markers on the
+conversation (`buyer_last_read_at` / `seller_last_read_at`);
+a side's unread count is the other side's messages newer than
+its marker. AI messages count as unread for the buyer and never
+for the seller (the seller approved them, or opted into
+auto-reply). Buyer display follows the reviews rule: name when
+set, else the masked phone.
+
+**The SIDRA bridge contract:** both directions are signed with
+HMAC-SHA256 (hex) over ONE canonical payload defined in the
+domain crate (`sidra_signature_payload`):
+`<conversation_id>:<message_id>:<text>`.
+
+Outbound: when a buyer posts a message and the bridge is
+configured, the API POSTs `{conversation_id, store_id,
+buyer_message_id, body, product_id}` to `SIDRA_API_URL` with an
+`X-Sidra-Signature` header (the message id and body in the
+payload's slots). The notification is **best effort**: it fires
+in a detached task, a failure is logged, and the buyer's
+request never fails because SIDRA is down.
+
+Inbound: SIDRA POSTs `{conversation_id,
+in_reply_to_message_id, reply_text, signature}` to
+`/v1/sidra/reply`, the signature covering the reply text and
+the buyer message it answers. A bad signature is a 401 and
+nothing is stored; an unknown conversation or answered message
+is a 404; a closed conversation is a 409. A valid reply lands
+by the store's mode: `sidra_auto_reply` on → it is inserted
+directly as an `ai` message (`{mode: "sent"}`); off → it waits
+as a pending suggestion (`{mode: "suggested"}`) until the
+seller sends or dismisses it from the inbox. Even a
+seller-approved suggestion enters the thread labelled `ai` —
+the words are SIDRA's. Every callback outcome, accepted or
+rejected, is logged to stderr; there is deliberately no audit
+table, because no money moves on a chat reply — the stored
+message or suggestion is itself the record.
+
+**Honest limits:** the bridge needs BOTH `SIDRA_API_URL` and
+`SIDRA_WEBHOOK_SECRET`; a half-configuration is treated as
+unconfigured (with a startup warning), the callback answers
+503, and the inbox works completely as a human chat — SIDRA is
+an enhancement, never a dependency. The web UI polls the
+thread every 10 seconds; there is no websocket or push yet.
+Outbound delivery is not retried: if SIDRA misses a
+notification it can still answer later through the callback
+only for messages it knows about, so a missed notification can
+mean a missed AI reply — the seller's own inbox is unaffected.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -1018,6 +1093,29 @@ count, the 2-created / 1-skipped import, idempotent re-import,
 and unlink; the Next.js seller import page (`/seller/import`)
 linked from the seller dashboard and products page.
 
+**Real (Wave 13):** buyer <-> store messaging and the SIDRA
+bridge — migration 0015 (`conversations` with per-side read
+markers, `messages`, `sidra_suggestions`, and the store's
+`sidra_auto_reply` mode flag); the pure domain message-body
+rule and the ONE canonical SIDRA signature payload; the
+find-or-create conversation service (open conversations only,
+suspended stores hidden); per-side unread counts computed from
+the read markers; the HMAC-verified SIDRA callback applying by
+store mode (direct `ai` message, or a pending suggestion the
+seller sends/dismisses); the best-effort outbound notification
+on buyer messages; an integration test
+(`crates/api/tests/wave13.rs`, same `DATABASE_URL` gate)
+covering find-or-create idempotence, the unread lifecycle,
+participant-only access, wrong-signature 401 with nothing
+stored, suggestion then seller-send, dismissal, direct insert
+under auto-reply, close semantics, and the unconfigured app
+answering 503 while human chat keeps working; the Next.js
+buyer messages pages (`/messages`, `/messages/[id]`), the
+seller inbox (`/seller/inbox` with the suggestion queue and
+SIDRA settings card), the shared `MessageThread` component
+(10-second polling), and "মেসেজ করুন" buttons on the storefront
+and product pages.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters. Manual Phase 2 couriers (Sundarban,
@@ -1032,24 +1130,29 @@ import pipeline is the real source.
 **TODO / not wired:** live gateway calls and real-gateway webhook
 signature verification (need merchant credentials + each gateway's
 integration docs), refunds, Redis, a real SMS gateway,
-SIDRA calls, worker jobs — including automatic courier status
+worker jobs — including automatic courier status
 polling, which will call the same refresh service function the API
 exposes (the worker still logs its planned jobs and exits cleanly).
+(The SIDRA bridge contract IS wired in Wave 13 — SIDRA itself is
+the external service at the other end of it, configured by
+`SIDRA_API_URL` / `SIDRA_WEBHOOK_SECRET`.)
 
 ## Verification status
 
 - **Next.js: verified on this machine** — `npm ci && npm run build`
   passes (Wave 10 admin pages included: /admin, /admin/stores,
   /admin/payouts, /admin/users, /admin/settings; Wave 12 adds
-  /seller/import).
+  /seller/import; Wave 13 adds /messages, /messages/[id] and
+  /seller/inbox).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
-  (domain 51, courier 31, payments 8 unit tests; the `DATABASE_URL`-
+  (domain 53, courier 31, payments 8 unit tests; the `DATABASE_URL`-
   gated integration tests skip cleanly without a database). The API
   binary was also smoke-tested locally without a database: routes
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
-  (including the Wave 10 admin endpoints).
-- **Rust integration + clippy: CI-only** — the Wave 2–12 integration
+  (including the Wave 13 messaging endpoints), and the SIDRA
+  callback answers 503 without a database.
+- **Rust integration + clippy: CI-only** — the Wave 2–13 integration
   tests against a real Postgres 16 service and clippy `-D warnings`
   are verified via **GitHub Actions CI** (`.github/workflows/ci.yml`)
-  on push. Waves 1–11 are green there; Wave 12 awaits its first CI run.
+  on push. Waves 1–12 are green there; Wave 13 awaits its first CI run.

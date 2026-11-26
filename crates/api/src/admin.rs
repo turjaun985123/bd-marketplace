@@ -293,7 +293,7 @@ pub async fn set_store_status(
     sqlx::query_as(
         "UPDATE stores SET status = $2 WHERE id = $1 \
          RETURNING id, owner_user_id, slug, name, description, status, \
-         facebook_page_id, facebook_page_name, created_at",
+         facebook_page_id, facebook_page_name, sidra_auto_reply, created_at",
     )
     .bind(store_id)
     .bind(status)

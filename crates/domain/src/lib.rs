@@ -1055,6 +1055,40 @@ pub fn parse_setting_i64(raw: &str) -> Option<i64> {
     raw.trim().parse::<i64>().ok()
 }
 
+/// Maximum length of a conversation message body, in characters.
+pub const MAX_MESSAGE_BODY_CHARS: usize = 2_000;
+
+/// Validate a conversation message body (buyer, seller and AI
+/// messages alike). A message must say something: 1 to
+/// [`MAX_MESSAGE_BODY_CHARS`] characters after trimming, counted
+/// in Unicode characters, not bytes.
+pub fn validate_message_body(body: &str) -> Result<(), &'static str> {
+    let len = body.trim().chars().count();
+    if len == 0 {
+        return Err("message body must not be empty");
+    }
+    if len > MAX_MESSAGE_BODY_CHARS {
+        return Err("message body must be at most 2000 characters");
+    }
+    Ok(())
+}
+
+/// The canonical string a SIDRA bridge signature covers, in ONE
+/// place so the signer (SIDRA, and the platform's outbound
+/// notifier) and the verifier (the platform's callback endpoint)
+/// can never drift apart:
+///
+/// `<conversation_id>:<message_id>:<text>`
+///
+/// In the inbound callback, `message_id` is the buyer message the
+/// AI reply answers (`in_reply_to`) and `text` is the reply text.
+/// In the outbound notification, `message_id` is the buyer message
+/// just posted and `text` is its body. Ids are the canonical
+/// hyphenated UUID strings.
+pub fn sidra_signature_payload(conversation_id: &str, message_id: &str, text: &str) -> String {
+    format!("{conversation_id}:{message_id}:{text}")
+}
+
 /// Maximum length of a Facebook-import draft title, in characters.
 pub const MAX_FB_TITLE_CHARS: usize = 120;
 
@@ -2236,5 +2270,31 @@ mod tests {
         let long_post = "y".repeat(2_500);
         let draft = draft_from_fb_post(&long_post);
         assert_eq!(draft.description.chars().count(), MAX_FB_DESCRIPTION_CHARS);
+    }
+
+    #[test]
+    fn message_body_validation() {
+        assert!(validate_message_body("আসসালামু আলাইকুম").is_ok());
+        assert!(validate_message_body("  padded  ").is_ok());
+        // Empty and whitespace-only bodies say nothing.
+        assert!(validate_message_body("").is_err());
+        assert!(validate_message_body("   \n\t ").is_err());
+        // The limit counts characters, not bytes (Bangla chars are
+        // multi-byte and must not be penalised).
+        let at_limit = "ক".repeat(MAX_MESSAGE_BODY_CHARS);
+        assert!(validate_message_body(&at_limit).is_ok());
+        let over_limit = "x".repeat(MAX_MESSAGE_BODY_CHARS + 1);
+        assert!(validate_message_body(&over_limit).is_err());
+    }
+
+    #[test]
+    fn sidra_signature_payload_shape() {
+        // The canonical signed string: conversation, message, text,
+        // colon-joined, nothing trimmed or escaped.
+        assert_eq!(
+            sidra_signature_payload("conv-1", "msg-2", "দাম ৫০০ টাকা"),
+            "conv-1:msg-2:দাম ৫০০ টাকা"
+        );
+        assert_eq!(sidra_signature_payload("", "", ""), "::");
     }
 }

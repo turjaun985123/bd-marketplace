@@ -19,6 +19,8 @@ export default function MarketplaceHomePage() {
         <Link href="/cart">আমার কার্ট — Cart</Link>
         {" · "}
         <Link href="/orders">আমার অর্ডার — My orders</Link>
+        {" · "}
+        <Link href="/messages">মেসেজ — Messages</Link>
         <AdminLink />
       </p>
 

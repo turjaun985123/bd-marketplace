@@ -2,9 +2,11 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import PriceTag from "@/components/PriceTag";
 import Stars from "@/components/Stars";
 import {
+  createConversation,
   createReview,
   deleteReview,
   getProduct,
@@ -37,6 +39,8 @@ export default function ProductDetailPage({
 }) {
   const { ready, token, user } = useAuth();
   const { add, error: cartError } = useCart();
+  const router = useRouter();
+  const [messageError, setMessageError] = useState<string | null>(null);
   const [product, setProduct] = useState<Product | null>(null);
   const [reviews, setReviews] = useState<Review[] | null>(null);
   const [store, setStore] = useState<Store | null>(null);
@@ -81,6 +85,25 @@ export default function ProductDetailPage({
     setAdded(false);
     await add(params.id, 1);
     setAdded(true);
+  }
+
+  // Ask the seller about THIS product (Wave 13): find-or-create
+  // the product-scoped conversation and go to the thread.
+  async function onMessageSeller() {
+    if (!token || !product) return;
+    setMessageError(null);
+    try {
+      const conversation = await createConversation(
+        token,
+        product.store_id,
+        product.id
+      );
+      router.push(`/messages/${conversation.id}`);
+    } catch (err) {
+      setMessageError(
+        err instanceof Error ? err.message : "মেসেজ শুরু করা যায়নি।"
+      );
+    }
   }
 
   async function onSubmitReview(e: React.FormEvent) {
@@ -174,6 +197,15 @@ export default function ProductDetailPage({
         </p>
       )}
       {cartError && <p role="alert">{cartError}</p>}
+
+      {token && (
+        <p>
+          <button type="button" onClick={() => void onMessageSeller()}>
+            মেসেজ করুন — Message the seller
+          </button>
+          {messageError && <span role="alert"> {messageError}</span>}
+        </p>
+      )}
 
       <h2>রিভিউ — Reviews</h2>
 
