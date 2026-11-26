@@ -360,7 +360,7 @@ async fn wave31_seller_and_buyer_exports_flow() {
     let orders = export["orders"].as_array().expect("orders list");
     assert_eq!(orders.len(), 1, "orders: {export}");
     assert_eq!(orders[0]["id"], order_id);
-    assert_eq!(orders[0]["delivery_phone"], "01999999999");
+    assert_eq!(orders[0]["delivery_phone"], "+8801999999999");
     let exported_subs = orders[0]["sub_orders"].as_array().expect("order sub-orders");
     assert_eq!(exported_subs.len(), 1, "order sub-orders: {export}");
     assert_eq!(exported_subs[0]["id"], sub_order_id);
