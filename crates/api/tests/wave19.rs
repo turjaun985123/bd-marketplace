@@ -277,7 +277,7 @@ async fn sub_order_status(app: &Router, seller: &str, sub_order_id: &str) -> Str
 /// The product's stock, read straight from the database.
 async fn product_stock(pool: &PgPool, product_id: &str) -> i64 {
     let uuid = uuid::Uuid::parse_str(product_id).expect("product id is a uuid");
-    sqlx::query_scalar("SELECT stock FROM products WHERE id = $1")
+    sqlx::query_scalar("SELECT stock::bigint FROM products WHERE id = $1")
         .bind(uuid)
         .fetch_one(pool)
         .await
