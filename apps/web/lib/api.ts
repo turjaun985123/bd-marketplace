@@ -2992,6 +2992,38 @@ export async function downloadSellerAnalyticsCsv(
 }
 
 /**
+ * Data portability exports (Wave 31): the caller's own record
+ * as one downloadable JSON document — for a seller, the store,
+ * the full catalogue (drafts included), sub-orders with items,
+ * payouts, coupons, promotions and the lifetime charges total;
+ * for a buyer, the profile (own phone in full), orders with
+ * sub-orders and items, reviews, wishlist and asked questions.
+ * Like the analytics CSV download, these return the Blob and
+ * the page saves it under a local name; direct API callers get
+ * the server's canonical filename from Content-Disposition
+ * (the domain `export_filename`).
+ */
+export async function downloadSellerExport(token: string): Promise<Blob> {
+  const res = await fetch(`${apiBase()}/v1/seller/export`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    throw new Error(`এক্সপোর্ট ডাউনলোড করা যায়নি (HTTP ${res.status})`);
+  }
+  return res.blob();
+}
+
+export async function downloadBuyerExport(token: string): Promise<Blob> {
+  const res = await fetch(`${apiBase()}/v1/buyer/export`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    throw new Error(`এক্সপোর্ট ডাউনলোড করা যায়নি (HTTP ${res.status})`);
+  }
+  return res.blob();
+}
+
+/**
  * Platform analytics (Wave 27, admin). GMV is goods − discount
  * + delivery over NON-cancelled sub-orders; commission is
  * goods − discount − seller payout over DELIVERED sub-orders

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import PriceTag from "@/components/PriceTag";
 import {
+  downloadSellerExport,
   getBuyerRisk,
   getPayoutAccount,
   getSellerDashboard,
@@ -41,6 +42,11 @@ const STATUS_LABELS: Record<string, string> = {
  * shared parser, and the API enforces the 500-taka minimum and the
  * available-balance fit. Payouts stay "অনুরোধ করা হয়েছে"
  * (requested) until platform approval lands with the admin wave.
+ *
+ * Wave 31: the footer section downloads the seller's own record
+ * (GET /v1/seller/export) as one JSON file — the portability
+ * export, fetched as a Blob with the auth header and saved via
+ * an object URL, the Wave 27 CSV pattern.
  */
 export default function SellerDashboardPage() {
   const { ready, token } = useAuth();
@@ -63,6 +69,9 @@ export default function SellerDashboardPage() {
   const [riskPhone, setRiskPhone] = useState("");
   const [risk, setRisk] = useState<BuyerRisk | null>(null);
   const [riskBusy, setRiskBusy] = useState(false);
+
+  // Data export state (Wave 31 portability).
+  const [exportBusy, setExportBusy] = useState(false);
 
   const load = useCallback(async () => {
     if (!token) return;
@@ -145,6 +154,30 @@ export default function SellerDashboardPage() {
       setMessage(err instanceof Error ? err.message : "ঝুঁকি দেখা যায়নি।");
     } finally {
       setRiskBusy(false);
+    }
+  }
+
+  // Wave 31: download the seller's own record (store, full
+  // catalogue, sub-orders, payouts, coupons, promotions) as
+  // one JSON file — the portability export.
+  async function onDownloadExport() {
+    if (!token) return;
+    setExportBusy(true);
+    setMessage(null);
+    try {
+      const blob = await downloadSellerExport(token);
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = "bd-marketplace-seller-export.json";
+      anchor.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setMessage(
+        err instanceof Error ? err.message : "এক্সপোর্ট ডাউনলোড করা যায়নি।"
+      );
+    } finally {
+      setExportBusy(false);
     }
   }
 
@@ -462,6 +495,23 @@ export default function SellerDashboardPage() {
                   হিসেবে ঝুঁকি নিম্ন ধরা হয়েছে।
                 </p>
               ))}
+          </section>
+
+          <section>
+            <h2>ডেটা এক্সপোর্ট — Data export</h2>
+            <p>
+              আপনার স্টোরের সব তথ্য একটি JSON ফাইলে ডাউনলোড করুন:
+              স্টোর, পুরো পণ্য তালিকা (খসড়াসহ), সাব-অর্ডার ও আইটেম,
+              পে-আউট, কুপন আর প্রমোশন। এটি আপনার নিজের রেকর্ড —
+              প্ল্যাটফর্ম ছাড়লেও হিসাব আপনার কাছে থাকবে।
+            </p>
+            <button
+              type="button"
+              onClick={() => void onDownloadExport()}
+              disabled={exportBusy}
+            >
+              {exportBusy ? "তৈরি হচ্ছে…" : "ডেটা এক্সপোর্ট ডাউনলোড"}
+            </button>
           </section>
         </>
       )}

@@ -1697,6 +1697,72 @@ a fallback. The Wave 29 caveat stands: notification rows
 a worker claims and then dies on stay in `sending` with
 no automatic reaper yet.
 
+Wave 31 (backups + data portability):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| GET | `/v1/seller/export` | Bearer, seller with a store (404 without one). The seller's whole record as ONE downloadable JSON document (see below) |
+| GET | `/v1/buyer/export` | Bearer. The buyer's whole record as ONE downloadable JSON document (see below) |
+
+**Backups.** `scripts/backup.sh` writes a gzipped
+`pg_dump` of the database plus a `.sha256` sidecar and
+prunes to the newest 14 files. It runs two ways: directly
+(`DATABASE_URL=... ./scripts/backup.sh [outdir]`, needs
+`pg_dump` on PATH) or against the compose stack
+(`./scripts/backup.sh --compose [outdir]`, which runs
+pg_dump inside the `postgres` container with the
+container's own `POSTGRES_USER` / `POSTGRES_DB`). The
+script header carries a cron example. `scripts/restore.sh
+[--yes] <backup.sql.gz>` restores: it verifies the
+checksum sidecar when present, asks for confirmation
+unless `--yes` is given, DROPS and recreates the target's
+`public` schema (a restore replaces, never merges), loads
+with psql `ON_ERROR_STOP` so a bad dump fails loudly
+instead of half-loading, and prints the restored table
+count as a smoke check. CI proves the round trip on every
+run: after the test step, the rust job dumps the test
+database, restores it into a scratch database, and
+asserts the schema survived (more than 20 public tables,
+`orders` among them) — a migration whose schema pg_dump
+cannot round-trip fails in CI, not during a recovery.
+
+**Exports.** Both endpoints answer with
+`Content-Disposition: attachment` and the domain
+`export_filename` (`bd-marketplace-<kind>-<slug-or-phone>-
+<yyyymmdd>.json`, sanitized to `[a-z0-9-]`). An export
+MIRRORS STORED FIELDS — rows as they sit in the tables,
+items nested under their sub-orders — rather than
+re-shaping the public views, because the owner is
+entitled to the record as kept. The seller document
+holds the primary store (verification tier included),
+ALL products of ALL the seller's stores (drafts and
+archived included — an export that dropped drafts would
+not be the catalogue), the newest 1_000 sub-orders with
+items, payouts, coupons, promotions, and the lifetime
+`seller_charges` total. The buyer document holds the
+profile — the phone IN FULL, because it is the buyer's
+own data shown to themselves; the masking on public
+surfaces protects users from other people, never from
+themselves — the newest 1_000 orders with sub-orders and
+items (delivery details live on the orders, so addresses
+travel with them; there is no separate address book),
+reviews, wishlist (ids + titles) and asked questions.
+The seller dashboard and the buyer orders page both carry
+a ডেটা এক্সপোর্ট download button (fetch-blob, the Wave 27
+pattern). The intent is portability: nobody is locked in
+— a seller can leave with their catalogue, sales history
+and money ledger, a buyer with their history.
+
+**Honest limits:** file backups are point-in-time dumps,
+not point-in-time recovery — there is no WAL archiving,
+so a restore lands on the last backup, not on any moment
+between backups. Nothing copies backups off-site: the
+script writes files, and shipping them somewhere safe is
+the operator's job (the script header says so). And an
+export is a JSON snapshot for the owner's records — not
+a migration tool: nothing imports it back, here or on
+another platform.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -2114,11 +2180,32 @@ broken or unsafe without it.
   and the web image built with
   `NEXT_PUBLIC_API_BASE_URL=https://api.marketplace.example.com`).
 
+### Ops: backups & data portability (Wave 31)
+
+- **Backups:** run `scripts/backup.sh` on a schedule (the
+  script header has a cron example) — directly with
+  `DATABASE_URL`, or with `--compose` against this stack.
+  It keeps the newest 14 dumps in `./backups` (gitignored).
+  `scripts/restore.sh` is the restore drill; CI re-proves
+  the dump/restore round trip on every run. Copy the files
+  OFF this host — a backup that lives only beside the
+  database is not a backup. See the Wave 31 section under
+  API endpoints for the full story and its honest limits.
+- **Data exports:** sellers and buyers download their own
+  record as JSON from `GET /v1/seller/export` /
+  `GET /v1/buyer/export` (buttons on the seller dashboard
+  and the buyer orders page) — the portability promise;
+  exports are snapshots for the owner, not a migration
+  tool.
+
 ### Honest limits
 
-- **Backups are on you.** The compose stack keeps data in a
-  named Docker volume; there is no managed backup, snapshot
-  schedule or restore drill in this repository.
+- **Backups are scripted, not managed.** Wave 31 ships
+  `scripts/backup.sh` / `scripts/restore.sh` and a CI
+  restore proof, but there is no managed backup service,
+  no WAL archiving (no point-in-time recovery) and no
+  off-site copy automation — scheduling the script and
+  shipping the files somewhere safe stays on the operator.
 - **One host, one replica.** No horizontal-scaling story:
   the API keeps no in-memory session state (JWT + Postgres),
   so it *could* be replicated behind a load balancer, but
@@ -2828,6 +2915,28 @@ to delivered with its notification, the staleness
 window, and the terminal/manual exclusions at exact
 counts. No new endpoints and no web changes.
 
+**Real (Wave 31):** backups + data portability —
+`scripts/backup.sh` (direct via `DATABASE_URL` or
+`--compose` through the stack's postgres container;
+gzipped dump + SHA-256 sidecar, newest-14 retention) and
+`scripts/restore.sh` (checksum verify, confirmation,
+schema-replacing load with `ON_ERROR_STOP`, table-count
+smoke check); a CI step in the rust job that dumps the
+test database and restores it into a scratch database on
+every run, asserting the schema round-trips; and the two
+export endpoints (`GET /v1/seller/export`,
+`GET /v1/buyer/export`) returning the caller's own record
+as one downloadable JSON document (domain
+`export_filename`; seller: store + full catalogue +
+newest 1_000 sub-orders with items + payouts + coupons +
+promotions + charges total; buyer: profile with the own
+phone in full + newest 1_000 orders nested + reviews +
+wishlist + questions), with download buttons on the
+seller dashboard and buyer orders page. An integration
+test (`crates/api/tests/wave31.rs`, same `DATABASE_URL`
+gate) covers both documents' contents, cross-seller
+isolation, the storeless 404 and the anonymous 401s.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters, and the four manual couriers run
@@ -2877,22 +2986,24 @@ the external service at the other end of it, configured by
   ProductCard, and the admin settings promotion price;
   Wave 27 adds /seller/analytics and /admin/analytics;
   Wave 28 adds /admin/audit; Wave 29 adds
-  /admin/notifications).
+  /admin/notifications; Wave 31 adds no page — it adds the
+  ডেটা এক্সপোর্ট download buttons on the seller dashboard
+  and the buyer orders page).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
-  (domain 104, courier 31, payments 8 unit tests, plus the API
+  (domain 106, courier 31, payments 8 unit tests, plus the API
   crate's JWT-secret unit tests; the `DATABASE_URL`-
   gated integration tests skip cleanly without a database). The API
   binary was also smoke-tested locally without a database: routes
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
   (including the Wave 13 messaging endpoints), and the SIDRA
   callback answers 503 without a database.
-- **Rust integration + clippy: CI-only** — the Wave 2–30 integration
+- **Rust integration + clippy: CI-only** — the Wave 2–31 integration
   tests (including the Wave 29 outbox test in the `notify`
   crate) against a real Postgres 16 service and clippy
   `-D warnings` are verified via **GitHub Actions CI**
   (`.github/workflows/ci.yml`)
-  on push. Waves 1–29 are green there; Wave 30 awaits its first CI run.
+  on push. Waves 1–30 are green there; Wave 31 awaits its first CI run.
 - **Docker images: CI-only** — Docker is not installed on the
   development machine, so `Dockerfile.api`, `Dockerfile.worker`
   and `apps/web/Dockerfile` are verified by the CI `docker` job

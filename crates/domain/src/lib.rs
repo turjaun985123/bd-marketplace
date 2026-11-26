@@ -2751,6 +2751,38 @@ pub fn render_body(kind: &str, vars: &NotificationVars) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Data portability (Wave 31)
+// ---------------------------------------------------------------------------
+
+/// The download filename for a data export (Wave 31):
+/// `bd-marketplace-<kind>-<slug>-<yyyymmdd>.json`, where
+/// `<slug>` is the store slug for a seller export or the
+/// account phone for a buyer export, sanitized to
+/// `[a-z0-9-]`: ASCII letters are lowercased, digits and
+/// hyphens pass through, and every other character (the `+`
+/// of an international phone, spaces, punctuation) becomes
+/// a hyphen. The result is always a safe, portable filename
+/// — no path separators, no spaces, no characters a
+/// filesystem or a `Content-Disposition` header would choke
+/// on. `kind` and `yyyymmdd` are caller-supplied and used
+/// as-is (the API passes its own fixed kind strings and a
+/// `chrono` `%Y%m%d` date).
+pub fn export_filename(kind: &str, slug_or_phone: &str, yyyymmdd: &str) -> String {
+    let sanitized: String = slug_or_phone
+        .chars()
+        .map(|c| {
+            let lower = c.to_ascii_lowercase();
+            if lower.is_ascii_alphanumeric() || lower == '-' {
+                lower
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!("bd-marketplace-{kind}-{sanitized}-{yyyymmdd}.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4615,6 +4647,51 @@ mod tests {
             "invoice-rahim-store-000007"
         );
         assert_eq!(invoice_filename("a", 123_456), "invoice-a-123456");
+    }
+
+    #[test]
+    fn export_filename_combines_kind_slug_and_date() {
+        assert_eq!(
+            export_filename("seller", "rahim-store", "20261126"),
+            "bd-marketplace-seller-rahim-store-20261126.json"
+        );
+        assert_eq!(
+            export_filename("buyer", "01712345678", "20260101"),
+            "bd-marketplace-buyer-01712345678-20260101.json"
+        );
+    }
+
+    #[test]
+    fn export_filename_sanitizes_to_lowercase_filename_chars() {
+        // Uppercase letters fold down; existing hyphens and
+        // digits pass through untouched.
+        assert_eq!(
+            export_filename("seller", "Rahim-Store-24", "20261126"),
+            "bd-marketplace-seller-rahim-store-24-20261126.json"
+        );
+        // The `+` of an international phone becomes a hyphen.
+        assert_eq!(
+            export_filename("buyer", "+8801712345678", "20261126"),
+            "bd-marketplace-buyer--8801712345678-20261126.json"
+        );
+        // Spaces, underscores, dots and slashes all become
+        // hyphens — the result can never escape a directory.
+        assert_eq!(
+            export_filename("seller", "My Shop_2.0/dhaka", "20261126"),
+            "bd-marketplace-seller-my-shop-2-0-dhaka-20261126.json"
+        );
+        // Non-ASCII characters (e.g. Bangla) become hyphens too
+        // — "রহিম" is four chars, so four hyphens sit between
+        // the two separator hyphens.
+        assert_eq!(
+            export_filename("seller", "রহিম", "20261126"),
+            "bd-marketplace-seller------20261126.json"
+        );
+        // An empty slug still yields a well-formed filename.
+        assert_eq!(
+            export_filename("buyer", "", "20261126"),
+            "bd-marketplace-buyer--20261126.json"
+        );
     }
 
     #[test]

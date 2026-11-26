@@ -233,6 +233,7 @@ pub mod audit;
 pub mod auth;
 pub mod cart;
 pub mod coupons;
+pub mod exports;
 pub mod facebook;
 pub mod inventory;
 pub mod invoices;
@@ -1191,6 +1192,12 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/seller/analytics/export.csv",
             get(analytics::seller_analytics_csv_handler),
         )
+        // Wave 31 — data portability: the caller's own record as
+        // one downloadable JSON document (the seller's catalogue
+        // + sales + money ledger; the buyer's orders + reviews +
+        // wishlist + questions).
+        .route("/v1/seller/export", get(exports::seller_export_handler))
+        .route("/v1/buyer/export", get(exports::buyer_export_handler))
         // Wave 12 — Facebook Page link + post import: link/unlink
         // the seller's Page, read the link + Graph API status,
         // preview parsed drafts from pasted posts, import the

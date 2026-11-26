@@ -6,6 +6,7 @@ import PriceTag from "@/components/PriceTag";
 import {
   cancelOrder,
   createReturnRequest,
+  downloadBuyerExport,
   listBuyerReturnRequests,
   listOrders,
   paymentStatusLabel,
@@ -38,6 +39,10 @@ import { useAuth } from "@/hooks/useAuth";
  * Wave 22: a delivered or returned sub-order links to its
  * printable per-store invoice (the seller's document for that
  * slice; the receipt link below stays the whole-order summary).
+ *
+ * Wave 31: the header button downloads the buyer's own record
+ * (GET /v1/buyer/export — profile, orders, reviews, wishlist,
+ * questions) as one JSON file, the portability export.
  */
 export default function BuyerOrdersPage() {
   const { ready, token } = useAuth();
@@ -53,6 +58,30 @@ export default function BuyerOrdersPage() {
     {}
   );
   const [returningId, setReturningId] = useState<string | null>(null);
+  const [exportBusy, setExportBusy] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+
+  // Wave 31: download the buyer's own record as one JSON file.
+  async function onDownloadExport() {
+    if (!token) return;
+    setExportBusy(true);
+    setExportError(null);
+    try {
+      const blob = await downloadBuyerExport(token);
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = "bd-marketplace-buyer-export.json";
+      anchor.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setExportError(
+        err instanceof Error ? err.message : "এক্সপোর্ট ডাউনলোড করা যায়নি।"
+      );
+    } finally {
+      setExportBusy(false);
+    }
+  }
 
   // Reload orders + the buyer's return requests together; both
   // lists are re-read after any action so what is shown is always
@@ -208,6 +237,18 @@ export default function BuyerOrdersPage() {
   return (
     <main>
       <h1>আমার অর্ডার — My orders</h1>
+      <p>
+        <button
+          type="button"
+          onClick={() => void onDownloadExport()}
+          disabled={exportBusy}
+        >
+          {exportBusy ? "তৈরি হচ্ছে…" : "ডেটা এক্সপোর্ট — Download my data (JSON)"}
+        </button>{" "}
+        আপনার প্রোফাইল, অর্ডার, রিভিউ, উইশলিস্ট আর প্রশ্ন — সব এক
+        ফাইলে।
+      </p>
+      {exportError && <p role="alert">{exportError}</p>}
       {error && <p role="alert">{error}</p>}
       {orders === null ? (
         <p>অর্ডার লোড হচ্ছে…</p>

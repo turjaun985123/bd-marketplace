@@ -35,6 +35,36 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Test workspace
         run: cargo test --workspace
+      # Wave 31: prove the backup story end-to-end on every run —
+      # dump the test database the suites just migrated, restore
+      # it into a scratch database, and check the schema survived
+      # the round trip. This is the same pg_dump -> psql flow
+      # scripts/backup.sh + scripts/restore.sh automate for the
+      # operator; if a migration ever produces a schema pg_dump
+      # cannot round-trip, this step fails here, not in recovery.
+      - name: Verify backup + restore
+        run: |
+          set -euo pipefail
+          if ! command -v pg_dump >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y postgresql-client
+          fi
+          export PGPASSWORD=marketplace
+          pg_dump -h localhost -U marketplace -d marketplace_test \
+            -f /tmp/ci-backup.sql
+          createdb -h localhost -U marketplace marketplace_restore_check
+          psql -h localhost -U marketplace -d marketplace_restore_check \
+            -v ON_ERROR_STOP=1 -q -f /tmp/ci-backup.sql
+          tables=$(psql -h localhost -U marketplace \
+            -d marketplace_restore_check -tAc \
+            "SELECT count(*) FROM information_schema.tables \
+             WHERE table_schema = 'public'")
+          echo "restored public tables: $tables"
+          [ "$tables" -gt 20 ]
+          [ "$(psql -h localhost -U marketplace \
+            -d marketplace_restore_check -tAc \
+            "SELECT to_regclass('public.orders')")" = "orders" ]
+          dropdb -h localhost -U marketplace marketplace_restore_check
       - name: Clippy (warnings are errors)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
