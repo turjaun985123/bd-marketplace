@@ -89,6 +89,7 @@ pub mod payments;
 pub mod payouts;
 pub mod products;
 pub mod reviews;
+pub mod search;
 pub mod shipments;
 pub mod stores;
 
@@ -616,6 +617,11 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/products/:id",
             get(products::get_product).patch(products::update_product),
         )
+        // Wave 15 — Postgres-native product search (pg_trgm +
+        // ILIKE) and typeahead suggestions; public, active
+        // products of active stores only.
+        .route("/v1/search", get(search::search_handler))
+        .route("/v1/search/suggest", get(search::suggest_handler))
         // Wave 3 — cart (one cart per signed-in buyer).
         .route("/v1/cart", get(cart::get_cart).delete(cart::clear))
         .route("/v1/cart/items", post(cart::add_item))

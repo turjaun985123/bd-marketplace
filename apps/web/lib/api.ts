@@ -42,6 +42,8 @@ export interface Product {
   title: string;
   title_bn: string | null;
   description: string | null;
+  /** Free-text category label (Wave 15); null when uncategorised. */
+  category: string | null;
   price_poisha: number;
   compare_at_poisha: number | null;
   stock: number;
@@ -83,6 +85,8 @@ export interface CreateProductInput {
   title: string;
   title_bn?: string;
   description?: string;
+  /** Optional category label (Wave 15). */
+  category?: string;
   price_poisha: number;
   compare_at_poisha?: number;
   stock: number;
@@ -419,6 +423,68 @@ export function getStoreProducts(
   token?: string | null
 ): Promise<ProductList> {
   return call(`/v1/stores/${encodeURIComponent(slug)}/products`, { token });
+}
+
+/** Sort orders the search endpoint understands (Wave 15). */
+export type SearchSort =
+  | "relevance"
+  | "price_asc"
+  | "price_desc"
+  | "newest"
+  | "rating";
+
+/** One page of search results (Wave 15): the shared Product shape
+ * plus the pagination envelope (`per_page`, not `limit`). */
+export interface SearchResult {
+  items: Product[];
+  total: number;
+  page: number;
+  per_page: number;
+}
+
+/**
+ * GET /v1/search — Postgres-native product search (Wave 15):
+ * text over title / Bangla title / description, composed with the
+ * category, price-range and store filters. Public — no token.
+ */
+export function searchProducts(params?: {
+  q?: string;
+  store_slug?: string;
+  category?: string;
+  min_price_poisha?: number;
+  max_price_poisha?: number;
+  sort?: SearchSort;
+  page?: number;
+  per_page?: number;
+}): Promise<SearchResult> {
+  const search = new URLSearchParams();
+  if (params?.q) search.set("q", params.q);
+  if (params?.store_slug) search.set("store_slug", params.store_slug);
+  if (params?.category) search.set("category", params.category);
+  if (params?.min_price_poisha !== undefined)
+    search.set("min_price_poisha", String(params.min_price_poisha));
+  if (params?.max_price_poisha !== undefined)
+    search.set("max_price_poisha", String(params.max_price_poisha));
+  if (params?.sort) search.set("sort", params.sort);
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.per_page) search.set("per_page", String(params.per_page));
+  const qs = search.toString();
+  return call(`/v1/search${qs ? `?${qs}` : ""}`);
+}
+
+/** Typeahead suggestions (Wave 15): product titles + stores. */
+export interface SearchSuggestions {
+  products: { id: string; title: string }[];
+  stores: { slug: string; name: string }[];
+}
+
+/**
+ * GET /v1/search/suggest — suggestions for a text fragment. The
+ * API answers with two empty lists below 2 characters.
+ */
+export function searchSuggest(q: string): Promise<SearchSuggestions> {
+  const search = new URLSearchParams({ q });
+  return call(`/v1/search/suggest?${search.toString()}`);
 }
 
 /** POST /v1/products — create a product (seller, own store only). */

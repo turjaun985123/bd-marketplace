@@ -677,6 +677,64 @@ coupon on many orders while it lasts. Coupons never discount
 delivery, never stack (one code per order), and a coupon whose
 redemptions exist cannot be deleted, only deactivated.
 
+Wave 15 (product search — Postgres-native):
+
+Search runs entirely on Postgres: **pg_trgm similarity + ILIKE**
+over the product text, backed by the trigram GIN indexes
+(migration 0004 for the per-column title indexes, migration 0017
+for the combined title index and the description index). There
+is deliberately **no external search service** — no extra
+process to deploy, secure and keep in sync. The two endpoints
+below are the whole search contract, so if the catalogue ever
+outgrows Postgres, a dedicated engine (Meilisearch or similar)
+can be put behind the same endpoints without clients changing.
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| GET | `/v1/search` | Public. Query params: `q`, `store_slug`, `category`, `min_price_poisha`, `max_price_poisha`, `sort`, `page`, `per_page` → `{items, total, page, per_page}`; `items` are the shared product view (Wave 8 rating summary included). Invalid parameters are a 400 |
+| GET | `/v1/search/suggest` | Public. `?q=` → `{products: [{id, title}], stores: [{slug, name}]}` — up to 8 distinct product titles and 4 stores; below 2 characters both lists are empty |
+
+**Matching and ranking.** With `q` present, a product matches
+when the text appears in its title, Bangla title or description
+(ILIKE contains, metacharacters escaped by the domain crate's
+`search_like_pattern`), or when the combined title text is
+trigram-similar to it (similarity ≥ 0.2 — the typo tolerance
+this wave offers). Relevance order comes from ONE rank
+expression in the items query: exact title match (English or
+Bangla) first, then title prefix, then title substring, then a
+small boost for description-only matches, with the pg_trgm
+similarity of `title || ' ' || title_bn` breaking remaining
+ties. Sorts: `relevance` (the default with text), `newest`
+(the default without), `price_asc`, `price_desc`, `rating`
+(highest rated first, unreviewed last). All parameter rules —
+text ≤ 100 chars, non-negative bounds, min ≤ max, page ≥ 1,
+per_page 1..=48 — live in the domain crate's
+`validate_search_params`, so they are unit-tested pure rules.
+
+**Filters compose with AND:** `category` (case-insensitive
+exact match on the label), the inclusive price range, and
+`store_slug` (the storefront's within-store search rides on
+this). Visibility is the strict public rule — only `active`
+products of `active` stores, with NO owner exception: search
+is a discovery surface, and drafts or suspended-store products
+never appear (sellers manage drafts through the listing
+endpoints). The Wave 2 `GET /v1/products` listing is unchanged;
+search is additive.
+
+**Categories (migration 0017):** `products.category` is a
+free-text seller label — optional, at most 60 characters
+(domain `validate_category`), set on product create/PATCH and
+in the seller product form. It is deliberately NOT a taxonomy
+table yet; the filter matches the label exactly
+(case-insensitively), so sellers should reuse spellings.
+
+**Limits (stated, not hidden):** typo tolerance is only what
+trigram similarity gives — no stemming, no synonyms, no
+Bangla transliteration matching (searching "shari" does not
+find "শাড়ি"). Faceting is exactly the filters listed above —
+no per-category counts, no brand/size attributes. Ranking is
+the one fixed expression, not personalised.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -947,7 +1005,9 @@ NEXT_PUBLIC_API_BASE_URL=http://localhost:8080 npm run dev   # http://localhost:
 # /orders/{id} (printable receipt), /seller, /seller/products
 # (seller catalogue + create form, with a weight-in-grams field),
 # /seller/orders (sub-orders) and /seller/import (Facebook Page
-# link + post import, Wave 12)
+# link + post import, Wave 12); /search (search results with
+# filters + pagination, Wave 15, with the shared SearchBar on
+# the home page and storefronts)
 ```
 
 ## Scope — what is real, stubbed and TODO
@@ -1229,6 +1289,26 @@ two-step store-scope preview, the receipt discount line, and
 the shared `CouponManager` component behind the seller
 (`/seller/coupons`) and admin (`/admin/coupons`) pages.
 
+**Real (Wave 15):** product search on Postgres — migration 0017
+(`products.category` plus the combined-title and description
+trigram indexes); the pure domain search rules
+(`validate_search_params`, `validate_category`, the LIKE-pattern
+escaping in `search_like_pattern` / `search_prefix_pattern`);
+`GET /v1/search` (trigram + ILIKE matching, the one-expression
+relevance rank, category / price / store filters composing with
+AND, five sorts, strict public visibility) returning the shared
+product view; `GET /v1/search/suggest` (distinct product titles
++ stores, silent below 2 characters); an integration test
+(`crates/api/tests/wave15.rs`, same `DATABASE_URL` gate)
+covering English + Bangla title matches, description-only
+ranking below title matches, every filter, price sorts,
+pagination totals and slices, draft + suspended-store
+invisibility, suggestions, and the 400s; the Next.js shared
+`SearchBar` (debounced suggestions) on the marketplace home and
+on storefronts (store-scoped), the `/search` results page with
+its filter form and pagination, and a category field on the
+seller product form.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters. Manual Phase 2 couriers (Sundarban,
@@ -1256,16 +1336,17 @@ the external service at the other end of it, configured by
   passes (Wave 10 admin pages included: /admin, /admin/stores,
   /admin/payouts, /admin/users, /admin/settings; Wave 12 adds
   /seller/import; Wave 13 adds /messages, /messages/[id] and
-  /seller/inbox; Wave 14 adds /seller/coupons and /admin/coupons).
+  /seller/inbox; Wave 14 adds /seller/coupons and /admin/coupons;
+  Wave 15 adds /search).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
-  (domain 58, courier 31, payments 8 unit tests; the `DATABASE_URL`-
+  (domain 61, courier 31, payments 8 unit tests; the `DATABASE_URL`-
   gated integration tests skip cleanly without a database). The API
   binary was also smoke-tested locally without a database: routes
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
   (including the Wave 13 messaging endpoints), and the SIDRA
   callback answers 503 without a database.
-- **Rust integration + clippy: CI-only** — the Wave 2–14 integration
+- **Rust integration + clippy: CI-only** — the Wave 2–15 integration
   tests against a real Postgres 16 service and clippy `-D warnings`
   are verified via **GitHub Actions CI** (`.github/workflows/ci.yml`)
-  on push. Waves 1–13 are green there; Wave 14 awaits its first CI run.
+  on push. Waves 1–14 are green there; Wave 15 awaits its first CI run.

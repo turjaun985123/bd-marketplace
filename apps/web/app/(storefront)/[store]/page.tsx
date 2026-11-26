@@ -1,5 +1,6 @@
 import MessageStoreButton from "@/components/MessageStoreButton";
 import ProductGrid from "@/components/ProductGrid";
+import SearchBar from "@/components/SearchBar";
 
 /**
  * Per-seller storefront: the store's own page, rendering the SAME
@@ -21,6 +22,7 @@ export default function StorefrontPage({
         কেন্দ্রীয় মার্কেটপ্লেসেও পাওয়া যায়।
       </p>
       <MessageStoreButton slug={params.store} />
+      <SearchBar storeSlug={params.store} />
       <h2>পণ্য — Products</h2>
       <ProductGrid storeSlug={params.store} />
     </main>

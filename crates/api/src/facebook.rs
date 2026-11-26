@@ -354,6 +354,7 @@ pub async fn import_products_for_owner(
             title: draft.title.trim().to_string(),
             title_bn: draft.title_bn.clone(),
             description: draft.description.clone(),
+            category: None,
             price_poisha: draft.price_poisha,
             compare_at_poisha: None,
             stock: draft.stock,

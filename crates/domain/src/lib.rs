@@ -1478,6 +1478,180 @@ pub fn allocate_discount(subtotals: &[i64], discount: i64) -> Vec<i64> {
     shares
 }
 
+// ---------------------------------------------------------------------------
+// Search (Wave 15)
+// ---------------------------------------------------------------------------
+
+/// Maximum length of a product category label, in characters.
+pub const MAX_CATEGORY_CHARS: usize = 60;
+
+/// Validate a product category label. The label is OPTIONAL: `None`
+/// is valid and means "uncategorised", and a blank label is valid
+/// too (callers normalize blank to `None`). A present label may be
+/// at most [`MAX_CATEGORY_CHARS`] characters, counted after
+/// trimming, in Unicode characters, not bytes.
+pub fn validate_category(category: Option<&str>) -> Result<(), &'static str> {
+    match category {
+        None => Ok(()),
+        Some(raw) => {
+            if raw.trim().chars().count() > MAX_CATEGORY_CHARS {
+                Err("category must be at most 60 characters")
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Maximum search text length, in characters.
+pub const MAX_SEARCH_QUERY_CHARS: usize = 100;
+
+/// Default search page size when the caller omits `per_page`.
+pub const DEFAULT_SEARCH_PER_PAGE: i64 = 20;
+
+/// Largest search page size (search pages stay small enough to
+/// rank and render quickly).
+pub const MAX_SEARCH_PER_PAGE: i64 = 48;
+
+/// The sort orders product search understands. The API layer maps
+/// each variant to a fixed ORDER BY fragment — user input never
+/// reaches the SQL text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchSort {
+    /// Best match first (only meaningful with search text; the
+    /// validator falls back to it only when text is present).
+    Relevance,
+    /// Cheapest first.
+    PriceAsc,
+    /// Most expensive first.
+    PriceDesc,
+    /// Most recently created first.
+    Newest,
+    /// Highest rated first (unreviewed products last).
+    Rating,
+}
+
+/// Validated product-search parameters (Wave 15). The API layer
+/// hands the raw query-string values to [`validate_search_params`]
+/// and then works only with this struct, so the search rules live
+/// in exactly one place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchParams {
+    /// The trimmed search text, or `None` for a pure filter browse.
+    pub q: Option<String>,
+    /// Inclusive lower price bound in poisha, when set.
+    pub min_price_poisha: Option<i64>,
+    /// Inclusive upper price bound in poisha, when set.
+    pub max_price_poisha: Option<i64>,
+    pub sort: SearchSort,
+    /// 1-based page number.
+    pub page: i64,
+    /// Page size, 1..=[`MAX_SEARCH_PER_PAGE`].
+    pub per_page: i64,
+}
+
+/// Validate raw product-search parameters. Rules: the text is
+/// trimmed, blank means absent, and at most
+/// [`MAX_SEARCH_QUERY_CHARS`] characters; price bounds are
+/// non-negative and, when both are set, min must not exceed max;
+/// the sort defaults to relevance when text is present and to
+/// newest otherwise; the page is 1-based; the page size is
+/// 1..=[`MAX_SEARCH_PER_PAGE`], defaulting to
+/// [`DEFAULT_SEARCH_PER_PAGE`]. Error strings are user-facing.
+pub fn validate_search_params(
+    q: Option<&str>,
+    min_price_poisha: Option<i64>,
+    max_price_poisha: Option<i64>,
+    sort: Option<&str>,
+    page: Option<i64>,
+    per_page: Option<i64>,
+) -> Result<SearchParams, &'static str> {
+    let q = match q {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else if trimmed.chars().count() > MAX_SEARCH_QUERY_CHARS {
+                return Err("search text must be at most 100 characters");
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        None => None,
+    };
+    if min_price_poisha.is_some_and(|min| min < 0) || max_price_poisha.is_some_and(|max| max < 0)
+    {
+        return Err("price bounds must not be negative");
+    }
+    if let (Some(min), Some(max)) = (min_price_poisha, max_price_poisha) {
+        if min > max {
+            return Err("min_price_poisha must not exceed max_price_poisha");
+        }
+    }
+    let sort = match sort {
+        None => {
+            if q.is_some() {
+                SearchSort::Relevance
+            } else {
+                SearchSort::Newest
+            }
+        }
+        Some("relevance") => SearchSort::Relevance,
+        Some("price_asc") => SearchSort::PriceAsc,
+        Some("price_desc") => SearchSort::PriceDesc,
+        Some("newest") => SearchSort::Newest,
+        Some("rating") => SearchSort::Rating,
+        Some(_) => {
+            return Err("sort must be one of: relevance, price_asc, price_desc, newest, rating")
+        }
+    };
+    let page = page.unwrap_or(1);
+    if page < 1 {
+        return Err("page must be at least 1");
+    }
+    let per_page = per_page.unwrap_or(DEFAULT_SEARCH_PER_PAGE);
+    if !(1..=MAX_SEARCH_PER_PAGE).contains(&per_page) {
+        return Err("per_page must be between 1 and 48");
+    }
+    Ok(SearchParams {
+        q,
+        min_price_poisha,
+        max_price_poisha,
+        sort,
+        page,
+        per_page,
+    })
+}
+
+/// Escape the SQL LIKE metacharacters in a search text: each
+/// backslash, percent and underscore gains a backslash prefix
+/// (the queries rely on the Postgres default `ESCAPE '\'`).
+/// Keeping this in the domain crate means every ILIKE caller
+/// escapes the same way — user text can never widen its own match.
+fn escape_like_text(q: &str) -> String {
+    let mut escaped = String::with_capacity(q.len());
+    for ch in q.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+/// Build the contains-match ILIKE pattern for a search text: the
+/// text escaped by [`escape_like_text`], wrapped in `%...%`.
+pub fn search_like_pattern(q: &str) -> String {
+    format!("%{}%", escape_like_text(q))
+}
+
+/// Build the prefix-match ILIKE pattern for a search text: the
+/// text escaped by [`escape_like_text`], with a single trailing
+/// `%`. Used by the search rank's title-prefix boost.
+pub fn search_prefix_pattern(q: &str) -> String {
+    format!("{}%", escape_like_text(q))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2630,5 +2804,93 @@ mod tests {
             "conv-1:msg-2:দাম ৫০০ টাকা"
         );
         assert_eq!(sidra_signature_payload("", "", ""), "::");
+    }
+
+    #[test]
+    fn category_validation() {
+        // Absent and blank labels are valid (uncategorised).
+        assert!(validate_category(None).is_ok());
+        assert!(validate_category(Some("")).is_ok());
+        assert!(validate_category(Some("   ")).is_ok());
+        assert!(validate_category(Some("clothing")).is_ok());
+        // The limit counts characters, not bytes: 60 Bangla chars
+        // (multi-byte) pass, 61 of anything fail.
+        assert!(validate_category(Some(&"ক".repeat(MAX_CATEGORY_CHARS))).is_ok());
+        assert!(validate_category(Some(&"x".repeat(MAX_CATEGORY_CHARS + 1))).is_err());
+    }
+
+    #[test]
+    fn search_params_validation() {
+        // Defaults: text present -> relevance; absent -> newest.
+        let with_q = validate_search_params(Some("shirt"), None, None, None, None, None)
+            .expect("valid");
+        assert_eq!(with_q.q.as_deref(), Some("shirt"));
+        assert_eq!(with_q.sort, SearchSort::Relevance);
+        assert_eq!(with_q.page, 1);
+        assert_eq!(with_q.per_page, DEFAULT_SEARCH_PER_PAGE);
+
+        let no_q = validate_search_params(None, None, None, None, None, None).expect("valid");
+        assert_eq!(no_q.q, None);
+        assert_eq!(no_q.sort, SearchSort::Newest);
+
+        // Blank text is absent text; surrounding space is trimmed.
+        let blank = validate_search_params(Some("   "), None, None, None, None, None)
+            .expect("valid");
+        assert_eq!(blank.q, None);
+        assert_eq!(blank.sort, SearchSort::Newest);
+        let padded = validate_search_params(Some("  শাড়ি  "), None, None, None, None, None)
+            .expect("valid");
+        assert_eq!(padded.q.as_deref(), Some("শাড়ি"));
+
+        // Every named sort parses; an unknown one is a 400.
+        for (raw, expected) in [
+            ("relevance", SearchSort::Relevance),
+            ("price_asc", SearchSort::PriceAsc),
+            ("price_desc", SearchSort::PriceDesc),
+            ("newest", SearchSort::Newest),
+            ("rating", SearchSort::Rating),
+        ] {
+            let parsed =
+                validate_search_params(None, None, None, Some(raw), None, None).expect("valid");
+            assert_eq!(parsed.sort, expected);
+        }
+        assert!(validate_search_params(None, None, None, Some("popular"), None, None).is_err());
+
+        // Price bounds: negative is invalid, min above max is
+        // invalid, equal bounds are a valid single-price filter.
+        assert!(validate_search_params(None, Some(-1), None, None, None, None).is_err());
+        assert!(validate_search_params(None, None, Some(-5), None, None, None).is_err());
+        assert!(validate_search_params(None, Some(1_000), Some(999), None, None, None).is_err());
+        assert!(validate_search_params(None, Some(1_000), Some(1_000), None, None, None).is_ok());
+
+        // Pagination bounds: page is 1-based, per_page 1..=48.
+        assert!(validate_search_params(None, None, None, None, Some(0), None).is_err());
+        assert!(validate_search_params(None, None, None, None, None, Some(0)).is_err());
+        assert!(
+            validate_search_params(None, None, None, None, None, Some(MAX_SEARCH_PER_PAGE + 1))
+                .is_err()
+        );
+        assert!(
+            validate_search_params(None, None, None, None, Some(3), Some(MAX_SEARCH_PER_PAGE))
+                .is_ok()
+        );
+
+        // Over-long text is rejected (counted in characters).
+        let long_q = "x".repeat(MAX_SEARCH_QUERY_CHARS + 1);
+        assert!(validate_search_params(Some(&long_q), None, None, None, None, None).is_err());
+        let at_limit = "ক".repeat(MAX_SEARCH_QUERY_CHARS);
+        assert!(validate_search_params(Some(&at_limit), None, None, None, None, None).is_ok());
+    }
+
+    #[test]
+    fn search_like_patterns_escape_metacharacters() {
+        assert_eq!(search_like_pattern("shirt"), "%shirt%");
+        assert_eq!(search_prefix_pattern("shirt"), "shirt%");
+        // %, _ and \ in user text must match themselves literally.
+        assert_eq!(search_like_pattern("50% off"), "%50\\% off%");
+        assert_eq!(search_like_pattern("a_b\\c"), "%a\\_b\\\\c%");
+        assert_eq!(search_prefix_pattern("a_b"), "a\\_b%");
+        // Bangla text passes through untouched.
+        assert_eq!(search_like_pattern("শাড়ি"), "%শাড়ি%");
     }
 }

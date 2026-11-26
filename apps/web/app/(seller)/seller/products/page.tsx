@@ -29,6 +29,7 @@ export default function SellerProductsPage() {
   // Create-product form state (price typed in taka for humans).
   const [title, setTitle] = useState("");
   const [titleBn, setTitleBn] = useState("");
+  const [category, setCategory] = useState("");
   const [priceTaka, setPriceTaka] = useState("");
   const [stock, setStock] = useState("0");
   const [status, setStatus] = useState("draft");
@@ -66,6 +67,7 @@ export default function SellerProductsPage() {
         store_id: store.id,
         title: title.trim(),
         title_bn: titleBn.trim() || undefined,
+        category: category.trim() || undefined,
         price_poisha: Math.round(Number(priceTaka) * 100),
         stock: Number(stock),
         status,
@@ -74,6 +76,7 @@ export default function SellerProductsPage() {
       setProducts((prev) => [created, ...prev]);
       setTitle("");
       setTitleBn("");
+      setCategory("");
       setPriceTaka("");
       setStock("0");
       setWeightGrams("1000");
@@ -161,6 +164,15 @@ export default function SellerProductsPage() {
             <label>
               পণ্যের নাম (বাংলা)
               <input value={titleBn} onChange={(e) => setTitleBn(e.target.value)} />
+            </label>
+            <label>
+              ক্যাটাগরি (Category) — খোঁজার ফিল্টারে ব্যবহৃত হয়
+              <input
+                value={category}
+                onChange={(e) => setCategory(e.target.value)}
+                placeholder="যেমন: clothing"
+                maxLength={60}
+              />
             </label>
             <label>
               দাম (টাকা)

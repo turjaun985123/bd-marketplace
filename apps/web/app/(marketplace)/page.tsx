@@ -2,6 +2,7 @@ import Link from "next/link";
 import AdminLink from "@/components/AdminLink";
 import DeliveryChargeWidget from "@/components/DeliveryChargeWidget";
 import ProductGrid from "@/components/ProductGrid";
+import SearchBar from "@/components/SearchBar";
 
 export default function MarketplaceHomePage() {
   return (
@@ -23,6 +24,8 @@ export default function MarketplaceHomePage() {
         <Link href="/messages">মেসেজ — Messages</Link>
         <AdminLink />
       </p>
+
+      <SearchBar />
 
       <h2>পণ্য — Products</h2>
       <ProductGrid />

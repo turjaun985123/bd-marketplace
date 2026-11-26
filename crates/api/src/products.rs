@@ -19,7 +19,7 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use domain::{validate_product_input, ProductInput};
+use domain::{validate_category, validate_product_input, ProductInput};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
@@ -37,6 +37,10 @@ pub struct Product {
     pub title: String,
     pub title_bn: Option<String>,
     pub description: Option<String>,
+    /// Free-text category label (Wave 15); null when the seller
+    /// did not set one. Search filters on it (case-insensitive
+    /// exact match).
+    pub category: Option<String>,
     pub price_poisha: i64,
     pub compare_at_poisha: Option<i64>,
     pub stock: i32,
@@ -60,8 +64,8 @@ pub struct Product {
     pub updated_at: DateTime<Utc>,
 }
 
-const PRODUCT_COLUMNS: &str = "p.id, p.store_id, s.slug AS store_slug, p.title, p.title_bn, \
-    p.description, p.price_poisha, p.compare_at_poisha, p.stock, p.status, \
+pub(crate) const PRODUCT_COLUMNS: &str = "p.id, p.store_id, s.slug AS store_slug, p.title, p.title_bn, \
+    p.description, p.category, p.price_poisha, p.compare_at_poisha, p.stock, p.status, \
     p.weight_grams, p.source, p.source_ref, rv.rating_avg, rv.rating_count, \
     p.created_at, p.updated_at";
 
@@ -72,7 +76,7 @@ const PRODUCT_COLUMNS: &str = "p.id, p.store_id, s.slug AS store_slug, p.title, 
 /// row per product: `rating_avg` null and `rating_count` 0 when the
 /// product has no reviews. The average is rounded in SQL to one
 /// decimal and cast to float8 for JSON output.
-const PRODUCT_RATING_JOIN: &str = "LEFT JOIN LATERAL (\
+pub(crate) const PRODUCT_RATING_JOIN: &str = "LEFT JOIN LATERAL (\
     SELECT CAST(ROUND(AVG(r.rating)::numeric, 1) AS float8) AS rating_avg, \
            COUNT(*)::bigint AS rating_count \
     FROM reviews r WHERE r.product_id = p.id\
@@ -192,6 +196,8 @@ pub struct NewProduct {
     pub title: String,
     pub title_bn: Option<String>,
     pub description: Option<String>,
+    /// Category label (Wave 15); the Facebook import passes None.
+    pub category: Option<String>,
     pub price_poisha: i64,
     pub compare_at_poisha: Option<i64>,
     pub stock: i32,
@@ -212,15 +218,16 @@ where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
     sqlx::query_scalar(
-        "INSERT INTO products (store_id, title, title_bn, description, \
+        "INSERT INTO products (store_id, title, title_bn, description, category, \
          price_poisha, compare_at_poisha, stock, status, weight_grams, \
          source, source_ref) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id",
     )
     .bind(input.store_id)
     .bind(input.title.trim())
     .bind(&input.title_bn)
     .bind(&input.description)
+    .bind(&input.category)
     .bind(input.price_poisha)
     .bind(input.compare_at_poisha)
     .bind(input.stock)
@@ -231,6 +238,17 @@ where
     .fetch_one(executor)
     .await
     .map_err(|e| ApiError::internal("create product", e))
+}
+
+/// Normalize a category label for storage: trimmed, with a blank
+/// label becoming `None` (uncategorised). Validation is the domain
+/// crate's `validate_category`, called by both write paths before
+/// this helper stores anything.
+fn normalize_category(category: Option<&str>) -> Option<String> {
+    category
+        .map(str::trim)
+        .filter(|trimmed| !trimmed.is_empty())
+        .map(str::to_string)
 }
 
 /// Create a product in a store the caller owns. Input rules come from
@@ -249,6 +267,7 @@ pub async fn create_product_for_owner(
         weight_grams: input.weight_grams,
     };
     validate_product_input(&validated).map_err(ApiError::bad_request)?;
+    validate_category(input.category.as_deref()).map_err(ApiError::bad_request)?;
     if let Some(compare_at) = input.compare_at_poisha {
         if compare_at < 0 {
             return Err(ApiError::bad_request("compare_at_poisha must be >= 0"));
@@ -266,6 +285,7 @@ pub async fn create_product_for_owner(
             title: input.title.clone(),
             title_bn: input.title_bn.clone(),
             description: input.description.clone(),
+            category: normalize_category(input.category.as_deref()),
             price_poisha: input.price_poisha,
             compare_at_poisha: input.compare_at_poisha,
             stock: input.stock,
@@ -301,6 +321,7 @@ pub async fn update_product_for_owner(
             .unwrap_or(i64::from(existing.weight_grams)),
     };
     validate_product_input(&merged).map_err(ApiError::bad_request)?;
+    validate_category(patch.category.as_deref()).map_err(ApiError::bad_request)?;
     // The domain validator has already proven 1..=50,000, so this fits.
     let merged_weight_grams = i32::try_from(merged.weight_grams)
         .map_err(|_| ApiError::bad_request("weight_grams out of range"))?;
@@ -309,11 +330,14 @@ pub async fn update_product_for_owner(
             return Err(ApiError::bad_request("compare_at_poisha must be >= 0"));
         }
     }
+    // Like the other optional text fields, a PATCH can set the
+    // category but not clear it back to NULL.
+    let merged_category = normalize_category(patch.category.as_deref()).or(existing.category);
 
     sqlx::query(
         "UPDATE products SET title = $2, title_bn = $3, description = $4, \
          price_poisha = $5, compare_at_poisha = $6, stock = $7, status = $8, \
-         weight_grams = $9, updated_at = now() WHERE id = $1",
+         weight_grams = $9, category = $10, updated_at = now() WHERE id = $1",
     )
     .bind(id)
     .bind(merged.title.trim())
@@ -324,6 +348,7 @@ pub async fn update_product_for_owner(
     .bind(merged.stock)
     .bind(&merged.status)
     .bind(merged_weight_grams)
+    .bind(&merged_category)
     .execute(pool)
     .await
     .map_err(|e| ApiError::internal("update product", e))?;
@@ -341,6 +366,8 @@ pub struct CreateProductInput {
     pub title: String,
     pub title_bn: Option<String>,
     pub description: Option<String>,
+    /// Optional category label (Wave 15), validated by the domain.
+    pub category: Option<String>,
     pub price_poisha: i64,
     pub compare_at_poisha: Option<i64>,
     #[serde(default)]
@@ -365,6 +392,8 @@ pub struct UpdateProductInput {
     pub title: Option<String>,
     pub title_bn: Option<String>,
     pub description: Option<String>,
+    /// Optional category label (Wave 15); set-only, like title_bn.
+    pub category: Option<String>,
     pub price_poisha: Option<i64>,
     pub compare_at_poisha: Option<i64>,
     pub stock: Option<i32>,
