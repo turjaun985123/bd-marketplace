@@ -3259,14 +3259,15 @@ pub fn validate_api_key_scopes(scopes: &[String]) -> Result<Vec<String>, String>
             ));
         }
     }
-    // Plain loop, not iterator filter: `scope` here is `&&str`
-    // so `*scope` is `&str` and compares cleanly with
-    // `s.as_str()` (the filter-closure form tripped E0277,
-    // `str` vs `&str`, in CI run 45845322564).
+    // Plain loop over the const array: iterating `[&str; 2]`
+    // by value yields `&str`, so `scope` compares directly
+    // with `s.as_str()` (two earlier forms — a filter closure
+    // and a deref — tripped E0277 in CI; this is the shape
+    // `API_KEY_SCOPES.contains(&scope.as_str())` above uses).
     let mut out: Vec<String> = Vec::new();
     for scope in API_KEY_SCOPES {
-        if scopes.iter().any(|s| s.as_str() == *scope) {
-            out.push((*scope).to_string());
+        if scopes.iter().any(|s| s.as_str() == scope) {
+            out.push(scope.to_string());
         }
     }
     Ok(out)
