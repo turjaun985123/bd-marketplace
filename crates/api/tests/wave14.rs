@@ -89,7 +89,7 @@ async fn call(
 }
 
 async fn login(app: &axum::Router, phone: &str) -> String {
-    let (status, _) = call(
+    let (status, body) = call(
         app,
         "POST",
         "/v1/auth/request-otp",
@@ -97,13 +97,17 @@ async fn login(app: &axum::Router, phone: &str) -> String {
         Some(json!({ "phone": phone })),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "request-otp {phone}: {body}");
+    let dev_otp = body["dev_otp"]
+        .as_str()
+        .expect("dev mode returns dev_otp")
+        .to_string();
     let (status, body) = call(
         app,
         "POST",
         "/v1/auth/verify-otp",
         None,
-        Some(json!({ "phone": phone, "code": "123456" })),
+        Some(json!({ "phone": phone, "code": dev_otp })),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "verify otp: {body}");
