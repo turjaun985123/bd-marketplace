@@ -22,6 +22,13 @@
 //! received it; one review per buyer per product; the store owner
 //! may post one reply per review; and the product view gains a live
 //! rating summary from the single aggregate join in `products`.
+//! Wave 9: seller dashboard, earnings and payout requests
+//! (`payouts` module) — a store earns only from DELIVERED
+//! sub-orders (goods minus the commission snapshot); one earnings
+//! aggregate feeds the dashboard, the balance endpoint and payout
+//! creation; sellers save one payout account and request payouts
+//! against their available balance (platform minimum 500 taka);
+//! approval and payment processing land with the admin wave.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -36,6 +43,7 @@ pub mod auth;
 pub mod cart;
 pub mod orders;
 pub mod payments;
+pub mod payouts;
 pub mod products;
 pub mod reviews;
 pub mod shipments;
@@ -490,6 +498,19 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/v1/seller/reviews/:id/reply",
             post(reviews::create_reply_handler).patch(reviews::update_reply_handler),
+        )
+        // Wave 9 — seller dashboard, balance, payout account and
+        // payout requests (approval/payment land with the admin wave).
+        .route("/v1/seller/dashboard", get(payouts::dashboard_handler))
+        .route("/v1/seller/balance", get(payouts::balance_handler))
+        .route(
+            "/v1/seller/payout-account",
+            get(payouts::get_payout_account_handler)
+                .put(payouts::save_payout_account_handler),
+        )
+        .route(
+            "/v1/seller/payouts",
+            post(payouts::request_payout_handler).get(payouts::list_payouts_handler),
         )
         .layer(CorsLayer::permissive())
         .with_state(state)

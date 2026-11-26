@@ -35,6 +35,8 @@ const SELECT_STORE_BY_SLUG_SQL: &str =
     "SELECT id, owner_user_id, slug, name, description, created_at FROM stores WHERE slug = $1";
 const SELECT_STORE_BY_ID_SQL: &str =
     "SELECT id, owner_user_id, slug, name, description, created_at FROM stores WHERE id = $1";
+const SELECT_STORE_BY_OWNER_SQL: &str = "SELECT id, owner_user_id, slug, name, description, \
+    created_at FROM stores WHERE owner_user_id = $1 ORDER BY created_at ASC LIMIT 1";
 
 /// Create a store for the authenticated user. Validates the slug with
 /// the pure domain function, maps a duplicate slug to 409, and upgrades
@@ -93,6 +95,20 @@ pub async fn get_store_by_slug(pool: &PgPool, slug: &str) -> Result<Store, ApiEr
     .await
     .map_err(|e| ApiError::internal("load store", e))?
     .ok_or_else(|| ApiError::not_found("store not found"))
+}
+
+/// Fetch the store a seller operates under: their earliest-created
+/// store, or a 404 when they have none. Wave 9 scopes earnings and
+/// payouts to this one store (payout accounts and payouts are
+/// per-store rows), which matches the platform's one-storefront-
+/// per-seller model everywhere else.
+pub async fn get_store_by_owner(pool: &PgPool, owner_user_id: Uuid) -> Result<Store, ApiError> {
+    sqlx::query_as(SELECT_STORE_BY_OWNER_SQL)
+        .bind(owner_user_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| ApiError::internal("load seller store", e))?
+        .ok_or_else(|| ApiError::not_found("you do not have a store yet"))
 }
 
 /// Fetch a store by id (used for product ownership checks).

@@ -736,3 +736,131 @@ export function refreshShipment(token: string, shipmentId: string): Promise<Ship
     token,
   });
 }
+
+/** A store's money summary (Wave 9): earnings from DELIVERED
+ * sub-orders only, minus what is paid out or waiting in requests. */
+export interface Earnings {
+  earned_poisha: number;
+  paid_out_poisha: number;
+  pending_poisha: number;
+  available_poisha: number;
+}
+
+/** Sub-order counts per fulfilment status (Wave 9 dashboard). */
+export interface SubOrderStatusCounts {
+  placed: number;
+  confirmed: number;
+  shipped: number;
+  delivered: number;
+  cancelled: number;
+  returned: number;
+}
+
+/** Everything the seller home page renders (Wave 9). */
+export interface SellerDashboard {
+  store: Store;
+  counts: {
+    products: number;
+    sub_orders_by_status: SubOrderStatusCounts;
+  };
+  earnings: Earnings;
+  recent_sub_orders: SellerSubOrder[];
+}
+
+/** Where a store's payout money goes (Wave 9). */
+export interface PayoutAccount {
+  id: string;
+  store_id: string;
+  /** bkash | nagad | bank */
+  method: string;
+  account_name: string;
+  account_number: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** One payout request with its account snapshot (Wave 9). */
+export interface Payout {
+  id: string;
+  store_id: string;
+  amount_poisha: number;
+  method: string;
+  account_name: string;
+  account_number: string;
+  /** requested | approved | paid | rejected */
+  status: string;
+  note: string | null;
+  created_at: string;
+  processed_at: string | null;
+}
+
+export interface PayoutList {
+  items: Payout[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+/** Bangla label for a payout status (Wave 9). */
+export function payoutStatusLabel(status: string): string {
+  switch (status) {
+    case "requested":
+      return "অনুরোধ করা হয়েছে";
+    case "approved":
+      return "অনুমোদিত";
+    case "paid":
+      return "পরিশোধিত";
+    case "rejected":
+      return "প্রত্যাখ্যাত";
+    default:
+      return status;
+  }
+}
+
+/** GET /v1/seller/dashboard — store, counts, earnings, recent orders. */
+export function getSellerDashboard(token: string): Promise<SellerDashboard> {
+  return call("/v1/seller/dashboard", { token });
+}
+
+/** GET /v1/seller/balance — the caller's store earnings summary. */
+export function getSellerBalance(token: string): Promise<Earnings> {
+  return call("/v1/seller/balance", { token });
+}
+
+/** GET /v1/seller/payout-account — the saved account, or null. */
+export function getPayoutAccount(token: string): Promise<PayoutAccount | null> {
+  return call("/v1/seller/payout-account", { token });
+}
+
+/** PUT /v1/seller/payout-account — create or replace the account. */
+export function savePayoutAccount(
+  token: string,
+  input: { method: string; account_name: string; account_number: string }
+): Promise<PayoutAccount> {
+  return call("/v1/seller/payout-account", { method: "PUT", token, body: input });
+}
+
+/**
+ * POST /v1/seller/payouts — request a payout of `amountPoisha`
+ * against the available balance. The API enforces the 500-taka
+ * minimum and the balance fit; the account is snapshotted.
+ */
+export function requestPayout(token: string, amountPoisha: number): Promise<Payout> {
+  return call("/v1/seller/payouts", {
+    method: "POST",
+    token,
+    body: { amount_poisha: amountPoisha },
+  });
+}
+
+/** GET /v1/seller/payouts — the store's payout requests, newest first. */
+export function listPayouts(
+  token: string,
+  params?: { page?: number; limit?: number }
+): Promise<PayoutList> {
+  const search = new URLSearchParams();
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/seller/payouts${qs ? `?${qs}` : ""}`, { token });
+}

@@ -66,14 +66,21 @@ crates/api/             Axum API — thin handlers over service functions
   src/payments.rs       method availability, webhook callback
                         application (the one apply path), retry,
                         dev-simulate helper
+  src/reviews.rs        reviews + ratings + seller replies
+  src/shipments.rs      courier availability, shipment booking,
+                        tracking refresh
+  src/payouts.rs        seller dashboard, the one earnings
+                        aggregate, payout account + payout requests
   tests/wave2.rs        end-to-end integration test (needs DATABASE_URL)
   tests/wave3.rs        cart + split checkout integration test (same gate)
   tests/wave4.rs        weight / cancel / receipt integration test
   tests/wave5.rs        online payments integration test (same gate)
+  tests/wave9.rs        dashboard / earnings / payouts test (same gate)
 crates/worker/          Tokio worker binary (jobs listed, implementation TODO)
 migrations/             SQLx migrations (users, stores, otp_codes, products,
                         carts, orders, sub_orders, order_items, payments,
-                        payment_events)
+                        payment_events, shipments, reviews, payout_accounts,
+                        payouts)
 infra/docker-compose.yml  Postgres + Redis + MinIO
 .env.example            every environment variable, no real values
 .github/workflows/ci.yml  Rust tests/clippy (with a Postgres service) + Next.js build
@@ -417,6 +424,67 @@ user owns the product's store — deliberately no separate seller
 reviews page, so a reply is always written next to the review it
 answers.
 
+Wave 9 (seller dashboard, earnings and payout requests):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| GET | `/v1/seller/dashboard` | Bearer, store required (no store: 404). The seller home in one response: store, product count, sub-order counts per status, earnings, and the 5 most recent sub-orders (the shared seller list view) |
+| GET | `/v1/seller/balance` | Bearer. The earnings summary alone: earned / paid out / pending / available |
+| GET | `/v1/seller/payout-account` | Bearer. Your payout account, or `null` when none is saved |
+| PUT | `/v1/seller/payout-account` | Bearer. Create or replace the payout account (domain-validated; invalid input is a 400) |
+| POST | `/v1/seller/payouts` | Bearer. Request a payout of `amount_poisha` against the available balance (201; the account fields are snapshotted onto the payout) |
+| GET | `/v1/seller/payouts?page=&limit=` | Bearer. Your store's payout requests, newest first |
+
+**Earning rule:** a store earns only from sub-orders whose status
+is `delivered`, and what it earns per sub-order is the goods
+subtotal minus the commission snapshot taken at checkout
+(`goods_subtotal_poisha − commission_poisha` — the same number
+checkout stores as `seller_payout_poisha`). The delivery charge
+share is courier/platform money and NEVER earns. A sub-order whose
+shipment is only `partial_delivered` is not `delivered`, so it
+earns nothing until it is fully delivered — deliberately
+conservative: money is counted only when it is certainly the
+seller's. One aggregate (`seller_earnings` in
+`crates/api/src/payouts.rs`) computes earned / paid out / pending;
+the dashboard, the balance endpoint and payout creation all read
+it, so the numbers cannot disagree.
+
+**Balance formula:** available = earned − paid out − pending,
+where paid out sums payouts in `approved` (committed) or `paid`
+(gone), and pending sums payouts still `requested`. The pure
+domain function `compute_available_balance` returns the raw
+arithmetic; the API clamps the reported value at zero (with
+consistent inputs it can never be negative, because a payout may
+only be requested against the available balance).
+
+**Minimum payout:** 500 taka (`MIN_PAYOUT_POISHA = 50_000` in the
+domain crate) — a platform rule constant, enforced by
+`validate_payout_amount` together with the balance fit.
+
+**Payout lifecycle — plainly:** in this wave sellers can only
+CREATE requests; a payout stays `requested` until the platform
+acts on it. Approval (`requested → approved`), rejection
+(`requested → rejected`) and payment (`approved → paid`) are
+platform operations whose endpoints land with the ADMIN wave; the
+transition table already exists as the pure domain function
+`can_transition_payout`, so the rule lives in exactly one place
+from the start.
+
+**Account validation rules** (pure domain
+`validate_payout_account`): the method must be `bkash`, `nagad`
+or `bank`. For bKash/Nagad the account number must be a valid
+Bangladeshi mobile number (the wallet account is the phone
+number; local and `+880…` forms both accepted). For bank, the
+account holder name must be non-empty and the account number must
+be 6–24 ASCII letters or digits. One account per store; saving
+again replaces it, and existing payout rows keep the snapshot
+they were created with.
+
+**Scoping:** the payout store is the seller's earliest-created
+store. Counts and recent orders cover the seller's whole selling
+activity (the same scope as the seller orders page), while
+earnings and payouts are strictly per payout store.
+
 Auth rules that matter: only a SHA-256 hash of an OTP is ever stored;
 ownership is checked on every seller mutation (403 for non-owners);
 every product query is scoped by store. Listing visibility: public
@@ -639,6 +707,29 @@ edit/delete and the owner's reply box, plus rating lines on the
 shared product card and the storefront page rendering the shared
 grid.
 
+**Real (Wave 9):** seller dashboard, earnings and payout
+requests — migration 0012 (`payout_accounts`, one per store;
+`payouts` with the account snapshot and the
+requested/approved/paid/rejected lifecycle); the pure domain
+payout rules (`MIN_PAYOUT_POISHA`, `compute_available_balance`,
+`is_valid_payout_status`, `can_transition_payout`,
+`validate_payout_account`, `validate_payout_amount`); the single
+`seller_earnings` aggregate (delivered sub-orders only, goods
+minus commission) behind the dashboard, balance and payout
+creation endpoints; an integration test
+(`crates/api/tests/wave9.rs`, same `DATABASE_URL` gate) driving a
+real delivery, then covering the no-store 404, delivered-only
+earnings against a merely-confirmed order, account-first and
+bad-number 400s, the below-minimum 400, a valid request moving
+money from available to pending, the exceeds-balance 400, and
+per-seller isolation; the seller home page (`/seller`) with money
+stat cards, status counts, recent orders, the payout account
+form, the payout request form (taka input converted by the shared
+`parseTakaToPoisha`) and the payout history with Bangla status
+labels. Payout APPROVAL and PAYMENT are not here yet — they are
+platform operations and land with the admin wave; until then
+payouts stay `requested`.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 eCourier / Paperfly courier adapters. Manual Phase 2 couriers
 (Sundarban, SA Paribahan, Karatoa, Carrybee) join behind the same
@@ -647,7 +738,8 @@ trait later. SMS sending has only the dev-mode log implementation
 
 **TODO / not wired:** live gateway calls and real-gateway webhook
 signature verification (need merchant credentials + each gateway's
-integration docs), refunds and payouts, Redis, a real SMS gateway,
+integration docs), refunds, payout approval/payment processing
+(admin wave), Redis, a real SMS gateway,
 SIDRA calls, worker jobs — including automatic courier status
 polling, which will call the same refresh service function the API
 exposes (the worker still logs its planned jobs and exits cleanly).
@@ -655,14 +747,15 @@ exposes (the worker still logs its planned jobs and exits cleanly).
 ## Verification status
 
 - **Next.js: verified on this machine** — `npm ci && npm run build`
-  passes (Wave 8 product detail page + storefront grid included).
+  passes (Wave 9 seller dashboard page included).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
-  (domain 37, courier 21, payments 8 unit tests; the `DATABASE_URL`-
+  (domain 41, courier 21, payments 8 unit tests; the `DATABASE_URL`-
   gated integration tests skip cleanly without a database). The API
   binary was also smoke-tested locally without a database: routes
-  build, `/v1/couriers` answers, auth rejects unauthenticated calls.
-- **Rust integration + clippy: CI-only** — the Wave 2–8 integration
+  build, `/v1/couriers` answers, auth rejects unauthenticated calls
+  (including the Wave 9 seller endpoints).
+- **Rust integration + clippy: CI-only** — the Wave 2–9 integration
   tests against a real Postgres 16 service and clippy `-D warnings`
   are verified via **GitHub Actions CI** (`.github/workflows/ci.yml`)
-  on push. Waves 1–7 are green there; Wave 8 awaits its first CI run.
+  on push. Waves 1–8 are green there; Wave 9 awaits its first CI run.

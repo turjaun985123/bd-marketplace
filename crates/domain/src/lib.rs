@@ -807,6 +807,107 @@ pub fn mask_phone(phone: &str) -> String {
     format!("{head}****{tail}")
 }
 
+/// Minimum payout a seller may request, in poisha (500 taka). A
+/// platform rule, not a per-seller setting: small payouts cost more
+/// to process (mobile-banking fees, manual review) than they are
+/// worth, so earnings accumulate until they cross this floor.
+pub const MIN_PAYOUT_POISHA: i64 = 50_000;
+
+/// A seller's available balance: what they have earned, minus what
+/// has already been paid or committed out, minus what is sitting in
+/// `requested` payouts waiting for approval. This is the raw
+/// arithmetic and is deliberately NOT clamped: with consistent
+/// inputs it can never go negative (a payout may only be requested
+/// against the available balance), so a negative result means the
+/// inputs disagree — a bug the caller should see, not have hidden.
+/// The API boundary clamps via its `available_balance` helper and
+/// reports and gates payout requests on the clamped value; with
+/// consistent inputs the raw and clamped values are identical.
+pub fn compute_available_balance(
+    earned_poisha: i64,
+    paid_out_poisha: i64,
+    pending_poisha: i64,
+) -> i64 {
+    earned_poisha - paid_out_poisha - pending_poisha
+}
+
+/// Payout lifecycle statuses — mirrors the DB CHECK constraint on
+/// `payouts.status` (migration 0012).
+pub fn is_valid_payout_status(status: &str) -> bool {
+    matches!(status, "requested" | "approved" | "paid" | "rejected")
+}
+
+/// May a payout move from `from` to `to`? The single payout
+/// transition table (Wave 9): a request is approved or rejected by
+/// the platform; an approved payout is then paid out. `paid` and
+/// `rejected` are final. Same-state moves and every other pair are
+/// rejected. (The endpoints that drive these moves land with the
+/// admin wave; the table lives here now so the rule exists in
+/// exactly one place from the start.)
+pub fn can_transition_payout(from: &str, to: &str) -> bool {
+    matches!(
+        (from, to),
+        ("requested", "approved") | ("requested", "rejected") | ("approved", "paid")
+    )
+}
+
+/// Validate a seller's payout account — where payout money goes.
+/// - `bkash` / `nagad`: the account number must be a valid
+///   Bangladeshi mobile number (the wallet account IS the phone
+///   number); local and international forms both accepted.
+/// - `bank`: the account name must be non-empty (a bank transfer
+///   needs the account holder's name) and the account number must
+///   be 6 to 24 ASCII letters or digits (bank account numbers carry
+///   no checksum we can verify; shape is all we can check).
+/// Any other method is rejected. Error strings are user-facing.
+pub fn validate_payout_account(
+    method: &str,
+    account_name: &str,
+    account_number: &str,
+) -> Result<(), &'static str> {
+    match method {
+        "bkash" | "nagad" => {
+            if normalize_bd_phone(account_number).is_some() {
+                Ok(())
+            } else {
+                Err("wallet account number must be a valid Bangladeshi mobile number")
+            }
+        }
+        "bank" => {
+            if account_name.trim().is_empty() {
+                return Err("bank payout requires the account holder name");
+            }
+            let number = account_number.trim();
+            let len = number.chars().count();
+            if !(6..=24).contains(&len)
+                || !number.chars().all(|c| c.is_ascii_alphanumeric())
+            {
+                return Err("bank account number must be 6-24 letters or digits");
+            }
+            Ok(())
+        }
+        _ => Err("payout method must be bkash, nagad or bank"),
+    }
+}
+
+/// May a seller request a payout of `amount_poisha` against an
+/// available balance of `available_poisha`? Two rules: the amount
+/// must reach the platform minimum ([`MIN_PAYOUT_POISHA`]) and must
+/// not exceed what is available. Error strings are user-facing and
+/// name the failed rule.
+pub fn validate_payout_amount(
+    amount_poisha: i64,
+    available_poisha: i64,
+) -> Result<(), &'static str> {
+    if amount_poisha < MIN_PAYOUT_POISHA {
+        return Err("payout amount is below the minimum payout");
+    }
+    if amount_poisha > available_poisha {
+        return Err("payout amount exceeds the available balance");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1523,5 +1624,77 @@ mod tests {
         assert_eq!(to_local_phone("+8801212345678"), None);
         assert_eq!(to_local_phone("12345"), None);
         assert_eq!(to_local_phone(""), None);
+    }
+
+    #[test]
+    fn available_balance_is_raw_arithmetic() {
+        // Earned minus paid-out minus pending.
+        assert_eq!(compute_available_balance(184_000, 0, 0), 184_000);
+        assert_eq!(compute_available_balance(184_000, 50_000, 100_000), 34_000);
+        assert_eq!(compute_available_balance(0, 0, 0), 0);
+        // Deliberately NOT clamped: inconsistent inputs surface as a
+        // negative result instead of being silently hidden.
+        assert_eq!(compute_available_balance(10_000, 20_000, 0), -10_000);
+    }
+
+    #[test]
+    fn payout_transition_table() {
+        for status in ["requested", "approved", "paid", "rejected"] {
+            assert!(is_valid_payout_status(status), "{status}");
+        }
+        assert!(!is_valid_payout_status("pending"));
+        assert!(!is_valid_payout_status(""));
+
+        // The legal path: requested -> approved -> paid, and
+        // requested -> rejected.
+        assert!(can_transition_payout("requested", "approved"));
+        assert!(can_transition_payout("requested", "rejected"));
+        assert!(can_transition_payout("approved", "paid"));
+        // Everything else is illegal: skips, backwards moves,
+        // same-state, and anything out of the final states.
+        assert!(!can_transition_payout("requested", "paid"));
+        assert!(!can_transition_payout("approved", "rejected"));
+        assert!(!can_transition_payout("approved", "requested"));
+        assert!(!can_transition_payout("paid", "requested"));
+        assert!(!can_transition_payout("rejected", "approved"));
+        assert!(!can_transition_payout("requested", "requested"));
+        assert!(!can_transition_payout("paid", "paid"));
+    }
+
+    #[test]
+    fn payout_account_validation() {
+        // Wallets: the account number is a BD mobile number; both
+        // the local and the international form are accepted.
+        assert!(validate_payout_account("bkash", "Rahim Uddin", "01712345678").is_ok());
+        assert!(validate_payout_account("nagad", "Rahim Uddin", "+8801712345678").is_ok());
+        assert!(validate_payout_account("bkash", "Rahim Uddin", "01212345678").is_err());
+        assert!(validate_payout_account("bkash", "Rahim Uddin", "12345").is_err());
+        assert!(validate_payout_account("nagad", "Rahim Uddin", "").is_err());
+        // Bank: holder name required; number 6..=24 alphanumeric.
+        assert!(validate_payout_account("bank", "Rahim Uddin", "12345678901").is_ok());
+        assert!(validate_payout_account("bank", "Rahim Uddin", "AC123456").is_ok());
+        assert!(validate_payout_account("bank", "", "12345678901").is_err());
+        assert!(validate_payout_account("bank", "  ", "12345678901").is_err());
+        assert!(validate_payout_account("bank", "Rahim Uddin", "12345").is_err());
+        assert!(validate_payout_account("bank", "Rahim Uddin", "1234567890123456789012345").is_err());
+        assert!(validate_payout_account("bank", "Rahim Uddin", "1234-5678").is_err());
+        // Unknown methods are rejected outright.
+        assert!(validate_payout_account("rocket", "Rahim Uddin", "01712345678").is_err());
+        assert!(validate_payout_account("", "Rahim Uddin", "01712345678").is_err());
+    }
+
+    #[test]
+    fn payout_amount_validation() {
+        // The minimum is 50_000 poisha (500 taka).
+        assert_eq!(MIN_PAYOUT_POISHA, 50_000);
+        assert!(validate_payout_amount(49_999, 184_000).is_err());
+        assert!(validate_payout_amount(0, 184_000).is_err());
+        assert!(validate_payout_amount(-1, 184_000).is_err());
+        // At the minimum and within the balance: fine.
+        assert!(validate_payout_amount(50_000, 184_000).is_ok());
+        assert!(validate_payout_amount(184_000, 184_000).is_ok());
+        // Above the available balance: rejected, even past the minimum.
+        assert!(validate_payout_amount(184_001, 184_000).is_err());
+        assert!(validate_payout_amount(50_000, 0).is_err());
     }
 }
