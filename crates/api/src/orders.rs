@@ -4,9 +4,10 @@
 //! the cart's product rows, validates stock, splits the cart per seller
 //! (`split_cart_by_seller`), computes every money figure with the pure
 //! domain function `build_order_totals` (which itself reuses the Wave 1
-//! delivery-charge and commission functions), writes order + sub_orders
-//! + order_items with price/title snapshots, decrements stock and clears
-//! the cart. If any step fails the whole checkout rolls back — a buyer
+//! delivery-charge and commission functions), writes the order, its
+//! sub_orders and order_items with price/title snapshots, decrements
+//! stock and clears the cart. If any step fails the whole checkout
+//! rolls back — a buyer
 //! can never be charged for half an order.
 //!
 //! Wave 3 payment rule: COD only. Other methods are rejected with a
