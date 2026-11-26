@@ -7,6 +7,8 @@ export default function SellerDashboardPage() {
       <p>
         <Link href="/seller/products">আমার পণ্য — My products</Link>
         {" · "}
+        <Link href="/seller/orders">আমার বিক্রির অর্ডার — Seller orders</Link>
+        {" · "}
         <Link href="/login">লগইন — Login</Link>
       </p>
       <p>

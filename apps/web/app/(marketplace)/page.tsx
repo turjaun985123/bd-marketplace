@@ -14,6 +14,10 @@ export default function MarketplaceHomePage() {
       </p>
       <p>
         <Link href="/login">লগইন / বিক্রেতা হোন — Login</Link>
+        {" · "}
+        <Link href="/cart">আমার কার্ট — Cart</Link>
+        {" · "}
+        <Link href="/orders">আমার অর্ডার — My orders</Link>
       </p>
 
       <h2>পণ্য — Products</h2>

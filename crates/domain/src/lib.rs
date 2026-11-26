@@ -137,6 +137,147 @@ pub fn compute_commission(subtotal_poisha: i64, rate_bps: u32) -> CommissionQuot
     }
 }
 
+impl DeliveryZone {
+    /// The snake_case string stored in the database (`orders.delivery_zone`)
+    /// and used by the checkout API payload.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DeliveryZone::InsideDhaka => "inside_dhaka",
+            DeliveryZone::DhakaSuburb => "dhaka_suburb",
+            DeliveryZone::OutsideDhaka => "outside_dhaka",
+        }
+    }
+}
+
+/// Parse a delivery zone from its snake_case database/API string
+/// (`inside_dhaka`, `dhaka_suburb`, `outside_dhaka`). Returns `None`
+/// for anything else. Inverse of [`DeliveryZone::as_str`].
+pub fn parse_delivery_zone(value: &str) -> Option<DeliveryZone> {
+    match value {
+        "inside_dhaka" => Some(DeliveryZone::InsideDhaka),
+        "dhaka_suburb" => Some(DeliveryZone::DhakaSuburb),
+        "outside_dhaka" => Some(DeliveryZone::OutsideDhaka),
+        _ => None,
+    }
+}
+
+/// Maximum quantity of a single product in a cart.
+pub const MAX_CART_QUANTITY: u32 = 99;
+
+/// Validate a cart quantity: a single line may hold 1..=99 units.
+/// Takes `i64` so raw JSON numbers can be handed over unchecked;
+/// returns the quantity as `u32` on success.
+pub fn validate_cart_quantity(quantity: i64) -> Result<u32, String> {
+    if (1..=i64::from(MAX_CART_QUANTITY)).contains(&quantity) {
+        Ok(quantity as u32)
+    } else {
+        Err(format!(
+            "quantity must be between 1 and {MAX_CART_QUANTITY}"
+        ))
+    }
+}
+
+/// One seller's group of cart items, ready for order-total computation.
+/// `weight_kg` is the group's total billable weight (callers decide how
+/// weight is derived — Wave 3 uses 1 kg per item unit).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderGroupInput {
+    pub store_id: String,
+    pub items: Vec<CartItem>,
+    pub weight_kg: u32,
+}
+
+/// Money breakdown for one seller's sub-order, all in poisha.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubOrderTotals {
+    pub goods_subtotal_poisha: i64,
+    pub delivery_charge_poisha: i64,
+    pub commission_poisha: i64,
+    pub seller_payout_poisha: i64,
+}
+
+/// Full money breakdown of a split order: one entry per seller group,
+/// in the same order as the input groups, plus the order-level totals.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderTotals {
+    pub sub_orders: Vec<SubOrderTotals>,
+    pub goods_total_poisha: i64,
+    pub delivery_total_poisha: i64,
+    /// What the buyer pays (COD): goods + delivery.
+    pub grand_total_poisha: i64,
+}
+
+/// Compute every money figure for a split order from per-seller groups.
+///
+/// This is a composition of the existing atomic functions — it does NOT
+/// re-implement their maths: the delivery charge comes from
+/// [`calculate_delivery_charge`] (the COD amount passed is the group's
+/// goods subtotal; the Wave 1 charge rule validates the COD amount but
+/// does not price on it, so the charge is exact) and commission/payout
+/// from [`compute_commission`]
+/// applied to the goods subtotal only.
+pub fn build_order_totals(
+    groups: &[OrderGroupInput],
+    zone: DeliveryZone,
+    commission_rate_bps: u32,
+) -> OrderTotals {
+    let mut sub_orders = Vec::with_capacity(groups.len());
+    let mut goods_total_poisha = 0i64;
+    let mut delivery_total_poisha = 0i64;
+
+    for group in groups {
+        let goods_subtotal_poisha: i64 =
+            group.items.iter().map(CartItem::line_total_poisha).sum();
+        let delivery_charge_poisha = calculate_delivery_charge(
+            zone,
+            group.weight_kg,
+            goods_subtotal_poisha,
+        );
+        let quote = compute_commission(goods_subtotal_poisha, commission_rate_bps);
+        goods_total_poisha += goods_subtotal_poisha;
+        delivery_total_poisha += delivery_charge_poisha;
+        sub_orders.push(SubOrderTotals {
+            goods_subtotal_poisha,
+            delivery_charge_poisha,
+            commission_poisha: quote.commission_poisha,
+            seller_payout_poisha: quote.seller_payout_poisha,
+        });
+    }
+
+    OrderTotals {
+        sub_orders,
+        goods_total_poisha,
+        delivery_total_poisha,
+        grand_total_poisha: goods_total_poisha + delivery_total_poisha,
+    }
+}
+
+/// Sub-order (per-seller fulfilment) statuses — mirrors the DB CHECK
+/// constraint on `sub_orders.status`.
+pub fn is_valid_sub_order_status(status: &str) -> bool {
+    matches!(
+        status,
+        "placed" | "confirmed" | "shipped" | "delivered" | "returned" | "cancelled"
+    )
+}
+
+/// May a sub-order move from `from` to `to`? The single transition table
+/// for seller fulfilment: forward flow placed → confirmed → shipped →
+/// delivered; a not-yet-shipped sub-order may be cancelled; a shipped
+/// one may be returned. Everything else (skips, backwards moves,
+/// same-state, moves out of a terminal state) is rejected.
+pub fn can_transition_sub_order(from: &str, to: &str) -> bool {
+    matches!(
+        (from, to),
+        ("placed", "confirmed")
+            | ("confirmed", "shipped")
+            | ("shipped", "delivered")
+            | ("placed", "cancelled")
+            | ("confirmed", "cancelled")
+            | ("shipped", "returned")
+    )
+}
+
 /// Validate a Bangladeshi mobile number in local form: exactly 11 ASCII
 /// digits, starting with `01`, third digit in 3..=9 (operator prefixes
 /// 013–019). Pure helper — the single source of truth for phone rules.
@@ -395,5 +536,135 @@ mod tests {
         let mut bad = ok;
         bad.status = "live".to_string();
         assert!(validate_product_input(&bad).is_err());
+    }
+
+    #[test]
+    fn delivery_zone_string_round_trip() {
+        for zone in [
+            DeliveryZone::InsideDhaka,
+            DeliveryZone::DhakaSuburb,
+            DeliveryZone::OutsideDhaka,
+        ] {
+            assert_eq!(parse_delivery_zone(zone.as_str()), Some(zone));
+        }
+        assert_eq!(DeliveryZone::InsideDhaka.as_str(), "inside_dhaka");
+        assert_eq!(DeliveryZone::DhakaSuburb.as_str(), "dhaka_suburb");
+        assert_eq!(DeliveryZone::OutsideDhaka.as_str(), "outside_dhaka");
+        assert_eq!(parse_delivery_zone("InsideDhaka"), None);
+        assert_eq!(parse_delivery_zone("dhaka"), None);
+        assert_eq!(parse_delivery_zone(""), None);
+    }
+
+    #[test]
+    fn cart_quantity_bounds() {
+        assert_eq!(validate_cart_quantity(1), Ok(1));
+        assert_eq!(validate_cart_quantity(99), Ok(99));
+        assert!(validate_cart_quantity(0).is_err());
+        assert!(validate_cart_quantity(100).is_err());
+        assert!(validate_cart_quantity(-3).is_err());
+    }
+
+    fn group(store: &str, items: Vec<CartItem>, weight_kg: u32) -> OrderGroupInput {
+        OrderGroupInput {
+            store_id: store.to_string(),
+            items,
+            weight_kg,
+        }
+    }
+
+    #[test]
+    fn order_totals_two_sellers_match_worked_example() {
+        // The MVP-plan worked example, through build_order_totals:
+        // two sellers, goods 2,450 + 2,000 BDT, one 1 kg parcel each,
+        // outside Dhaka -> delivery 120 BDT per seller.
+        let groups = vec![
+            group("store-a", vec![item("store-a", "p1", 1, 2_450)], 1),
+            group("store-b", vec![item("store-b", "p2", 1, 2_000)], 1),
+        ];
+        let totals = build_order_totals(&groups, DeliveryZone::OutsideDhaka, 800);
+        assert_eq!(totals.goods_total_poisha, 445_000);
+        assert_eq!(totals.delivery_total_poisha, 24_000);
+        assert_eq!(totals.grand_total_poisha, 469_000); // 4,690 BDT
+        assert_eq!(totals.sub_orders.len(), 2);
+        assert_eq!(totals.sub_orders[0].goods_subtotal_poisha, 245_000);
+        assert_eq!(totals.sub_orders[0].delivery_charge_poisha, 12_000);
+        assert_eq!(totals.sub_orders[0].commission_poisha, 19_600); // 8% of 2,450
+        assert_eq!(totals.sub_orders[0].seller_payout_poisha, 225_400);
+        assert_eq!(totals.sub_orders[1].commission_poisha, 16_000); // 8% of 2,000
+        assert_eq!(totals.sub_orders[1].seller_payout_poisha, 184_000);
+        let payout_sum: i64 = totals
+            .sub_orders
+            .iter()
+            .map(|s| s.seller_payout_poisha)
+            .sum();
+        assert_eq!(payout_sum, 409_400); // sellers receive 4,094 BDT for goods
+    }
+
+    #[test]
+    fn order_totals_single_seller_with_weight_and_quantities() {
+        // One seller: 2 x 1,500 BDT + 1 x 500 BDT = 3,500 BDT goods,
+        // 3 units -> 3 kg, inside Dhaka: 60 + 2*20 = 100 BDT delivery.
+        let groups = vec![group(
+            "store-a",
+            vec![
+                item("store-a", "p1", 2, 1_500),
+                item("store-a", "p2", 1, 500),
+            ],
+            3,
+        )];
+        let totals = build_order_totals(&groups, DeliveryZone::InsideDhaka, 800);
+        assert_eq!(totals.goods_total_poisha, 350_000);
+        assert_eq!(totals.delivery_total_poisha, 10_000);
+        assert_eq!(totals.grand_total_poisha, 360_000);
+        assert_eq!(totals.sub_orders[0].commission_poisha, 28_000);
+        assert_eq!(totals.sub_orders[0].seller_payout_poisha, 322_000);
+    }
+
+    #[test]
+    fn order_totals_empty_groups_are_zero() {
+        let totals = build_order_totals(&[], DeliveryZone::DhakaSuburb, 800);
+        assert!(totals.sub_orders.is_empty());
+        assert_eq!(totals.goods_total_poisha, 0);
+        assert_eq!(totals.delivery_total_poisha, 0);
+        assert_eq!(totals.grand_total_poisha, 0);
+    }
+
+    #[test]
+    fn sub_order_transition_table() {
+        // The allowed forward/cancel/return moves.
+        for (from, to) in [
+            ("placed", "confirmed"),
+            ("confirmed", "shipped"),
+            ("shipped", "delivered"),
+            ("placed", "cancelled"),
+            ("confirmed", "cancelled"),
+            ("shipped", "returned"),
+        ] {
+            assert!(can_transition_sub_order(from, to), "{from} -> {to}");
+        }
+        // Everything else is rejected: skips, backwards, same-state,
+        // moves out of terminal states, unknown statuses.
+        for (from, to) in [
+            ("placed", "shipped"),
+            ("placed", "delivered"),
+            ("placed", "returned"),
+            ("placed", "placed"),
+            ("confirmed", "delivered"),
+            ("confirmed", "returned"),
+            ("confirmed", "placed"),
+            ("shipped", "cancelled"),
+            ("shipped", "confirmed"),
+            ("delivered", "returned"),
+            ("delivered", "cancelled"),
+            ("cancelled", "confirmed"),
+            ("returned", "shipped"),
+            ("bogus", "confirmed"),
+            ("placed", "bogus"),
+        ] {
+            assert!(!can_transition_sub_order(from, to), "{from} -> {to}");
+        }
+        assert!(is_valid_sub_order_status("placed"));
+        assert!(is_valid_sub_order_status("returned"));
+        assert!(!is_valid_sub_order_status("bogus"));
     }
 }

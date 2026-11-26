@@ -63,7 +63,8 @@ pub struct ProductList {
 }
 
 /// Clamp pagination inputs to sane bounds (page >= 1, 1 <= limit <= 100).
-fn clamp_pagination(page: Option<i64>, limit: Option<i64>) -> (i64, i64) {
+/// Shared with the orders module — one pagination rule for the whole API.
+pub(crate) fn clamp_pagination(page: Option<i64>, limit: Option<i64>) -> (i64, i64) {
     let page = page.unwrap_or(1).max(1);
     let limit = limit.unwrap_or(20).clamp(1, 100);
     (page, limit)

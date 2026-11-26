@@ -43,9 +43,11 @@ apps/web/               Next.js (App Router, TypeScript)
   app/(storefront)/     per-seller storefront     ->  /[store]
   app/(seller)/         seller dashboard          ->  /seller
   app/(admin)/          platform admin            ->  /admin
-  components/           ProductCard, PriceTag, DeliveryChargeWidget
-  hooks/                useDeliveryCharge (only caller of /v1/delivery-charge)
-  lib/                  formatBdt and shared helpers
+  components/           ProductCard, PriceTag, DeliveryChargeWidget, ProductGrid
+  hooks/                useAuth, useCart (only cart caller),
+                        useDeliveryCharge (only caller of /v1/delivery-charge)
+  lib/                  api.ts typed client (one function per endpoint),
+                        formatBdt and shared helpers
 crates/domain/          pure, unit-tested domain functions (no DB, no network)
 crates/courier/         CourierAdapter trait + Tier 1 stubs (Steadfast, Pathao, RedX)
 crates/payments/        PaymentAdapter trait + COD (records intent) + stubs
@@ -54,9 +56,14 @@ crates/api/             Axum API — thin handlers over service functions
   src/auth.rs           phone + OTP + JWT service functions + SmsSender trait
   src/stores.rs         store create/get service functions
   src/products.rs       product CRUD + the ONE shared listing function
+  src/cart.rs           one cart per buyer: add/set/remove/clear + cart view
+  src/orders.rs         COD checkout (one transaction), buyer orders,
+                        seller sub-orders + status transitions
   tests/wave2.rs        end-to-end integration test (needs DATABASE_URL)
+  tests/wave3.rs        cart + split checkout integration test (same gate)
 crates/worker/          Tokio worker binary (jobs listed, implementation TODO)
-migrations/             SQLx migrations (users, stores, otp_codes, products)
+migrations/             SQLx migrations (users, stores, otp_codes, products,
+                        carts, orders, sub_orders, order_items)
 infra/docker-compose.yml  Postgres + Redis + MinIO
 .env.example            every environment variable, no real values
 .github/workflows/ci.yml  Rust tests/clippy (with a Postgres service) + Next.js build
@@ -86,6 +93,41 @@ Wave 2 (Postgres-backed; return 503 when `DATABASE_URL` is not set):
 | PATCH | `/v1/products/{id}` | Bearer (owner) | Update title/price/stock/status |
 | GET | `/v1/products?q=&store_slug=&page=&limit=` | — | Marketplace listing: active products, title/title_bn search (ILIKE + pg_trgm), pagination |
 | GET | `/v1/stores/{slug}/products` | — | Storefront listing — the SAME service function as the marketplace listing, with the store filter set |
+
+Wave 3 (Postgres-backed, Bearer auth on everything):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| POST | `/v1/cart/items` | Add a product to your cart (must be `active`; quantities accumulate, result must stay within 1..=99) |
+| GET | `/v1/cart` | Your cart: lines with title/price/store + goods total |
+| PATCH | `/v1/cart/items/{product_id}` | Set a line's quantity (0 removes the line) |
+| DELETE | `/v1/cart/items/{product_id}` | Remove one line |
+| DELETE | `/v1/cart` | Empty the cart |
+| POST | `/v1/orders` | Checkout: split the cart per seller and place one order (see below) |
+| GET | `/v1/orders?page=&limit=` | Your own orders, newest first, with sub-orders + items |
+| GET | `/v1/orders/{id}` | One of your own orders (another buyer's order is a 404) |
+| GET | `/v1/seller/sub-orders?page=&limit=` | Sub-orders for stores you own, with items + delivery details |
+| PATCH | `/v1/seller/sub-orders/{id}/status` | Move a sub-order's status (owner only; the domain transition table decides legality) |
+
+Checkout (`POST /v1/orders`) runs in ONE transaction: it locks the
+cart's product rows (`FOR UPDATE`), rejects an empty cart (400),
+non-active products (400) and insufficient stock (409, naming the
+product), then splits by seller (`split_cart_by_seller`) and computes
+every figure with `build_order_totals` — per sub-order: goods subtotal,
+delivery charge (Wave 1 function), commission and seller payout (Wave 1
+function, on the goods subtotal only). It writes the order, sub_orders
+and order_items (title/price snapshots), decrements stock and clears
+the cart — all-or-nothing. **Payment: COD only in Wave 3** — any other
+`payment_method` is a 400 ("not yet available", online payments are
+Wave 5). **Weight assumption: 1 kg per item unit** — products have no
+weight column yet, so a sub-order's billable weight is its total unit
+count. Commission rate comes from `COMMISSION_RATE_BPS` (default 800 =
+8%), read once at startup.
+
+Sub-order status flow (pure domain function `can_transition_sub_order`,
+unit-tested): `placed → confirmed → shipped → delivered`, plus
+`placed/confirmed → cancelled` and `shipped → returned`. Everything
+else is a 400.
 
 Auth rules that matter: only a SHA-256 hash of an OTP is ever stored;
 ownership is checked on every seller mutation (403 for non-owners);
@@ -153,7 +195,8 @@ cd apps/web
 npm install
 NEXT_PUBLIC_API_BASE_URL=http://localhost:8080 npm run dev   # http://localhost:3000
 # Pages: / (marketplace, real product grid), /login (phone + OTP),
-# /seller and /seller/products (seller catalogue + create form)
+# /cart, /checkout, /orders (buyer), /seller, /seller/products
+# (seller catalogue + create form) and /seller/orders (sub-orders)
 ```
 
 ## Scope — what is real, stubbed and TODO
@@ -176,6 +219,24 @@ service; Next.js typed API client (`lib/api.ts`), `useAuth` hook, real
 marketplace product grid, `/login` (phone → OTP) and
 `/seller/products` pages.
 
+**Real (Wave 3):** carts (one per buyer; add/set/remove/clear, domain
+quantity bounds 1..=99); split checkout in a single transaction with
+stock locking, snapshots and stock decrement; orders + sub_orders +
+order_items migrations; all checkout money computed by the new pure
+domain function `build_order_totals` composing the Wave 1 delivery /
+commission functions (unit tests include the two-seller ৳4,690 worked
+example and the sub-order transition table); buyer order history;
+seller sub-order list + status updates (owner-only, domain-checked
+transitions); an end-to-end integration test
+(`crates/api/tests/wave3.rs`, same `DATABASE_URL` gate) covering a
+two-seller COD checkout outside Dhaka (grand total ৳4,690), stock
+decrement, cart clearing, the insufficient-stock 409 and legal/illegal
+status transitions; Next.js `useCart` hook (the only cart caller),
+add-to-cart in the product grid, `/cart`, `/checkout` (per-seller
+delivery preview via the shared `useDeliveryCharge` hook — the
+server's totals at order time are final), `/orders` and
+`/seller/orders` pages.
+
 **Stubbed (typed `NotConfigured` errors — never fake success, no network
 calls, no credentials):** Steadfast / Pathao / RedX courier adapters;
 bKash / Nagad / SSLCommerz / ShurjoPay payment adapters. Tier 1b couriers
@@ -183,17 +244,18 @@ bKash / Nagad / SSLCommerz / ShurjoPay payment adapters. Tier 1b couriers
 Karatoa, Carrybee) join behind the same traits later. SMS sending has
 only the dev-mode log implementation (see the dev OTP flow above).
 
-**TODO / not wired:** Redis, orders/checkout persistence, courier
-booking, payouts, a real SMS gateway, SIDRA calls, worker jobs (the
-worker logs its planned jobs and exits cleanly).
+**TODO / not wired:** Redis, online payments (bKash/Nagad/SSLCommerz —
+Wave 5), courier booking, payouts, a real SMS gateway, SIDRA calls,
+worker jobs (the worker logs its planned jobs and exits cleanly).
 
 ## Verification status
 
 - **Next.js: verified on this machine** — `npm ci && npm run build`
-  passes (Wave 2 routes `/login` and `/seller/products` included).
+  passes (Wave 3 routes `/cart`, `/checkout`, `/orders` and
+  `/seller/orders` included).
 - **Rust: NOT compiled locally** — this development VM has no `cargo`
   installed, by design. Rust compilation, `cargo test --workspace`
-  (including the Wave 2 integration test against CI's Postgres service)
-  and clippy `-D warnings` are verified via **GitHub Actions CI**
-  (`.github/workflows/ci.yml`) on push. Wave 1 was green there; Wave 2
-  awaits its first CI run.
+  (including the Wave 2 + Wave 3 integration tests against CI's
+  Postgres service) and clippy `-D warnings` are verified via
+  **GitHub Actions CI** (`.github/workflows/ci.yml`) on push. Waves 1–2
+  are green there (Wave 2 at `0eb1ac1`); Wave 3 awaits its first CI run.

@@ -3,10 +3,11 @@
 //!
 //! Wave 1: stateless domain endpoints (delivery charge, cart split,
 //! commission). Wave 2: Postgres persistence (SQLx), phone + OTP + JWT
-//! auth, stores and products. Handlers only parse/validate, call ONE
-//! service function, and return its result — business rules live in the
-//! `domain` crate (pure functions) or in the service functions in the
-//! `auth`, `stores` and `products` modules, never inside handlers.
+//! auth, stores and products. Wave 3: carts, split orders and COD
+//! checkout (`cart` and `orders` modules). Handlers only parse/validate,
+//! call ONE service function, and return its result — business rules
+//! live in the `domain` crate (pure functions) or in the service
+//! functions in the per-resource modules, never inside handlers.
 //!
 //! Database behaviour: when `DATABASE_URL` is set at startup the API
 //! connects and runs the workspace migrations automatically. When it is
@@ -14,13 +15,15 @@
 //! endpoints; DB-backed endpoints return a clear 503 instead of panicking.
 
 pub mod auth;
+pub mod cart;
+pub mod orders;
 pub mod products;
 pub mod stores;
 
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, patch, post},
     Json, Router,
 };
 use domain::{
@@ -41,7 +44,14 @@ pub struct AppState {
     /// True only in explicit dev mode (`APP_ENV=dev` or `SMS_DEV_MODE=true`).
     /// Gates the log SMS sender and the `dev_otp` response field.
     pub sms_dev_mode: bool,
+    /// Platform commission rate in basis points (800 = 8%). Read once at
+    /// startup from `COMMISSION_RATE_BPS` (see `from_env`); checkout
+    /// passes it to the domain `build_order_totals` function.
+    pub commission_rate_bps: u32,
 }
+
+/// Default commission rate: 8% (matches the MVP plan's worked example).
+pub const DEFAULT_COMMISSION_RATE_BPS: u32 = 800;
 
 impl AppState {
     pub fn new(pool: Option<PgPool>, jwt_secret: String, sms_dev_mode: bool) -> Self {
@@ -49,6 +59,7 @@ impl AppState {
             pool,
             jwt_secret,
             sms_dev_mode,
+            commission_rate_bps: DEFAULT_COMMISSION_RATE_BPS,
         }
     }
 
@@ -70,7 +81,20 @@ impl AppState {
         };
         let sms_dev_mode = std::env::var("APP_ENV").map(|v| v == "dev").unwrap_or(false)
             || std::env::var("SMS_DEV_MODE").map(|v| v == "true").unwrap_or(false);
-        AppState::new(pool, jwt_secret, sms_dev_mode)
+        let mut state = AppState::new(pool, jwt_secret, sms_dev_mode);
+        // COMMISSION_RATE_BPS is read once, here at startup; invalid or
+        // out-of-range values keep the default rather than breaking money
+        // maths later.
+        if let Ok(raw) = std::env::var("COMMISSION_RATE_BPS") {
+            match raw.parse::<u32>() {
+                Ok(rate) if rate <= 10_000 => state.commission_rate_bps = rate,
+                _ => eprintln!(
+                    "WARNING: COMMISSION_RATE_BPS='{raw}' is invalid — \
+                     using the default {DEFAULT_COMMISSION_RATE_BPS} bps"
+                ),
+            }
+        }
+        state
     }
 
     /// The pool, or a clear 503 when the API runs without a database.
@@ -245,6 +269,28 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/v1/products/:id",
             get(products::get_product).patch(products::update_product),
+        )
+        // Wave 3 — cart (one cart per signed-in buyer).
+        .route("/v1/cart", get(cart::get_cart).delete(cart::clear))
+        .route("/v1/cart/items", post(cart::add_item))
+        .route(
+            "/v1/cart/items/:product_id",
+            patch(cart::set_item_quantity).delete(cart::remove_item),
+        )
+        // Wave 3 — checkout + buyer orders.
+        .route(
+            "/v1/orders",
+            post(orders::create_order).get(orders::list_orders),
+        )
+        .route("/v1/orders/:id", get(orders::get_order))
+        // Wave 3 — seller sub-orders.
+        .route(
+            "/v1/seller/sub-orders",
+            get(orders::list_seller_sub_orders_handler),
+        )
+        .route(
+            "/v1/seller/sub-orders/:id/status",
+            patch(orders::update_sub_order_status_handler),
         )
         .layer(CorsLayer::permissive())
         .with_state(state)
