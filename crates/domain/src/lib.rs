@@ -3259,11 +3259,17 @@ pub fn validate_api_key_scopes(scopes: &[String]) -> Result<Vec<String>, String>
             ));
         }
     }
-    Ok(API_KEY_SCOPES
-        .iter()
-        .filter(|scope| scopes.iter().any(|s| s.as_str() == *scope))
-        .map(|scope| scope.to_string())
-        .collect())
+    // Plain loop, not iterator filter: `scope` here is `&&str`
+    // so `*scope` is `&str` and compares cleanly with
+    // `s.as_str()` (the filter-closure form tripped E0277,
+    // `str` vs `&str`, in CI run 45845322564).
+    let mut out: Vec<String> = Vec::new();
+    for scope in API_KEY_SCOPES {
+        if scopes.iter().any(|s| s.as_str() == *scope) {
+            out.push((*scope).to_string());
+        }
+    }
+    Ok(out)
 }
 
 /// May a key carrying `scopes` make this call (Wave 37)?
