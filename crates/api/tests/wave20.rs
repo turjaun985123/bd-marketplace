@@ -28,7 +28,7 @@ async fn call(
     uri: &str,
     body: Option<Value>,
 ) -> (StatusCode, Value) {
-    let mut builder = Request::builder().method(method).uri(uri);
+    let builder = Request::builder().method(method).uri(uri);
     let request = match body {
         Some(value) => builder
             .header("Content-Type", "application/json")
