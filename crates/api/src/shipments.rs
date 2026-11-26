@@ -1,31 +1,41 @@
 //! Shipments: courier booking for seller sub-orders, tracking
-//! refresh, and courier availability (Wave 6).
+//! refresh, and courier availability (Wave 6). Wave 7 adds the
+//! Pathao and RedX adapters behind the same factory, per-courier
+//! delivery-charge estimates (`GET /v1/couriers/estimate`), and
+//! smart routing: booking with courier `auto` resolves to the
+//! cheapest available courier through the domain `choose_courier`
+//! function, and the shipment stores the CHOSEN courier's name.
 //!
 //! Honesty rules for this module, mirroring the payments module: a
 //! shipment exists only when a courier adapter actually booked it —
-//! the real Steadfast adapter with merchant credentials, or the DEV
-//! courier simulator behind its explicit dev flag (its consignment
-//! ids are prefixed `DEV-`). Without credentials and without dev
-//! mode, booking is a 503 and nothing is written. Statuses live in
-//! the domain crate's unified shipment set; the legal moves are the
+//! a real adapter with merchant credentials, or the DEV courier
+//! simulator behind its explicit dev flag (its consignment ids are
+//! prefixed `DEV-`). Without credentials and without dev mode,
+//! booking is a 503 and nothing is written. Statuses live in the
+//! domain crate's unified shipment set; the legal moves are the
 //! domain transition table's, never this module's invention.
+//! Estimates are the adapters' local domain-tariff estimates, never
+//! live courier quotes, and the responses say so by construction:
+//! an unavailable courier has no price at all.
 //!
 //! One shipment per sub-order: the database enforces it (UNIQUE on
 //! `shipments.sub_order_id`) and this module checks first so the
 //! seller gets a clean 409 instead of a constraint error.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
 use chrono::{DateTime, Utc};
 use courier::{
-    courier_adapter_for, courier_credentials_complete, CourierError, CouriersConfig, Parcel,
-    ShipmentRequest, KNOWN_COURIERS,
+    courier_adapter_for, courier_credentials_complete, pathao_credentials_complete,
+    redx_credentials_complete, CourierError, CouriersConfig, Parcel, ShipmentRequest,
+    KNOWN_COURIERS,
 };
 use domain::{
-    can_transition_shipment, can_transition_sub_order, parse_delivery_zone, weight_kg_from_grams,
+    can_transition_shipment, can_transition_sub_order, choose_courier, parse_delivery_zone,
+    validate_weight_grams, weight_kg_from_grams, CourierQuote, DeliveryZone,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
@@ -136,30 +146,47 @@ pub async fn load_shipment_summary_for_sub_order(
     }))
 }
 
-/// Availability of every known courier under the current config:
-/// Steadfast is `live` when its merchant credentials are complete;
-/// any known courier is available in `dev` mode (the simulator
-/// serves it); everything else is honestly `not_configured`.
+/// Does this courier have complete merchant credentials in the
+/// config? Steadfast, Pathao and RedX have real adapters with their
+/// own completeness rules (Wave 6/7); eCourier and Paperfly are
+/// still stubs, so they never report live.
+fn courier_has_live_credentials(name: &str, config: &CouriersConfig) -> bool {
+    match name {
+        "steadfast" => courier_credentials_complete(&config.steadfast),
+        "pathao" => pathao_credentials_complete(&config.pathao),
+        "redx" => redx_credentials_complete(&config.redx),
+        _ => false,
+    }
+}
+
+/// Availability of ONE courier under the current config: `live`
+/// when its merchant credentials are complete; available in `dev`
+/// mode when the simulator is on (the simulator serves every known
+/// courier); otherwise honestly `not_configured`. The single
+/// availability rule — the availability list, the estimate endpoint
+/// and smart routing all read it from here.
+pub fn courier_availability_entry(name: &str, config: &CouriersConfig) -> CourierAvailability {
+    let (available, mode, reason) = if courier_has_live_credentials(name, config) {
+        (true, Some("live".to_string()), None)
+    } else if config.dev_mode {
+        (true, Some("dev".to_string()), None)
+    } else {
+        (false, None, Some("not_configured".to_string()))
+    };
+    CourierAvailability {
+        courier: name.to_string(),
+        available,
+        mode,
+        reason,
+        is_default: name == config.default_courier,
+    }
+}
+
+/// Availability of every known courier under the current config.
 pub fn courier_availability(config: &CouriersConfig) -> Vec<CourierAvailability> {
     KNOWN_COURIERS
         .iter()
-        .map(|name| {
-            let (available, mode, reason) =
-                if *name == "steadfast" && courier_credentials_complete(&config.steadfast) {
-                    (true, Some("live".to_string()), None)
-                } else if config.dev_mode {
-                    (true, Some("dev".to_string()), None)
-                } else {
-                    (false, None, Some("not_configured".to_string()))
-                };
-            CourierAvailability {
-                courier: name.to_string(),
-                available,
-                mode,
-                reason,
-                is_default: *name == config.default_courier,
-            }
-        })
+        .map(|name| courier_availability_entry(name, config))
         .collect()
 }
 
@@ -194,6 +221,142 @@ fn is_unique_violation(err: &sqlx::Error) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Estimates + smart routing (Wave 7)
+// ---------------------------------------------------------------------------
+
+/// One courier's delivery-charge estimate for a parcel. The price
+/// is present only for an available courier, and it is the
+/// adapter's local estimate under the platform tariff — never a
+/// live courier quote (see the module docs).
+#[derive(Debug, Serialize)]
+pub struct CourierEstimate {
+    pub courier: String,
+    pub available: bool,
+    /// `live` or `dev` when available (same rule as availability).
+    pub mode: Option<String>,
+    /// Machine-readable reason when unavailable (`not_configured`).
+    pub reason: Option<String>,
+    pub price_poisha: Option<i64>,
+}
+
+/// The estimate endpoint's answer: every known courier's estimate
+/// for one zone and weight, plus the smart-routing recommendation —
+/// the domain `choose_courier` verdict over these same numbers
+/// (`None` when no courier is available).
+#[derive(Debug, Serialize)]
+pub struct CourierEstimates {
+    pub zone: String,
+    pub weight_grams: i64,
+    pub estimates: Vec<CourierEstimate>,
+    pub recommended: Option<String>,
+}
+
+/// The parcel the estimates and routing price: billed per started
+/// kilogram exactly like checkout, and with no COD amount — a
+/// delivery-charge estimate never includes a COD fee (the Wave 1
+/// rule: no COD percentage is baked in anywhere).
+fn estimate_parcel(zone: DeliveryZone, weight_grams: i64) -> Parcel {
+    let weight_kg = weight_kg_from_grams(weight_grams).ceil().max(1.0) as u32;
+    Parcel {
+        weight_kg,
+        cod_amount_poisha: 0,
+        zone,
+    }
+}
+
+/// Price every known courier for one parcel: availability from the
+/// one shared rule, and for each available courier the adapter's
+/// local estimate. Returns the public estimates AND the routing
+/// quotes built from the same numbers, so the estimate endpoint and
+/// booking's `auto` resolution can never disagree. An available
+/// courier whose estimate call fails gets no quote — routing never
+/// picks a courier it could not price.
+async fn courier_quotes(
+    config: &CouriersConfig,
+    parcel: &Parcel,
+) -> (Vec<CourierEstimate>, Vec<CourierQuote<'static>>) {
+    let mut estimates = Vec::new();
+    let mut quotes = Vec::new();
+    for name in KNOWN_COURIERS {
+        let availability = courier_availability_entry(name, config);
+        // Only an available courier is ever priced: an unavailable
+        // courier's price must not exist, let alone be routed on.
+        let price_poisha = if availability.available {
+            match courier_adapter_for(name, config) {
+                Ok(adapter) => adapter.price_estimate(parcel).await.ok(),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        if let Some(price) = price_poisha {
+            quotes.push(CourierQuote {
+                courier: name,
+                available: true,
+                price_poisha: price,
+            });
+        }
+        estimates.push(CourierEstimate {
+            courier: availability.courier,
+            available: availability.available,
+            mode: availability.mode,
+            reason: availability.reason,
+            price_poisha,
+        });
+    }
+    (estimates, quotes)
+}
+
+/// Estimate every courier for a zone and weight, and recommend one.
+/// The estimate endpoint's one service function.
+pub async fn estimate_couriers(
+    state: &AppState,
+    zone: DeliveryZone,
+    weight_grams: i64,
+) -> CourierEstimates {
+    let parcel = estimate_parcel(zone, weight_grams);
+    let (estimates, quotes) = courier_quotes(&state.couriers_config, &parcel).await;
+    CourierEstimates {
+        zone: zone.as_str().to_string(),
+        weight_grams,
+        estimates,
+        recommended: choose_courier(&quotes).map(str::to_string),
+    }
+}
+
+/// Resolve which courier serves a booking. THE one resolution
+/// function — the booking handler calls it and nothing else
+/// decides. No name means the configured default courier; an
+/// explicit name is used as given (the factory and the adapter then
+/// produce the honest 400 for an unknown name or 503 for an
+/// unconfigured one, exactly as before Wave 7); `auto` means smart
+/// routing — the cheapest available courier for this parcel by the
+/// domain rule, or a 503 when no courier can book at all. The
+/// resolved name is what gets stored on the shipment — never the
+/// literal string `auto`.
+pub async fn resolve_booking_courier(
+    state: &AppState,
+    requested: Option<&str>,
+    zone: DeliveryZone,
+    weight_grams: i64,
+) -> Result<String, ApiError> {
+    let config = &state.couriers_config;
+    match requested {
+        None => Ok(config.default_courier.clone()),
+        Some("auto") => {
+            let parcel = estimate_parcel(zone, weight_grams);
+            let (_estimates, quotes) = courier_quotes(config, &parcel).await;
+            choose_courier(&quotes).map(str::to_string).ok_or_else(|| {
+                ApiError::service_unavailable(
+                    "no courier is available for this booking (none configured)",
+                )
+            })
+        }
+        Some(name) => Ok(name.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Booking (seller)
 // ---------------------------------------------------------------------------
 
@@ -214,17 +377,22 @@ struct SubOrderBookingRow {
 }
 
 /// Book a courier shipment for one of the seller's CONFIRMED
-/// sub-orders. The adapter call happens first (it may be a network
-/// call for Steadfast, so no transaction is held across it); the
-/// shipment row, its `create` event and the sub-order's move to
-/// `shipped` then commit in ONE transaction. A duplicate booking is
-/// a 409 — checked up front, and the UNIQUE constraint is the
-/// backstop if two bookings race.
+/// sub-orders. The courier is resolved by
+/// [`resolve_booking_courier`] (explicit name, configured default,
+/// or `auto` smart routing) once the parcel's zone and weight are
+/// known. `area_id` is passed through for couriers whose API needs
+/// a numeric recipient area id (RedX); the rest ignore it. The
+/// adapter call happens first (it may be a network call, so no
+/// transaction is held across it); the shipment row, its `create`
+/// event and the sub-order's move to `shipped` then commit in ONE
+/// transaction. A duplicate booking is a 409 — checked up front,
+/// and the UNIQUE constraint is the backstop if two bookings race.
 pub async fn create_shipment_for_seller(
     state: &AppState,
     user: &AuthUser,
     sub_order_id: Uuid,
     courier_name: Option<&str>,
+    area_id: Option<i64>,
 ) -> Result<Shipment, ApiError> {
     let pool = state.require_pool()?;
     let config = &state.couriers_config;
@@ -264,11 +432,6 @@ pub async fn create_shipment_for_seller(
         ));
     }
 
-    let courier_name = courier_name
-        .map(str::to_string)
-        .unwrap_or_else(|| config.default_courier.clone());
-    let adapter = courier_adapter_for(&courier_name, config).map_err(courier_error_to_api)?;
-
     // Parcel weight: the sub-order's items at their products'
     // current weights, billed per started kilogram exactly like
     // checkout (Wave 4). Product weights can be edited after
@@ -286,6 +449,13 @@ pub async fn create_shipment_for_seller(
     let zone = parse_delivery_zone(&row.delivery_zone).ok_or_else(|| {
         ApiError::internal("parse delivery zone", sqlx::Error::RowNotFound)
     })?;
+
+    // Which courier serves this parcel: the seller's pick, the
+    // configured default, or `auto` smart routing over the
+    // estimates for this zone and weight.
+    let courier_name =
+        resolve_booking_courier(state, courier_name, zone, total_grams).await?;
+    let adapter = courier_adapter_for(&courier_name, config).map_err(courier_error_to_api)?;
 
     // The courier collects the sub-order's goods + delivery share
     // only when the order itself is pay-on-delivery; an online-paid
@@ -309,6 +479,7 @@ pub async fn create_shipment_for_seller(
             zone,
         },
         note: None,
+        area_id,
     };
 
     let booked = adapter
@@ -475,9 +646,40 @@ pub async fn list_couriers(State(state): State<AppState>) -> Json<Vec<CourierAva
 }
 
 #[derive(Deserialize)]
+pub struct CourierEstimateQuery {
+    /// Delivery zone (`inside_dhaka`, `dhaka_suburb`,
+    /// `outside_dhaka`); defaults to `inside_dhaka`.
+    pub zone: Option<String>,
+    /// Parcel weight in grams; defaults to 1,000 (1 kg) and is
+    /// validated by the same domain rule as product weights.
+    pub weight_grams: Option<i64>,
+}
+
+pub async fn courier_estimates(
+    State(state): State<AppState>,
+    Query(query): Query<CourierEstimateQuery>,
+) -> Result<Json<CourierEstimates>, ApiError> {
+    let zone = match query.zone.as_deref() {
+        None => DeliveryZone::InsideDhaka,
+        Some(raw) => parse_delivery_zone(raw)
+            .ok_or_else(|| ApiError::bad_request(format!("unknown delivery zone '{raw}'")))?,
+    };
+    let weight_grams = query.weight_grams.unwrap_or(1_000);
+    validate_weight_grams(weight_grams)
+        .map_err(|message| ApiError::bad_request(format!("weight_grams: {message}")))?;
+    Ok(Json(estimate_couriers(&state, zone, weight_grams).await))
+}
+
+#[derive(Deserialize)]
 pub struct CreateShipmentInput {
-    /// Courier name; omitted means the configured default courier.
+    /// Courier name; omitted means the configured default courier,
+    /// and `auto` means smart routing (the cheapest available
+    /// courier for this parcel — the shipment stores the chosen
+    /// courier's name, never the literal `auto`).
     pub courier: Option<String>,
+    /// Recipient area id for couriers whose API addresses areas by
+    /// numeric id (RedX requires one); ignored by the others.
+    pub area_id: Option<i64>,
 }
 
 pub async fn create_shipment(
@@ -486,8 +688,12 @@ pub async fn create_shipment(
     Path(id): Path<Uuid>,
     body: Option<Json<CreateShipmentInput>>,
 ) -> Result<(StatusCode, Json<Shipment>), ApiError> {
-    let courier = body.and_then(|Json(input)| input.courier);
-    let shipment = create_shipment_for_seller(&state, &user, id, courier.as_deref()).await?;
+    let (courier, area_id) = match body {
+        Some(Json(input)) => (input.courier, input.area_id),
+        None => (None, None),
+    };
+    let shipment =
+        create_shipment_for_seller(&state, &user, id, courier.as_deref(), area_id).await?;
     Ok((StatusCode::CREATED, Json(shipment)))
 }
 

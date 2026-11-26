@@ -135,6 +135,33 @@ export interface CourierInfo {
   is_default: boolean;
 }
 
+/**
+ * One courier's delivery-charge estimate (GET /v1/couriers/estimate,
+ * Wave 7). The price is the platform's local tariff estimate, never
+ * a live courier quote, and it is null for an unavailable courier.
+ */
+export interface CourierEstimate {
+  courier: string;
+  available: boolean;
+  /** "live" | "dev" | null — "dev" means the DEV simulator. */
+  mode: string | null;
+  /** Machine-readable reason when unavailable, e.g. "not_configured". */
+  reason: string | null;
+  price_poisha: number | null;
+}
+
+/**
+ * Estimates for one zone + weight, plus the smart-routing
+ * recommendation (cheapest available courier; platform priority
+ * breaks ties; null when no courier is available).
+ */
+export interface CourierEstimates {
+  zone: string;
+  weight_grams: number;
+  estimates: CourierEstimate[];
+  recommended: string | null;
+}
+
 /** Bangla label for a unified shipment status (display only). */
 export function shipmentStatusLabel(status: string): string {
   switch (status) {
@@ -537,20 +564,42 @@ export function getCouriers(): Promise<CourierInfo[]> {
 }
 
 /**
+ * GET /v1/couriers/estimate — per-courier delivery-charge estimates
+ * for a zone and weight, plus the smart-routing recommendation
+ * (Wave 7). Prices are local tariff estimates, not live quotes.
+ */
+export function getCourierEstimates(
+  zone: string,
+  weightGrams = 1000
+): Promise<CourierEstimates> {
+  return call(
+    `/v1/couriers/estimate?zone=${encodeURIComponent(zone)}&weight_grams=${weightGrams}`
+  );
+}
+
+/**
  * POST /v1/seller/sub-orders/{id}/shipment — book a courier shipment
  * for a confirmed sub-order (Wave 6). Omitting `courier` books the
- * platform's default courier. One shipment per sub-order: a second
- * booking is a 409, and with no courier configured it is a 503.
+ * platform's default courier; `courier: "auto"` (Wave 7) lets smart
+ * routing pick the cheapest available courier, and the shipment
+ * stores the chosen courier's name. `areaId` is the recipient's
+ * numeric area id for couriers that require one (RedX); the others
+ * ignore it. One shipment per sub-order: a second booking is a 409,
+ * and with no courier configured it is a 503.
  */
 export function createShipment(
   token: string,
   subOrderId: string,
-  courier?: string
+  courier?: string,
+  areaId?: number
 ): Promise<Shipment> {
+  const body: { courier?: string; area_id?: number } = {};
+  if (courier) body.courier = courier;
+  if (areaId !== undefined) body.area_id = areaId;
   return call(`/v1/seller/sub-orders/${encodeURIComponent(subOrderId)}/shipment`, {
     method: "POST",
     token,
-    body: courier ? { courier } : {},
+    body,
   });
 }
 

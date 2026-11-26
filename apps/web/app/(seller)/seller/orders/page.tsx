@@ -5,11 +5,13 @@ import Link from "next/link";
 import PriceTag from "@/components/PriceTag";
 import {
   createShipment,
+  getCourierEstimates,
   getCouriers,
   listSellerSubOrders,
   refreshShipment,
   shipmentStatusLabel,
   updateSubOrderStatus,
+  type CourierEstimates,
   type CourierInfo,
   type SellerSubOrder,
 } from "@/lib/api";
@@ -38,12 +40,22 @@ const STATUSES = [
  * available; unavailable couriers are disabled, dev-simulated ones
  * are labelled). A booked shipment shows its courier, consignment
  * id and unified status, with a tracking refresh button.
+ *
+ * Wave 7: the courier select gains an "অটো (সবচেয়ে সস্তা)" option —
+ * smart routing on the API picks the cheapest available courier and
+ * the shipment stores the chosen courier's name. Per-courier
+ * "আনুমানিক ৳X" texts come from GET /v1/couriers/estimate priced at
+ * the page-level zone of the first confirmed sub-order and a 1 kg
+ * parcel: they are the platform tariff's estimates for orientation,
+ * not live courier quotes, and each booking is priced by the API
+ * from the sub-order's real zone and weight.
  */
 export default function SellerOrdersPage() {
   const { ready, token } = useAuth();
   const [subOrders, setSubOrders] = useState<SellerSubOrder[] | null>(null);
   const [choices, setChoices] = useState<Record<string, string>>({});
   const [couriers, setCouriers] = useState<CourierInfo[]>([]);
+  const [estimates, setEstimates] = useState<CourierEstimates | null>(null);
   const [courierChoices, setCourierChoices] = useState<Record<string, string>>({});
   const [busyId, setBusyId] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -76,15 +88,43 @@ export default function SellerOrdersPage() {
     };
   }, []);
 
+  // Wave 7: per-courier estimates for the option labels, priced
+  // once per page at the first confirmed sub-order's zone (falling
+  // back to the first sub-order's) and a 1 kg parcel. Purely
+  // display orientation — the API prices every booking from the
+  // sub-order's real zone and weight.
+  useEffect(() => {
+    if (estimates !== null || !subOrders || subOrders.length === 0) return;
+    const zoneSource =
+      subOrders.find((s) => s.status === "confirmed") ?? subOrders[0];
+    let cancelled = false;
+    getCourierEstimates(zoneSource.delivery_zone, 1000)
+      .then((result) => {
+        if (!cancelled) setEstimates(result);
+      })
+      .catch(() => {
+        // No estimates: options render without the price texts.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [subOrders, estimates]);
+
   /** The courier a booking for this sub-order would use: the
-   * seller's pick, else the platform default, else the first
-   * available courier. */
-  function chosenCourier(sub: SellerSubOrder): string | undefined {
-    if (courierChoices[sub.id]) return courierChoices[sub.id];
-    const fallback =
-      couriers.find((c) => c.is_default && c.available) ??
-      couriers.find((c) => c.available);
-    return fallback?.courier;
+   * seller's pick, else "auto" — smart routing picks the cheapest
+   * available courier and the shipment records the chosen name. */
+  function chosenCourier(sub: SellerSubOrder): string {
+    return courierChoices[sub.id] ?? "auto";
+  }
+
+  /** The local-tariff estimate text for one courier option, when
+   * the estimate endpoint priced it ("আনুমানিক ৳60"). */
+  function estimateText(courier: string): string {
+    const estimate = estimates?.estimates.find((e) => e.courier === courier);
+    if (!estimate || estimate.price_poisha === null) return "";
+    const taka = estimate.price_poisha / 100;
+    const amount = Number.isInteger(taka) ? String(taka) : taka.toFixed(2);
+    return ` — আনুমানিক ৳${amount}`;
   }
 
   async function onBookCourier(sub: SellerSubOrder) {
@@ -216,7 +256,7 @@ export default function SellerOrdersPage() {
                 <label>
                   কুরিয়ার (courier)
                   <select
-                    value={chosenCourier(sub) ?? ""}
+                    value={chosenCourier(sub)}
                     onChange={(e) =>
                       setCourierChoices((prev) => ({
                         ...prev,
@@ -224,6 +264,12 @@ export default function SellerOrdersPage() {
                       }))
                     }
                   >
+                    <option value="auto">
+                      অটো (সবচেয়ে সস্তা)
+                      {estimates?.recommended
+                        ? ` — সুপারিশ: ${estimates.recommended}${estimateText(estimates.recommended)}`
+                        : ""}
+                    </option>
                     {couriers.map((c) => (
                       <option
                         key={c.courier}
@@ -234,13 +280,16 @@ export default function SellerOrdersPage() {
                         {c.is_default ? " (ডিফল্ট)" : ""}
                         {c.mode === "dev" ? " — ডেভ মোড (পরীক্ষামূলক)" : ""}
                         {!c.available ? " — এখনো চালু হয়নি" : ""}
+                        {c.available ? estimateText(c.courier) : ""}
                       </option>
                     ))}
                   </select>
                 </label>{" "}
                 <button
                   type="submit"
-                  disabled={busyId === sub.id || !chosenCourier(sub)}
+                  disabled={
+                    busyId === sub.id || !couriers.some((c) => c.available)
+                  }
                 >
                   {busyId === sub.id ? "বুক হচ্ছে…" : "কুরিয়ার বুক করুন"}
                 </button>

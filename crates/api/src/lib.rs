@@ -13,6 +13,10 @@
 //! Steadfast adapter behind merchant credentials (or the DEV courier
 //! simulator behind its flag), one shipment per sub-order, tracking
 //! refresh that syncs sub-order status, and courier availability.
+//! Wave 7: the Pathao and RedX adapters (same credential-gated
+//! pattern), per-courier delivery-charge estimates, and smart
+//! routing — booking with courier `auto` picks the cheapest
+//! available courier via the domain `choose_courier` function.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -37,7 +41,7 @@ use axum::{
     routing::{get, patch, post},
     Json, Router,
 };
-use ::courier::{CourierConfig, CouriersConfig};
+use ::courier::{CourierConfig, CouriersConfig, PathaoConfig, RedxConfig};
 use domain::{
     calculate_delivery_charge, compute_commission, split_cart_by_seller, CartItem,
     CommissionQuote, DeliveryZone, SellerSubOrder,
@@ -269,13 +273,17 @@ fn payments_config_from_env() -> PaymentsConfig {
     }
 }
 
-/// Build the Wave 6 couriers configuration from the environment:
+/// Build the couriers configuration from the environment:
 /// `COURIER_DEV_MODE` gates the DEV courier simulator (with a loud
 /// startup warning — it must never be on in production),
 /// `STEADFAST_API_KEY` / `STEADFAST_SECRET_KEY` are the platform's
 /// Steadfast merchant credentials, `STEADFAST_BASE_URL` overrides
 /// the production API base URL (sandbox/testing), and
 /// `DEFAULT_COURIER` names the courier sellers get by default.
+/// Wave 7 adds Pathao (`PATHAO_CLIENT_ID` / `PATHAO_CLIENT_SECRET`
+/// / `PATHAO_STORE_ID`, `PATHAO_BASE_URL` overrides the Hermes API
+/// base URL) and RedX (`REDX_API_KEY`, `REDX_BASE_URL` overrides
+/// the open-API base URL).
 fn couriers_config_from_env() -> CouriersConfig {
     let dev_mode = std::env::var("COURIER_DEV_MODE")
         .map(|v| v == "true")
@@ -294,6 +302,18 @@ fn couriers_config_from_env() -> CouriersConfig {
             secret_key: env_value("STEADFAST_SECRET_KEY"),
             base_url: env_value("STEADFAST_BASE_URL")
                 .unwrap_or_else(|| ::courier::DEFAULT_STEADFAST_BASE_URL.to_string()),
+        },
+        pathao: PathaoConfig {
+            client_id: env_value("PATHAO_CLIENT_ID"),
+            client_secret: env_value("PATHAO_CLIENT_SECRET"),
+            store_id: env_value("PATHAO_STORE_ID"),
+            base_url: env_value("PATHAO_BASE_URL")
+                .unwrap_or_else(|| ::courier::DEFAULT_PATHAO_BASE_URL.to_string()),
+        },
+        redx: RedxConfig {
+            api_key: env_value("REDX_API_KEY"),
+            base_url: env_value("REDX_BASE_URL")
+                .unwrap_or_else(|| ::courier::DEFAULT_REDX_BASE_URL.to_string()),
         },
         default_courier: env_value("DEFAULT_COURIER")
             .unwrap_or_else(|| "steadfast".to_string()),
@@ -443,7 +463,9 @@ pub fn build_app(state: AppState) -> Router {
         )
         // Wave 6 — couriers + shipments: availability, booking a
         // shipment for a confirmed sub-order, tracking refresh.
+        // Wave 7 — per-courier estimates + smart routing.
         .route("/v1/couriers", get(shipments::list_couriers))
+        .route("/v1/couriers/estimate", get(shipments::courier_estimates))
         .route(
             "/v1/seller/sub-orders/:id/shipment",
             post(shipments::create_shipment),

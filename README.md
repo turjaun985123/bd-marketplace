@@ -257,9 +257,9 @@ endpoint** for a created consignment, so the adapter's `cancel`
 returns `Unsupported` rather than pretending; and `price_estimate`
 is a purely local estimate from the domain delivery-charge function
 under our own tariff — no network call, and not a quote from
-Steadfast. Pathao, RedX, eCourier and Paperfly remain
-`NotConfigured` stubs behind the same trait (Pathao/RedX are
-Wave 7).
+Steadfast. Pathao and RedX became real adapters in Wave 7 (below);
+eCourier and Paperfly remain `NotConfigured` stubs behind the same
+trait.
 
 **DEV courier simulator** (`COURIER_DEV_MODE=true`, local/CI only —
 NEVER in production): booking mints a
@@ -285,6 +285,85 @@ courier collects is the sub-order's goods + delivery share for
 pay-on-delivery orders, and 0 for online-paid orders. Order and
 seller sub-order views now embed a `shipment` summary (`id`,
 `courier`, `consignment_id`, `status`) per sub-order.
+
+Wave 7 (Pathao + RedX adapters, smart routing):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| GET | `/v1/couriers/estimate?zone=inside_dhaka&weight_grams=1000` | Per-courier delivery-charge estimates for one zone + weight (public): each available courier's local-tariff estimate in poisha, plus `recommended` — the smart-routing pick over the same numbers (`null` when no courier is available). An unavailable courier has NO price at all |
+| POST | `/v1/seller/sub-orders/{id}/shipment` | The Wave 6 booking endpoint, extended: the body may be `{ "courier": "auto" }` for smart routing (the shipment stores the CHOSEN courier's name, never the literal `auto`), and may carry `{ "area_id": 123 }` — the recipient's numeric area id that RedX requires |
+
+**Pathao adapter** (real, credential-gated): authentication is an
+OAuth-style client-credentials exchange —
+`POST /aladdin/api/v1/issue-token` with `PATHAO_CLIENT_ID` +
+`PATHAO_CLIENT_SECRET` returns a bearer token, which the adapter
+caches and reuses until the token response's own `expires_in` says
+otherwise (one-hour fallback; Pathao's docs describe ~30-day
+tokens, and we deliberately do not hard-code that lifetime).
+Booking is `POST /aladdin/api/v1/orders` with the bearer token: the
+merchant's numeric store id (`PATHAO_STORE_ID`), our invoice as
+`merchant_order_id`, the recipient phone converted to the 11-digit
+local form Pathao requires (the platform stores `+880` canonical;
+the single domain conversion `to_local_phone` does it), the parcel
+weight in kg, `delivery_type` 48, and the COD amount — Pathao
+collects WHOLE taka, so poisha are rounded half-up at that boundary
+only (`poisha_to_whole_taka`: 150 poisha → 2 taka). Tracking is
+`GET /aladdin/api/v1/orders/{consignment_id}`; the raw
+`order_status` is mapped by the single domain function
+`map_pathao_status` (`FailedDelivery` → `out_for_delivery` — a
+failed attempt on a delivery run, which Pathao retries; `OnHold` →
+`in_transit`, the same paused-in-the-pipeline choice as Steadfast's
+hold). Pathao's merchant API has **no simple cancel endpoint**, so
+`cancel` returns `Unsupported` honestly. `price_estimate` is the
+local domain estimate, NOT Pathao's price-plan endpoint: that
+endpoint is an authenticated POST, and calling it per routing
+decision would make routing network-dependent and slow.
+
+**RedX adapter** (real, credential-gated): booking is
+`POST /parcel` — customer name/phone/address (phone in the local
+11-digit form), the cash collection amount in taka, the parcel
+weight in GRAMS, our invoice as `merchant_invoice_id`, and a
+numeric `area_id`. RedX area ids are RedX's own and there is no
+honest default: a booking without the recipient's `area_id` fails
+loudly with a gateway error before any network call, rather than
+guessing an area. Tracking parses the status defensively from the
+known field names (`status`, `parcel_status`, `current_status` —
+top level first, then under `data`) and maps it with the single
+domain function `map_redx_status` (RedX reports human strings like
+`out-for-delivery`; only confidently known strings are mapped, the
+rest are `unknown`). RedX's open API documents **no cancel call**,
+so `cancel` returns `Unsupported`. **Two uncertainties to confirm
+at merchant onboarding:** the exact `API-ACCESS-TOKEN` header
+format (the adapter sends the raw API key as the header value, per
+RedX's docs style; the live API might expect a `Bearer <key>`
+form) and the exact tracking endpoint path (the adapter uses
+`GET /tracking/{tracking_id}`). Each is isolated to one header
+line / one URL line when the answer is known.
+
+**Smart routing rule:** among the couriers AVAILABLE for the
+parcel (credentials complete, or the DEV simulator on), the lowest
+local-tariff estimate wins; ties break by platform priority —
+steadfast, then pathao, then redx, then ecourier, then paperfly.
+The rule is the pure domain function `choose_courier`
+(unit-tested), and the estimate endpoint and booking's `auto`
+resolution read the SAME quotes through the one shared
+`resolve_booking_courier` function, so they can never disagree.
+Honest limit: the prices are our own tariff's estimates (the domain
+delivery-charge function), not live courier quotes — couriers
+confirm their real charge on the consignment after booking. When
+nothing is available, an `auto` booking is a 503, not a silent
+fallback. Availability itself is now one shared per-courier rule:
+`GET /v1/couriers` reports Pathao `live` when `PATHAO_CLIENT_ID` +
+`PATHAO_CLIENT_SECRET` + `PATHAO_STORE_ID` are all set, and RedX
+`live` when `REDX_API_KEY` is set.
+
+**Adapter verification status (honesty):** the Pathao and RedX
+adapters are coded to the documented API shapes and their response
+parsers are fixture-tested in the courier crate, but they CANNOT
+be verified against the live services until platform merchant
+accounts exist. Without complete credentials every network
+operation returns `NotConfigured` and nothing is sent — the same
+rule as Steadfast and the payment gateways.
 
 Auth rules that matter: only a SHA-256 hash of an OTP is ever stored;
 ownership is checked on every seller mutation (403 for non-owners);
@@ -465,9 +544,28 @@ the production-mode 503; the seller orders page (courier select +
 buyer orders page (per-sub-order shipment block with Bangla status
 labels + refresh).
 
+**Real (Wave 7):** the Pathao and RedX adapters behind the same
+`courier_adapter_for` factory (Pathao: client-credentials token
+flow with caching, order create/track with fixture-tested parsers,
+local-format recipient phone, whole-taka COD rounding; RedX:
+parcel create/track with defensive parsers, weight in grams, a
+required numeric `area_id` with no invented default); the pure
+domain Pathao/RedX raw-status mappings on the one shared status
+normalization, and the pure `choose_courier` smart-routing rule
+(cheapest available, platform-priority tie-break); the estimate
+endpoint (`GET /v1/couriers/estimate`) and booking with
+`courier: "auto"` resolving through the one shared
+`resolve_booking_courier` function, with per-courier availability
+generalized to one rule; an integration test
+(`crates/api/tests/wave7.rs`, same `DATABASE_URL` gate) covering
+dev-mode estimates with the priority recommendation, `auto` and
+named-Pathao DEV bookings, and the production-mode estimates +
+`auto` 503; the seller orders page (Auto option with the routing
+recommendation, per-courier আনুমানিক estimate texts priced from
+the estimate endpoint).
+
 **Stubbed (typed errors — never fake success, no network calls):**
-Pathao / RedX / eCourier / Paperfly courier adapters (Pathao and
-RedX land as real adapters in Wave 7). Manual Phase 2 couriers
+eCourier / Paperfly courier adapters. Manual Phase 2 couriers
 (Sundarban, SA Paribahan, Karatoa, Carrybee) join behind the same
 trait later. SMS sending has only the dev-mode log implementation
 (see the dev OTP flow above).
@@ -482,14 +580,14 @@ exposes (the worker still logs its planned jobs and exits cleanly).
 ## Verification status
 
 - **Next.js: verified on this machine** — `npm ci && npm run build`
-  passes (Wave 6 seller/buyer orders changes included).
+  passes (Wave 7 seller orders changes included).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
-  (domain 26, courier 10, payments 8 unit tests; the `DATABASE_URL`-
+  (domain 33, courier 21, payments 8 unit tests; the `DATABASE_URL`-
   gated integration tests skip cleanly without a database). The API
   binary was also smoke-tested locally without a database: routes
   build, `/v1/couriers` answers, auth rejects unauthenticated calls.
-- **Rust integration + clippy: CI-only** — the Wave 2–6 integration
+- **Rust integration + clippy: CI-only** — the Wave 2–7 integration
   tests against a real Postgres 16 service and clippy `-D warnings`
   are verified via **GitHub Actions CI** (`.github/workflows/ci.yml`)
-  on push. Waves 1–5 are green there; Wave 6 awaits its first CI run.
+  on push. Waves 1–6 are green there; Wave 7 awaits its first CI run.

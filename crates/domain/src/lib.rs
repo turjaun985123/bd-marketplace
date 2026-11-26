@@ -426,6 +426,45 @@ pub fn can_transition_shipment(from: &str, to: &str) -> bool {
     )
 }
 
+/// Normalize a courier's raw status string for mapping: trim
+/// surrounding whitespace, lowercase, fold spaces, hyphens and
+/// underscores into single underscores, and split camelCase word
+/// boundaries — so `Out for Delivery`, `out-for-delivery`,
+/// `OUT_FOR_DELIVERY` and `OutForDelivery` all normalize to
+/// `out_for_delivery`, and Pathao's `InTransit` normalizes to
+/// `in_transit`. Every courier status mapping below matches on this
+/// normalized form — couriers disagree wildly on casing and
+/// separators, and the normalization rule should exist in exactly
+/// one place.
+pub fn normalize_courier_status(raw: &str) -> String {
+    let mut out = String::new();
+    // The previous SIGNIFICANT character as written (before
+    // lowercasing), or '_' after a separator run. Camel boundaries
+    // are detected against the original casing so an all-caps word
+    // like `PENDING` stays one word.
+    let mut prev: Option<char> = None;
+    for c in raw.trim().chars() {
+        if c == ' ' || c == '-' || c == '_' {
+            if prev != Some('_') && !out.is_empty() {
+                out.push('_');
+                prev = Some('_');
+            }
+            continue;
+        }
+        if c.is_ascii_uppercase()
+            && prev.is_some_and(|p| p.is_ascii_lowercase() || p.is_ascii_digit())
+        {
+            out.push('_');
+        }
+        out.push(c.to_ascii_lowercase());
+        prev = Some(c);
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    out
+}
+
 /// Map one Steadfast `delivery_status` value onto the unified
 /// shipment status set (see [`is_valid_shipment_status`]). This is
 /// the single Steadfast mapping: the courier crate's adapter calls
@@ -441,9 +480,11 @@ pub fn can_transition_shipment(from: &str, to: &str) -> bool {
 /// is still inside the delivery pipeline, just paused. Anything else
 /// (values Steadfast adds later, typos, empty strings) maps to
 /// `unknown`, which the transition table treats as no change.
-/// Matching ignores surrounding whitespace and letter case.
+/// Matching is on the normalized form (see
+/// [`normalize_courier_status`]), so whitespace, case, spaces and
+/// hyphens never change the answer.
 pub fn map_steadfast_status(raw: &str) -> &'static str {
-    match raw.trim().to_ascii_lowercase().as_str() {
+    match normalize_courier_status(raw).as_str() {
         "pending" => "created",
         "delivered" => "delivered",
         "partial_delivered" => "partial_delivered",
@@ -452,6 +493,155 @@ pub fn map_steadfast_status(raw: &str) -> &'static str {
         "hold" => "in_transit",
         _ => "unknown",
     }
+}
+
+/// Map one Pathao `order_status` value onto the unified shipment
+/// status set. This is the single Pathao mapping: the courier
+/// crate's adapter calls it, so the mapping exists in exactly one
+/// place.
+///
+/// Pathao's documented values and the choices made here: `Pending`
+/// and `PickupRequested` (order placed, pickup not yet done) map to
+/// `created`, as does `PickupFailed` — a failed pickup attempt means
+/// the parcel is still with the merchant, so the shipment has not
+/// started moving; `Assigned` (a rider is assigned) and `Picked`
+/// map to `picked_up`; `InTransit` maps to `in_transit`, and so
+/// does `OnHold` — the same choice as Steadfast's `hold`: the
+/// parcel is paused inside the pipeline, not back with the sender;
+/// `Delivered` maps to `delivered`; `PartialDelivered` keeps its
+/// own unified status; `FailedDelivery` (the rider attempted
+/// delivery and failed; Pathao retries) maps to `out_for_delivery`
+/// — the parcel is out with the rider on a delivery run, which is
+/// exactly what that unified status means, and mapping it backwards
+/// to `in_transit` would fight the transition table; `Returned`
+/// maps to `returned`; `ReturnRequested` (a return has been asked
+/// for but the parcel is still travelling back) maps to
+/// `return_in_transit`; `Cancelled` maps to `cancelled`. Anything
+/// else maps to `unknown`, which the transition table treats as no
+/// change. Matching is on the normalized form, so `InTransit`,
+/// `in_transit` and `in transit` are the same value.
+pub fn map_pathao_status(raw: &str) -> &'static str {
+    match normalize_courier_status(raw).as_str() {
+        "pending" => "created",
+        "pickup_requested" => "created",
+        "pickup_failed" => "created",
+        "assigned" => "picked_up",
+        "picked" => "picked_up",
+        "in_transit" => "in_transit",
+        "on_hold" => "in_transit",
+        "failed_delivery" => "out_for_delivery",
+        "delivered" => "delivered",
+        "partial_delivered" => "partial_delivered",
+        "partially_delivered" => "partial_delivered",
+        "return_requested" => "return_in_transit",
+        "returned" => "returned",
+        "cancelled" => "cancelled",
+        _ => "unknown",
+    }
+}
+
+/// Map one RedX tracking status onto the unified shipment status
+/// set. This is the single RedX mapping: the courier crate's adapter
+/// calls it, so the mapping exists in exactly one place.
+///
+/// RedX reports human-readable status strings (`picked-up`,
+/// `out-for-delivery`, `on-hold`, …) rather than machine codes, so
+/// the table is deliberately conservative — only the strings we are
+/// confident about are mapped, and everything else is `unknown`
+/// (which the transition table treats as no change) rather than a
+/// guess. The choices: `created` and `package is ready for
+/// delivery` (RedX's earliest tracking state: the parcel is booked
+/// and waiting) map to `created`; the picked variants (`picked-up`,
+/// `picked`) map to `picked_up`; transit and hub strings
+/// (`in-transit`, `at-hub`, `received-at-hub`) map to `in_transit`,
+/// and so does `on-hold` — the same paused-in-the-pipeline choice as
+/// the other couriers; `out-for-delivery` maps to
+/// `out_for_delivery`, and so does `failed-delivery` (a failed
+/// attempt on a delivery run; RedX retries — the same choice as
+/// Pathao's `FailedDelivery`); `delivered` maps to `delivered`;
+/// `partial-delivered` / `partially-delivered` keep their own
+/// unified status; on the return path, `return-in-transit` and
+/// `returning` map to `return_in_transit`, while `returned` and
+/// `delivered-returned` (a parcel that came back after a delivery
+/// attempt) map to `returned`; `cancelled` (and the US spelling
+/// `canceled`) maps to `cancelled`. Matching is on the normalized
+/// form, so hyphens, spaces, underscores and case never change the
+/// answer.
+pub fn map_redx_status(raw: &str) -> &'static str {
+    match normalize_courier_status(raw).as_str() {
+        "created" => "created",
+        "package_is_ready_for_delivery" => "created",
+        "picked_up" => "picked_up",
+        "picked" => "picked_up",
+        "in_transit" => "in_transit",
+        "at_hub" => "in_transit",
+        "in_hub" => "in_transit",
+        "received_at_hub" => "in_transit",
+        "on_hold" => "in_transit",
+        "out_for_delivery" => "out_for_delivery",
+        "failed_delivery" => "out_for_delivery",
+        "delivered" => "delivered",
+        "partial_delivered" => "partial_delivered",
+        "partially_delivered" => "partial_delivered",
+        "return_in_transit" => "return_in_transit",
+        "returning" => "return_in_transit",
+        "returned" => "returned",
+        "delivered_returned" => "returned",
+        "cancelled" => "cancelled",
+        "canceled" => "cancelled",
+        _ => "unknown",
+    }
+}
+
+/// One courier's candidacy for smart routing: its name, whether it
+/// can actually book right now (credentials configured, or the DEV
+/// simulator is on — the API layer decides this from config), and
+/// its delivery-charge estimate in poisha.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CourierQuote<'a> {
+    pub courier: &'a str,
+    pub available: bool,
+    pub price_poisha: i64,
+}
+
+/// Platform priority for breaking routing ties, best first:
+/// Steadfast, then Pathao, then RedX, then eCourier, then Paperfly.
+/// An unrecognised courier name ranks after every known courier.
+pub fn courier_priority(courier: &str) -> usize {
+    match courier {
+        "steadfast" => 0,
+        "pathao" => 1,
+        "redx" => 2,
+        "ecourier" => 3,
+        "paperfly" => 4,
+        _ => usize::MAX,
+    }
+}
+
+/// Smart routing: pick the courier for a parcel from the candidates.
+/// The rule is deliberately simple and explainable — among the
+/// AVAILABLE candidates the lowest estimated price wins, and ties
+/// break by platform priority ([`courier_priority`]). Unavailable
+/// candidates are skipped entirely (their price is never trusted),
+/// and an empty or all-unavailable list yields `None`, which the
+/// caller turns into an honest "no courier available" error.
+pub fn choose_courier<'a>(candidates: &[CourierQuote<'a>]) -> Option<&'a str> {
+    let mut best: Option<&CourierQuote<'a>> = None;
+    for candidate in candidates.iter().filter(|c| c.available) {
+        let wins = match best {
+            None => true,
+            Some(current) => {
+                candidate.price_poisha < current.price_poisha
+                    || (candidate.price_poisha == current.price_poisha
+                        && courier_priority(candidate.courier)
+                            < courier_priority(current.courier))
+            }
+        };
+        if wins {
+            best = Some(candidate);
+        }
+    }
+    best.map(|c| c.courier)
 }
 
 /// Validate a Bangladeshi mobile number in local form: exactly 11 ASCII
@@ -494,6 +684,20 @@ pub fn normalize_bd_phone(phone: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Convert a Bangladeshi mobile number to the LOCAL form
+/// `01XXXXXXXXX`. Accepts the same inputs as [`normalize_bd_phone`]
+/// (local, `880…` and `+880…` forms, whitespace ignored) and returns
+/// `None` for anything that is not a valid BD mobile number. This is
+/// the form some courier APIs (Pathao, RedX) require for recipient
+/// phone numbers, while the platform stores the canonical `+880…`
+/// form everywhere else — this function is the single conversion.
+pub fn to_local_phone(phone: &str) -> Option<String> {
+    let canonical = normalize_bd_phone(phone)?;
+    // The canonical form is "+880" followed by the local number
+    // without its leading 0; re-attach the 0.
+    Some(format!("0{}", &canonical[4..]))
 }
 
 /// Is this a valid store slug? Slugs are the storefront subdomain segment:
@@ -1083,5 +1287,149 @@ mod tests {
         ] {
             assert!(is_valid_shipment_status(map_steadfast_status(raw)), "{raw}");
         }
+    }
+
+    #[test]
+    fn courier_status_normalization() {
+        // The one normalization rule every mapping shares: trim,
+        // lowercase, spaces and hyphens fold to underscores.
+        assert_eq!(normalize_courier_status(" Delivered "), "delivered");
+        assert_eq!(normalize_courier_status("Out for Delivery"), "out_for_delivery");
+        assert_eq!(normalize_courier_status("out-for-delivery"), "out_for_delivery");
+        assert_eq!(normalize_courier_status("OUT_FOR_DELIVERY"), "out_for_delivery");
+        // CamelCase splits at word boundaries; an all-caps word
+        // stays one word.
+        assert_eq!(normalize_courier_status("InTransit"), "in_transit");
+        assert_eq!(normalize_courier_status("PickupRequested"), "pickup_requested");
+        assert_eq!(normalize_courier_status("PENDING"), "pending");
+        assert_eq!(normalize_courier_status(""), "");
+        // Refactoring map_steadfast_status onto the helper changed
+        // none of its results (also covered by the test above).
+        assert_eq!(map_steadfast_status("Partial Delivered"), "partial_delivered");
+        assert_eq!(map_steadfast_status("HOLD"), "in_transit");
+    }
+
+    #[test]
+    fn pathao_status_mapping() {
+        // Every documented Pathao order_status value.
+        assert_eq!(map_pathao_status("Pending"), "created");
+        assert_eq!(map_pathao_status("PickupRequested"), "created");
+        assert_eq!(map_pathao_status("PickupFailed"), "created");
+        assert_eq!(map_pathao_status("Assigned"), "picked_up");
+        assert_eq!(map_pathao_status("Picked"), "picked_up");
+        assert_eq!(map_pathao_status("InTransit"), "in_transit");
+        assert_eq!(map_pathao_status("OnHold"), "in_transit");
+        assert_eq!(map_pathao_status("FailedDelivery"), "out_for_delivery");
+        assert_eq!(map_pathao_status("Delivered"), "delivered");
+        assert_eq!(map_pathao_status("PartialDelivered"), "partial_delivered");
+        assert_eq!(map_pathao_status("ReturnRequested"), "return_in_transit");
+        assert_eq!(map_pathao_status("Returned"), "returned");
+        assert_eq!(map_pathao_status("Cancelled"), "cancelled");
+        // Normalization: case, spaces, underscores and hyphens are
+        // all the same value.
+        assert_eq!(map_pathao_status("in_transit"), "in_transit");
+        assert_eq!(map_pathao_status("IN TRANSIT"), "in_transit");
+        assert_eq!(map_pathao_status("in-transit"), "in_transit");
+        assert_eq!(map_pathao_status(" return requested "), "return_in_transit");
+        // Unrecognised values are honestly unknown, never guessed.
+        assert_eq!(map_pathao_status(""), "unknown");
+        assert_eq!(map_pathao_status("bogus"), "unknown");
+        assert_eq!(map_pathao_status("PaymentDone"), "unknown");
+        for raw in ["Pending", "Picked", "Delivered", "Returned", "whatever"] {
+            assert!(is_valid_shipment_status(map_pathao_status(raw)), "{raw}");
+        }
+    }
+
+    #[test]
+    fn redx_status_mapping() {
+        // The RedX human-readable tracking strings.
+        assert_eq!(map_redx_status("created"), "created");
+        assert_eq!(map_redx_status("package is ready for delivery"), "created");
+        assert_eq!(map_redx_status("picked-up"), "picked_up");
+        assert_eq!(map_redx_status("picked"), "picked_up");
+        assert_eq!(map_redx_status("in-transit"), "in_transit");
+        assert_eq!(map_redx_status("at-hub"), "in_transit");
+        assert_eq!(map_redx_status("received at hub"), "in_transit");
+        assert_eq!(map_redx_status("on-hold"), "in_transit");
+        assert_eq!(map_redx_status("out-for-delivery"), "out_for_delivery");
+        assert_eq!(map_redx_status("failed-delivery"), "out_for_delivery");
+        assert_eq!(map_redx_status("delivered"), "delivered");
+        assert_eq!(map_redx_status("partial-delivered"), "partial_delivered");
+        assert_eq!(map_redx_status("return-in-transit"), "return_in_transit");
+        assert_eq!(map_redx_status("returned"), "returned");
+        assert_eq!(map_redx_status("delivered-returned"), "returned");
+        assert_eq!(map_redx_status("cancelled"), "cancelled");
+        // Normalization covers the spelling variants too.
+        assert_eq!(map_redx_status("Out For Delivery"), "out_for_delivery");
+        assert_eq!(map_redx_status("DELIVERED"), "delivered");
+        assert_eq!(map_redx_status("canceled"), "cancelled");
+        // Unrecognised strings are honestly unknown, never guessed.
+        assert_eq!(map_redx_status(""), "unknown");
+        assert_eq!(map_redx_status("agent is nearby"), "unknown");
+        for raw in ["picked-up", "delivered", "returned", "whatever"] {
+            assert!(is_valid_shipment_status(map_redx_status(raw)), "{raw}");
+        }
+    }
+
+    #[test]
+    fn courier_choice_picks_cheapest_available() {
+        let quotes = [
+            CourierQuote { courier: "steadfast", available: true, price_poisha: 6_000 },
+            CourierQuote { courier: "pathao", available: true, price_poisha: 5_500 },
+            CourierQuote { courier: "redx", available: true, price_poisha: 7_000 },
+        ];
+        assert_eq!(choose_courier(&quotes), Some("pathao"));
+    }
+
+    #[test]
+    fn courier_choice_breaks_ties_by_priority() {
+        // Equal prices: platform priority decides, regardless of
+        // the order candidates are listed in.
+        let quotes = [
+            CourierQuote { courier: "redx", available: true, price_poisha: 6_000 },
+            CourierQuote { courier: "paperfly", available: true, price_poisha: 6_000 },
+            CourierQuote { courier: "pathao", available: true, price_poisha: 6_000 },
+            CourierQuote { courier: "steadfast", available: true, price_poisha: 6_000 },
+        ];
+        assert_eq!(choose_courier(&quotes), Some("steadfast"));
+        let quotes = [
+            CourierQuote { courier: "paperfly", available: true, price_poisha: 6_000 },
+            CourierQuote { courier: "ecourier", available: true, price_poisha: 6_000 },
+            CourierQuote { courier: "redx", available: true, price_poisha: 6_000 },
+        ];
+        assert_eq!(choose_courier(&quotes), Some("redx"));
+    }
+
+    #[test]
+    fn courier_choice_skips_unavailable_and_handles_none() {
+        // The cheapest candidate is unavailable: its price is never
+        // trusted, the next cheapest available courier wins.
+        let quotes = [
+            CourierQuote { courier: "pathao", available: false, price_poisha: 1 },
+            CourierQuote { courier: "redx", available: true, price_poisha: 7_000 },
+            CourierQuote { courier: "steadfast", available: true, price_poisha: 6_000 },
+        ];
+        assert_eq!(choose_courier(&quotes), Some("steadfast"));
+        // Nobody available, and the empty list, both yield None.
+        let quotes = [
+            CourierQuote { courier: "steadfast", available: false, price_poisha: 6_000 },
+        ];
+        assert_eq!(choose_courier(&quotes), None);
+        assert_eq!(choose_courier(&[]), None);
+    }
+
+    #[test]
+    fn local_phone_conversion() {
+        // Canonical, 880-prefixed and already-local inputs all land
+        // on the same 11-digit local form.
+        assert_eq!(to_local_phone("+8801712345678").as_deref(), Some("01712345678"));
+        assert_eq!(to_local_phone("8801712345678").as_deref(), Some("01712345678"));
+        assert_eq!(to_local_phone("01712345678").as_deref(), Some("01712345678"));
+        assert_eq!(to_local_phone(" +880 1912 345678 ").as_deref(), Some("01912345678"));
+        // Invalid numbers convert to nothing, never to a guess.
+        assert_eq!(to_local_phone("01212345678"), None);
+        assert_eq!(to_local_phone("+8801212345678"), None);
+        assert_eq!(to_local_phone("12345"), None);
+        assert_eq!(to_local_phone(""), None);
     }
 }
