@@ -365,6 +365,58 @@ accounts exist. Without complete credentials every network
 operation returns `NotConfigured` and nothing is sent — the same
 rule as Steadfast and the payment gateways.
 
+Wave 8 (reviews, ratings and seller replies):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| POST | `/v1/products/{id}/reviews` | Bearer. Review a product you RECEIVED (see the eligibility rule); rating 1–5, body optional (max 1000 chars). 201 with the review; 400 invalid input, 403 not eligible, 409 already reviewed |
+| GET | `/v1/products/{id}/reviews?page=&limit=` | Public review list, newest first, paginated like every other list; each review carries its seller reply when one exists |
+| PATCH | `/v1/reviews/{id}` | Bearer, author only (anyone else: 404). Edit rating and/or body |
+| DELETE | `/v1/reviews/{id}` | Bearer, author only (anyone else: 404). 204; the reply goes with it |
+| POST | `/v1/seller/reviews/{id}/reply` | Bearer, owner of the product's store only (anyone else: 404). One reply per review (a second is a 409); body required, max 500 chars |
+| PATCH | `/v1/seller/reviews/{id}/reply` | Bearer, same ownership rule. Edit the store's reply |
+
+**Eligibility rule:** a buyer may review a product only when one of
+their orders contains it in a sub-order whose status is
+`delivered` — shipped is not enough, and a returned sub-order does
+not qualify. The single query behind the rule
+(`find_delivered_order_for_review`) returns the newest qualifying
+order id, which is stored on the review as its proof; ineligible
+creates are a 403 with the message "You can review only products
+you received".
+
+**One review per buyer per product** (database UNIQUE on
+`(product_id, buyer_id)`, migration 0011): a second create is a
+409; changing your mind goes through PATCH on the same row.
+Deleting a review deletes its seller reply too (foreign-key
+cascade).
+
+**Buyer masking:** public review views never expose a buyer's full
+phone number. The display string is the buyer's name when they
+have one set, otherwise their masked phone — first three and last
+three digits of the local form, middle hidden (`017****678`), via
+the pure domain function `mask_phone`.
+
+**Rating summary source:** the product view's `rating_avg` (one
+decimal, null when unreviewed) and `rating_count` are computed
+LIVE on every product read by one aggregate — a lateral join in
+the shared product SELECT in `crates/api/src/products.rs`
+(`PRODUCT_RATING_JOIN`) — so the marketplace list, the storefront
+list and the product detail always agree. There is NO cached
+counter yet; if read volume ever makes the aggregate expensive,
+the fix is a maintained summary column updated by the review
+service functions, not a second formula.
+
+**Seller reply rules:** only the user who owns the store selling
+the reviewed product may reply (other sellers get a 404, the same
+as a missing review — a review's existence is not leaked to
+competitors). One reply per review; the reply records its store,
+and editing it goes through PATCH. On the web side, replies are
+written from the product detail page itself when the signed-in
+user owns the product's store — deliberately no separate seller
+reviews page, so a reply is always written next to the review it
+answers.
+
 Auth rules that matter: only a SHA-256 hash of an OTP is ever stored;
 ownership is checked on every seller mutation (403 for non-owners);
 every product query is scoped by store. Listing visibility: public
@@ -431,9 +483,11 @@ cd apps/web
 npm install
 NEXT_PUBLIC_API_BASE_URL=http://localhost:8080 npm run dev   # http://localhost:3000
 # Pages: / (marketplace, real product grid), /login (phone + OTP),
-# /cart, /checkout, /orders (buyer), /orders/{id} (printable receipt),
-# /seller, /seller/products (seller catalogue + create form, with a
-# weight-in-grams field) and /seller/orders (sub-orders)
+# /products/{id} (product detail + reviews, Wave 8), /{store}
+# (storefront, same shared grid), /cart, /checkout, /orders (buyer),
+# /orders/{id} (printable receipt), /seller, /seller/products
+# (seller catalogue + create form, with a weight-in-grams field)
+# and /seller/orders (sub-orders)
 ```
 
 ## Scope — what is real, stubbed and TODO
@@ -564,6 +618,27 @@ named-Pathao DEV bookings, and the production-mode estimates +
 recommendation, per-courier আনুমানিক estimate texts priced from
 the estimate endpoint).
 
+**Real (Wave 8):** reviews and ratings — migration 0011 (`reviews`
+with the one-per-buyer-per-product UNIQUE, `review_replies` with
+one reply per review); the pure domain validators `validate_rating`,
+`validate_review_body`, `validate_reply_body` and `mask_phone`;
+delivered-only eligibility enforced by the single
+`find_delivered_order_for_review` query (403 before delivery);
+author-only edit/delete (404 for everyone else); store-owner-only
+replies (404 for other sellers, 409 on a duplicate); the live
+rating summary (`rating_avg` / `rating_count`) on the shared
+product view via the one aggregate join, so list, storefront and
+detail agree; an end-to-end integration test
+(`crates/api/tests/wave8.rs`, same `DATABASE_URL` gate) that drives
+a real Wave 6 delivery, then covers the 403, 201, 409, invalid
+rating 400, summary changes across create/edit/delete, cross-buyer
+edit 404, reply ownership and the masked public list; the product
+detail page (`/products/{id}`) with the shared `Stars` component,
+review form (the API's 403 message shown as-is), own-review
+edit/delete and the owner's reply box, plus rating lines on the
+shared product card and the storefront page rendering the shared
+grid.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 eCourier / Paperfly courier adapters. Manual Phase 2 couriers
 (Sundarban, SA Paribahan, Karatoa, Carrybee) join behind the same
@@ -580,14 +655,14 @@ exposes (the worker still logs its planned jobs and exits cleanly).
 ## Verification status
 
 - **Next.js: verified on this machine** — `npm ci && npm run build`
-  passes (Wave 7 seller orders changes included).
+  passes (Wave 8 product detail page + storefront grid included).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
-  (domain 33, courier 21, payments 8 unit tests; the `DATABASE_URL`-
+  (domain 37, courier 21, payments 8 unit tests; the `DATABASE_URL`-
   gated integration tests skip cleanly without a database). The API
   binary was also smoke-tested locally without a database: routes
   build, `/v1/couriers` answers, auth rejects unauthenticated calls.
-- **Rust integration + clippy: CI-only** — the Wave 2–7 integration
+- **Rust integration + clippy: CI-only** — the Wave 2–8 integration
   tests against a real Postgres 16 service and clippy `-D warnings`
   are verified via **GitHub Actions CI** (`.github/workflows/ci.yml`)
-  on push. Waves 1–6 are green there; Wave 7 awaits its first CI run.
+  on push. Waves 1–7 are green there; Wave 8 awaits its first CI run.

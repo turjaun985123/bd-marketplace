@@ -8,6 +8,10 @@
 //! `active` products, except that a signed-in owner also sees their own
 //! store's non-active products (drafts/archived) so sellers can manage
 //! their catalogue.
+//!
+//! Wave 8: the product view also carries the review rating summary
+//! (`rating_avg` / `rating_count`), produced by the single aggregate
+//! join `PRODUCT_RATING_JOIN` shared by every product query here.
 
 use axum::{
     extract::{Path, Query, State},
@@ -39,13 +43,32 @@ pub struct Product {
     pub status: String,
     /// Weight of one unit in grams (Wave 4 — drives delivery charges).
     pub weight_grams: i32,
+    /// Mean review rating rounded to one decimal (Wave 8); null when
+    /// the product has no reviews. Computed live by the aggregate in
+    /// `PRODUCT_RATING_JOIN` — there is no cached counter to drift.
+    pub rating_avg: Option<f64>,
+    /// Number of reviews (Wave 8); 0 when there are none.
+    pub rating_count: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 const PRODUCT_COLUMNS: &str = "p.id, p.store_id, s.slug AS store_slug, p.title, p.title_bn, \
     p.description, p.price_poisha, p.compare_at_poisha, p.stock, p.status, \
-    p.weight_grams, p.created_at, p.updated_at";
+    p.weight_grams, rv.rating_avg, rv.rating_count, p.created_at, p.updated_at";
+
+/// Rating summary aggregate (Wave 8): THE one place ratings are
+/// summarised. Every query that selects `PRODUCT_COLUMNS` joins this,
+/// so the marketplace list, the storefront list and the product
+/// detail can never disagree. The lateral subquery always yields one
+/// row per product: `rating_avg` null and `rating_count` 0 when the
+/// product has no reviews. The average is rounded in SQL to one
+/// decimal and cast to float8 for JSON output.
+const PRODUCT_RATING_JOIN: &str = "LEFT JOIN LATERAL (\
+    SELECT CAST(ROUND(AVG(r.rating)::numeric, 1) AS float8) AS rating_avg, \
+           COUNT(*)::bigint AS rating_count \
+    FROM reviews r WHERE r.product_id = p.id\
+    ) rv ON true";
 
 /// Visibility + search predicate shared by the listing SELECT and COUNT
 /// queries (static fragments only — all values stay bound parameters).
@@ -104,6 +127,7 @@ pub async fn list_products(
 
     let items: Vec<Product> = sqlx::query_as(&format!(
         "SELECT {PRODUCT_COLUMNS} FROM products p JOIN stores s ON s.id = p.store_id \
+         {PRODUCT_RATING_JOIN} \
          WHERE {PRODUCT_WHERE} ORDER BY p.created_at DESC LIMIT $4 OFFSET $5"
     ))
     .bind(&pattern)
@@ -127,6 +151,7 @@ pub async fn list_products(
 pub async fn get_product_by_id(pool: &PgPool, id: Uuid) -> Result<Product, ApiError> {
     sqlx::query_as(&format!(
         "SELECT {PRODUCT_COLUMNS} FROM products p JOIN stores s ON s.id = p.store_id \
+         {PRODUCT_RATING_JOIN} \
          WHERE p.id = $1"
     ))
     .bind(id)

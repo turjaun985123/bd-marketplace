@@ -17,6 +17,11 @@
 //! pattern), per-courier delivery-charge estimates, and smart
 //! routing — booking with courier `auto` picks the cheapest
 //! available courier via the domain `choose_courier` function.
+//! Wave 8: reviews and ratings (`reviews` module) — a buyer may
+//! review a product only after a delivered sub-order proves they
+//! received it; one review per buyer per product; the store owner
+//! may post one reply per review; and the product view gains a live
+//! rating summary from the single aggregate join in `products`.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -32,6 +37,7 @@ pub mod cart;
 pub mod orders;
 pub mod payments;
 pub mod products;
+pub mod reviews;
 pub mod shipments;
 pub mod stores;
 
@@ -471,6 +477,20 @@ pub fn build_app(state: AppState) -> Router {
             post(shipments::create_shipment),
         )
         .route("/v1/shipments/:id/refresh", post(shipments::refresh))
+        // Wave 8 — reviews: buyers review products they received,
+        // edit/delete their own; store owners reply once per review.
+        .route(
+            "/v1/products/:id/reviews",
+            post(reviews::create_review_handler).get(reviews::list_reviews_handler),
+        )
+        .route(
+            "/v1/reviews/:id",
+            patch(reviews::update_review_handler).delete(reviews::delete_review_handler),
+        )
+        .route(
+            "/v1/seller/reviews/:id/reply",
+            post(reviews::create_reply_handler).patch(reviews::update_reply_handler),
+        )
         .layer(CorsLayer::permissive())
         .with_state(state)
 }

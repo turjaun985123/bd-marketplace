@@ -3,20 +3,22 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import ProductCard from "./ProductCard";
-import { listProducts, type Product } from "@/lib/api";
+import { getStoreProducts, listProducts, type Product } from "@/lib/api";
 import { useAuth } from "@/hooks/useAuth";
 import { useCart } from "@/hooks/useCart";
 
 /**
- * Shared marketplace product grid: fetches real products from the Rust
- * API via the typed client and renders them with the shared ProductCard.
+ * Shared product grid: fetches real products from the Rust API via the
+ * typed client and renders them with the shared ProductCard. Used by
+ * the central marketplace (no `storeSlug`) and by storefront pages
+ * (with `storeSlug`) — one grid, two listings, never a copy.
  * Handles the three honest states — loading, API unreachable, and
  * "no products yet" — in Bangla first.
  *
  * ProductCard stays presentational: the add-to-cart button is wired
  * here, in the grid, through the shared useCart hook.
  */
-export default function ProductGrid() {
+export default function ProductGrid({ storeSlug }: { storeSlug?: string }) {
   const { token } = useAuth();
   const { add, error: cartError } = useCart();
   const [products, setProducts] = useState<Product[] | null>(null);
@@ -25,7 +27,10 @@ export default function ProductGrid() {
 
   useEffect(() => {
     let cancelled = false;
-    listProducts({ limit: 24 })
+    const request = storeSlug
+      ? getStoreProducts(storeSlug, token)
+      : listProducts({ limit: 24 });
+    request
       .then((list) => {
         if (!cancelled) setProducts(list.items);
       })
@@ -35,7 +40,7 @@ export default function ProductGrid() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [storeSlug, token]);
 
   async function onAdd(productId: string) {
     setAddedId(null);
@@ -71,6 +76,9 @@ export default function ProductGrid() {
             name={p.title_bn ?? p.title}
             storeName={p.store_slug}
             pricePoisha={p.price_poisha}
+            href={`/products/${p.id}`}
+            ratingAvg={p.rating_avg}
+            ratingCount={p.rating_count}
           />
           {token ? (
             <p>

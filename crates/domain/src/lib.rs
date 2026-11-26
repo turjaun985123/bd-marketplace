@@ -755,6 +755,58 @@ pub fn validate_product_input(input: &ProductInput) -> Result<(), String> {
     Ok(())
 }
 
+/// Maximum length of a review body, in characters.
+pub const MAX_REVIEW_BODY_CHARS: usize = 1_000;
+/// Maximum length of a seller reply body, in characters.
+pub const MAX_REPLY_BODY_CHARS: usize = 500;
+
+/// Is this a valid review rating? Ratings are whole stars, 1 to 5.
+pub fn validate_rating(rating: i64) -> bool {
+    (1..=5).contains(&rating)
+}
+
+/// Validate a review body. The body is OPTIONAL: an empty (or
+/// whitespace-only) body is allowed and means "rating only". A present
+/// body may be at most [`MAX_REVIEW_BODY_CHARS`] characters (counted
+/// after trimming, in Unicode characters, not bytes).
+pub fn validate_review_body(body: &str) -> Result<(), &'static str> {
+    if body.trim().chars().count() > MAX_REVIEW_BODY_CHARS {
+        return Err("review body must be at most 1000 characters");
+    }
+    Ok(())
+}
+
+/// Validate a seller reply body. Unlike a review body, a reply is
+/// meaningless when empty: it must be 1 to [`MAX_REPLY_BODY_CHARS`]
+/// characters after trimming.
+pub fn validate_reply_body(body: &str) -> Result<(), &'static str> {
+    let len = body.trim().chars().count();
+    if len == 0 {
+        return Err("reply body must not be empty");
+    }
+    if len > MAX_REPLY_BODY_CHARS {
+        return Err("reply body must be at most 500 characters");
+    }
+    Ok(())
+}
+
+/// Mask a phone number for public display: keep the first three and
+/// last three digits of the local form, hide the middle. Canonical
+/// numbers are converted to local form first (`+8801712345678`
+/// becomes `017****678`). Inputs too short to mask safely are fully
+/// hidden. Review lists use this so a buyer's full number is never
+/// exposed publicly.
+pub fn mask_phone(phone: &str) -> String {
+    let local = to_local_phone(phone).unwrap_or_else(|| phone.to_string());
+    let chars: Vec<char> = local.chars().collect();
+    if chars.len() < 7 {
+        return "****".to_string();
+    }
+    let head: String = chars.iter().take(3).collect();
+    let tail: String = chars.iter().skip(chars.len() - 3).collect();
+    format!("{head}****{tail}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -890,6 +942,46 @@ mod tests {
         );
         assert_eq!(normalize_bd_phone(" 01712 345678 ").as_deref(), Some("+8801712345678"));
         assert_eq!(normalize_bd_phone("01212345678"), None);
+    }
+
+    #[test]
+    fn rating_rules() {
+        assert!(validate_rating(1));
+        assert!(validate_rating(5));
+        assert!(!validate_rating(0));
+        assert!(!validate_rating(6));
+        assert!(!validate_rating(-1));
+    }
+
+    #[test]
+    fn review_body_rules() {
+        // Optional: empty and whitespace-only bodies are allowed.
+        assert!(validate_review_body("").is_ok());
+        assert!(validate_review_body("   ").is_ok());
+        assert!(validate_review_body("ভালো পণ্য").is_ok());
+        assert!(validate_review_body(&"a".repeat(1_000)).is_ok());
+        assert!(validate_review_body(&"a".repeat(1_001)).is_err());
+        // Surrounding whitespace does not count towards the limit.
+        assert!(validate_review_body(&format!("  {}  ", "a".repeat(1_000))).is_ok());
+    }
+
+    #[test]
+    fn reply_body_rules() {
+        assert!(validate_reply_body("ধন্যবাদ!").is_ok());
+        assert!(validate_reply_body(&"a".repeat(500)).is_ok());
+        assert!(validate_reply_body("").is_err());
+        assert!(validate_reply_body("   ").is_err());
+        assert!(validate_reply_body(&"a".repeat(501)).is_err());
+    }
+
+    #[test]
+    fn phone_masking() {
+        // Canonical numbers are shown in local form, middle hidden.
+        assert_eq!(mask_phone("+8801712345678"), "017****678");
+        // Local input stays local.
+        assert_eq!(mask_phone("01712345678"), "017****678");
+        // Too short to mask safely: fully hidden.
+        assert_eq!(mask_phone("12345"), "****");
     }
 
     #[test]

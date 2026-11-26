@@ -35,6 +35,10 @@ export interface Product {
   status: string;
   /** Weight of one unit in grams (Wave 4 — drives delivery charges). */
   weight_grams: number;
+  /** Mean review rating, one decimal (Wave 8); null when unreviewed. */
+  rating_avg: number | null;
+  /** Number of reviews (Wave 8). */
+  rating_count: number;
   created_at: string;
   updated_at: string;
 }
@@ -387,6 +391,124 @@ export function createProduct(
   input: CreateProductInput
 ): Promise<Product> {
   return call("/v1/products", { method: "POST", token, body: input });
+}
+
+/** GET /v1/products/{id} — one product, with its rating summary. */
+export function getProduct(id: string, token?: string | null): Promise<Product> {
+  return call(`/v1/products/${encodeURIComponent(id)}`, { token });
+}
+
+/** A seller's reply to a review (Wave 8). */
+export interface ReviewReply {
+  id: string;
+  review_id: string;
+  store_id: string;
+  body: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** One product review (Wave 8). The buyer is shown by name when they
+ * have one, otherwise by masked phone — never the full number. */
+export interface Review {
+  id: string;
+  product_id: string;
+  buyer_id: string;
+  buyer_display: string;
+  order_id: string;
+  rating: number;
+  body: string | null;
+  created_at: string;
+  updated_at: string;
+  reply: ReviewReply | null;
+}
+
+export interface ReviewList {
+  items: Review[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+/** GET /v1/products/{id}/reviews — public review list, newest first. */
+export function getProductReviews(
+  productId: string,
+  params?: { page?: number; limit?: number }
+): Promise<ReviewList> {
+  const search = new URLSearchParams();
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/products/${encodeURIComponent(productId)}/reviews${qs ? `?${qs}` : ""}`);
+}
+
+/**
+ * POST /v1/products/{id}/reviews — review a product. The API allows
+ * this only after the buyer received the product in a delivered
+ * order; otherwise it rejects with 403 and the eligibility message.
+ */
+export function createReview(
+  token: string,
+  productId: string,
+  rating: number,
+  body?: string
+): Promise<Review> {
+  return call(`/v1/products/${encodeURIComponent(productId)}/reviews`, {
+    method: "POST",
+    token,
+    body: { rating, body },
+  });
+}
+
+/** PATCH /v1/reviews/{id} — edit your own review (others get 404). */
+export function updateReview(
+  token: string,
+  reviewId: string,
+  patch: { rating?: number; body?: string }
+): Promise<Review> {
+  return call(`/v1/reviews/${encodeURIComponent(reviewId)}`, {
+    method: "PATCH",
+    token,
+    body: patch,
+  });
+}
+
+/** DELETE /v1/reviews/{id} — delete your own review (others get 404). */
+export function deleteReview(token: string, reviewId: string): Promise<void> {
+  return call(`/v1/reviews/${encodeURIComponent(reviewId)}`, {
+    method: "DELETE",
+    token,
+  });
+}
+
+/**
+ * POST /v1/seller/reviews/{id}/reply — the store owner replies to a
+ * review of their product. One reply per review (a second is a 409);
+ * sellers of other stores get a 404.
+ */
+export function replyToReview(
+  token: string,
+  reviewId: string,
+  body: string
+): Promise<ReviewReply> {
+  return call(`/v1/seller/reviews/${encodeURIComponent(reviewId)}/reply`, {
+    method: "POST",
+    token,
+    body: { body },
+  });
+}
+
+/** PATCH /v1/seller/reviews/{id}/reply — edit your store's reply. */
+export function updateReply(
+  token: string,
+  reviewId: string,
+  body: string
+): Promise<ReviewReply> {
+  return call(`/v1/seller/reviews/${encodeURIComponent(reviewId)}/reply`, {
+    method: "PATCH",
+    token,
+    body: { body },
+  });
 }
 
 /** GET /v1/cart — the signed-in buyer's cart. */
