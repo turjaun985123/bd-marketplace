@@ -74,9 +74,12 @@ const PRODUCT_RATING_JOIN: &str = "LEFT JOIN LATERAL (\
 /// queries (static fragments only — all values stay bound parameters).
 /// $1 = ILIKE pattern (or NULL), $2 = store slug (or NULL),
 /// $3 = viewer user id (or NULL; owners additionally see own non-active).
+/// Wave 10: a SUSPENDED store's products are hidden from everyone
+/// except the store's owner (who still manages their catalogue).
 const PRODUCT_WHERE: &str = "($1::text IS NULL OR p.title ILIKE $1 OR p.title_bn ILIKE $1) \
     AND ($2::text IS NULL OR s.slug = $2) \
-    AND (p.status = 'active' OR s.owner_user_id = $3)";
+    AND (p.status = 'active' OR s.owner_user_id = $3) \
+    AND (s.status = 'active' OR s.owner_user_id = $3)";
 
 /// One page of products plus the total match count.
 #[derive(Debug, Serialize)]
@@ -378,21 +381,17 @@ pub async fn get_product(
 ) -> Result<Json<Product>, ApiError> {
     let pool = state.require_pool()?;
     let product = get_product_by_id(pool, id).await?;
-    if product.status != "active" {
-        // Non-active products are visible only to their store's owner.
-        let viewer = authenticate_optional(&state, &headers);
-        let is_owner = match viewer {
-            Some(user) => {
-                get_store_by_id(pool, product.store_id)
-                    .await
-                    .map(|store| store.owner_user_id == user.user_id)
-                    .unwrap_or(false)
-            }
-            None => false,
-        };
-        if !is_owner {
-            return Err(ApiError::not_found("product not found"));
-        }
+    // Two visibility gates, both answered "404" so nothing leaks:
+    // a non-active product is visible only to its store's owner,
+    // and so is ANY product of a suspended store (Wave 10). The
+    // owner always passes both gates (catalogue management).
+    let store = get_store_by_id(pool, product.store_id).await?;
+    let viewer = authenticate_optional(&state, &headers);
+    let is_owner = viewer
+        .map(|user| store.owner_user_id == user.user_id)
+        .unwrap_or(false);
+    if !is_owner && (product.status != "active" || store.status == "suspended") {
+        return Err(ApiError::not_found("product not found"));
     }
     Ok(Json(product))
 }

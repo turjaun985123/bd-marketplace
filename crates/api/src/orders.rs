@@ -321,6 +321,9 @@ struct LockedCartItem {
     unit_price_poisha: i64,
     stock: i32,
     status: String,
+    /// The selling store's status (Wave 10): a suspended store
+    /// cannot sell, so checkout refuses its products with a 409.
+    store_status: String,
     quantity: i32,
     weight_grams: i32,
 }
@@ -368,9 +371,11 @@ pub async fn place_order(
     // Lock the product rows so stock cannot change under this checkout.
     let locked: Vec<LockedCartItem> = sqlx::query_as(
         "SELECT ci.product_id, p.store_id, p.title, \
-         p.price_poisha AS unit_price_poisha, p.stock, p.status, ci.quantity, \
+         p.price_poisha AS unit_price_poisha, p.stock, p.status, \
+         s.status AS store_status, ci.quantity, \
          p.weight_grams \
          FROM cart_items ci JOIN products p ON p.id = ci.product_id \
+         JOIN stores s ON s.id = p.store_id \
          WHERE ci.cart_id = $1 FOR UPDATE OF p",
     )
     .bind(cart_id)
@@ -382,6 +387,12 @@ pub async fn place_order(
         return Err(ApiError::bad_request("cart is empty"));
     }
     for item in &locked {
+        if item.store_status == "suspended" {
+            return Err(ApiError::conflict(format!(
+                "the store selling '{}' is suspended and cannot take orders right now",
+                item.title
+            )));
+        }
         if item.status != "active" {
             return Err(ApiError::bad_request(format!(
                 "product '{}' is no longer available",
@@ -417,7 +428,10 @@ pub async fn place_order(
             items: sub.items.clone(),
         })
         .collect();
-    let totals = build_order_totals(&groups, zone, state.commission_rate_bps);
+    // The commission rate is the EFFECTIVE one (Wave 10): an
+    // admin-set platform setting wins over the startup value.
+    let commission_rate_bps = crate::admin::effective_commission_bps(state).await;
+    let totals = build_order_totals(&groups, zone, commission_rate_bps);
 
     let order_payment_status = if method.is_online() {
         "pending"

@@ -93,13 +93,31 @@ fn sms_sender(state: &AppState) -> Result<LogSmsSender, ApiError> {
 // ---------------------------------------------------------------------------
 
 /// A row of the `users` table; also the public user JSON shape.
+/// `is_admin` (Wave 10) is a flag ON TOP of the role: an admin
+/// keeps their buyer/seller role, and the flag alone unlocks the
+/// `/v1/admin/*` endpoints (see the `admin` module).
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct User {
     pub id: Uuid,
     pub phone: String,
     pub name: Option<String>,
     pub role: String,
+    pub is_admin: bool,
     pub created_at: DateTime<Utc>,
+}
+
+const USER_COLUMNS: &str = "id, phone, name, role, is_admin, created_at";
+
+/// Load one user by id (404 when there is no such user). The admin
+/// guard re-reads the row on every call so a revoked admin flag
+/// takes effect immediately, not at token expiry.
+pub async fn load_user(pool: &PgPool, user_id: Uuid) -> Result<User, ApiError> {
+    sqlx::query_as(&format!("SELECT {USER_COLUMNS} FROM users WHERE id = $1"))
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| ApiError::internal("load user", e))?
+        .ok_or_else(|| ApiError::not_found("user not found"))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -288,11 +306,11 @@ pub async fn verify_otp_code(
 
 /// Find the user for a phone, creating a `buyer` account on first login.
 pub async fn find_or_create_user(pool: &PgPool, phone: &str) -> Result<User, ApiError> {
-    sqlx::query_as(
+    sqlx::query_as(&format!(
         "INSERT INTO users (phone) VALUES ($1) \
          ON CONFLICT (phone) DO UPDATE SET phone = EXCLUDED.phone \
-         RETURNING id, phone, name, role, created_at",
-    )
+         RETURNING {USER_COLUMNS}"
+    ))
     .bind(phone)
     .fetch_one(pool)
     .await
@@ -343,4 +361,16 @@ pub async fn verify_otp(
     let user = verify_otp_code(&state, &req.phone, &req.code).await?;
     let token = issue_token(&state, &user)?;
     Ok(Json(VerifyOtpResponse { token, user }))
+}
+
+/// The signed-in user's own row, re-read from the database: the
+/// web app uses it to refresh what login stored (above all the
+/// `is_admin` flag, which may have changed since the token was
+/// issued).
+pub async fn me(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Json<User>, ApiError> {
+    let pool = state.require_pool()?;
+    Ok(Json(load_user(pool, user.user_id).await?))
 }

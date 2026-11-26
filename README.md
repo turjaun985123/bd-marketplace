@@ -103,6 +103,7 @@ Wave 2 (Postgres-backed; return 503 when `DATABASE_URL` is not set):
 | --- | --- | --- | --- |
 | POST | `/v1/auth/request-otp` | — | Validate + normalize a BD phone, store a HASHED 6-digit OTP (5 min, max 5 attempts), deliver it via the SMS sender |
 | POST | `/v1/auth/verify-otp` | — | Verify the OTP, create the user if new (role `buyer`), return a 7-day JWT |
+| GET | `/v1/auth/me` | Bearer | The caller's own user row, re-read from the database (Wave 10: carries `is_admin`, so clients can refresh what login stored) |
 | POST | `/v1/stores` | Bearer | Create a store (slug validated, duplicate slug → 409); first store upgrades the user to `seller` |
 | GET | `/v1/stores/{slug}` | — | Public store profile |
 | POST | `/v1/products` | Bearer (owner) | Create a product in your own store (Wave 4: accepts `weight_grams`, default 1000) |
@@ -137,7 +138,8 @@ and order_items (title/price snapshots), decrements stock and clears
 the cart — all-or-nothing. **Payment: COD only in Wave 3** — any other
 `payment_method` is a 400 ("not yet available", online payments are
 Wave 5). Commission rate comes from `COMMISSION_RATE_BPS` (default 800 =
-8%), read once at startup.
+8%), read once at startup — since Wave 10 an admin platform setting
+overrides it at checkout time (see the Wave 10 section).
 
 Sub-order status flow (pure domain function `can_transition_sub_order`,
 unit-tested): `placed → confirmed → shipped → delivered`, plus
@@ -485,11 +487,97 @@ store. Counts and recent orders cover the seller's whole selling
 activity (the same scope as the seller orders page), while
 earnings and payouts are strictly per payout store.
 
+Wave 10 (platform admin):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| GET | `/v1/admin/overview` | Bearer, admin. Platform metrics: user/store/product/order counts, GMV, commission earned, pending payouts (count + amount), pending online payments |
+| GET | `/v1/admin/stores?q=&page=&limit=` | Bearer, admin. Every store with owner phone, product count and status; `q` matches name or slug |
+| PATCH | `/v1/admin/stores/{id}/status` | Bearer, admin. Set a store `active` or `suspended` (anything else: 400); returns the store view |
+| GET | `/v1/admin/orders?status=&page=&limit=` | Bearer, admin. Every order (the shared buyer order view), newest first, optional order-status filter |
+| GET | `/v1/admin/payouts?status=&page=&limit=` | Bearer, admin. The payout queue with store name + owner phone, optional status filter |
+| POST | `/v1/admin/payouts/{id}/approve` | Bearer, admin. `requested → approved`; illegal moves are a 409 |
+| POST | `/v1/admin/payouts/{id}/reject` | Bearer, admin. `requested → rejected`; an optional JSON `note` records the reason |
+| POST | `/v1/admin/payouts/{id}/mark-paid` | Bearer, admin. `approved → paid` |
+| GET | `/v1/admin/users?q=&page=&limit=` | Bearer, admin. Every user with role, admin flag and store count; `q` matches a phone substring |
+| PATCH | `/v1/admin/users/{id}` | Bearer, admin. Set or clear ANOTHER user's `is_admin` (your own flag: 400) |
+| GET | `/v1/admin/settings` | Bearer, admin. The EFFECTIVE settings: `commission_bps`, `min_payout_poisha`, `platform_name` |
+| PUT | `/v1/admin/settings` | Bearer, admin. Store setting overrides (validated: commission 0–3000 bps, minimum payout 0–10,000,000 poisha) |
+
+Every admin handler starts from the ONE guard
+(`require_admin` in `crates/api/src/admin.rs`), which re-reads
+the caller's user row on every request — a revoked flag stops
+working immediately, not when the JWT expires. Non-admins get a
+403 on all of the above.
+
+**Admin model:** admin is a boolean flag on the user row
+(`users.is_admin`, migration 0013), NOT a role — an admin keeps
+their buyer/seller role, and the flag alone unlocks the admin
+endpoints. There is deliberately **no endpoint that creates the
+first admin** (an endpoint that grants admin is an attack
+target). Promote by SQL instead; the account must have logged
+in at least once so its user row exists:
+
+```sql
+UPDATE users SET is_admin = true WHERE phone = '+8801XXXXXXXXX';
+```
+
+After that, admins promote and demote OTHER users from the
+admin panel. An admin can never change their OWN flag through
+the API (400, "you cannot change your own admin flag") — the
+platform cannot lock itself out of its last admin by accident.
+
+**Suspension semantics:** suspending a store hides its products
+from the marketplace listing, the storefront listing and the
+public product detail (404 for everyone but the owner — the
+enforcement lives in the shared product queries, so no client
+can route around it), and checkout refuses any cart containing
+a suspended store's product with a 409 naming the product. The
+seller can still sign in, see and manage their catalogue, and
+keep their payout history; existing orders are untouched.
+Reactivation restores visibility and checkout exactly — nothing
+is ever deleted.
+
+**Payout processing (lifecycle completed):** the three
+processing endpoints are thin handlers over ONE service
+function driven by the Wave 9 domain transition table
+(`requested → approved → paid`, `requested → rejected`). A legal
+move stamps `processed_at`; rejection stores the admin's note
+as the reason the seller sees. Rejecting a request releases its
+amount back into the seller's available balance (it stops
+counting as pending; nothing was ever paid out). Approving
+keeps the amount committed (it counts as paid out from
+approval on, so it can never be requested twice).
+
+**Settings override precedence:** a row in `platform_settings`
+(migration 0013) beats the startup value, which beats the
+built-in default — for commission: setting > `COMMISSION_RATE_BPS`
+env > 800; for the minimum payout: setting > the domain
+constant `MIN_PAYOUT_POISHA` (50,000). Checkout and payout
+creation read through the two effective-value helpers
+(`effective_commission_bps`, `effective_min_payout`), never the
+raw values. Stored values are parsed by the pure domain
+function `parse_setting_i64` and range-checked on read, so a
+bad row is ignored instead of breaking checkout. Overrides
+apply to NEW operations only: an order keeps the commission
+snapshot it was placed with, and a payout request keeps the
+rules it was validated under.
+
+**Overview metric definitions:** counts are plain table counts.
+GMV (`gmv_goods_poisha`) is the sum of `goods_subtotal_poisha`
+over sub-orders whose status is NOT `cancelled`, and
+`commission_earned_poisha` is the same filter over
+`commission_poisha` — a cancelled sub-order never moved money,
+so it counts towards neither. `payouts_pending` covers payouts
+still `requested`; `payments_pending_count` covers online
+payments still `pending` settlement.
+
 Auth rules that matter: only a SHA-256 hash of an OTP is ever stored;
 ownership is checked on every seller mutation (403 for non-owners);
 every product query is scoped by store. Listing visibility: public
-callers see only `active` products; a signed-in owner also sees their
-own store's drafts/archived items.
+callers see only `active` products of `active` stores; a signed-in
+owner also sees their own store's drafts/archived items (and their
+products while the store is suspended, Wave 10).
 
 OpenAPI: dependencies stay minimal instead of pulling in a spec
 generator; this table is the endpoint listing for now. The typed
@@ -726,9 +814,35 @@ per-seller isolation; the seller home page (`/seller`) with money
 stat cards, status counts, recent orders, the payout account
 form, the payout request form (taka input converted by the shared
 `parseTakaToPoisha`) and the payout history with Bangla status
-labels. Payout APPROVAL and PAYMENT are not here yet — they are
-platform operations and land with the admin wave; until then
-payouts stay `requested`.
+labels. Payout APPROVAL and PAYMENT are not in this wave — they
+are platform operations and land with the admin wave (Wave 10,
+below); until then payouts stay `requested`.
+
+**Real (Wave 10):** the platform admin — migration 0013
+(`users.is_admin`, `stores.status`, `platform_settings`); the
+pure domain settings rules (`validate_commission_bps`,
+`parse_setting_i64`, the setting key constants, and
+`validate_payout_amount_with_min`, which the Wave 9 validator
+now delegates to); the ONE `require_admin` guard behind every
+`/v1/admin/*` endpoint; overview metrics (GMV and commission
+exclude cancelled sub-orders); store suspension enforced in the
+shared product listing/detail paths and at checkout (409), with
+owner access preserved; the payout processing queue completing
+the Wave 9 lifecycle (approve / reject-with-note / mark-paid
+over the one transition function, rejection restoring the
+seller's available balance); user admin flags with the
+self-change lockout; platform settings whose stored values
+override the startup commission rate and minimum payout through
+the two effective-value helpers checkout and payout creation
+call; `GET /v1/auth/me` and `is_admin` on every user view; an
+integration test (`crates/api/tests/wave10.rs`, same
+`DATABASE_URL` gate) covering the 403 wall, SQL promotion,
+overview numbers, the full payout lifecycle, suspension and
+reactivation, the commission override changing a real checkout,
+and flag promotion/demotion; the Next.js admin area
+(`/admin` overview, stores, payouts, users, settings) behind
+the shared `AdminShell` guard, plus an admins-only Admin link
+in the marketplace nav.
 
 **Stubbed (typed errors — never fake success, no network calls):**
 eCourier / Paperfly courier adapters. Manual Phase 2 couriers
@@ -738,8 +852,7 @@ trait later. SMS sending has only the dev-mode log implementation
 
 **TODO / not wired:** live gateway calls and real-gateway webhook
 signature verification (need merchant credentials + each gateway's
-integration docs), refunds, payout approval/payment processing
-(admin wave), Redis, a real SMS gateway,
+integration docs), refunds, Redis, a real SMS gateway,
 SIDRA calls, worker jobs — including automatic courier status
 polling, which will call the same refresh service function the API
 exposes (the worker still logs its planned jobs and exits cleanly).
@@ -747,15 +860,16 @@ exposes (the worker still logs its planned jobs and exits cleanly).
 ## Verification status
 
 - **Next.js: verified on this machine** — `npm ci && npm run build`
-  passes (Wave 9 seller dashboard page included).
+  passes (Wave 10 admin pages included: /admin, /admin/stores,
+  /admin/payouts, /admin/users, /admin/settings).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
-  (domain 41, courier 21, payments 8 unit tests; the `DATABASE_URL`-
+  (domain 44, courier 21, payments 8 unit tests; the `DATABASE_URL`-
   gated integration tests skip cleanly without a database). The API
   binary was also smoke-tested locally without a database: routes
   build, `/v1/couriers` answers, auth rejects unauthenticated calls
-  (including the Wave 9 seller endpoints).
-- **Rust integration + clippy: CI-only** — the Wave 2–9 integration
+  (including the Wave 10 admin endpoints).
+- **Rust integration + clippy: CI-only** — the Wave 2–10 integration
   tests against a real Postgres 16 service and clippy `-D warnings`
   are verified via **GitHub Actions CI** (`.github/workflows/ci.yml`)
-  on push. Waves 1–8 are green there; Wave 9 awaits its first CI run.
+  on push. Waves 1–9 are green there; Wave 10 awaits its first CI run.

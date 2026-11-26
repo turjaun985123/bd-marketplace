@@ -10,6 +10,8 @@ export interface User {
   phone: string;
   name: string | null;
   role: string;
+  /** Wave 10: platform admin flag, on top of the role. */
+  is_admin: boolean;
   created_at: string;
 }
 
@@ -19,6 +21,8 @@ export interface Store {
   slug: string;
   name: string;
   description: string | null;
+  /** active | suspended (Wave 10 admin kill switch). */
+  status: string;
   created_at: string;
 }
 
@@ -353,6 +357,15 @@ export function requestOtp(phone: string): Promise<RequestOtpResult> {
 /** POST /v1/auth/verify-otp — step 2: returns the JWT + user. */
 export function verifyOtp(phone: string, code: string): Promise<VerifyOtpResult> {
   return call("/v1/auth/verify-otp", { method: "POST", body: { phone, code } });
+}
+
+/**
+ * GET /v1/auth/me — the signed-in user's row, re-read from the API
+ * (Wave 10). Login stores a snapshot; this refreshes it — above all
+ * `is_admin`, which may have changed since the token was issued.
+ */
+export function getMe(token: string): Promise<User> {
+  return call("/v1/auth/me", { token });
 }
 
 /** GET /v1/stores/{slug} — public store profile (also resolves the id). */
@@ -863,4 +876,229 @@ export function listPayouts(
   if (params?.limit) search.set("limit", String(params.limit));
   const qs = search.toString();
   return call(`/v1/seller/payouts${qs ? `?${qs}` : ""}`, { token });
+}
+
+// ---------------------------------------------------------------------------
+// Wave 10 — platform admin. Every call needs an admin token; the API
+// answers 403 for everyone else (the pages also gate on /v1/auth/me).
+// ---------------------------------------------------------------------------
+
+/** Platform metrics (GET /v1/admin/overview). GMV and commission
+ * exclude cancelled sub-orders — they never moved money. */
+export interface AdminOverview {
+  users: number;
+  stores: number;
+  products: number;
+  orders: number;
+  gmv_goods_poisha: number;
+  commission_earned_poisha: number;
+  payouts_pending: { count: number; amount_poisha: number };
+  payments_pending_count: number;
+}
+
+/** A store in the admin list: owner phone + product count added. */
+export interface AdminStore {
+  id: string;
+  owner_user_id: string;
+  owner_phone: string;
+  slug: string;
+  name: string;
+  description: string | null;
+  /** active | suspended */
+  status: string;
+  product_count: number;
+  created_at: string;
+}
+
+export interface AdminStoreList {
+  items: AdminStore[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+/** A payout in the admin queue: store name + owner phone added. */
+export interface AdminPayout {
+  id: string;
+  store_id: string;
+  store_name: string;
+  owner_phone: string;
+  amount_poisha: number;
+  method: string;
+  account_name: string;
+  account_number: string;
+  /** requested | approved | paid | rejected */
+  status: string;
+  note: string | null;
+  created_at: string;
+  processed_at: string | null;
+}
+
+export interface AdminPayoutList {
+  items: AdminPayout[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+/** A user in the admin list: store count added. */
+export interface AdminUser {
+  id: string;
+  phone: string;
+  name: string | null;
+  role: string;
+  is_admin: boolean;
+  store_count: number;
+  created_at: string;
+}
+
+export interface AdminUserList {
+  items: AdminUser[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+/** Effective platform settings (GET /v1/admin/settings): the values
+ * checkout and payout creation actually use, after overrides. */
+export interface AdminSettings {
+  commission_bps: number;
+  min_payout_poisha: number;
+  platform_name: string;
+}
+
+/** GET /v1/admin/overview — platform metrics for the stat cards. */
+export function getAdminOverview(token: string): Promise<AdminOverview> {
+  return call("/v1/admin/overview", { token });
+}
+
+/** GET /v1/admin/stores — every store, optional name/slug search. */
+export function listAdminStores(
+  token: string,
+  params?: { q?: string; page?: number; limit?: number }
+): Promise<AdminStoreList> {
+  const search = new URLSearchParams();
+  if (params?.q) search.set("q", params.q);
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/admin/stores${qs ? `?${qs}` : ""}`, { token });
+}
+
+/**
+ * PATCH /v1/admin/stores/{id}/status — suspend or reactivate a
+ * store. Suspension hides its products publicly and blocks its
+ * checkouts (409); it deletes nothing.
+ */
+export function setAdminStoreStatus(
+  token: string,
+  storeId: string,
+  status: "active" | "suspended"
+): Promise<Store> {
+  return call(`/v1/admin/stores/${encodeURIComponent(storeId)}/status`, {
+    method: "PATCH",
+    token,
+    body: { status },
+  });
+}
+
+/** GET /v1/admin/orders — every order, optional status filter. */
+export function listAdminOrders(
+  token: string,
+  params?: { status?: string; page?: number; limit?: number }
+): Promise<OrderList> {
+  const search = new URLSearchParams();
+  if (params?.status) search.set("status", params.status);
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/admin/orders${qs ? `?${qs}` : ""}`, { token });
+}
+
+/** GET /v1/admin/payouts — the processing queue, optional status filter. */
+export function listAdminPayouts(
+  token: string,
+  params?: { status?: string; page?: number; limit?: number }
+): Promise<AdminPayoutList> {
+  const search = new URLSearchParams();
+  if (params?.status) search.set("status", params.status);
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/admin/payouts${qs ? `?${qs}` : ""}`, { token });
+}
+
+/** POST /v1/admin/payouts/{id}/approve — requested -> approved. */
+export function approvePayout(token: string, payoutId: string): Promise<Payout> {
+  return call(`/v1/admin/payouts/${encodeURIComponent(payoutId)}/approve`, {
+    method: "POST",
+    token,
+  });
+}
+
+/** POST /v1/admin/payouts/{id}/reject — requested -> rejected, with a reason. */
+export function rejectPayout(
+  token: string,
+  payoutId: string,
+  note?: string
+): Promise<Payout> {
+  return call(`/v1/admin/payouts/${encodeURIComponent(payoutId)}/reject`, {
+    method: "POST",
+    token,
+    body: { note },
+  });
+}
+
+/** POST /v1/admin/payouts/{id}/mark-paid — approved -> paid. */
+export function markPayoutPaid(token: string, payoutId: string): Promise<Payout> {
+  return call(`/v1/admin/payouts/${encodeURIComponent(payoutId)}/mark-paid`, {
+    method: "POST",
+    token,
+  });
+}
+
+/** GET /v1/admin/users — every user, optional phone substring search. */
+export function listAdminUsers(
+  token: string,
+  params?: { q?: string; page?: number; limit?: number }
+): Promise<AdminUserList> {
+  const search = new URLSearchParams();
+  if (params?.q) search.set("q", params.q);
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/admin/users${qs ? `?${qs}` : ""}`, { token });
+}
+
+/**
+ * PATCH /v1/admin/users/{id} — set or clear ANOTHER user's admin
+ * flag. The API refuses self-changes with a 400.
+ */
+export function setUserAdmin(
+  token: string,
+  userId: string,
+  isAdmin: boolean
+): Promise<User> {
+  return call(`/v1/admin/users/${encodeURIComponent(userId)}`, {
+    method: "PATCH",
+    token,
+    body: { is_admin: isAdmin },
+  });
+}
+
+/** GET /v1/admin/settings — the effective platform settings. */
+export function getAdminSettings(token: string): Promise<AdminSettings> {
+  return call("/v1/admin/settings", { token });
+}
+
+/**
+ * PUT /v1/admin/settings — store overrides. A stored commission
+ * rate beats COMMISSION_RATE_BPS at checkout; a stored minimum
+ * payout beats the built-in 500-taka floor for new requests.
+ */
+export function updateAdminSettings(
+  token: string,
+  patch: { commission_bps?: number; min_payout_poisha?: number }
+): Promise<AdminSettings> {
+  return call("/v1/admin/settings", { method: "PUT", token, body: patch });
 }

@@ -1,4 +1,5 @@
 import Link from "next/link";
+import AdminLink from "@/components/AdminLink";
 import DeliveryChargeWidget from "@/components/DeliveryChargeWidget";
 import ProductGrid from "@/components/ProductGrid";
 
@@ -18,6 +19,7 @@ export default function MarketplaceHomePage() {
         <Link href="/cart">আমার কার্ট — Cart</Link>
         {" · "}
         <Link href="/orders">আমার অর্ডার — My orders</Link>
+        <AdminLink />
       </p>
 
       <h2>পণ্য — Products</h2>

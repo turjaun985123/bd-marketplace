@@ -27,8 +27,16 @@
 //! sub-orders (goods minus the commission snapshot); one earnings
 //! aggregate feeds the dashboard, the balance endpoint and payout
 //! creation; sellers save one payout account and request payouts
-//! against their available balance (platform minimum 500 taka);
-//! approval and payment processing land with the admin wave.
+//! against their available balance (platform minimum 500 taka).
+//! Wave 10: the platform admin (`admin` module) — every admin
+//! endpoint sits behind the one `require_admin` guard (the
+//! `is_admin` flag on the user row; the first admin is promoted
+//! by SQL, never by an endpoint); admins get overview metrics,
+//! the payout processing queue (approve / reject / mark-paid over
+//! the Wave 9 transition table), store suspension (enforced in
+//! the shared product queries and at checkout), user admin flags
+//! (never their own), and platform settings whose rows override
+//! the startup commission rate and minimum payout at read time.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -39,6 +47,7 @@
 //! NOT set the API still starts and serves the Wave 1 stateless
 //! endpoints; DB-backed endpoints return a clear 503 instead of panicking.
 
+pub mod admin;
 pub mod auth;
 pub mod cart;
 pub mod orders;
@@ -76,8 +85,11 @@ pub struct AppState {
     /// Gates the log SMS sender and the `dev_otp` response field.
     pub sms_dev_mode: bool,
     /// Platform commission rate in basis points (800 = 8%). Read once at
-    /// startup from `COMMISSION_RATE_BPS` (see `from_env`); checkout
-    /// passes it to the domain `build_order_totals` function.
+    /// startup from `COMMISSION_RATE_BPS` (see `from_env`). This is
+    /// the FALLBACK rate: checkout asks `admin::effective_commission_bps`
+    /// for the rate to pass to the domain `build_order_totals`
+    /// function, and an admin-set platform setting (Wave 10) wins
+    /// over this value.
     pub commission_rate_bps: u32,
     /// Payment configuration (Wave 5): the DEV simulator switch and
     /// secret, plus one merchant credential set per gateway. Built
@@ -425,6 +437,8 @@ pub fn build_app(state: AppState) -> Router {
         // Wave 2 — auth (phone + OTP + JWT).
         .route("/v1/auth/request-otp", post(auth::request_otp))
         .route("/v1/auth/verify-otp", post(auth::verify_otp))
+        // Wave 10 — the caller's own row, re-read (carries is_admin).
+        .route("/v1/auth/me", get(auth::me))
         // Wave 2 — stores.
         .route("/v1/stores", post(stores::create_store))
         .route("/v1/stores/:slug", get(stores::get_store))
@@ -511,6 +525,33 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/v1/seller/payouts",
             post(payouts::request_payout_handler).get(payouts::list_payouts_handler),
+        )
+        // Wave 10 — platform admin: every route behind require_admin.
+        .route("/v1/admin/overview", get(admin::overview_handler))
+        .route("/v1/admin/stores", get(admin::list_stores_handler))
+        .route(
+            "/v1/admin/stores/:id/status",
+            patch(admin::set_store_status_handler),
+        )
+        .route("/v1/admin/orders", get(admin::list_orders_handler))
+        .route("/v1/admin/payouts", get(admin::list_payouts_handler))
+        .route(
+            "/v1/admin/payouts/:id/approve",
+            post(admin::approve_payout_handler),
+        )
+        .route(
+            "/v1/admin/payouts/:id/reject",
+            post(admin::reject_payout_handler),
+        )
+        .route(
+            "/v1/admin/payouts/:id/mark-paid",
+            post(admin::mark_payout_paid_handler),
+        )
+        .route("/v1/admin/users", get(admin::list_users_handler))
+        .route("/v1/admin/users/:id", patch(admin::set_user_admin_handler))
+        .route(
+            "/v1/admin/settings",
+            get(admin::get_settings_handler).put(admin::update_settings_handler),
         )
         .layer(CorsLayer::permissive())
         .with_state(state)

@@ -18,11 +18,10 @@
 //!   domain minimum (500 taka) and fit the available balance. The
 //!   payout row SNAPSHOTS the account fields, so editing the
 //!   account later never rewrites where an earlier payout goes.
-//! - Lifecycle: sellers create `requested` payouts here. Approval
-//!   and payment processing are platform operations and land with
-//!   the admin wave, so payouts stay `requested` until then; the
-//!   transition table already lives in the domain
-//!   (`can_transition_payout`).
+//! - Lifecycle: sellers create `requested` payouts here. Approval,
+//!   rejection and payment are platform operations driven by the
+//!   admin endpoints (Wave 10, `admin` module) through the same
+//!   domain transition table (`can_transition_payout`).
 //!
 //! Scoping: every query starts from the authenticated user. The
 //! payout store is the seller's earliest-created store
@@ -40,7 +39,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use domain::{
-    compute_available_balance, validate_payout_account, validate_payout_amount,
+    compute_available_balance, validate_payout_account, validate_payout_amount_with_min,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
@@ -307,9 +306,12 @@ pub async fn save_payout_account(
 /// Request a payout of `amount_poisha` from the caller's available
 /// balance. Requires a saved payout account (its fields are
 /// snapshotted onto the payout row); the domain amount validator
-/// enforces the platform minimum and the balance fit.
+/// enforces the platform minimum and the balance fit. The minimum
+/// is the EFFECTIVE one (Wave 10): an admin-set platform setting
+/// wins over the built-in [`domain::MIN_PAYOUT_POISHA`].
 pub async fn request_payout(
     pool: &PgPool,
+    state: &AppState,
     user: &AuthUser,
     amount_poisha: i64,
 ) -> Result<Payout, ApiError> {
@@ -328,8 +330,13 @@ pub async fn request_payout(
     })?;
 
     let earnings = seller_earnings(pool, store.id).await?;
-    validate_payout_amount(amount_poisha, earnings.available_poisha)
-        .map_err(ApiError::bad_request)?;
+    let min_payout_poisha = crate::admin::effective_min_payout(state).await;
+    validate_payout_amount_with_min(
+        amount_poisha,
+        earnings.available_poisha,
+        min_payout_poisha,
+    )
+    .map_err(ApiError::bad_request)?;
 
     sqlx::query_as(
         "INSERT INTO payouts (store_id, amount_poisha, method, account_name, account_number) \
@@ -459,7 +466,7 @@ pub async fn request_payout_handler(
     Json(input): Json<RequestPayoutInput>,
 ) -> Result<(StatusCode, Json<Payout>), ApiError> {
     let pool = state.require_pool()?;
-    let payout = request_payout(pool, &user, input.amount_poisha).await?;
+    let payout = request_payout(pool, &state, &user, input.amount_poisha).await?;
     Ok((StatusCode::CREATED, Json(payout)))
 }
 

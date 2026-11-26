@@ -892,21 +892,65 @@ pub fn validate_payout_account(
 }
 
 /// May a seller request a payout of `amount_poisha` against an
-/// available balance of `available_poisha`? Two rules: the amount
-/// must reach the platform minimum ([`MIN_PAYOUT_POISHA`]) and must
-/// not exceed what is available. Error strings are user-facing and
-/// name the failed rule.
-pub fn validate_payout_amount(
+/// available balance of `available_poisha`, when the platform
+/// minimum payout is `min_payout_poisha`? Two rules: the amount
+/// must reach the minimum and must not exceed what is available.
+/// Error strings are user-facing and name the failed rule. The
+/// minimum is a parameter so an admin-set platform setting can
+/// override the built-in [`MIN_PAYOUT_POISHA`] without a second
+/// copy of the rules.
+pub fn validate_payout_amount_with_min(
     amount_poisha: i64,
     available_poisha: i64,
+    min_payout_poisha: i64,
 ) -> Result<(), &'static str> {
-    if amount_poisha < MIN_PAYOUT_POISHA {
+    if amount_poisha < min_payout_poisha {
         return Err("payout amount is below the minimum payout");
     }
     if amount_poisha > available_poisha {
         return Err("payout amount exceeds the available balance");
     }
     Ok(())
+}
+
+/// [`validate_payout_amount_with_min`] with the built-in platform
+/// minimum ([`MIN_PAYOUT_POISHA`]).
+pub fn validate_payout_amount(
+    amount_poisha: i64,
+    available_poisha: i64,
+) -> Result<(), &'static str> {
+    validate_payout_amount_with_min(amount_poisha, available_poisha, MIN_PAYOUT_POISHA)
+}
+
+/// The `platform_settings` key for the commission rate override
+/// (Wave 10). When a row with this key holds a valid value, it
+/// beats the startup `COMMISSION_RATE_BPS` at checkout.
+pub const COMMISSION_BPS_KEY: &str = "commission_bps";
+
+/// The `platform_settings` key for the minimum payout override
+/// (Wave 10). When a row with this key holds a valid value, it
+/// beats [`MIN_PAYOUT_POISHA`] for new payout requests.
+pub const MIN_PAYOUT_KEY: &str = "min_payout_poisha";
+
+/// Is `bps` a legal platform commission rate, in basis points?
+/// Zero is allowed (a commission-free promotion is a legitimate
+/// platform decision); the cap is 3,000 bps = 30% — above that a
+/// "commission" is a data-entry error, not a business model. The
+/// same rule gates the admin settings endpoint and the read-back
+/// of a stored setting, so an out-of-range row is ignored rather
+/// than applied.
+pub fn validate_commission_bps(bps: i64) -> bool {
+    (0..=3_000).contains(&bps)
+}
+
+/// Parse a stored platform setting into an integer: surrounding
+/// whitespace is ignored, anything else that is not a plain
+/// base-10 integer (empty, decimal point, letters, overflow) is
+/// `None`. Settings are stored as text so future non-numeric
+/// settings share the table; readers treat `None` as "no override"
+/// and fall back to the startup value.
+pub fn parse_setting_i64(raw: &str) -> Option<i64> {
+    raw.trim().parse::<i64>().ok()
 }
 
 #[cfg(test)]
@@ -1697,5 +1741,50 @@ mod tests {
         // Above the available balance: rejected, even past the minimum.
         assert!(validate_payout_amount(184_001, 184_000).is_err());
         assert!(validate_payout_amount(50_000, 0).is_err());
+    }
+
+    #[test]
+    fn payout_amount_validation_with_custom_min() {
+        // A lower admin-set minimum admits smaller payouts.
+        assert!(validate_payout_amount_with_min(10_000, 184_000, 10_000).is_ok());
+        assert!(validate_payout_amount_with_min(9_999, 184_000, 10_000).is_err());
+        // A higher minimum blocks what the default would allow.
+        assert!(validate_payout_amount_with_min(50_000, 184_000, 100_000).is_err());
+        assert!(validate_payout_amount_with_min(100_000, 184_000, 100_000).is_ok());
+        // The balance fit is independent of the minimum.
+        assert!(validate_payout_amount_with_min(184_001, 184_000, 10_000).is_err());
+        // The delegating wrapper always uses the built-in minimum.
+        assert_eq!(
+            validate_payout_amount(49_999, 184_000),
+            validate_payout_amount_with_min(49_999, 184_000, MIN_PAYOUT_POISHA)
+        );
+    }
+
+    #[test]
+    fn commission_bps_validation() {
+        assert!(validate_commission_bps(0));
+        assert!(validate_commission_bps(800));
+        assert!(validate_commission_bps(3_000));
+        assert!(!validate_commission_bps(3_001));
+        assert!(!validate_commission_bps(5_000));
+        assert!(!validate_commission_bps(10_000));
+        assert!(!validate_commission_bps(-1));
+    }
+
+    #[test]
+    fn setting_value_parsing() {
+        assert_eq!(parse_setting_i64("800"), Some(800));
+        assert_eq!(parse_setting_i64("  1000  "), Some(1_000));
+        assert_eq!(parse_setting_i64("0"), Some(0));
+        assert_eq!(parse_setting_i64("-5"), Some(-5));
+        assert_eq!(parse_setting_i64(""), None);
+        assert_eq!(parse_setting_i64("   "), None);
+        assert_eq!(parse_setting_i64("abc"), None);
+        assert_eq!(parse_setting_i64("10.5"), None);
+        assert_eq!(parse_setting_i64("1_000"), None);
+        assert_eq!(parse_setting_i64("99999999999999999999999999"), None);
+        // The setting keys are the contract with the settings table.
+        assert_eq!(COMMISSION_BPS_KEY, "commission_bps");
+        assert_eq!(MIN_PAYOUT_KEY, "min_payout_poisha");
     }
 }
