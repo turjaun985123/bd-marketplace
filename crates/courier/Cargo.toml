@@ -1,0 +1,11 @@
+[package]
+name = "courier"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = "0.1"
+domain = { path = "../domain" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
