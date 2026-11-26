@@ -137,6 +137,100 @@ pub fn compute_commission(subtotal_poisha: i64, rate_bps: u32) -> CommissionQuot
     }
 }
 
+/// Validate a Bangladeshi mobile number in local form: exactly 11 ASCII
+/// digits, starting with `01`, third digit in 3..=9 (operator prefixes
+/// 013–019). Pure helper — the single source of truth for phone rules.
+fn is_valid_local_bd_phone(local: &str) -> bool {
+    let bytes = local.as_bytes();
+    bytes.len() == 11
+        && local.bytes().all(|b| b.is_ascii_digit())
+        && bytes[0] == b'0'
+        && bytes[1] == b'1'
+        && (b'3'..=b'9').contains(&bytes[2])
+}
+
+/// Is this a valid Bangladeshi mobile number? Accepts the local form
+/// `01XXXXXXXXX` and the international form `+8801XXXXXXXXX`.
+pub fn is_valid_bd_phone(phone: &str) -> bool {
+    if let Some(rest) = phone.strip_prefix("+880") {
+        is_valid_local_bd_phone(&format!("0{rest}"))
+    } else {
+        is_valid_local_bd_phone(phone)
+    }
+}
+
+/// Normalize a Bangladeshi mobile number to the canonical international
+/// form `+8801XXXXXXXXX`. Accepts `01XXXXXXXXX`, `8801XXXXXXXXX` and
+/// `+8801XXXXXXXXX` (whitespace ignored). Returns `None` if invalid.
+/// Auth stores and looks up only this canonical form.
+pub fn normalize_bd_phone(phone: &str) -> Option<String> {
+    let cleaned: String = phone.chars().filter(|c| !c.is_whitespace()).collect();
+    let local = if let Some(rest) = cleaned.strip_prefix("+880") {
+        format!("0{rest}")
+    } else if let Some(rest) = cleaned.strip_prefix("880") {
+        format!("0{rest}")
+    } else {
+        cleaned
+    };
+    if is_valid_local_bd_phone(&local) {
+        Some(format!("+880{}", &local[1..]))
+    } else {
+        None
+    }
+}
+
+/// Is this a valid store slug? Slugs are the storefront subdomain segment:
+/// 3–40 chars, lowercase ASCII letters, digits and hyphens, and they must
+/// start and end with a letter or digit.
+pub fn is_valid_slug(slug: &str) -> bool {
+    let len = slug.chars().count();
+    if !(3..=40).contains(&len) {
+        return false;
+    }
+    let valid_chars = slug
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if !valid_chars {
+        return false;
+    }
+    let bytes = slug.as_bytes();
+    bytes[0].is_ascii_alphanumeric() && bytes[len - 1].is_ascii_alphanumeric()
+}
+
+/// Product lifecycle statuses (mirrors the DB CHECK constraint).
+pub fn is_valid_product_status(status: &str) -> bool {
+    matches!(status, "draft" | "active" | "archived")
+}
+
+/// Typed input for product validation — mirrors the create/update payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProductInput {
+    pub title: String,
+    /// Price in poisha.
+    pub price_poisha: i64,
+    pub stock: i32,
+    pub status: String,
+}
+
+/// Validate product input. Pure and shared by the create and update
+/// service functions so the rules can never drift apart. Returns a
+/// human-readable error message on failure.
+pub fn validate_product_input(input: &ProductInput) -> Result<(), String> {
+    if input.title.trim().is_empty() {
+        return Err("title must not be empty".to_string());
+    }
+    if input.price_poisha < 0 {
+        return Err("price_poisha must be >= 0".to_string());
+    }
+    if input.stock < 0 {
+        return Err("stock must be >= 0".to_string());
+    }
+    if !is_valid_product_status(&input.status) {
+        return Err("status must be one of: draft, active, archived".to_string());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +317,83 @@ mod tests {
         }
         assert_eq!(commission_total, 35_600); // 356 BDT
         assert_eq!(payout_total, 409_400); // 4,094 BDT
+    }
+
+    #[test]
+    fn bd_phone_accepts_local_and_international_forms() {
+        assert!(is_valid_bd_phone("01712345678"));
+        assert!(is_valid_bd_phone("01312345678"));
+        assert!(is_valid_bd_phone("01912345678"));
+        assert!(is_valid_bd_phone("+8801712345678"));
+    }
+
+    #[test]
+    fn bd_phone_rejects_bad_numbers() {
+        assert!(!is_valid_bd_phone("01212345678")); // third digit 2 — no such prefix
+        assert!(!is_valid_bd_phone("01012345678")); // third digit 0
+        assert!(!is_valid_bd_phone("0171234567")); // 10 digits
+        assert!(!is_valid_bd_phone("017123456789")); // 12 digits
+        assert!(!is_valid_bd_phone("02712345678")); // landline-style prefix
+        assert!(!is_valid_bd_phone("0171234567a")); // letter
+        assert!(!is_valid_bd_phone("+8801212345678")); // bad prefix, intl form
+        assert!(!is_valid_bd_phone(""));
+    }
+
+    #[test]
+    fn bd_phone_normalizes_to_canonical_form() {
+        assert_eq!(
+            normalize_bd_phone("01712345678").as_deref(),
+            Some("+8801712345678")
+        );
+        assert_eq!(
+            normalize_bd_phone("8801712345678").as_deref(),
+            Some("+8801712345678")
+        );
+        assert_eq!(
+            normalize_bd_phone("+8801712345678").as_deref(),
+            Some("+8801712345678")
+        );
+        assert_eq!(normalize_bd_phone(" 01712 345678 ").as_deref(), Some("+8801712345678"));
+        assert_eq!(normalize_bd_phone("01212345678"), None);
+    }
+
+    #[test]
+    fn slug_rules() {
+        assert!(is_valid_slug("rahim-store"));
+        assert!(is_valid_slug("shop123"));
+        assert!(is_valid_slug("abc"));
+        assert!(!is_valid_slug("ab")); // too short
+        assert!(!is_valid_slug("Rahim-Store")); // uppercase
+        assert!(!is_valid_slug("rahim_store")); // underscore
+        assert!(!is_valid_slug("-rahim")); // starts with hyphen
+        assert!(!is_valid_slug("rahim-")); // ends with hyphen
+        assert!(!is_valid_slug(&"a".repeat(41))); // too long
+    }
+
+    #[test]
+    fn product_input_validation() {
+        let ok = ProductInput {
+            title: "Panjabi".to_string(),
+            price_poisha: 150_000,
+            stock: 10,
+            status: "active".to_string(),
+        };
+        assert!(validate_product_input(&ok).is_ok());
+
+        let mut bad = ok.clone();
+        bad.title = "  ".to_string();
+        assert!(validate_product_input(&bad).is_err());
+
+        let mut bad = ok.clone();
+        bad.price_poisha = -1;
+        assert!(validate_product_input(&bad).is_err());
+
+        let mut bad = ok.clone();
+        bad.stock = -1;
+        assert!(validate_product_input(&bad).is_err());
+
+        let mut bad = ok;
+        bad.status = "live".to_string();
+        assert!(validate_product_input(&bad).is_err());
     }
 }

@@ -1,7 +1,14 @@
+import Link from "next/link";
+
 export default function SellerDashboardPage() {
   return (
     <main>
       <h1>বিক্রেতা ড্যাশবোর্ড</h1>
+      <p>
+        <Link href="/seller/products">আমার পণ্য — My products</Link>
+        {" · "}
+        <Link href="/login">লগইন — Login</Link>
+      </p>
       <p>
         Seller dashboard placeholder (Wave 1). মোবাইলেই চালানো যায় এমন সহজ
         ড্যাশবোর্ড: পণ্য যোগ করা, অর্ডার দেখা, কুরিয়ার বুকিং, পেআউট হিসাব —

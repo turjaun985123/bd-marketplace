@@ -1,10 +1,6 @@
+import Link from "next/link";
 import DeliveryChargeWidget from "@/components/DeliveryChargeWidget";
-import ProductCard from "@/components/ProductCard";
-
-// Wave 1 placeholder data — replaced by Rust API product calls in Wave 2.
-const demoProducts = [
-  { name: "নমুনা পণ্য — Demo product", storeName: "নমুনা স্টোর", pricePoisha: 45000 },
-];
+import ProductGrid from "@/components/ProductGrid";
 
 export default function MarketplaceHomePage() {
   return (
@@ -17,19 +13,11 @@ export default function MarketplaceHomePage() {
         ডেলিভারি।
       </p>
       <p>
-        Central marketplace home (Wave 1 placeholder). Seller storefronts,
-        unified cart and order splitting are powered by the Rust API.
+        <Link href="/login">লগইন / বিক্রেতা হোন — Login</Link>
       </p>
 
       <h2>পণ্য — Products</h2>
-      {demoProducts.map((p) => (
-        <ProductCard
-          key={p.name}
-          name={p.name}
-          storeName={p.storeName}
-          pricePoisha={p.pricePoisha}
-        />
-      ))}
+      <ProductGrid />
 
       <DeliveryChargeWidget />
     </main>

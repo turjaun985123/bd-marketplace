@@ -9,6 +9,24 @@ on:
 jobs:
   rust:
     runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: marketplace
+          POSTGRES_PASSWORD: marketplace
+          POSTGRES_DB: marketplace_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U marketplace"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      # Used by the Wave 2 integration test (crates/api/tests/wave2.rs),
+      # which runs the real migrations against this database.
+      DATABASE_URL: postgres://marketplace:marketplace@localhost:5432/marketplace_test
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
