@@ -100,6 +100,12 @@ jobs:
         run: |
           npm ci
           npm run build
+      # Wave 38: the PWA wiring check — sw.js never-cache
+      # deny markers, manifest presence, and icon files
+      # whose IHDR dimensions match their promised sizes.
+      - name: Check PWA wiring
+        working-directory: apps/web
+        run: node scripts/check-pwa.mjs
       # Package the standalone server the same way the web
       # Dockerfile does (static + public copied in) and upload
       # it as a downloadable artifact — no local builds.

@@ -2341,6 +2341,94 @@ move the app, revoke the old key. A key with no expiry
 stays valid until revoked — the 365-day cap binds only
 keys created WITH an expiry.
 
+Wave 38 (PWA — installable, offline-tolerant web app):
+
+**Manifest + icons.** `app/manifest.ts` (Next 14's
+MetadataRoute.Manifest, served as /manifest.webmanifest
+and linked automatically): Bangla name, `lang: "bn"`,
+`display: "standalone"`, start_url `/`, theme_color the
+brand green from globals.css (#1b5e20 — the
+verification-badge green; globals.css defines no --brand
+variable, so the hex is shared by copy between the
+manifest, the layout's viewport export, and the icon
+script). The icons are REAL generated PNGs, drawn
+pixel-by-pixel by `apps/web/scripts/make-icons.mjs` — a
+dependency-free Node script (built-in `zlib` only) that
+renders a white shopping-bag outline on the brand green
+with signed-distance math and 3×3 supersampling:
+icon-192 + icon-512 (rounded tile, transparent corners,
+purpose "any"), icon-maskable-512 (full-bleed, motif
+shrunk to the centre ~54% so it stays inside the 80%
+safe-zone circle), and apple-touch-icon.png (180×180,
+full-bleed — iOS masks it itself). Regenerate with
+`node scripts/make-icons.mjs`; never hand-edit the PNGs.
+
+**Service worker** (`public/sw.js`, hand-written, no
+Workbox): registered by `components/PwaRegister` in
+production only (a worker in `next dev` would cache
+stale dev bundles), versioned caches (`w38-v1` — bump
+the version on any rule change; activate deletes older
+caches and claims clients, and a `SKIP_WAITING` message
+lets an update apply). It handles ONLY same-origin GET
+requests; everything else passes through untouched. (In
+the deployed shape the API is same-origin — the web
+bundle bakes `NEXT_PUBLIC_API_BASE_URL=""` and a proxy
+routes /v1 — so the rules below cover the real API
+traffic.) The rules:
+
+| Traffic | Rule | Why |
+| --- | --- | --- |
+| `/_next/static/*`, `/icons/*`, `/manifest.webmanifest` | Cache-first | Content-hashed or versioned assets; immutable in practice |
+| Navigations | Network-first, cached page as fallback, then the precached `/offline` page | Fresh pages online; a visited page — or an honest offline page — when the network drops |
+| GET `/v1/products*`, `/v1/search*`, `/v1/stores*` (public catalogue, storefront profile + products, reviews) | Network-first, cache fallback | Public, carries no per-user data; on flaky BD connections a slightly stale catalogue beats a dead page |
+| `/v1/auth/*`, `/v1/cart/*`, `/v1/orders*`, `/v1/seller/*`, `/v1/admin/*`, `/v1/payments/*`, `/v1/loyalty`, `/v1/wishlist*`, `/v1/conversations*`, `/v1/api-keys*` | NEVER cached — network only, nothing stored | Authenticated or mutating surfaces: a cached copy could be stale, personal, or both |
+| Any non-GET request, any cross-origin request | Untouched | Mutations are never replayed or stored by the worker |
+
+The app shell (`/`, `/offline`, the manifest, the two
+"any" icons) is precached at install. `/offline` is a
+static Bangla page (no API data) with a reload button.
+
+**Install UX.** One shared component,
+`components/InstallAppButton`, mounted in the home-page
+nav and the buyer orders header: on Chromium it
+captures `beforeinstallprompt` and shows "📲 অ্যাপ
+ইনস্টল করুন — Install app" only when the browser
+actually offers an install (and never when already
+running standalone); iOS Safari has no such event, so a
+conservative iOS-Safari detection shows the manual hint
+instead (শেয়ার বোতাম → 'Add to Home Screen').
+`app/layout.tsx` also carries the Next 14 split the
+platform wants: `metadata.icons` + `appleWebApp` in the
+metadata export, `themeColor` in the separate
+`viewport` export.
+
+**CI guard.** `apps/web/scripts/check-pwa.mjs`
+(dependency-free; `npm run check-pwa`, and a web-job
+step after the build) asserts sw.js exists and still
+carries the never-cache deny markers for
+`/v1/auth/`, `/v1/cart/`, `/v1/orders`, that
+`app/manifest.ts` exists, and that all four icon files
+are real PNGs whose IHDR dimensions match their names —
+a simplified worker or a wrong-sized icon fails CI
+before it reaches a phone.
+
+**Honest limits:** the worker is hand-written — no
+Workbox, no background sync, no push notifications
+(nothing queues an offline action for later; a failed
+mutation is simply failed). Offline means a READ-ONLY
+catalogue shell: pages and public product/search/store
+responses seen before can render, but cart, checkout,
+orders, login and everything authenticated need the
+network — the never-cache list above is a privacy rule,
+not a missing feature. Cached catalogue data can be
+stale (network-first bounds that to one failed fetch,
+but a page served offline is as old as the last visit).
+The icons are a simple generated geometric mark, not a
+designed brand icon — real brand artwork is future
+design work. iOS install is manual via the Share menu
+(Apple offers no prompt API), and iOS evicts caches
+under storage pressure like every web app there.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -3666,6 +3754,28 @@ leaking neither key nor hash, and the per-key 429 with
 JWT traffic unaffected; the limiter and route rules
 also have unit tests in the module.
 
+**Real (Wave 38):** the PWA shell — `app/manifest.ts`
+(Bangla name, standalone display, brand-green theme);
+four real PNG icons generated pixel-by-pixel by
+`apps/web/scripts/make-icons.mjs` (dependency-free,
+`zlib` only: 192 + 512 "any", 512 maskable inside the
+safe zone, 180 apple-touch); the hand-written
+`public/sw.js` (versioned caches; cache-first statics,
+network-first navigations + public catalogue GETs,
+an explicit never-cache deny list for every
+authenticated/mutating prefix, /offline fallback,
+production-only registration via
+`components/PwaRegister`); `/offline`, a static Bangla
+page; the shared `components/InstallAppButton`
+(beforeinstallprompt on Chromium, Share-menu hint on
+iOS Safari, hidden when installed) in the home nav and
+the orders header; layout metadata (icons, appleWebApp,
+viewport themeColor); and the dependency-free
+`scripts/check-pwa.mjs` guard wired into the CI web
+job. No API change, no migration. Offline is a
+read-only catalogue shell by design — see the Wave 38
+section for the caching table and the honest limits.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters, and the four manual couriers run
@@ -3728,7 +3838,11 @@ the external service at the other end of it, configured by
   loyalty card, and loyalty discount lines on the order
   and receipt views; Wave 36 adds /seller/subscription,
   the dashboard plan badge and the seller nav link;
-  Wave 37 adds /seller/api-keys and the seller nav link).
+  Wave 37 adds /seller/api-keys and the seller nav link;
+  Wave 38 adds /offline and the PWA shell — the manifest
+  route, the generated icons, and the service worker —
+  plus the install button on the home page and the
+  buyer orders page).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
   (domain 118, courier 31, payments 8 unit tests, plus the API

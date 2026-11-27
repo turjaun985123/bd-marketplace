@@ -1,5 +1,6 @@
 import Link from "next/link";
 import AdminLink from "@/components/AdminLink";
+import InstallAppButton from "@/components/InstallAppButton";
 import DeliveryChargeWidget from "@/components/DeliveryChargeWidget";
 import HomeDiscovery from "@/components/HomeDiscovery";
 import ProductGrid from "@/components/ProductGrid";
@@ -28,6 +29,11 @@ export default function MarketplaceHomePage() {
         {" · "}
         <Link href="/messages">মেসেজ — Messages</Link>
         <AdminLink />
+      </p>
+      {/* Wave 38: the shared install affordance — renders
+          only when the browser can actually install. */}
+      <p>
+        <InstallAppButton />
       </p>
 
       <SearchBar />

@@ -22,6 +22,7 @@ import {
   type SubOrder,
 } from "@/lib/api";
 import { useAuth } from "@/hooks/useAuth";
+import InstallAppButton from "@/components/InstallAppButton";
 
 /**
  * The buyer's own orders (login-gated), newest first, with the
@@ -265,6 +266,12 @@ export default function BuyerOrdersPage() {
         </button>{" "}
         আপনার প্রোফাইল, অর্ডার, রিভিউ, উইশলিস্ট আর প্রশ্ন — সব এক
         ফাইলে।
+      </p>
+      {/* Wave 38: the shared install affordance, same
+          component as the home nav (renders only when the
+          browser offers an install). */}
+      <p>
+        <InstallAppButton />
       </p>
       {exportError && <p role="alert">{exportError}</p>}
       {loyalty && (
