@@ -20,6 +20,7 @@ use axum::{
     Router,
 };
 use courier::CouriersConfig;
+use payments::PaymentsConfig;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -195,7 +196,15 @@ async fn test_app() -> Option<Router> {
         dev_mode: true,
         ..CouriersConfig::default()
     };
+    // Payments DEV simulator on (the wave17 pattern): the
+    // online-payment half of this test settles through the
+    // dev gateway; without it bkash is honestly
+    // not-configured and the checkout refuses.
     let state = AppState::new(Some(pool), "wave55n-test-secret".to_string(), true)
+        .with_payments_config(PaymentsConfig {
+            dev_mode: true,
+            ..PaymentsConfig::default()
+        })
         .with_couriers_config(dev_couriers);
     Some(build_app(state))
 }
