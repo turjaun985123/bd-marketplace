@@ -3167,6 +3167,39 @@ order of preference is: fix it, bump past it, or —
 only when neither is honestly possible — a
 documented ignore.
 
+Wave 46 (load smoke — a regression smoke over the
+public read paths):
+
+`crates/api/tests/wave46.rs` adds a bounded,
+deterministic burst to the integration suite. It
+seeds one store with twelve active, categorised
+products through the public API, then fires 200
+anonymous GET requests — 8 concurrent tokio workers
+x 25 requests, round-robin across the four hot
+public reads (product list, product detail rotating
+over the seeded ids, search, and the storefront
+read `GET /v1/stores/{slug}`), so each route
+receives exactly 50. It asserts exactly three
+things: every response is 200 (any 4xx/5xx fails,
+naming route and status); each route's count is
+exactly 50 (no silently skipped workers); and the
+whole burst finishes under a generous 120-second
+pathology ceiling whose only job is to catch
+accidental N+1 storms or missing-index table scans
+at seed scale. Per-route min/median/max latencies
+are printed to the CI log as observational data and
+are never asserted.
+
+**This is a regression smoke, not a benchmark.**
+In-process oneshot requests on a shared CI runner
+prove the read paths survive concurrency without
+errors and without pathological slowdowns at seed
+scale; it does NOT measure production capacity,
+network behaviour, or Postgres under real load, and
+no capacity numbers are claimed from it. A real
+load test needs a deployed environment and remains
+future work.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -4692,6 +4725,22 @@ for security-relevant cargo majors. See the Wave 45
 section for the contract and the honest limits
 (Rust-only gate, ignore discipline, red-main
 pressure by design).
+
+**Real (Wave 46):** a load smoke, not a benchmark —
+one new integration test (`wave46.rs`) and no
+production changes. It seeds a store with twelve
+active products and fires a fixed burst of 200
+anonymous reads (8 workers x 25, round-robin, 50
+each) at the product list, product detail, search
+and storefront routes, asserting all-200 responses,
+exact per-route counts, and a generous 120-second
+pathology ceiling; per-route latencies are printed
+to the CI log, never asserted. It proves the public
+read paths survive concurrency without errors or
+pathological slowdowns at seed scale — production
+capacity and real load behaviour remain unmeasured
+and need a deployed environment. See the Wave 46
+section.
 
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
