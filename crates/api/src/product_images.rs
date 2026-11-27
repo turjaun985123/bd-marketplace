@@ -1122,6 +1122,7 @@ pub async fn replace_product_image(
     )
     .bind(product_id)
     .bind(&processed.content_hash)
+    .bind(image_id)
     .fetch_one(pool)
     .await
     .map_err(|e| ApiError::internal("check duplicate image", e))?;
