@@ -34,6 +34,10 @@ export default function MarketplaceHomePage() {
         {" · "}
         <Link href="/wishlist">♡ উইশলিস্ট — Wishlist</Link>
         {" · "}
+        <Link href="/browse">ব্রাউজ — Browse</Link>
+        {" · "}
+        <Link href="/saved-searches">সংরক্ষিত খোঁজ — Saved searches</Link>
+        {" · "}
         <Link href="/orders">আমার অর্ডার — My orders</Link>
         {" · "}
         <Link href="/track">অর্ডার ট্র্যাক — Track order</Link>

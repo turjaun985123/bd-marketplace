@@ -3,30 +3,35 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { EmptyState, Skeleton } from "@/components/ui";
-import { getHomeFeed, type HomeCategory } from "@/lib/api";
+import { getCategories, type HomeCategory } from "@/lib/api";
 
 /**
- * The category index (Wave 52): the platform's categories
- * as a browsable tile page, from the same home-feed
- * category aggregate the home tiles use (product counts
- * over active products in active stores, each tile's cover
- * from the category's best-selling product that has an
- * image; the feed's named category cap applies here too).
+ * The category index (Wave 52; Wave 53's endpoint): the
+ * platform's categories as a browsable tile page, from
+ * GET /v1/categories — the same category aggregate the
+ * home feed's tiles use (product counts over active
+ * products in active stores, each tile's cover from the
+ * category's best-selling product that has an image),
+ * without the feed's tile cap.
  *
  * Categories are still the products' free-text labels —
  * there is no categories table — so this page is a view of
  * the catalogue's own vocabulary, and each tile lands on
- * the search page filtered to that label.
+ * the browse page filtered to that label.
  */
 export default function CategoriesPage() {
   const [categories, setCategories] = useState<HomeCategory[] | null>(null);
   const [failed, setFailed] = useState(false);
+  // Wave 53: a find-as-you-type box over the tile list —
+  // the vocabulary is the catalogue's own free text, and
+  // on a mature catalogue it outgrows one screen.
+  const [filterText, setFilterText] = useState("");
 
   useEffect(() => {
     let cancelled = false;
-    getHomeFeed()
-      .then((feed) => {
-        if (!cancelled) setCategories(feed.categories);
+    getCategories()
+      .then((list) => {
+        if (!cancelled) setCategories(list.categories);
       })
       .catch(() => {
         if (!cancelled) setFailed(true);
@@ -42,6 +47,19 @@ export default function CategoriesPage() {
         <Link href="/">← মার্কেটপ্লেস</Link>
       </p>
       <h1>সব ক্যাটাগরি — All categories</h1>
+      {categories !== null && categories.length > 6 && (
+        <p>
+          <label>
+            ক্যাটাগরি খুঁজুন — Find a category{" "}
+            <input
+              type="search"
+              value={filterText}
+              onChange={(e) => setFilterText(e.target.value)}
+              placeholder="যেমন: clothing"
+            />
+          </label>
+        </p>
+      )}
       {failed ? (
         <EmptyState title="ক্যাটাগরি লোড করা যায়নি — Categories could not load">
           <p>একটু পরে আবার চেষ্টা করুন। (Please try again shortly.)</p>
@@ -61,10 +79,18 @@ export default function CategoriesPage() {
         </EmptyState>
       ) : (
         <div className="category-tiles">
-          {categories.map((category) => (
+          {categories
+            .filter(
+              (category) =>
+                filterText.trim() === "" ||
+                category.category
+                  .toLowerCase()
+                  .includes(filterText.trim().toLowerCase())
+            )
+            .map((category) => (
             <Link
               key={category.category}
-              href={`/search?category=${encodeURIComponent(category.category)}`}
+              href={`/browse?category=${encodeURIComponent(category.category)}`}
               className="category-tile"
             >
               {category.image_url ? (

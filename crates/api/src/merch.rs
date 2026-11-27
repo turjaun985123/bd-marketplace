@@ -129,6 +129,54 @@ const FLASH_UNITS_SOLD_SQL: &str = "SELECT oi.product_id, \
             WHERE pv.id = oi.variant_id), 0) \
     GROUP BY oi.product_id";
 
+/// The SQL twin of the flash resolution (Wave 53): a
+/// lateral join that computes, for the product aliased `p`,
+/// the flash price the Rust resolution
+/// ([`resolve_flash_on`]) would produce at the database
+/// clock — the live sale picked by the same rule
+/// ([`live_sale_on`]: active, half-open window, earliest
+/// ending first), the item's sale price, withheld when the
+/// item's cap is already consumed by units sold at the sale
+/// price (the [`FLASH_UNITS_SOLD_SQL`] aggregate in
+/// per-product scalar form: non-cancelled sub-orders,
+/// orders placed inside the window, snapshot price equal
+/// to the sale price plus the variant delta).
+///
+/// Discovery queries (search/browse, the product list's
+/// price sorts) filter and order by THIS expression, so a
+/// facet or a price sort can never disagree with the
+/// `flash_price_poisha` the Rust attach fills on the very
+/// same rows. The alias is `fx`; the effective price is
+/// [`EFFECTIVE_PRICE_SQL`]. The join carries no binds —
+/// it reads the database clock, like the `is_promoted`
+/// column in the shared product SELECT.
+pub(crate) const FLASH_PRICE_JOIN: &str = "LEFT JOIN LATERAL (\
+    SELECT fsi.sale_price_poisha AS flash_price_poisha \
+    FROM (SELECT id, starts_at, ends_at FROM flash_sales \
+          WHERE is_active AND starts_at <= now() AND now() < ends_at \
+          ORDER BY ends_at ASC, created_at ASC LIMIT 1) fs \
+    JOIN flash_sale_items fsi \
+      ON fsi.flash_sale_id = fs.id AND fsi.product_id = p.id \
+    WHERE (fsi.stock_cap IS NULL OR (\
+          SELECT COALESCE(SUM(oi.quantity), 0)::bigint \
+          FROM order_items oi \
+          JOIN sub_orders so ON so.id = oi.sub_order_id \
+          JOIN orders o ON o.id = so.order_id \
+          WHERE oi.product_id = p.id AND so.status <> 'cancelled' \
+            AND o.created_at >= fs.starts_at AND o.created_at < fs.ends_at \
+            AND oi.unit_price_poisha = fsi.sale_price_poisha + COALESCE((\
+                SELECT pv.price_delta_poisha FROM product_variants pv \
+                WHERE pv.id = oi.variant_id), 0)) < fsi.stock_cap) \
+    ORDER BY fs.ends_at ASC, fs.created_at ASC LIMIT 1) fx ON true";
+
+/// The price a buyer pays for the product aliased `p`
+/// under the [`FLASH_PRICE_JOIN`]: the resolved flash
+/// price when one exists, else the base price. Every
+/// price filter, price sort and price facet in the
+/// discovery queries names this expression — never
+/// `p.price_poisha` alone.
+pub(crate) const EFFECTIVE_PRICE_SQL: &str = "COALESCE(fx.flash_price_poisha, p.price_poisha)";
+
 /// The sale live at `now`, if any.
 async fn live_sale_on(
     conn: &mut PgConnection,
@@ -1703,7 +1751,7 @@ pub struct HomeCategory {
 }
 
 /// The category aggregate's raw row (image facts folded into
-/// `image_url` by [`build_home_feed`]).
+/// `image_url` by [`load_categories`]).
 #[derive(Debug, FromRow)]
 struct HomeCategoryRow {
     category: String,
@@ -1797,6 +1845,63 @@ async fn load_rail(pool: &PgPool, sql: &str, now: DateTime<Utc>) -> Result<Vec<P
     Ok(products)
 }
 
+/// The category aggregate (Wave 52, extracted in Wave 53):
+/// counts over active products in active stores, each
+/// tile's cover from the category's best-selling product
+/// that has an image (newest with an image when nothing
+/// has sold — the lateral's sold-count order falls through
+/// to recency). Sorted by count descending, label
+/// ascending, capped at `limit`.
+///
+/// This is THE category list: the home feed's tiles and
+/// the public `GET /v1/categories` both read it, so the
+/// two surfaces can never publish different vocabularies
+/// or counts.
+pub async fn load_categories(pool: &PgPool, limit: i64) -> Result<Vec<HomeCategory>, ApiError> {
+    let category_rows: Vec<HomeCategoryRow> = sqlx::query_as(
+        "SELECT cat.category, cat.product_count, \
+                img.storage_key, img.external_url, img.width \
+         FROM ( \
+             SELECT p.category AS category, COUNT(*)::bigint AS product_count \
+             FROM products p JOIN stores s ON s.id = p.store_id \
+             WHERE p.status = 'active' AND s.status = 'active' \
+               AND p.category IS NOT NULL AND btrim(p.category) <> '' \
+             GROUP BY p.category \
+         ) cat \
+         LEFT JOIN LATERAL ( \
+             SELECT pi.storage_key, pi.external_url, pi.width \
+             FROM products p2 \
+             JOIN stores s2 ON s2.id = p2.store_id \
+             JOIN product_images pi ON pi.product_id = p2.id \
+             WHERE p2.category = cat.category \
+               AND p2.status = 'active' AND s2.status = 'active' \
+             ORDER BY (SELECT COALESCE(SUM(oi.quantity), 0)::bigint \
+                       FROM order_items oi \
+                       JOIN sub_orders so ON so.id = oi.sub_order_id \
+                       WHERE oi.product_id = p2.id AND so.status = 'delivered') DESC, \
+                      p2.created_at DESC \
+             LIMIT 1 \
+         ) img ON true \
+         ORDER BY cat.product_count DESC, cat.category ASC LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::internal("load categories", e))?;
+    Ok(category_rows
+        .into_iter()
+        .map(|row| HomeCategory {
+            image_url: media::product_image_url(
+                row.storage_key.as_deref(),
+                row.external_url.as_deref(),
+                row.width,
+            ),
+            category: row.category,
+            product_count: row.product_count,
+        })
+        .collect())
+}
+
 /// Assemble the home feed as of `now`. The instant is a
 /// parameter — not read from the clock inside — so the admin
 /// preview (`GET /v1/admin/home-preview?at=`) renders exactly
@@ -1828,51 +1933,9 @@ pub async fn build_home_feed(pool: &PgPool, now: DateTime<Utc>) -> Result<HomeFe
     .map(with_banner_image)
     .collect();
 
-    // Category tiles: counts over active products in active
-    // stores, each tile's cover from the category's
-    // best-selling product that has an image.
-    let category_rows: Vec<HomeCategoryRow> = sqlx::query_as(
-        "SELECT cat.category, cat.product_count, \
-                img.storage_key, img.external_url, img.width \
-         FROM ( \
-             SELECT p.category AS category, COUNT(*)::bigint AS product_count \
-             FROM products p JOIN stores s ON s.id = p.store_id \
-             WHERE p.status = 'active' AND s.status = 'active' \
-               AND p.category IS NOT NULL AND btrim(p.category) <> '' \
-             GROUP BY p.category \
-         ) cat \
-         LEFT JOIN LATERAL ( \
-             SELECT pi.storage_key, pi.external_url, pi.width \
-             FROM products p2 \
-             JOIN stores s2 ON s2.id = p2.store_id \
-             JOIN product_images pi ON pi.product_id = p2.id \
-             WHERE p2.category = cat.category \
-               AND p2.status = 'active' AND s2.status = 'active' \
-             ORDER BY (SELECT COALESCE(SUM(oi.quantity), 0)::bigint \
-                       FROM order_items oi \
-                       JOIN sub_orders so ON so.id = oi.sub_order_id \
-                       WHERE oi.product_id = p2.id AND so.status = 'delivered') DESC, \
-                      p2.created_at DESC \
-             LIMIT 1 \
-         ) img ON true \
-         ORDER BY cat.product_count DESC, cat.category ASC LIMIT $1"
-    )
-    .bind(HOME_CATEGORY_LIMIT)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| ApiError::internal("load home categories", e))?;
-    let categories = category_rows
-        .into_iter()
-        .map(|row| HomeCategory {
-            image_url: media::product_image_url(
-                row.storage_key.as_deref(),
-                row.external_url.as_deref(),
-                row.width,
-            ),
-            category: row.category,
-            product_count: row.product_count,
-        })
-        .collect();
+    // Category tiles: the shared aggregate (Wave 53
+    // extracted it for `GET /v1/categories`).
+    let categories = load_categories(pool, HOME_CATEGORY_LIMIT).await?;
 
     // The flash sale live at `now`, with its cards.
     let flash_sale = load_home_flash_sale(pool, now).await?;
@@ -2067,6 +2130,35 @@ pub async fn home_feed_handler(
     let pool = state.require_pool()?;
     let feed = build_home_feed(pool, Utc::now()).await?;
     Ok((public_cache_headers(true), Json(feed)))
+}
+
+/// How many categories `GET /v1/categories` serves at
+/// most (Wave 53). The home feed caps its tiles at
+/// [`HOME_CATEGORY_LIMIT`]; the standalone list is the
+/// full vocabulary page, so its cap is a safety bound,
+/// not a display choice.
+pub const CATEGORIES_LIST_LIMIT: i64 = 200;
+
+/// The public category list payload (Wave 53): the same
+/// tile shape the home feed carries, under its own
+/// envelope so the endpoint can grow without the feed
+/// changing.
+#[derive(Debug, Serialize)]
+pub struct CategoryList {
+    pub categories: Vec<HomeCategory>,
+}
+
+/// `GET /v1/categories` — the platform's category
+/// vocabulary with product counts and cover images, from
+/// the same aggregate as the home feed's tiles
+/// ([`load_categories`]). Public and anonymous, so it
+/// carries the catalogue cache header.
+pub async fn list_categories_handler(
+    State(state): State<AppState>,
+) -> Result<(HeaderMap, Json<CategoryList>), ApiError> {
+    let pool = state.require_pool()?;
+    let categories = load_categories(pool, CATEGORIES_LIST_LIMIT).await?;
+    Ok((public_cache_headers(true), Json(CategoryList { categories })))
 }
 
 /// The admin preview query: `at` is an RFC 3339 timestamp.

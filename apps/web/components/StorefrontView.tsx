@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, type CSSProperties } from "react";
+import Link from "next/link";
 import MessageStoreButton from "./MessageStoreButton";
 import ProductGrid from "./ProductGrid";
 import StorefrontSections from "./StorefrontSections";
@@ -116,6 +117,11 @@ export default function StorefrontView({ slug }: { slug: string }) {
 
       <MessageStoreButton slug={slug} />
       <SearchBar storeSlug={slug} />
+      <p>
+        <Link href={`/${slug}/shop`}>
+          ফিল্টারসহ সব পণ্য দেখুন — Shop all products with filters
+        </Link>
+      </p>
       {/* Wave 52: the store's merchandising sections (on
           sale / best sellers / new), above the full grid. */}
       <StorefrontSections slug={slug} />

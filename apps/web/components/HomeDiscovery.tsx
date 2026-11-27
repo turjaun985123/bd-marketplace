@@ -2,14 +2,9 @@
 
 import { useEffect, useState } from "react";
 import ProductRail from "./ProductRail";
-import {
-  getProduct,
-  getRecommendations,
-  type Product,
-  type ProductDetail,
-} from "@/lib/api";
+import RecentlyViewedRail from "./RecentlyViewedRail";
+import { getRecommendations, type Product } from "@/lib/api";
 import { useAuth } from "@/hooks/useAuth";
-import { useRecentlyViewed } from "@/hooks/useRecentlyViewed";
 
 /**
  * The home page's discovery strips (Wave 24), in one client
@@ -20,18 +15,16 @@ import { useRecentlyViewed } from "@/hooks/useRecentlyViewed";
  *   a signed-in visitor whose rail is actually personalised
  *   (the API labels the top-rated fallback as such, and a
  *   fallback is not presented as "for you") and non-empty.
- * - "সম্প্রতি দেখেছেন" — recently viewed, resolved from the
- *   device-local id list (see useRecentlyViewed) through the
- *   public product endpoint. Ids whose product no longer
- *   resolves (deleted, hidden) are skipped silently.
+ * - "সম্প্রতি দেখেছেন" — recently viewed, the shared
+ *   RecentlyViewedRail (Wave 53): the device-local history
+ *   rendered from its card snapshots, with its clear
+ *   button. The history is never sent to the server.
  *
  * Either strip renders nothing when it has nothing to show.
  */
 export default function HomeDiscovery() {
   const { ready, token } = useAuth();
-  const recentIds = useRecentlyViewed();
   const [forYou, setForYou] = useState<Product[]>([]);
-  const [recent, setRecent] = useState<Product[]>([]);
 
   useEffect(() => {
     if (!ready || !token) return;
@@ -51,32 +44,10 @@ export default function HomeDiscovery() {
     };
   }, [ready, token]);
 
-  useEffect(() => {
-    if (recentIds.length === 0) return;
-    let cancelled = false;
-    Promise.all(
-      recentIds.map((id) => getProduct(id).catch(() => null))
-    ).then((products) => {
-      if (!cancelled) {
-        setRecent(
-          // The detail shape extends Product (Wave 33) — the
-          // rail renders the shared fields only.
-          products.filter((p): p is ProductDetail => p !== null)
-        );
-      }
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [recentIds]);
-
   return (
     <>
       <ProductRail title="আপনার জন্য — For you" products={forYou} />
-      <ProductRail
-        title="সম্প্রতি দেখেছেন — Recently viewed"
-        products={recent}
-      />
+      <RecentlyViewedRail title="সম্প্রতি দেখেছেন — Recently viewed" />
     </>
   );
 }

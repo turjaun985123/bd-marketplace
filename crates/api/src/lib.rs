@@ -363,6 +363,7 @@ pub mod recommend;
 pub mod returns;
 pub mod reviews;
 pub mod risk;
+pub mod saved_searches;
 pub mod search;
 pub mod shipments;
 pub mod stores;
@@ -1433,8 +1434,26 @@ pub fn build_app(state: AppState) -> Router {
         // Wave 15 — Postgres-native product search (pg_trgm +
         // ILIKE) and typeahead suggestions; public, active
         // products of active stores only.
+        // Wave 53 — the search endpoint is now the faceted
+        // browse (multi-value filters, facets, effective
+        // prices, the analytics log + its admin read), and
+        // signed-in buyers can save filter sets.
         .route("/v1/search", get(search::search_handler))
         .route("/v1/search/suggest", get(search::suggest_handler))
+        .route("/v1/search/popular", get(search::popular_searches_handler))
+        .route(
+            "/v1/admin/search-analytics",
+            get(search::admin_search_analytics_handler),
+        )
+        .route(
+            "/v1/buyer/saved-searches",
+            get(saved_searches::list_saved_searches_handler)
+                .post(saved_searches::create_saved_search_handler),
+        )
+        .route(
+            "/v1/buyer/saved-searches/:id",
+            delete(saved_searches::delete_saved_search_handler),
+        )
         // Wave 3 — cart (one cart per signed-in buyer).
         .route("/v1/cart", get(cart::get_cart).delete(cart::clear))
         .route("/v1/cart/items", post(cart::add_item))
@@ -1990,6 +2009,9 @@ pub fn build_app(state: AppState) -> Router {
         // Flash price resolution itself lives in the merch
         // module and is honoured by the cart and checkout.
         .route("/v1/home", get(merch::home_feed_handler))
+        // Wave 53 — the public category vocabulary, from
+        // the same aggregate as the home feed's tiles.
+        .route("/v1/categories", get(merch::list_categories_handler))
         .route(
             "/v1/collections/:slug",
             get(merch::get_collection_public_handler),

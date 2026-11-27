@@ -74,7 +74,7 @@ export default function HomeFeed() {
             {feed.categories.map((category) => (
               <Link
                 key={category.category}
-                href={`/search?category=${encodeURIComponent(category.category)}`}
+                href={`/browse?category=${encodeURIComponent(category.category)}`}
                 className="category-tile"
               >
                 {category.image_url ? (
@@ -110,6 +110,9 @@ export default function HomeFeed() {
           <div className="section-header">
             <h2 className="flash-title">⚡ {feed.flash_sale.title}</h2>
             <Countdown endsAt={feed.flash_sale.ends_at} />
+            <Link href="/browse?on_sale=true" className="section-header-link">
+              সব অফার — All offers
+            </Link>
           </div>
           <Rail cards>
             {feed.flash_sale.items.map((item) => (
@@ -154,9 +157,27 @@ export default function HomeFeed() {
         />
       ))}
 
-      <ProductRail title="নতুন এসেছে — New arrivals" products={feed.new_arrivals} />
-      <ProductRail title="সেরা বিক্রিত — Best sellers" products={feed.best_sellers} />
-      <ProductRail title="টপ রেটেড — Top rated" products={feed.top_rated} />
+      {/* Wave 53: every rail deep-links into the faceted
+          browse with the matching sort — the rail is the
+          preview, /browse is the full shelf. */}
+      <ProductRail
+        title="নতুন এসেছে — New arrivals"
+        products={feed.new_arrivals}
+        linkHref="/browse?sort=newest"
+        linkLabel="সব দেখুন — See all"
+      />
+      <ProductRail
+        title="সেরা বিক্রিত — Best sellers"
+        products={feed.best_sellers}
+        linkHref="/browse?sort=sold"
+        linkLabel="সব দেখুন — See all"
+      />
+      <ProductRail
+        title="টপ রেটেড — Top rated"
+        products={feed.top_rated}
+        linkHref="/browse?sort=rating"
+        linkLabel="সব দেখুন — See all"
+      />
       <ProductRail title="স্পন্সরড — Sponsored" products={feed.promoted} />
 
       {feed.featured_stores.length > 0 && (

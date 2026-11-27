@@ -55,12 +55,26 @@ export default function StorefrontSections({ slug }: { slug: string }) {
 
   return (
     <>
-      <ProductRail title="অফারে আছে — On sale at this store" products={onSale} />
+      {/* Wave 53: each section deep-links into the store's
+          shop page with the matching filter/sort. */}
+      <ProductRail
+        title="অফারে আছে — On sale at this store"
+        products={onSale}
+        linkHref={`/${slug}/shop?on_sale=true`}
+        linkLabel="সব অফার — All offers"
+      />
       <ProductRail
         title="এই স্টোরের সেরা বিক্রিত — This store's best sellers"
         products={bestSellers}
+        linkHref={`/${slug}/shop?sort=sold`}
+        linkLabel="সব দেখুন — See all"
       />
-      <ProductRail title="নতুন এসেছে — New at this store" products={newArrivals} />
+      <ProductRail
+        title="নতুন এসেছে — New at this store"
+        products={newArrivals}
+        linkHref={`/${slug}/shop?sort=newest`}
+        linkLabel="সব দেখুন — See all"
+      />
     </>
   );
 }

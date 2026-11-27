@@ -2462,6 +2462,47 @@ pub enum SearchSort {
     Newest,
     /// Highest rated first (unreviewed products last).
     Rating,
+    /// Best sellers first (Wave 53): the shared view's
+    /// delivered-units `sold_count`, descending. An explicit
+    /// buyer-chosen sort, so — like the price and rating
+    /// sorts — it stays pure (no sponsored boost).
+    Sold,
+}
+
+/// The query-string key for a sort order — the inverse of
+/// the parse in [`validate_search_params`]. Surfaces that
+/// need to WRITE a sort back into a URL or a stored filter
+/// (Wave 53 saved searches) go through here so the spelling
+/// lives in exactly one place.
+pub fn search_sort_key(sort: SearchSort) -> &'static str {
+    match sort {
+        SearchSort::Relevance => "relevance",
+        SearchSort::PriceAsc => "price_asc",
+        SearchSort::PriceDesc => "price_desc",
+        SearchSort::Newest => "newest",
+        SearchSort::Rating => "rating",
+        SearchSort::Sold => "sold",
+    }
+}
+
+/// Validate the plain product LIST's sort parameter (Wave
+/// 53). The list endpoint (`GET /v1/products`) has no search
+/// text, so it accepts the browse sort vocabulary minus the
+/// text rank: `relevance` is accepted and means the list's
+/// own default order (newest, sponsored first — the Wave 26
+/// rule), exactly as an absent sort does. Everything else
+/// maps to the same enum the search endpoint orders by.
+pub fn validate_product_list_sort(sort: Option<&str>) -> Result<SearchSort, &'static str> {
+    match sort {
+        None | Some("newest") | Some("relevance") => Ok(SearchSort::Newest),
+        Some("price_asc") => Ok(SearchSort::PriceAsc),
+        Some("price_desc") => Ok(SearchSort::PriceDesc),
+        Some("rating") => Ok(SearchSort::Rating),
+        Some("sold") => Ok(SearchSort::Sold),
+        Some(_) => Err(
+            "sort must be one of: newest, price_asc, price_desc, rating, sold",
+        ),
+    }
 }
 
 /// Validated product-search parameters (Wave 15). The API layer
@@ -2534,8 +2575,11 @@ pub fn validate_search_params(
         Some("price_desc") => SearchSort::PriceDesc,
         Some("newest") => SearchSort::Newest,
         Some("rating") => SearchSort::Rating,
+        Some("sold") => SearchSort::Sold,
         Some(_) => {
-            return Err("sort must be one of: relevance, price_asc, price_desc, newest, rating")
+            return Err(
+                "sort must be one of: relevance, price_asc, price_desc, newest, rating, sold",
+            )
         }
     };
     let page = page.unwrap_or(1);
@@ -2583,6 +2627,425 @@ pub fn search_like_pattern(q: &str) -> String {
 /// `%`. Used by the search rank's title-prefix boost.
 pub fn search_prefix_pattern(q: &str) -> String {
     format!("{}%", escape_like_text(q))
+}
+
+/// The largest price bound a browse filter may name, in
+/// poisha (Wave 53). ৳10,00,000 — a million taka — is far
+/// above anything the catalogue plausibly holds; the ceiling
+/// exists so a fat-fingered or hostile `max_price_poisha`
+/// cannot turn the facet aggregates into an unbounded scan
+/// plan, and so the rule is stated once, here.
+pub const MAX_PRICE_FILTER_POISHA: i64 = 100_000_000;
+
+/// Default page size for the faceted browse (Wave 53) when
+/// neither `limit` nor the legacy `per_page` is given.
+pub const DEFAULT_BROWSE_LIMIT: i64 = 24;
+
+/// Largest page size the faceted browse serves (Wave 53).
+/// Bigger than the Wave 15 search cap (48) because the
+/// browse page is a catalogue grid, not a ranked result
+/// list — but still one bounded page.
+pub const MAX_BROWSE_LIMIT: i64 = 60;
+
+/// Most values one multi-value browse filter (categories or
+/// store slugs) may carry in a single request (Wave 53).
+/// Twenty is far past any honest faceted navigation; the
+/// cap keeps the `= ANY(...)` binds bounded.
+pub const MAX_FILTER_VALUES: usize = 20;
+
+/// Longest single category filter value, in characters —
+/// the same bound [`validate_category`] puts on a stored
+/// label, so a filter can name anything storable.
+pub const MAX_CATEGORY_FILTER_CHARS: usize = MAX_CATEGORY_CHARS;
+
+/// Longest single store-slug filter value, in characters.
+/// Slugs are minted under the store rules (well under this);
+/// the bound only rejects junk.
+pub const MAX_STORE_FILTER_CHARS: usize = 80;
+
+/// The rating thresholds the browse facet reports counts
+/// for (Wave 53): "4★ & up", "3★ & up", "2★ & up" — the
+/// Daraz/AliExpress facet shape. An unrated product counts
+/// as 0 stars everywhere in the browse (see
+/// [`BrowseFilters::min_rating`]), so it appears in no
+/// threshold's count.
+pub const RATING_FACET_THRESHOLDS: [f64; 3] = [4.0, 3.0, 2.0];
+
+/// Raw faceted-browse filter input (Wave 53), exactly as
+/// the query string carries it: multi-value filters as the
+/// repeated parameters arrived, booleans still unparsed
+/// text, pagination in both spellings (`limit` is the
+/// browse spelling; `per_page` is the Wave 15 legacy one).
+/// [`validate_browse_filters`] is the one place this shape
+/// is judged.
+#[derive(Debug, Clone, Default)]
+pub struct BrowseFilterInput {
+    /// The search text, unparsed.
+    pub q: Option<String>,
+    /// Category labels as they arrived — repeated
+    /// `category` parameters; each may itself be a
+    /// comma-separated list.
+    pub categories: Vec<String>,
+    /// Store slugs as they arrived — repeated `store`
+    /// parameters plus the legacy single `store_slug`,
+    /// already merged by the handler.
+    pub store_slugs: Vec<String>,
+    /// Inclusive lower price bound in poisha (effective
+    /// price — see [`BrowseFilters`]).
+    pub min_price_poisha: Option<i64>,
+    /// Inclusive upper price bound in poisha.
+    pub max_price_poisha: Option<i64>,
+    /// Minimum rating (0..=5) as it arrived.
+    pub min_rating: Option<f64>,
+    /// The `in_stock` flag, unparsed (`"true"`/`"false"`).
+    pub in_stock: Option<String>,
+    /// The `on_sale` flag, unparsed.
+    pub on_sale: Option<String>,
+    /// The sort key, unparsed.
+    pub sort: Option<String>,
+    /// 1-based page number.
+    pub page: Option<i64>,
+    /// Legacy Wave 15 page size spelling.
+    pub per_page: Option<i64>,
+    /// Browse page size spelling; wins over `per_page`
+    /// when both arrive.
+    pub limit: Option<i64>,
+}
+
+/// Validated faceted-browse filters (Wave 53) — the only
+/// shape the search service reads. Every rule that can
+/// reject a browse request lives in
+/// [`validate_browse_filters`], so the handler has exactly
+/// one validation call and the saved-search write path can
+/// validate a stored filter with the same rules.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BrowseFilters {
+    /// The trimmed search text, or `None` for a pure
+    /// filter browse.
+    pub q: Option<String>,
+    /// Category labels to match (OR), normalised:
+    /// comma-split, trimmed, blanks dropped, duplicates
+    /// removed keeping first occurrence. Matching is
+    /// case-insensitive exact (the Wave 15 rule).
+    pub categories: Vec<String>,
+    /// Store slugs to match (OR), normalised like
+    /// `categories`.
+    pub store_slugs: Vec<String>,
+    /// Inclusive lower bound on the EFFECTIVE price in
+    /// poisha (the live flash price when one resolves,
+    /// else the base price) — a filter or sort that
+    /// disagreed with the price the product view shows
+    /// would be a bug, so the browse never prices by the
+    /// base alone.
+    pub min_price_poisha: Option<i64>,
+    /// Inclusive upper bound on the effective price.
+    pub max_price_poisha: Option<i64>,
+    /// Minimum rating, 0..=5, when set. An unrated product
+    /// counts as 0, so any positive minimum excludes it —
+    /// the same convention the rating facet counts use.
+    pub min_rating: Option<f64>,
+    /// Keep only products whose effective stock (the
+    /// Wave 33 variant-sum rule) is above zero.
+    pub in_stock: bool,
+    /// Keep only products on sale: in the live flash sale
+    /// (price resolved, cap not exhausted) OR carrying a
+    /// `compare_at_poisha` above the base price. No other
+    /// fact makes a product "on sale" — the badge never
+    /// invents a discount.
+    pub on_sale: bool,
+    /// The validated sort order.
+    pub sort: SearchSort,
+    /// 1-based page number.
+    pub page: i64,
+    /// The effective page size: `limit` when given
+    /// (1..=[`MAX_BROWSE_LIMIT`]), else the legacy
+    /// `per_page` under its Wave 15 bounds, else
+    /// [`DEFAULT_BROWSE_LIMIT`].
+    pub per_page: i64,
+}
+
+/// Parse one boolean filter flag as it arrives in a query
+/// string (Wave 53). Absent means false; `"true"`/`"1"`
+/// mean true; `"false"`/`"0"` mean false; anything else is
+/// a bilingual 400 — silently treating a typo as either
+/// value would filter (or not) without the buyer asking.
+pub fn parse_filter_bool(raw: Option<&str>, label: &str) -> Result<bool, String> {
+    match raw {
+        None => Ok(false),
+        Some("true") | Some("1") => Ok(true),
+        Some("false") | Some("0") => Ok(false),
+        Some(_) => Err(format!(
+            "{label} must be true or false — {label} true অথবা false হতে হবে"
+        )),
+    }
+}
+
+/// Normalise one multi-value filter list (Wave 53): split
+/// each arrived value on commas, trim every piece, drop
+/// blanks, drop duplicates (exact match after trimming,
+/// first occurrence wins), and refuse more than
+/// [`MAX_FILTER_VALUES`] surviving values or any value
+/// longer than `max_chars` characters. The label names the
+/// filter in the bilingual error.
+fn normalize_filter_values(
+    values: &[String],
+    max_chars: usize,
+    label: &str,
+) -> Result<Vec<String>, String> {
+    let mut normalised: Vec<String> = Vec::new();
+    for value in values {
+        for piece in value.split(',') {
+            let piece = piece.trim();
+            if piece.is_empty() {
+                continue;
+            }
+            if piece.chars().count() > max_chars {
+                return Err(format!(
+                    "{label} values must be at most {max_chars} characters — \
+                     {label}-এর মান সর্বোচ্চ {max_chars} অক্ষরের হতে হবে"
+                ));
+            }
+            if !normalised.iter().any(|seen| seen == piece) {
+                normalised.push(piece.to_string());
+            }
+        }
+    }
+    // Canonical order: the lists are only ever consumed
+    // as sets (SQL ANY, facet membership), so sorting
+    // them here makes the validated form — and with it
+    // the analytics fingerprint and the saved-search
+    // stored form — identical for every spelling of the
+    // same filter set.
+    normalised.sort();
+    if normalised.len() > MAX_FILTER_VALUES {
+        return Err(format!(
+            "at most {MAX_FILTER_VALUES} {label} values per search — \
+             একটি খোঁজে সর্বোচ্চ {MAX_FILTER_VALUES}টি {label} দেওয়া যাবে"
+        ));
+    }
+    Ok(normalised)
+}
+
+/// Validate raw faceted-browse input (Wave 53) — THE one
+/// validation function behind `GET /v1/search`, also reused
+/// by the saved-search write path so a stored filter obeys
+/// exactly the rules a live one does.
+///
+/// The Wave 15 core (text, price bounds, sort, page) is
+/// judged by [`validate_search_params`] and its established
+/// error wording is preserved; everything this wave adds —
+/// the price ceiling, the `limit` spelling, the rating
+/// range, the boolean flags, the multi-value lists — is
+/// judged here with bilingual errors.
+pub fn validate_browse_filters(input: BrowseFilterInput) -> Result<BrowseFilters, String> {
+    // The price ceiling is this wave's addition to the
+    // core price rules (the core judges sign and order).
+    for bound in [input.min_price_poisha, input.max_price_poisha]
+        .into_iter()
+        .flatten()
+    {
+        if bound > MAX_PRICE_FILTER_POISHA {
+            return Err(format!(
+                "price bounds must be at most {MAX_PRICE_FILTER_POISHA} poisha — \
+                 দামের সীমা সর্বোচ্চ {MAX_PRICE_FILTER_POISHA} পয়সা হতে হবে"
+            ));
+        }
+    }
+    // When `limit` arrives it owns the page size, so the
+    // legacy `per_page` is not handed to the core validator
+    // (its 48 cap is the legacy spelling's rule, not the
+    // browse spelling's).
+    let core_per_page = if input.limit.is_some() {
+        None
+    } else {
+        input.per_page
+    };
+    let core = validate_search_params(
+        input.q.as_deref(),
+        input.min_price_poisha,
+        input.max_price_poisha,
+        input.sort.as_deref(),
+        input.page,
+        core_per_page,
+    )
+    .map_err(str::to_string)?;
+    let per_page = match input.limit {
+        Some(limit) => {
+            if !(1..=MAX_BROWSE_LIMIT).contains(&limit) {
+                return Err(format!(
+                    "limit must be between 1 and {MAX_BROWSE_LIMIT} — \
+                     limit ১ থেকে {MAX_BROWSE_LIMIT}-এর মধ্যে হতে হবে"
+                ));
+            }
+            limit
+        }
+        None => {
+            if input.per_page.is_none() {
+                // Neither spelling arrived: the browse
+                // default, larger than the Wave 15 search
+                // default (a grid page, not a result list).
+                DEFAULT_BROWSE_LIMIT
+            } else {
+                core.per_page
+            }
+        }
+    };
+    let min_rating = match input.min_rating {
+        None => None,
+        Some(rating) => {
+            if !rating.is_finite() || !(0.0..=5.0).contains(&rating) {
+                return Err(
+                    "min_rating must be between 0 and 5 — min_rating ০ থেকে ৫-এর মধ্যে হতে হবে"
+                        .to_string(),
+                );
+            }
+            Some(rating)
+        }
+    };
+    Ok(BrowseFilters {
+        q: core.q,
+        categories: normalize_filter_values(
+            &input.categories,
+            MAX_CATEGORY_FILTER_CHARS,
+            "category",
+        )?,
+        store_slugs: normalize_filter_values(
+            &input.store_slugs,
+            MAX_STORE_FILTER_CHARS,
+            "store",
+        )?,
+        min_price_poisha: core.min_price_poisha,
+        max_price_poisha: core.max_price_poisha,
+        min_rating,
+        in_stock: parse_filter_bool(input.in_stock.as_deref(), "in_stock")?,
+        on_sale: parse_filter_bool(input.on_sale.as_deref(), "on_sale")?,
+        sort: core.sort,
+        page: core.page,
+        per_page,
+    })
+}
+
+/// A stable fingerprint of a validated browse filter set
+/// (Wave 53): the grouping key the search-analytics log
+/// stores beside the query text, so the operator can see
+/// WHICH filter combinations shoppers run without the log
+/// storing anything about WHO ran them. FNV-1a (64-bit)
+/// over a canonical rendering — a grouping key, not a
+/// security hash; two different filter sets colliding
+/// would only blur an analytics count.
+pub fn search_filters_fingerprint(filters: &BrowseFilters) -> String {
+    let canonical = format!(
+        "q={}|cat={}|store={}|min={}|max={}|rating={}|stock={}|sale={}|sort={}",
+        filters.q.as_deref().unwrap_or(""),
+        filters.categories.join(","),
+        filters.store_slugs.join(","),
+        filters
+            .min_price_poisha
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        filters
+            .max_price_poisha
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        filters
+            .min_rating
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        filters.in_stock,
+        filters.on_sale,
+        search_sort_key(filters.sort),
+    );
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in canonical.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// How many searches one buyer may save (Wave 53). A saved
+/// search is a convenience bookmark, not a data store; the
+/// cap keeps the account list a list.
+pub const MAX_SAVED_SEARCHES_PER_USER: i64 = 20;
+
+/// Longest saved-search name, in characters (Wave 53).
+pub const MAX_SAVED_SEARCH_NAME_CHARS: usize = 60;
+
+/// Validate a saved-search name (Wave 53): trimmed, 1..=60
+/// characters. Returns the trimmed name to store.
+pub fn validate_saved_search_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "a saved search needs a name — সংরক্ষিত খোঁজের একটি নাম দিন".to_string(),
+        );
+    }
+    if trimmed.chars().count() > MAX_SAVED_SEARCH_NAME_CHARS {
+        return Err(format!(
+            "a saved search name must be at most {MAX_SAVED_SEARCH_NAME_CHARS} characters — \
+             নাম সর্বোচ্চ {MAX_SAVED_SEARCH_NAME_CHARS} অক্ষরের হতে হবে"
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// How many buckets the browse price histogram splits the
+/// facet span into (Wave 53).
+pub const PRICE_HISTOGRAM_BUCKETS: usize = 8;
+
+/// Plan the price histogram's bucket ranges (Wave 53) for
+/// a facet span: `buckets` half-open ranges `[lo, hi)`
+/// covering `[min, max]` — the last range's `hi` is
+/// `max + 1` so the dearest product lands inside it.
+/// Ranges are whole poisha at least 1 wide; a span
+/// narrower than the bucket count yields one range per
+/// poisha value instead of empty ranges, and a single
+/// price (or an inverted span, which the caller never
+/// passes) yields one range. Pure: the API counts the
+/// exclude-price set into exactly these ranges, and the
+/// web renders them verbatim.
+pub fn price_histogram_ranges(min_poisha: i64, max_poisha: i64) -> Vec<(i64, i64)> {
+    if max_poisha <= min_poisha {
+        return vec![(min_poisha, max_poisha.saturating_add(1))];
+    }
+    let span = max_poisha - min_poisha + 1;
+    let buckets = (PRICE_HISTOGRAM_BUCKETS as i64).min(span) as usize;
+    let width = span / buckets as i64;
+    let mut ranges = Vec::with_capacity(buckets);
+    let mut lo = min_poisha;
+    for index in 0..buckets {
+        let hi = if index + 1 == buckets {
+            max_poisha.saturating_add(1)
+        } else {
+            lo + width
+        };
+        ranges.push((lo, hi));
+        lo = hi;
+    }
+    ranges
+}
+
+/// The default search-analytics window, in days (Wave 53).
+pub const DEFAULT_ANALYTICS_WINDOW_DAYS: i64 = 30;
+
+/// The widest search-analytics window the admin read
+/// allows, in days (Wave 53): a quarter of search history
+/// is an operations view; beyond that the log is an
+/// archive question, not a dashboard one.
+pub const MAX_ANALYTICS_WINDOW_DAYS: i64 = 90;
+
+/// Validate the admin search-analytics window (Wave 53):
+/// absent means the default; a present value must be
+/// 1..=MAX_ANALYTICS_WINDOW_DAYS.
+pub fn validate_analytics_window_days(days: Option<i64>) -> Result<i64, String> {
+    match days {
+        None => Ok(DEFAULT_ANALYTICS_WINDOW_DAYS),
+        Some(days) if (1..=MAX_ANALYTICS_WINDOW_DAYS).contains(&days) => Ok(days),
+        Some(_) => Err(format!(
+            "the analytics window must be 1..={MAX_ANALYTICS_WINDOW_DAYS} days — \
+             সময়সীমা ১ থেকে {MAX_ANALYTICS_WINDOW_DAYS} দিনের মধ্যে হতে হবে"
+        )),
+    }
 }
 
 /// Maximum length of a buyer's return reason, in characters.
@@ -6522,6 +6985,489 @@ mod tests {
         assert!(validate_search_params(Some(&long_q), None, None, None, None, None).is_err());
         let at_limit = "ক".repeat(MAX_SEARCH_QUERY_CHARS);
         assert!(validate_search_params(Some(&at_limit), None, None, None, None, None).is_ok());
+    }
+
+    #[test]
+    fn browse_filters_defaults_and_core_rules() {
+        // An empty input is a valid unfiltered browse: no
+        // text, newest-first (the core's no-text default),
+        // page 1 at the browse page size.
+        let filters = validate_browse_filters(BrowseFilterInput::default())
+            .expect("empty input is valid");
+        assert_eq!(filters.q, None);
+        assert_eq!(filters.sort, SearchSort::Newest);
+        assert_eq!(filters.page, 1);
+        assert_eq!(filters.per_page, DEFAULT_BROWSE_LIMIT);
+        assert!(filters.categories.is_empty());
+        assert!(filters.store_slugs.is_empty());
+        assert_eq!(filters.min_rating, None);
+        assert!(!filters.in_stock);
+        assert!(!filters.on_sale);
+
+        // Text present -> relevance default, and the Wave 15
+        // core still judges the shared fields (bad sort,
+        // inverted prices, page 0 all stay 400s).
+        let with_q = validate_browse_filters(BrowseFilterInput {
+            q: Some("  shirt ".to_string()),
+            ..BrowseFilterInput::default()
+        })
+        .expect("text is valid");
+        assert_eq!(with_q.q.as_deref(), Some("shirt"));
+        assert_eq!(with_q.sort, SearchSort::Relevance);
+        assert!(validate_browse_filters(BrowseFilterInput {
+            sort: Some("banana".to_string()),
+            ..BrowseFilterInput::default()
+        })
+        .is_err());
+        assert!(validate_browse_filters(BrowseFilterInput {
+            min_price_poisha: Some(1_000),
+            max_price_poisha: Some(999),
+            ..BrowseFilterInput::default()
+        })
+        .is_err());
+        assert!(validate_browse_filters(BrowseFilterInput {
+            page: Some(0),
+            ..BrowseFilterInput::default()
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn browse_filters_limit_spelling_and_bounds() {
+        // `limit` wins over the legacy `per_page` when both
+        // arrive, and it answers to the browse bounds
+        // (1..=60), not the legacy 48 cap.
+        let both = validate_browse_filters(BrowseFilterInput {
+            per_page: Some(10),
+            limit: Some(50),
+            ..BrowseFilterInput::default()
+        })
+        .expect("limit above the legacy cap is fine");
+        assert_eq!(both.per_page, 50);
+        let legacy = validate_browse_filters(BrowseFilterInput {
+            per_page: Some(48),
+            ..BrowseFilterInput::default()
+        })
+        .expect("legacy spelling at its cap");
+        assert_eq!(legacy.per_page, 48);
+        assert!(validate_browse_filters(BrowseFilterInput {
+            per_page: Some(49),
+            ..BrowseFilterInput::default()
+        })
+        .is_err());
+        assert!(validate_browse_filters(BrowseFilterInput {
+            limit: Some(0),
+            ..BrowseFilterInput::default()
+        })
+        .is_err());
+        assert!(validate_browse_filters(BrowseFilterInput {
+            limit: Some(MAX_BROWSE_LIMIT + 1),
+            ..BrowseFilterInput::default()
+        })
+        .is_err());
+        assert!(validate_browse_filters(BrowseFilterInput {
+            limit: Some(MAX_BROWSE_LIMIT),
+            ..BrowseFilterInput::default()
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn browse_filters_price_ceiling() {
+        // At the ceiling is fine; one poisha above is a 400.
+        assert!(validate_browse_filters(BrowseFilterInput {
+            max_price_poisha: Some(MAX_PRICE_FILTER_POISHA),
+            ..BrowseFilterInput::default()
+        })
+        .is_ok());
+        assert!(validate_browse_filters(BrowseFilterInput {
+            max_price_poisha: Some(MAX_PRICE_FILTER_POISHA + 1),
+            ..BrowseFilterInput::default()
+        })
+        .is_err());
+        assert!(validate_browse_filters(BrowseFilterInput {
+            min_price_poisha: Some(MAX_PRICE_FILTER_POISHA + 1),
+            ..BrowseFilterInput::default()
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn browse_filters_rating_and_bool_flags() {
+        let rated = validate_browse_filters(BrowseFilterInput {
+            min_rating: Some(4.5),
+            in_stock: Some("true".to_string()),
+            on_sale: Some("1".to_string()),
+            ..BrowseFilterInput::default()
+        })
+        .expect("valid rating and flags");
+        assert_eq!(rated.min_rating, Some(4.5));
+        assert!(rated.in_stock);
+        assert!(rated.on_sale);
+        let unrated = validate_browse_filters(BrowseFilterInput {
+            min_rating: Some(0.0),
+            in_stock: Some("false".to_string()),
+            on_sale: Some("0".to_string()),
+            ..BrowseFilterInput::default()
+        })
+        .expect("zero rating and false flags are valid");
+        assert_eq!(unrated.min_rating, Some(0.0));
+        assert!(!unrated.in_stock);
+        // Out of range, NaN and infinities are all refused;
+        // a mistyped flag is refused rather than guessed.
+        for bad in [5.1, -0.1, f64::NAN, f64::INFINITY] {
+            assert!(
+                validate_browse_filters(BrowseFilterInput {
+                    min_rating: Some(bad),
+                    ..BrowseFilterInput::default()
+                })
+                .is_err(),
+                "rating {bad} refused"
+            );
+        }
+        assert!(validate_browse_filters(BrowseFilterInput {
+            in_stock: Some("yes".to_string()),
+            ..BrowseFilterInput::default()
+        })
+        .is_err());
+        assert_eq!(parse_filter_bool(None, "in_stock"), Ok(false));
+        assert_eq!(parse_filter_bool(Some("true"), "in_stock"), Ok(true));
+    }
+
+    #[test]
+    fn browse_filters_multi_value_normalisation() {
+        // Repeated parameters, comma-joined values, stray
+        // blanks and duplicates all normalise to one clean
+        // OR list, first occurrence winning.
+        let filters = validate_browse_filters(BrowseFilterInput {
+            categories: vec![
+                " clothing , shoes ".to_string(),
+                "clothing".to_string(),
+                "".to_string(),
+                "electronics".to_string(),
+            ],
+            store_slugs: vec!["alpha,beta".to_string(), "alpha".to_string()],
+            ..BrowseFilterInput::default()
+        })
+        .expect("normalisable lists");
+        assert_eq!(filters.categories, vec!["clothing", "shoes", "electronics"]);
+        assert_eq!(filters.store_slugs, vec!["alpha", "beta"]);
+
+        // The value cap and the per-value length cap bite.
+        let too_many: Vec<String> = (0..=MAX_FILTER_VALUES)
+            .map(|n| format!("cat{n}"))
+            .collect();
+        assert!(validate_browse_filters(BrowseFilterInput {
+            categories: too_many,
+            ..BrowseFilterInput::default()
+        })
+        .is_err());
+        assert!(validate_browse_filters(BrowseFilterInput {
+            categories: vec!["x".repeat(MAX_CATEGORY_FILTER_CHARS + 1)],
+            ..BrowseFilterInput::default()
+        })
+        .is_err());
+        assert!(validate_browse_filters(BrowseFilterInput {
+            store_slugs: vec!["x".repeat(MAX_STORE_FILTER_CHARS + 1)],
+            ..BrowseFilterInput::default()
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn browse_filters_sold_sort_and_fingerprint() {
+        // The new sort parses through the core path, and
+        // its key round-trips.
+        let filters = validate_browse_filters(BrowseFilterInput {
+            sort: Some("sold".to_string()),
+            ..BrowseFilterInput::default()
+        })
+        .expect("sold sort is valid");
+        assert_eq!(filters.sort, SearchSort::Sold);
+        for sort in [
+            SearchSort::Relevance,
+            SearchSort::PriceAsc,
+            SearchSort::PriceDesc,
+            SearchSort::Newest,
+            SearchSort::Rating,
+            SearchSort::Sold,
+        ] {
+            let parsed = validate_search_params(
+                None,
+                None,
+                None,
+                Some(search_sort_key(sort)),
+                None,
+                None,
+            )
+            .expect("sort key parses");
+            assert_eq!(parsed.sort, sort);
+        }
+
+        // The fingerprint is stable for equal filter sets
+        // and moves when any component moves.
+        let base = validate_browse_filters(BrowseFilterInput {
+            q: Some("shirt".to_string()),
+            categories: vec!["clothing".to_string()],
+            ..BrowseFilterInput::default()
+        })
+        .expect("base filters");
+        let same = validate_browse_filters(BrowseFilterInput {
+            q: Some("shirt".to_string()),
+            categories: vec!["clothing".to_string()],
+            ..BrowseFilterInput::default()
+        })
+        .expect("same filters");
+        assert_eq!(
+            search_filters_fingerprint(&base),
+            search_filters_fingerprint(&same)
+        );
+        let moved = validate_browse_filters(BrowseFilterInput {
+            q: Some("shirt".to_string()),
+            categories: vec!["clothing".to_string()],
+            in_stock: Some("true".to_string()),
+            ..BrowseFilterInput::default()
+        })
+        .expect("moved filters");
+        assert_ne!(
+            search_filters_fingerprint(&base),
+            search_filters_fingerprint(&moved)
+        );
+        // The list-sort validator: relevance degrades to the
+        // list default, the rest of the vocabulary maps.
+        assert_eq!(validate_product_list_sort(None), Ok(SearchSort::Newest));
+        assert_eq!(
+            validate_product_list_sort(Some("relevance")),
+            Ok(SearchSort::Newest)
+        );
+        assert_eq!(
+            validate_product_list_sort(Some("sold")),
+            Ok(SearchSort::Sold)
+        );
+        assert!(validate_product_list_sort(Some("banana")).is_err());
+    }
+
+    #[test]
+    fn browse_fingerprint_ignores_input_order_and_duplicates() {
+        // The analytics grouping property: the same browse
+        // spelled differently — values reordered, repeated,
+        // comma-joined — is ONE filter set with ONE
+        // fingerprint.
+        let first = validate_browse_filters(BrowseFilterInput {
+            categories: vec!["clothing".to_string(), "footwear".to_string()],
+            store_slugs: vec!["alpha".to_string(), "beta".to_string()],
+            ..BrowseFilterInput::default()
+        })
+        .expect("first spelling");
+        let second = validate_browse_filters(BrowseFilterInput {
+            categories: vec!["footwear,clothing".to_string(), "clothing".to_string()],
+            store_slugs: vec!["beta".to_string(), "alpha".to_string()],
+            ..BrowseFilterInput::default()
+        })
+        .expect("second spelling");
+        assert_eq!(
+            search_filters_fingerprint(&first),
+            search_filters_fingerprint(&second),
+            "canonicalisation precedes fingerprinting"
+        );
+        // And the canonical lists themselves are the
+        // sorted, deduplicated sets.
+        assert_eq!(first.categories, vec!["clothing", "footwear"]);
+        assert_eq!(second.categories, vec!["clothing", "footwear"]);
+        assert_eq!(first.store_slugs, vec!["alpha", "beta"]);
+        assert_eq!(second.store_slugs, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn browse_filters_value_caps() {
+        // More distinct values than the cap is a 400, not a
+        // silent truncation — the shopper's filter must be
+        // the filter that ran.
+        let many: Vec<String> = (0..=MAX_FILTER_VALUES)
+            .map(|index| format!("cat-{index}"))
+            .collect();
+        assert!(validate_browse_filters(BrowseFilterInput {
+            categories: many,
+            ..BrowseFilterInput::default()
+        })
+        .is_err());
+        // A value longer than the label cap is a 400.
+        assert!(validate_browse_filters(BrowseFilterInput {
+            store_slugs: vec!["x".repeat(MAX_STORE_FILTER_CHARS + 1)],
+            ..BrowseFilterInput::default()
+        })
+        .is_err());
+        // Whitespace-only values drop out entirely.
+        let filters = validate_browse_filters(BrowseFilterInput {
+            categories: vec!["  ".to_string(), " clothing ".to_string()],
+            ..BrowseFilterInput::default()
+        })
+        .expect("blanks drop");
+        assert_eq!(filters.categories, vec!["clothing"]);
+    }
+
+    #[test]
+    fn saved_search_name_rules() {
+        assert_eq!(
+            validate_saved_search_name("  Eid shoes  "),
+            Ok("Eid shoes".to_string())
+        );
+        assert!(validate_saved_search_name("").is_err());
+        assert!(validate_saved_search_name("   ").is_err());
+        assert!(validate_saved_search_name(
+            &"x".repeat(MAX_SAVED_SEARCH_NAME_CHARS + 1)
+        )
+        .is_err());
+        assert!(validate_saved_search_name(
+            &"ক".repeat(MAX_SAVED_SEARCH_NAME_CHARS)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn price_histogram_ranges_cover_the_span() {
+        // The catalogue span of the wave's own tests:
+        // contiguous, non-overlapping, first lo = min,
+        // last hi = max + 1 (so the dearest product counts).
+        let ranges = price_histogram_ranges(20_000, 300_000);
+        assert_eq!(ranges.len(), PRICE_HISTOGRAM_BUCKETS);
+        assert_eq!(ranges[0].0, 20_000);
+        assert_eq!(ranges[ranges.len() - 1].1, 300_001);
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "ranges are contiguous");
+            assert!(pair[0].0 < pair[0].1, "no empty range");
+        }
+        // Every price in the span falls in exactly one range.
+        for price in [20_000, 50_000, 150_000, 299_999, 300_000] {
+            let hits = ranges
+                .iter()
+                .filter(|(lo, hi)| price >= *lo && price < *hi)
+                .count();
+            assert_eq!(hits, 1, "price {price} in exactly one range");
+        }
+        // A single price is one range; a tiny span yields
+        // one range per poisha, never an empty range.
+        assert_eq!(price_histogram_ranges(500, 500), vec![(500, 501)]);
+        let tiny = price_histogram_ranges(0, 3);
+        assert_eq!(tiny, vec![(0, 1), (1, 2), (2, 3), (3, 4)]);
+    }
+
+    #[test]
+    fn price_histogram_ranges_small_spans() {
+        // A span of exactly the bucket count: one poisha
+        // per range.
+        let ranges = price_histogram_ranges(0, 7);
+        assert_eq!(ranges.len(), 8);
+        assert_eq!(ranges[7], (7, 8));
+        // A span one wider than the bucket count: the last
+        // range absorbs the remainder and still ends at
+        // max + 1.
+        let ranges = price_histogram_ranges(0, 8);
+        assert_eq!(ranges.len(), 8);
+        assert_eq!(ranges[7], (7, 9));
+        // A large span divides evenly-ish and never loses
+        // the top price.
+        let ranges = price_histogram_ranges(0, 79_999);
+        assert_eq!(ranges[0].0, 0);
+        assert_eq!(ranges[ranges.len() - 1].1, 80_000);
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0);
+        }
+    }
+
+    #[test]
+    fn browse_fingerprint_distinguishes_real_changes() {
+        // The fingerprint is the analytics grouping key:
+        // two browses that differ in a real filter must
+        // land in different groups, or the operator's
+        // combination counts would merge unlike searches.
+        let base = validate_browse_filters(BrowseFilterInput {
+            q: Some("shirt".to_string()),
+            ..BrowseFilterInput::default()
+        })
+        .expect("base");
+        let sorted = validate_browse_filters(BrowseFilterInput {
+            q: Some("shirt".to_string()),
+            sort: Some("price_asc".to_string()),
+            ..BrowseFilterInput::default()
+        })
+        .expect("sorted");
+        let stocked = validate_browse_filters(BrowseFilterInput {
+            q: Some("shirt".to_string()),
+            in_stock: Some("true".to_string()),
+            ..BrowseFilterInput::default()
+        })
+        .expect("stocked");
+        let base_hash = search_filters_fingerprint(&base);
+        assert_ne!(base_hash, search_filters_fingerprint(&sorted));
+        assert_ne!(base_hash, search_filters_fingerprint(&stocked));
+        assert_ne!(
+            search_filters_fingerprint(&sorted),
+            search_filters_fingerprint(&stocked)
+        );
+    }
+
+    #[test]
+    fn browse_bool_flag_spellings() {
+        // The accepted spellings are the two query-string
+        // conventions; anything else is a 400, never a
+        // silent false.
+        let filters = validate_browse_filters(BrowseFilterInput {
+            in_stock: Some("1".to_string()),
+            on_sale: Some("true".to_string()),
+            ..BrowseFilterInput::default()
+        })
+        .expect("1/true parse");
+        assert!(filters.in_stock);
+        assert!(filters.on_sale);
+        let filters = validate_browse_filters(BrowseFilterInput {
+            in_stock: Some("0".to_string()),
+            on_sale: Some("false".to_string()),
+            ..BrowseFilterInput::default()
+        })
+        .expect("0/false parse");
+        assert!(!filters.in_stock);
+        assert!(!filters.on_sale);
+        assert!(validate_browse_filters(BrowseFilterInput {
+            in_stock: Some("perhaps".to_string()),
+            ..BrowseFilterInput::default()
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn product_list_sort_vocabulary() {
+        // The whole browse vocabulary maps for the plain
+        // list; relevance degrades to the list's default
+        // (the list has no text rank of its own).
+        assert_eq!(
+            validate_product_list_sort(Some("price_asc")),
+            Ok(SearchSort::PriceAsc)
+        );
+        assert_eq!(
+            validate_product_list_sort(Some("price_desc")),
+            Ok(SearchSort::PriceDesc)
+        );
+        assert_eq!(
+            validate_product_list_sort(Some("newest")),
+            Ok(SearchSort::Newest)
+        );
+        assert_eq!(
+            validate_product_list_sort(Some("rating")),
+            Ok(SearchSort::Rating)
+        );
+        assert!(validate_product_list_sort(Some("")).is_err());
+        assert!(validate_product_list_sort(Some("cheapest")).is_err());
+    }
+
+    #[test]
+    fn analytics_window_days_rules() {
+        assert_eq!(validate_analytics_window_days(None), Ok(30));
+        assert_eq!(validate_analytics_window_days(Some(1)), Ok(1));
+        assert_eq!(validate_analytics_window_days(Some(90)), Ok(90));
+        assert!(validate_analytics_window_days(Some(0)).is_err());
+        assert!(validate_analytics_window_days(Some(91)).is_err());
+        assert!(validate_analytics_window_days(Some(-3)).is_err());
     }
 
     #[test]

@@ -30,7 +30,10 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use domain::{stock_status, validate_category, validate_product_input, ProductInput};
+use domain::{
+    stock_status, validate_category, validate_product_input, validate_product_list_sort,
+    ProductInput, SearchSort,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
@@ -349,6 +352,13 @@ pub(crate) fn clamp_pagination(page: Option<i64>, limit: Option<i64>) -> (i64, i
 /// future client all call this. `q` matches title / title_bn (ILIKE,
 /// backed by the pg_trgm GIN indexes); `store_slug` restricts to one
 /// store; `viewer_user_id` is the optional signed-in caller.
+///
+/// Wave 53: `sort` joins the parameters (the domain's
+/// `validate_product_list_sort` judges it). The default —
+/// newest — keeps the Wave 26 rule below; the explicit
+/// sorts are pure, and the price sorts price by the
+/// EFFECTIVE price (the merch module's SQL flash twin),
+/// so the list orders by the price its own cards show.
 pub async fn list_products(
     pool: &PgPool,
     q: Option<&str>,
@@ -356,9 +366,11 @@ pub async fn list_products(
     page: Option<i64>,
     limit: Option<i64>,
     viewer_user_id: Option<Uuid>,
+    sort: Option<&str>,
 ) -> Result<ProductList, ApiError> {
     let (page, limit) = clamp_pagination(page, limit);
     let offset = (page - 1) * limit;
+    let sort = validate_product_list_sort(sort).map_err(ApiError::bad_request)?;
     let pattern: Option<String> = q
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -375,17 +387,37 @@ pub async fn list_products(
     .await
     .map_err(|e| ApiError::internal("count products", e))?;
 
-    // Wave 26: this listing's only ordering is the default
-    // (newest first), so live sponsored promotions sort ahead
-    // of it — the same promoted-first rule search applies to
-    // its default and relevance orderings. The flag is an
-    // output column of PRODUCT_COLUMNS, so ORDER BY can name
-    // it directly. Sponsored placement is always labelled in
-    // the UI (the স্পন্সরড badge), never disguised as organic.
+    // Wave 26: the DEFAULT ordering (newest first) puts
+    // live sponsored promotions ahead of it — the same
+    // promoted-first rule search applies to its default
+    // and relevance orderings. The flag is an output
+    // column of PRODUCT_COLUMNS, so ORDER BY can name it
+    // directly. Sponsored placement is always labelled in
+    // the UI (the স্পন্সরড badge), never disguised as
+    // organic. Wave 53's explicit sorts stay pure, like
+    // search's: price (by the effective price — the flash
+    // lateral rides this query for exactly that), rating
+    // and sold order by their key alone.
+    let order_by = match sort {
+        SearchSort::Newest | SearchSort::Relevance => {
+            "ORDER BY is_promoted DESC, p.created_at DESC".to_string()
+        }
+        SearchSort::PriceAsc => {
+            format!("ORDER BY {} ASC, p.created_at DESC", crate::merch::EFFECTIVE_PRICE_SQL)
+        }
+        SearchSort::PriceDesc => {
+            format!("ORDER BY {} DESC, p.created_at DESC", crate::merch::EFFECTIVE_PRICE_SQL)
+        }
+        SearchSort::Rating => "ORDER BY rv.rating_avg DESC NULLS LAST, rv.rating_count DESC, \
+             p.created_at DESC"
+            .to_string(),
+        SearchSort::Sold => "ORDER BY sold_count DESC, p.created_at DESC".to_string(),
+    };
     let mut items: Vec<Product> = sqlx::query_as(&format!(
         "SELECT {PRODUCT_COLUMNS} FROM products p JOIN stores s ON s.id = p.store_id \
-         {PRODUCT_RATING_JOIN} \
-         WHERE {PRODUCT_WHERE} ORDER BY is_promoted DESC, p.created_at DESC LIMIT $4 OFFSET $5"
+         {PRODUCT_RATING_JOIN} {} \
+         WHERE {PRODUCT_WHERE} {order_by} LIMIT $4 OFFSET $5",
+        crate::merch::FLASH_PRICE_JOIN
     ))
     .bind(&pattern)
     .bind(store_slug)
@@ -759,6 +791,9 @@ pub struct ListProductsQuery {
     pub store_slug: Option<String>,
     pub page: Option<i64>,
     pub limit: Option<i64>,
+    /// Wave 53: the list sort (`newest` default, or
+    /// `price_asc` / `price_desc` / `rating` / `sold`).
+    pub sort: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -789,6 +824,7 @@ pub async fn list_products_handler(
         query.page,
         query.limit,
         viewer,
+        query.sort.as_deref(),
     )
     .await?;
     // Wave 32: publicly cacheable only for anonymous reads
@@ -811,6 +847,7 @@ pub async fn list_store_products(
         query.page,
         query.limit,
         viewer,
+        query.sort.as_deref(),
     )
     .await?;
     Ok(Json(list))

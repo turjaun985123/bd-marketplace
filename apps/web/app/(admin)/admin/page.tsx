@@ -7,10 +7,12 @@ import PriceTag from "@/components/PriceTag";
 import {
   getAdminMetrics,
   getAdminOverview,
+  getSearchAnalytics,
   listAdminMerchEvents,
   type AdminMetrics,
   type AdminOverview,
   type MerchEventView,
+  type SearchAnalytics,
 } from "@/lib/api";
 import { formatDateTime } from "@/lib/format";
 import { useAuth } from "@/hooks/useAuth";
@@ -28,8 +30,82 @@ export default function AdminOverviewPage() {
     <AdminShell>
       <Overview />
       <SystemStatus />
+      <SearchAnalyticsCard />
       <RecentMerchEvents />
     </AdminShell>
+  );
+}
+
+/**
+ * Search analytics (Wave 53): what shoppers searched for
+ * in the trailing window — the most-run query texts with
+ * their mean result counts, and the zero-result texts,
+ * which are the catalogue gaps worth stocking. The log
+ * behind this carries no user id by design; the card
+ * renders nothing while the window is empty.
+ */
+function SearchAnalyticsCard() {
+  const { token } = useAuth();
+  const [analytics, setAnalytics] = useState<SearchAnalytics | null>(null);
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    getSearchAnalytics(token)
+      .then((data) => {
+        if (!cancelled) setAnalytics(data);
+      })
+      .catch(() => {
+        if (!cancelled) setAnalytics(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token]);
+
+  if (analytics === null || analytics.total_searches === 0) return null;
+  return (
+    <>
+      <h2>খোঁজের হিসাব — Search analytics</h2>
+      <p>
+        <Link href="/admin/search-analytics">
+          পুরো হিসাব — Full search analytics
+        </Link>
+      </p>
+      <div className="card">
+        <p>
+          গত {analytics.window_days} দিনে মোট খোঁজ:{" "}
+          <strong>{analytics.total_searches}</strong>টি — Total searches in the
+          last {analytics.window_days} days
+        </p>
+        {analytics.top_searches.length > 0 && (
+          <>
+            <p>সবচেয়ে বেশি খোঁজা — Top searches:</p>
+            <ul>
+              {analytics.top_searches.map((row) => (
+                <li key={row.query_text}>
+                  “{row.query_text}” — {row.searches} বার, গড়ে{" "}
+                  {row.avg_results}টি ফলাফল (avg {row.avg_results} results)
+                </li>
+              ))}
+            </ul>
+          </>
+        )}
+        {analytics.zero_result_searches.length > 0 && (
+          <>
+            <p>কিছুই মেলেনি — Zero-result searches (catalogue gaps):</p>
+            <ul>
+              {analytics.zero_result_searches.map((row) => (
+                <li key={row.query_text}>
+                  “{row.query_text}” — {row.searches} বার, শেষ{" "}
+                  {formatDateTime(row.last_searched_at)}
+                </li>
+              ))}
+            </ul>
+          </>
+        )}
+      </div>
+    </>
   );
 }
 

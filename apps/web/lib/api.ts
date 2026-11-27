@@ -1086,10 +1086,16 @@ export function updateStoreBranding(
   });
 }
 
-/** GET /v1/products — central marketplace listing (active products). */
+/**
+ * GET /v1/products — central marketplace listing (active
+ * products). Wave 53 adds `sort` (the search sort keys;
+ * price sorts order by the EFFECTIVE price, flash
+ * included, exactly like the browse).
+ */
 export function listProducts(params?: {
   q?: string;
   store_slug?: string;
+  sort?: SearchSort;
   page?: number;
   limit?: number;
   token?: string | null;
@@ -1097,6 +1103,7 @@ export function listProducts(params?: {
   const search = new URLSearchParams();
   if (params?.q) search.set("q", params.q);
   if (params?.store_slug) search.set("store_slug", params.store_slug);
+  if (params?.sort) search.set("sort", params.sort);
   if (params?.page) search.set("page", String(params.page));
   if (params?.limit) search.set("limit", String(params.limit));
   const qs = search.toString();
@@ -1111,56 +1118,148 @@ export function getStoreProducts(
   return call(`/v1/stores/${encodeURIComponent(slug)}/products`, { token });
 }
 
-/** Sort orders the search endpoint understands (Wave 15). */
+/**
+ * Sort orders the search endpoint understands (Wave 15;
+ * Wave 53 adds `sold` — best sellers first, by the API's
+ * delivered-units definition).
+ */
 export type SearchSort =
   | "relevance"
   | "price_asc"
   | "price_desc"
   | "newest"
-  | "rating";
+  | "rating"
+  | "sold";
 
-/** One page of search results (Wave 15): the shared Product shape
- * plus the pagination envelope (`per_page`, not `limit`). */
+/** One category row of a browse response's facet block. */
+export interface SearchFacetCategory {
+  category: string;
+  count: number;
+}
+
+/** One store row of a browse response's facet block. */
+export interface SearchFacetStore {
+  slug: string;
+  name: string;
+  count: number;
+}
+
+/** One rating threshold row ("4★ & up") of the facet block. */
+export interface SearchFacetRating {
+  min_rating: number;
+  count: number;
+}
+
+/** One band of the price facet's histogram. */
+export interface SearchPriceBucket {
+  min_poisha: number;
+  max_poisha: number;
+  count: number;
+}
+
+/**
+ * The facet block of a browse response (Wave 53). The
+ * convention: every group counts the result set filtered
+ * by all the OTHER groups — the category counts do not
+ * narrow when a category is picked (they are how the
+ * shopper widens), while the store counts do. `price` is
+ * the effective-price span of the set filtered by
+ * everything except the price bounds, split into
+ * histogram bands over the same set; bounds are null
+ * when that set is empty.
+ */
+export interface SearchFacets {
+  categories: SearchFacetCategory[];
+  stores: SearchFacetStore[];
+  price: {
+    min_poisha: number | null;
+    max_poisha: number | null;
+    histogram: SearchPriceBucket[];
+  };
+  ratings: SearchFacetRating[];
+}
+
+/**
+ * One page of search results: the shared Product shape
+ * plus the pagination envelope and (Wave 53) the facet
+ * block. `limit` and `per_page` are the same page size
+ * under both spellings.
+ */
 export interface SearchResult {
   items: Product[];
   total: number;
   page: number;
   per_page: number;
+  limit: number;
+  facets: SearchFacets;
 }
 
 /**
- * GET /v1/search — Postgres-native product search (Wave 15):
- * text over title / Bangla title / description, composed with the
- * category, price-range and store filters. Public — no token.
+ * GET /v1/search — the faceted browse (Wave 15's trigram
+ * search, Wave 53's facets): text over title / Bangla
+ * title / description, composed with repeatable category
+ * and store filters (OR within a group), effective-price
+ * bounds, a rating floor, stock and on-sale flags. Every
+ * price the response carries is the EFFECTIVE price (the
+ * live flash price when one resolves). Public — no token.
  */
 export function searchProducts(params?: {
   q?: string;
   store_slug?: string;
   category?: string;
+  categories?: string[];
+  stores?: string[];
   min_price_poisha?: number;
   max_price_poisha?: number;
+  min_rating?: number;
+  in_stock?: boolean;
+  on_sale?: boolean;
   sort?: SearchSort;
   page?: number;
   per_page?: number;
+  limit?: number;
 }): Promise<SearchResult> {
   const search = new URLSearchParams();
   if (params?.q) search.set("q", params.q);
   if (params?.store_slug) search.set("store_slug", params.store_slug);
-  if (params?.category) search.set("category", params.category);
+  if (params?.category) search.append("category", params.category);
+  for (const category of params?.categories ?? []) {
+    search.append("category", category);
+  }
+  for (const store of params?.stores ?? []) {
+    search.append("store", store);
+  }
   if (params?.min_price_poisha !== undefined)
     search.set("min_price_poisha", String(params.min_price_poisha));
   if (params?.max_price_poisha !== undefined)
     search.set("max_price_poisha", String(params.max_price_poisha));
+  if (params?.min_rating !== undefined)
+    search.set("min_rating", String(params.min_rating));
+  if (params?.in_stock) search.set("in_stock", "true");
+  if (params?.on_sale) search.set("on_sale", "true");
   if (params?.sort) search.set("sort", params.sort);
   if (params?.page) search.set("page", String(params.page));
   if (params?.per_page) search.set("per_page", String(params.per_page));
+  if (params?.limit) search.set("limit", String(params.limit));
   const qs = search.toString();
   return call(`/v1/search${qs ? `?${qs}` : ""}`);
 }
 
-/** Typeahead suggestions (Wave 15): product titles + stores. */
+/**
+ * Typeahead suggestions (Wave 15; v2 in Wave 53): product
+ * suggestions carry the EFFECTIVE price, the category and
+ * the primary image alongside the title, so the dropdown
+ * can render a real mini-card. Stores are unchanged.
+ */
 export interface SearchSuggestions {
-  products: { id: string; title: string }[];
+  products: {
+    id: string;
+    title: string;
+    price_poisha: number;
+    image_url: string | null;
+    category: string | null;
+  }[];
+  categories: { category: string; product_count: number }[];
   stores: { slug: string; name: string }[];
 }
 
@@ -4781,6 +4880,145 @@ export interface HomeFeed {
 /** GET /v1/home — the public home feed. */
 export function getHomeFeed(): Promise<HomeFeed> {
   return call("/v1/home");
+}
+
+/** GET /v1/categories — the full category list (Wave 53). */
+export interface CategoryList {
+  categories: HomeCategory[];
+}
+
+/**
+ * GET /v1/categories — every category label in the
+ * catalogue with its product count and cover image, from
+ * the same aggregate the home feed's tiles use (one
+ * vocabulary, two surfaces). Sorted by count desc.
+ */
+export function getCategories(): Promise<CategoryList> {
+  return call("/v1/categories");
+}
+
+/**
+ * A saved search's filter set (Wave 53): exactly the
+ * browse's filters minus pagination. The API stores the
+ * canonical form — lists deduplicated, the sort spelled
+ * out — so what comes back can differ slightly from what
+ * was sent.
+ */
+export interface SavedSearchFilters {
+  q: string | null;
+  categories: string[];
+  store_slugs: string[];
+  min_price_poisha: number | null;
+  max_price_poisha: number | null;
+  min_rating: number | null;
+  in_stock: boolean;
+  on_sale: boolean;
+  sort: string | null;
+}
+
+/** One saved search (Wave 53): the buyer's own browse state. */
+export interface SavedSearch {
+  id: string;
+  name: string;
+  filters: SavedSearchFilters;
+  created_at: string;
+}
+
+/** The saved-search list envelope: the caller's own, newest first. */
+export interface SavedSearchList {
+  items: SavedSearch[];
+  total: number;
+}
+
+/** GET /v1/buyer/saved-searches — the caller's saved searches. */
+export function listSavedSearches(token: string): Promise<SavedSearchList> {
+  return call("/v1/buyer/saved-searches", { token });
+}
+
+/** POST /v1/buyer/saved-searches — save the current browse state. */
+export function createSavedSearch(
+  token: string,
+  name: string,
+  filters: SavedSearchFilters
+): Promise<SavedSearch> {
+  return call("/v1/buyer/saved-searches", {
+    method: "POST",
+    token,
+    body: { name, filters },
+  });
+}
+
+/** DELETE /v1/buyer/saved-searches/{id} — remove one (owner only). */
+export function deleteSavedSearch(token: string, id: string): Promise<void> {
+  return call(`/v1/buyer/saved-searches/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    token,
+  });
+}
+
+/** One row of the admin top-searches list (Wave 53). */
+export interface TopSearch {
+  query_text: string;
+  searches: number;
+  avg_results: number;
+}
+
+/** One row of the admin zero-result list (Wave 53). */
+export interface ZeroResultSearch {
+  query_text: string;
+  searches: number;
+  last_searched_at: string;
+}
+
+/**
+ * GET /v1/admin/search-analytics (Wave 53): the trailing
+ * window's search totals, most-run query texts and
+ * zero-result texts. The underlying log carries no user
+ * id by design — this is catalogue-gap data, not tracking.
+ */
+/** One row of the admin top filter-combinations list (Wave 53). */
+export interface TopFilterCombination {
+  filters: SavedSearchFilters;
+  searches: number;
+  avg_results: number;
+}
+
+export interface SearchAnalytics {
+  window_days: number;
+  total_searches: number;
+  top_searches: TopSearch[];
+  zero_result_searches: ZeroResultSearch[];
+  top_filter_combinations: TopFilterCombination[];
+}
+
+/** GET /v1/admin/search-analytics — admin only; `days` widens the window. */
+export function getSearchAnalytics(
+  token: string,
+  days?: number
+): Promise<SearchAnalytics> {
+  const qs = days ? `?days=${days}` : "";
+  return call(`/v1/admin/search-analytics${qs}`, { token });
+}
+
+/** One popular search text (Wave 53). */
+export interface PopularSearch {
+  query_text: string;
+  searches: number;
+}
+
+/** GET /v1/search/popular — the public popular-searches payload. */
+export interface PopularSearches {
+  window_days: number;
+  searches: PopularSearch[];
+}
+
+/**
+ * GET /v1/search/popular — the most-run search texts of
+ * the trailing window, from the identifier-free analytics
+ * log. Powers the search box's popular list.
+ */
+export function getPopularSearches(): Promise<PopularSearches> {
+  return call("/v1/search/popular");
 }
 
 /**

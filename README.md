@@ -3900,6 +3900,161 @@ the sale price itself is never re-validated against a
 later base-price edit (the write-time rule is the
 guarantee).
 
+Wave 53 (discovery & facets — the Shopify-parity program
+continues):
+
+**Browsing becomes a real shopping surface: faceted,
+priced by the effective price everywhere, and honest
+about what it counts.** `GET /v1/search` is reworked
+into a faceted browse. Alongside the Wave 15 trigram
+text match it takes repeatable `category` and `store`
+parameters (OR within a group; the comma form works
+too, and the legacy `category=` / `store_slug=`
+spellings keep working), `min_price_poisha` /
+`max_price_poisha`, `min_rating` (0..=5), `in_stock` and
+`on_sale` flags, the sorts (`relevance`, `newest`,
+`price_asc`, `price_desc`, `rating`, and new `sold` —
+best sellers first by the delivered-units definition),
+and `page` + `limit` (default 24, max 60; the legacy
+`per_page` spelling still works and both names are
+echoed). The response keeps the shared product view and
+gains `facets`. **The facet convention** (the standard
+one, stated precisely): `total` and `items` apply EVERY
+filter; each facet group counts the set filtered by
+every OTHER group — the categories facet does not
+narrow when a category is picked (it is how the shopper
+widens), while the stores facet does; the price facet
+is the span over the set filtered by everything except
+the price bounds; the ratings facet counts products at
+or above the 4 / 3 / 2 thresholds with unrated products
+counting as 0 stars. **The effective-price rule:**
+every price in discovery — the price filter, the price
+sorts, the price facet, the suggestion price — is the
+price the buyer would pay: the live flash price when
+one resolves, else the base. The SQL side is a lateral
+join (`FLASH_PRICE_JOIN` in merch.rs) that mirrors the
+Rust resolution exactly: the same live-sale pick
+(active, half-open window, earliest-ending first), the
+same cap rule (the FLASH_UNITS_SOLD_SQL aggregate in
+per-product scalar form, variant deltas included), so
+the band that admits a product and the
+`flash_price_poisha` on its card can never disagree;
+the wave's tests pin both directions (a flash price
+pulls a product INTO a band its base is outside of, and
+pushes it OUT of a band its base is inside of). All
+filter validation lives in ONE domain function
+(`validate_browse_filters`) shared by the handler and
+the saved-searches service, with bilingual 400s.
+`GET /v1/search/suggest` v2: product suggestions gain
+`price_poisha` (effective), `image_url` and `category`
+— additive, the title-dedup behaviour is unchanged —
+and the payload gains a `categories` list (the labels
+the matching products live in, with counts) for the
+dropdown's "in category" rows. `GET /v1/categories`
+serves the full category list from the home feed's
+aggregate, extracted into one shared function both
+callers use. `GET /v1/products` gains the same `sort`
+(its envelope already existed); existing consumers are
+untouched. The price facet also carries a `histogram`:
+the span split into bands by a pure domain planner,
+counted on effective prices over the same exclude-price
+set — the filter panel renders it as clickable bars
+(clicking the active band again clears it).
+`GET /v1/search/popular` serves the most-run search
+texts of the trailing window from the analytics log —
+public aggregate data (texts + counts; the log holds
+nothing else about anyone) for the search box's popular
+list.
+
+**Web.** A new `/browse` page renders the shared
+`BrowseResults` component — desktop filter sidebar and
+mobile drawer over ONE `FilterPanel` (category and
+store checkboxes with facet counts, taka price inputs,
+rating radios, in-stock / on-sale toggles), the result
+count line, active-filter chips, grid AND list views
+(the list row prices by the same honesty rules as the
+card), windowed pagination, loading skeletons, an empty
+state whose reset is the "সব ফিল্টার মুছে ফেলুন"
+button, and a JSON-LD ItemList of the loaded page. All
+state lives in the URL (`lib/browse.ts` is the single
+translator), so browses are shareable and the category
+tiles (home + /categories, which now reads
+`/v1/categories`) and the header search deep-link into
+them. `/search` renders the same component — one
+discovery path; storefront within-store searches still
+land there scoped. The header SearchBar's dropdown
+renders suggest v2 (thumbnail, category, effective
+price) with full keyboard navigation and click-outside
+close; submit still works without it. The product page
+gains the "একই ক্যাটাগরিতে আরও" rail driven by the
+faceted endpoint (same category, sort `sold`, self
+excluded) and the recently-viewed rail. **Recently
+viewed, privacy note:** the history is DEVICE-LOCAL —
+localStorage only, capped at 12, now carrying a minimal
+card snapshot (title, store, prices, image) so the rail
+renders without a fetch; it is never sent to the
+server, and the rail's "মুছে ফেলুন — Clear" button (and
+clearing site data) forgets it. Wave 24's id-only
+entries migrate on read.
+
+The same discovery path serves two more surfaces: a
+store's **shop page** (`/{store}/shop`) — BrowseResults
+pinned to the store by the route, its categories and
+price span scoped by the same facets — and **category
+landings** (`/categories/{category}`), the browse pinned
+to one category with per-category metadata. The home
+rails, the flash section and the storefront sections
+all deep-link into these surfaces with their matching
+sort or filter. The browse toolbar adds a page-size
+control (24 / 48 / 60) and a copy-link share button —
+the URL is the state, so sharing is copying.
+
+**Extras that shipped with the wave.** (a) *Saved
+searches* for signed-in buyers: migration 0048, CRUD at
+`/v1/buyer/saved-searches` (owner-scoped, a per-user
+cap of 20), storing the validator's canonical filter
+form (lists deduplicated AND sorted, so equivalent
+spellings converge — the round trip save → list →
+render → browse is test-pinned); the `/saved-searches`
+page lists them with a plain-words summary, one-click
+apply-to-browse and delete, and the browse toolbar
+carries the save action. (b) *Search analytics-lite*:
+migration 0049's append-only `search_queries` log —
+query text, result count and a hash of the canonical
+filters, and NO user id or any other identifier, by
+design — read by `GET /v1/admin/search-analytics` (top
+searches with mean result counts + zero-result
+searches over a window the caller may set, 1..=90 days,
+default 30) and shown as a card on the admin overview
+plus a full `/admin/search-analytics` page. Migration
+0050 adds the canonical filters as JSON beside the
+hash, so the read also reports the top filter
+*combinations* in readable form (rows logged before
+0050 carry no shape and are excluded from that list,
+never guessed at). The log write is best-effort: a
+failed insert never fails the search. (c) *Recent
+searches* in the search box: the visitor's own
+submitted queries, device-local like the viewed
+history (localStorage, capped at 8, clearable from the
+dropdown) — never sent to the server.
+
+**Honest limits.** Categories are still the products'
+free-text labels: the facet groups by the raw label
+while the filter matches case-insensitively, so two
+labels differing only in case count as two facet rows
+(the category-vocabulary cleanup is a later wave's
+work). Search is still the Wave 15 trigram match —
+there is no full-text engine, no typo tolerance beyond
+the similarity threshold, and no personalised ranking:
+`relevance` is text similarity plus the Wave 26
+promoted-first rule under the default sorts only.
+Analytics counts every browse the API serves (including
+empty filter-only browses in the total; only text
+searches appear in the text lists), and the
+recently-viewed snapshot is the price as it was when
+viewed — the product page it links to always shows the
+live price.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -5581,6 +5736,21 @@ order-line thumbnails, settings-driven media limits,
 original filenames + alt suggestions, bulk URL attach,
 S3 presigned URLs, hover second-image, quality
 warnings, and Product JSON-LD. See the Wave 51 section.
+
+**Real (Wave 53):** the faceted browse — `GET /v1/search`
+reworked (repeatable category/store filters,
+effective-price bounds via the SQL twin of the flash
+resolution, rating floor, stock/sale flags, the `sold`
+sort, `limit` paging, and the exclude-own-group facet
+block), suggest v2 (effective price + image + category),
+`GET /v1/categories` from the extracted shared
+aggregate, the products list's sorts, saved searches
+(migration 0048 + buyer CRUD + page), the identifier-free
+search analytics log (migration 0049 + admin read +
+overview card), the /browse page with the shared
+FilterPanel/BrowseResults, the suggest-v2 SearchBar
+dropdown, and the snapshot-based recently-viewed rails.
+See the Wave 53 section.
 
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real

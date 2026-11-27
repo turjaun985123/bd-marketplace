@@ -7,6 +7,7 @@ import PriceTag from "@/components/PriceTag";
 import ProductGallery from "@/components/ProductGallery";
 import ProductImage from "@/components/ProductImage";
 import ProductRail from "@/components/ProductRail";
+import RecentlyViewedRail from "@/components/RecentlyViewedRail";
 import Stars from "@/components/Stars";
 import VerificationBadge from "@/components/VerificationBadge";
 import WishlistButton from "@/components/WishlistButton";
@@ -23,8 +24,8 @@ import {
   getProduct,
   getProductQuestions,
   getProductReviews,
-  getRelatedProducts,
   getStore,
+  searchProducts,
   replyToReview,
   updateReply,
   updateReview,
@@ -122,20 +123,43 @@ export default function ProductDetailPage({
     // every visitor should see — not only signed-in users.
     const s = await getStore(p.store_slug).catch(() => null);
     setStore(s);
-    // Wave 24 discovery rails: public endpoints, best-effort —
-    // a failed rail hides itself, it never breaks the page.
+    // Discovery rails: public endpoints, best-effort — a
+    // failed rail hides itself, it never breaks the page.
+    // Wave 53: the same-category rail runs on the ONE
+    // discovery path — the faceted browse, this category,
+    // best sellers first, self excluded — instead of the
+    // old related endpoint.
     const [rel, also] = await Promise.all([
-      getRelatedProducts(params.id).catch(() => null),
+      p.category
+        ? searchProducts({
+            categories: [p.category],
+            sort: "sold",
+            limit: 12,
+          }).catch(() => null)
+        : Promise.resolve(null),
       getAlsoBought(params.id).catch(() => null),
     ]);
-    if (rel) setRelated(rel.items);
+    if (rel) {
+      setRelated(rel.items.filter((item) => item.id !== p.id));
+    }
     if (also) setAlsoBought(also.items);
   }, [params.id, token, user]);
 
   // Wave 24: record the view in the DEVICE-LOCAL history
-  // (localStorage only — see useRecentlyViewed).
+  // (localStorage only — see useRecentlyViewed). Wave 53:
+  // the record carries the minimal card snapshot, so the
+  // rail renders without a fetch per product.
   useEffect(() => {
-    if (product) recordRecentlyViewed(product.id);
+    if (product) {
+      recordRecentlyViewed({
+        id: product.id,
+        title: product.title_bn ?? product.title,
+        store_slug: product.store_slug,
+        price_poisha: product.price_poisha,
+        flash_price_poisha: product.flash_price_poisha,
+        image_url: product.image_url,
+      });
+    }
   }, [product]);
 
   useEffect(() => {
@@ -479,7 +503,7 @@ export default function ProductDetailPage({
       )}
 
       <ProductRail
-        title="সম্পর্কিত পণ্য — Related products"
+        title="একই ক্যাটাগরিতে আরও — More in this category"
         products={related}
       />
       {/* Renders nothing at all while the product has no
@@ -488,6 +512,10 @@ export default function ProductDetailPage({
         title="অন্যরা এটাও কিনেছেন — Others also bought"
         products={alsoBought}
       />
+      {/* Wave 53: the visitor's own device-local history,
+          this product excluded — renders nothing when the
+          history holds nothing else. */}
+      <RecentlyViewedRail excludeId={params.id} />
 
       <h2>রিভিউ — Reviews</h2>
 
