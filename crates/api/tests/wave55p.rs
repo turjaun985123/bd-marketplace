@@ -260,7 +260,7 @@ async fn wave55p_split_order_address_checkout_and_reorder() {
         assert_eq!(items.len(), 1, "each seller sees only their slice");
         assert_eq!(items[0]["order_note"], "দুই দোকানেই একই নোট");
         assert_eq!(items[0]["delivery_district"], "Gazipur");
-        assert_eq!(items[0]["items"][0]["title"], title);
+        assert_eq!(items[0]["items"][0]["title_snapshot"], title);
     }
 
     // Both stores' fulfillment queues carry the district
