@@ -23,6 +23,15 @@
 //! system. The `done` flag is a record of that fact, never a
 //! claim that a gateway moved money.
 //!
+//! Wave 41 (audit HI-52): marking a refund `done` also settles
+//! the amount against the order's payment record in the same
+//! transaction (`settle_payment_refund` below): the payment's
+//! `refund_amount_poisha` accumulates per return, and when
+//! every sub-order of a fully online-paid order has its refund
+//! done, the payment and the order's `payment_status` move to
+//! `refunded` — the state Wave 5's schema always had but no
+//! code ever reached.
+//!
 //! Courier-driven returns (RTO) are NOT return requests: they
 //! restock through the shipment refresh path (see `shipments`)
 //! and never create rows here or refunds anywhere.
@@ -651,18 +660,30 @@ pub async fn mark_refund_done(
     // a refund done is the platform asserting money moved
     // off-platform, so it is exactly the kind of claim the
     // audit log exists to pin to an admin.
+    //
+    // Wave 41 (audit HI-52): the same transaction now also
+    // settles the refund against the PAYMENT that collected
+    // the order's money (see `settle_payment_refund` below) —
+    // before this wave the two records disagreed forever: the
+    // return said refunded, the payment still said `paid`.
+    // The status read also takes the row lock now, so two
+    // admins marking the same refund done concurrently cannot
+    // both pass the `pending` check and double-count the
+    // payment bookkeeping.
     let mut tx = pool
         .begin()
         .await
         .map_err(|e| ApiError::internal("begin mark refund done", e))?;
-    let refund_status: Option<String> =
-        sqlx::query_scalar("SELECT refund_status FROM return_requests WHERE id = $1")
-            .bind(return_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| ApiError::internal("load return refund status", e))?;
-    let refund_status =
-        refund_status.ok_or_else(|| ApiError::not_found("return request not found"))?;
+    let current: Option<(String, Uuid, Option<i64>)> = sqlx::query_as(
+        "SELECT refund_status, sub_order_id, refund_poisha FROM return_requests \
+         WHERE id = $1 FOR UPDATE",
+    )
+    .bind(return_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| ApiError::internal("load return refund status", e))?;
+    let (refund_status, sub_order_id, refund_poisha) =
+        current.ok_or_else(|| ApiError::not_found("return request not found"))?;
     if refund_status != "pending" {
         return Err(ApiError::conflict(format!(
             "refund is not pending (currently '{refund_status}')"
@@ -683,11 +704,140 @@ pub async fn mark_refund_done(
         None,
     )
     .await?;
+
+    if let Some(amount) = refund_poisha.filter(|amount| *amount > 0) {
+        settle_payment_refund(&mut tx, sub_order_id, amount).await?;
+    }
+
     tx.commit()
         .await
         .map_err(|e| ApiError::internal("commit mark refund done", e))?;
 
     load_seller_return_request(pool, return_id).await
+}
+
+/// Wave 41 (security audit HI-52): fold ONE recorded return
+/// refund into the payment record of the order it came from,
+/// inside the refund-done transaction.
+///
+/// The audit's prescription has two halves. The gateway half —
+/// an admin endpoint that calls the adapter's `refund()` and
+/// transitions on gateway success — cannot exist honestly
+/// today: every adapter's refund errors (real gateways
+/// `NotConfigured`/`NotImplemented` without merchant accounts,
+/// the DEV simulator and COD `Unsupported`), so such an
+/// endpoint could only ever fail or pretend. The half that CAN
+/// land is the audit's "until the live gateway refund exists"
+/// rule, implemented here: the off-platform refund-done
+/// updates both payment tables in the same transaction.
+///
+/// What "updates" means, precisely:
+///
+/// * Only an order whose money was actually collected online
+///   (`orders.payment_status = 'paid'`) has anything to fold
+///   into. COD orders collected cash through the courier and
+///   advance-paid COD orders collected only their advance —
+///   for those, the return's own refund record stays the
+///   whole story, exactly as before this wave.
+/// * The refund amount accumulates onto the payment's
+///   `refund_amount_poisha` (migration 0037) — the exact
+///   recorded figure per return, so a partial refund (one
+///   sub-order of several) is visible as a partial amount on
+///   a still-`paid` payment instead of forcing a false
+///   all-or-nothing status.
+/// * When EVERY sub-order of the order has a refund recorded
+///   done (this one included — it was flipped above, in this
+///   transaction), the order's refund obligation is fully
+///   discharged: the payment moves `paid -> refunded` (the
+///   domain transition table's refund move) with
+///   `refunded_at` stamped, and `orders.payment_status`
+///   follows it to `refunded`, so nothing downstream keeps
+///   treating the money as collected. The accumulated
+///   `refund_amount_poisha` keeps the exact taka figure —
+///   which can legitimately differ from the payment amount
+///   (the delivery charge is never refunded, Wave 16).
+///
+/// Both rows are locked (`FOR UPDATE`, order before payment —
+/// the settlement path's lock order), so concurrent
+/// refund-dones for different sub-orders of the same order
+/// serialize instead of racing the accumulation.
+async fn settle_payment_refund(
+    conn: &mut sqlx::PgConnection,
+    sub_order_id: Uuid,
+    refund_poisha: i64,
+) -> Result<(), ApiError> {
+    let order: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT o.id, o.payment_status FROM orders o \
+         JOIN sub_orders so ON so.order_id = o.id \
+         WHERE so.id = $1 FOR UPDATE OF o",
+    )
+    .bind(sub_order_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| ApiError::internal("lock order for refund bookkeeping", e))?;
+    let Some((order_id, order_payment_status)) = order else {
+        // The return's sub-order is gone (the schema's foreign
+        // keys make this unreachable in practice) — the return
+        // record itself still stands; there is simply no
+        // payment bookkeeping to fold into.
+        return Ok(());
+    };
+    if order_payment_status != "paid" {
+        return Ok(());
+    }
+
+    let payment: Option<(Uuid, i64)> = sqlx::query_as(
+        "SELECT id, refund_amount_poisha FROM payments \
+         WHERE order_id = $1 AND status = 'paid' \
+         ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE",
+    )
+    .bind(order_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| ApiError::internal("lock payment for refund bookkeeping", e))?;
+    let Some((payment_id, refunded_so_far)) = payment else {
+        // The order says `paid` but no paid payment row exists
+        // — a data inconsistency no code path produces today.
+        // The return record stands; there is no payment row to
+        // fold the refund into.
+        return Ok(());
+    };
+
+    sqlx::query(
+        "UPDATE payments SET refund_amount_poisha = $2, updated_at = now() WHERE id = $1",
+    )
+    .bind(payment_id)
+    .bind(refunded_so_far + refund_poisha)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| ApiError::internal("accumulate payment refund", e))?;
+
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM sub_orders WHERE order_id = $1), \
+                (SELECT COUNT(DISTINCT rr.sub_order_id) FROM return_requests rr \
+                 JOIN sub_orders so ON so.id = rr.sub_order_id \
+                 WHERE so.order_id = $1 AND rr.refund_status = 'done')",
+    )
+    .bind(order_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| ApiError::internal("count refunded sub-orders", e))?;
+    if counts.0 > 0 && counts.1 >= counts.0 {
+        sqlx::query(
+            "UPDATE payments SET status = 'refunded', refunded_at = now(), \
+             updated_at = now() WHERE id = $1",
+        )
+        .bind(payment_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| ApiError::internal("mark payment refunded", e))?;
+        sqlx::query("UPDATE orders SET payment_status = 'refunded' WHERE id = $1")
+            .bind(order_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| ApiError::internal("mark order refunded", e))?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

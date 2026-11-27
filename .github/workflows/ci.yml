@@ -121,6 +121,27 @@ jobs:
           path: /tmp/web-standalone.tar.gz
           retention-days: 14
 
+  # Wave 41 (security audit A14-15): dependency advisory
+  # visibility. `cargo audit` checks Cargo.lock against the
+  # RustSec advisory database on every run, so a vulnerable
+  # dependency (the class of finding CR-02/jsonwebtoken was)
+  # is SEEN the day it is published instead of at the next
+  # manual audit. Deliberately NON-GATING for now: this job
+  # is separate (no `needs` either way) and marked
+  # continue-on-error, so its result never blocks the
+  # rust/web/docker jobs or the run's conclusion — the first
+  # reports get triaged first, and making it gating is a
+  # follow-up decision (see the Wave 41 README section).
+  security-audit:
+    name: Security audit (cargo audit, non-gating)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   # Wave 20: the deployment images must always build. Build only
   # — nothing is pushed to a registry from CI.
   docker:

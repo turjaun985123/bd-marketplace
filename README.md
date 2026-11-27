@@ -2708,6 +2708,128 @@ like the RedX/eCourier/Paperfly field confirmations), no
 pick-list or packing workflow, and no per-item SLA clocks
 beyond the one placement clock described above.
 
+Wave 41 (security hardening II — the audit's
+highest-value High findings, picked up from Wave 39's
+deferred list; audit ids are the audit's own):
+
+**Callback amount vs the ORDER's expectation (HI-51).**
+Settlement used to trust the payment ROW as the
+definition of the price: Wave 5 proved the callback
+amount equals the row, but nothing proved the row still
+equals what the order expects. Inside the settlement
+transaction (under the Wave 39 locks), the expectation
+is now re-derived from the locked order: an online
+payment must equal the order's `grand_total_poisha`
+(checkout snapshots exactly that into both), and a COD
+order can only ever settle its recognised advance —
+any other COD settlement (a drifted advance amount, an
+order no longer `advance_pending`) is rejected instead
+of falling through to a generic `paid` the courier
+would collect ৳0 against. A mismatch is a 400, the
+callback stays in `payment_events`, and no money state
+moves. The wave41 test tampers a row's amount by SQL
+between checkout and callback — the correctly-signed
+callback for the tampered amount is rejected, the
+honest one settles.
+
+**`gateway_ref` uniqueness (HI-53, migration 0036).**
+Two partial unique indexes close the ambiguity the
+settlement lookup used to resolve newest-first:
+`payments_gateway_ref_unique` on `gateway_ref` (where
+present — references stored today are platform-minted
+and unique across the whole table, not just within a
+method) and `payments_one_pending_per_order` (at most
+one `pending` attempt per order; checkout creates
+exactly one, retry flips the same row). The webhook
+lookup is now exact — no ORDER BY choosing between
+duplicates that can no longer exist — and
+`insert_pending_payment` maps a uniqueness collision
+to a typed 409 instead of a 500 or a silent second
+settleable row. OPERATOR NOTE: on a database that
+already holds duplicate references or double-pending
+orders, the migration fails loudly until they are
+resolved — picking a winner silently is how the
+ambiguity started. The reference FORMAT is unchanged
+(`DEV-<method>-<order id>`): its predictability was
+the compounding half of the old CR-01 forgery, which
+Wave 39 closed at the secret, not the string.
+
+**OTP request throttle atomicity (HI-04/F04 +
+HI-06/F06).** The request path admitted its own race:
+the hourly count check, the log insert and the
+code replacement were separate statements, so
+concurrent requests for one phone could burst past
+the 20/hour cap and interleave DELETE/INSERT into two
+live codes. All of it now runs in ONE transaction
+serialized per phone by a transaction-scoped advisory
+lock keyed on the phone (no per-phone row exists to
+lock before the first request — the advisory lock is
+the anchor, released at commit), and the SMS is sent
+only after the commit, so a delivered code is always
+the committed one. A refused request still writes
+nothing. The wave41 test races six requests against
+three remaining slots: exactly 3 succeed, 3 are
+refused, the log holds exactly 20 rows, and exactly
+one live code survives.
+
+**Dependency advisory visibility (A14-15).** CI gains
+a `security-audit` job running `cargo audit` (via the
+official `rustsec/audit-check` action, pinned) against
+Cargo.lock on every run — the jsonwebtoken CVE class
+becomes visible the day it is published, not at the
+next manual audit. The job is deliberately NON-GATING
+this wave: separate from the rust/web/docker jobs and
+marked continue-on-error, so it reports without
+blocking. Making it gating is a follow-up once the
+first reports are triaged; no unrelated dependency
+advisories were fixed in this wave.
+
+**Refunds reach the payment record (HI-52, migration
+0037).** `refunded` existed in the schema and the
+transition table since Wave 5, but no code ever moved
+a payment there — a return refund recorded `done`
+off-platform left the payment and the order saying
+`paid` forever. The audit's gateway half (an admin
+endpoint calling the adapter's `refund()`) still
+cannot exist honestly: every adapter's refund errors
+today (real gateways NotConfigured/NotImplemented,
+the DEV simulator and COD Unsupported), so it would
+only ever fail or pretend. What landed is the audit's
+"until the live gateway refund exists" rule: the
+admin refund-done handler now folds the refund into
+the payment tables IN THE SAME TRANSACTION (its
+status read also takes the row lock, so two admins
+cannot double-mark and double-count). For an order
+collected online (`payment_status = 'paid'`), the
+refund accumulates onto the payment's new
+`refund_amount_poisha` — partial refunds stay visible
+as partial amounts on a still-`paid` payment — and
+when EVERY sub-order of the order has its refund
+done, the payment flips `paid -> refunded` with
+`refunded_at` stamped and `orders.payment_status`
+follows. The accumulated figure is the exact recorded
+refund (goods minus coupon discount per return); it
+can differ from the payment amount because the
+delivery charge is never refunded (Wave 16). COD and
+advance-paid orders are untouched: their money never
+sat in a gateway payment this record describes, and
+their return refund record stays the whole story.
+Admin/buyer visibility rides the existing surfaces —
+the payment object now carries `refund_amount_poisha`
+and `refunded_at`, and order views show the flipped
+status.
+
+**Backlog after Wave 41.** The remaining audit
+findings (the rest of the High list — cart-locking,
+ship-before-payment gates, payout clawback and
+holdback, loyalty expiry fidelity, session revocation,
+per-IP throttling beyond the per-phone OTP cap — plus
+the Medium/Low registers and CR-13's test-isolation
+redesign and CR-15's owner policy decision) stay
+queued in the audit's priority order for future
+waves. PR #1 holds the full register; nothing has
+been silently dropped.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -4104,6 +4226,33 @@ queue is a view over existing statuses, and the SLA pair
 rides the existing settings precedence. See the Wave 40
 section for the queue model, the one-clock age rule and
 the limits.
+**Real (Wave 41):** security hardening tranche 2 — no
+new endpoints; behaviour changes only where the audit
+proved a defect, plus two migrations. Settlement now
+re-derives the expected amount from the locked order
+(online = grand total; COD = only its recognised
+advance) and rejects a drifted payment row 400 with
+nothing moved (HI-51); `gateway_ref` is unique and at
+most one `pending` payment exists per order (0036),
+the webhook lookup is exact, and payment creation
+answers a collision with a typed 409 (HI-53); the OTP
+request path is one per-phone-locked transaction —
+count check, throttle log, code replacement — with
+the SMS sent after commit (HI-04/F04 + HI-06/F06);
+refunds reach the payment record: refund-done
+accumulates `refund_amount_poisha` on the order's
+payment and flips payment + order to `refunded`
+(stamping `refunded_at`, 0037) when every sub-order's
+refund is done (HI-52 — the record layer only; live
+gateway refund calls stay unwired, every adapter's
+refund still errors honestly); and CI gains a
+NON-GATING `security-audit` job (cargo audit on every
+run, A14-15). An integration test
+(`crates/api/tests/wave41.rs`, same `DATABASE_URL`
+gate) covers the tampered-row rejections (full +
+advance), the uniqueness conflicts, the six-way OTP
+race at the cap boundary, and the partial-then-complete
+refund flip with its COD regression.
 
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real

@@ -270,22 +270,45 @@ pub async fn request_otp_code(
     // append-only `otp_request_log` table — `otp_codes` itself
     // holds at most one row per phone (a new request deletes
     // the previous rows), so it cannot answer "how many
-    // requests in the last hour". The count check and the log
-    // insert are two statements in one request path, so two
-    // concurrent requests can both pass the check; that small
-    // race is accepted for a throttle whose job is capping
-    // SMS cost, not exact accounting. A refused request is
-    // NOT logged: hammering the endpoint costs one COUNT
-    // query per attempt and no SMS.
+    // requests in the last hour". A refused request is NOT
+    // logged: hammering the endpoint costs one COUNT query
+    // per attempt and no SMS.
+    //
+    // Wave 41 (security audit HI-04/F04 + HI-06/F06): the
+    // count check, the log insert and the code replacement
+    // used to be separate autocommit statements, so two
+    // concurrent requests for the same phone could BOTH pass
+    // the count check (bursting past the cap) and could
+    // interleave their DELETE/INSERT pairs into two live
+    // codes. All of it now runs in ONE transaction serialized
+    // per phone by a transaction-scoped advisory lock keyed
+    // on the phone (there is no per-phone row to lock before
+    // the first request exists — the advisory lock is the
+    // anchor; it releases at commit/rollback and never leaks
+    // across requests). The SMS goes out only AFTER the
+    // transaction commits, so a delivered code is always the
+    // committed one (audit HI-06's prescription).
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| ApiError::internal("begin OTP request transaction", e))?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(&phone)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::internal("lock OTP request for phone", e))?;
+
     let recent_requests: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM otp_request_log \
          WHERE phone = $1 AND created_at > now() - interval '1 hour'",
     )
     .bind(&phone)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| ApiError::internal("count recent OTP requests", e))?;
     if !otp_request_allowed(recent_requests) {
+        // Rollback drops the transaction unlogged, exactly as
+        // before: a refused request writes nothing.
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many OTP requests for this number — please wait a while and \
@@ -295,7 +318,7 @@ pub async fn request_otp_code(
     }
     sqlx::query("INSERT INTO otp_request_log (phone) VALUES ($1)")
         .bind(&phone)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| ApiError::internal("log OTP request", e))?;
 
@@ -303,19 +326,26 @@ pub async fn request_otp_code(
     let code_hash = hash_otp(&phone, &code);
     let expires_at = Utc::now() + TimeDelta::minutes(OTP_EXPIRY_MINUTES);
 
-    // One active code per phone: replace any previous rows.
+    // One active code per phone: replace any previous rows —
+    // inside the locked transaction, so a concurrent request
+    // for the same phone can no longer interleave a second
+    // live code between the DELETE and the INSERT.
     sqlx::query("DELETE FROM otp_codes WHERE phone = $1")
         .bind(&phone)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| ApiError::internal("delete old OTP", e))?;
     sqlx::query("INSERT INTO otp_codes (phone, code_hash, expires_at) VALUES ($1, $2, $3)")
         .bind(&phone)
         .bind(&code_hash)
         .bind(expires_at)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| ApiError::internal("store OTP", e))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::internal("commit OTP request", e))?;
 
     sender
         .send_sms(&phone, &format!("Your BD Marketplace login code is {code}"))

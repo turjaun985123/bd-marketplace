@@ -57,6 +57,14 @@ pub struct Payment {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub paid_at: Option<DateTime<Utc>>,
+    /// Wave 41 (audit HI-52): the running total of return
+    /// refunds recorded against this payment by the admin
+    /// refund-done path (migration 0037). Zero until a refund
+    /// is recorded; the status flips to `refunded` (and
+    /// `refunded_at` is stamped) only when the order is fully
+    /// refunded — see the `returns` module.
+    pub refund_amount_poisha: i64,
+    pub refunded_at: Option<DateTime<Utc>>,
 }
 
 /// The latest payment attempt, embedded in the order view.
@@ -86,7 +94,7 @@ pub struct MethodAvailability {
 }
 
 const PAYMENT_COLUMNS: &str = "id, order_id, method, amount_poisha, status, gateway_ref, \
-    created_at, updated_at, paid_at";
+    created_at, updated_at, paid_at, refund_amount_poisha, refunded_at";
 
 // ---------------------------------------------------------------------------
 // Loaders + writers (shared by checkout, webhook, retry and simulate)
@@ -133,9 +141,28 @@ pub async fn load_latest_payment_summary(
     }))
 }
 
+/// Is this database error a unique-constraint violation
+/// (Postgres SQLSTATE 23505)? Wave 41 uses it to tell an honest
+/// conflict (audit HI-53's uniqueness rules) apart from a real
+/// storage failure.
+fn is_unique_violation(err: &sqlx::Error) -> bool {
+    err.as_database_error()
+        .and_then(|db_err| db_err.code())
+        .as_deref()
+        == Some("23505")
+}
+
 /// Insert a `pending` payment attempt inside the caller's transaction
 /// (checkout). The order row is updated separately by checkout's
 /// insert, which already stores `payment_status = 'pending'`.
+///
+/// Wave 41 (audit HI-53): migration 0036 makes `gateway_ref`
+/// unique (partial, where present) and allows at most one
+/// `pending` attempt per order. A collision is therefore a
+/// CONFLICT the caller can reason about — a duplicate attempt
+/// against the same reference or order — never a silent second
+/// settleable row, so it maps to a typed 409 instead of the
+/// generic internal error.
 pub async fn insert_pending_payment(
     conn: &mut PgConnection,
     order_id: Uuid,
@@ -153,7 +180,16 @@ pub async fn insert_pending_payment(
     .bind(gateway_ref)
     .fetch_one(&mut *conn)
     .await
-    .map_err(|e| ApiError::internal("insert payment", e))
+    .map_err(|e| {
+        if is_unique_violation(&e) {
+            ApiError::conflict(
+                "a pending payment already exists for this order or gateway reference \
+                 (এই অর্ডার বা রেফারেন্সের জন্য ইতিমধ্যে একটি পেমেন্ট অপেক্ষমাণ আছে)",
+            )
+        } else {
+            ApiError::internal("insert payment", e)
+        }
+    })
 }
 
 /// Availability of every payment method under the current config:
@@ -288,6 +324,19 @@ pub async fn advance_policy_view(state: &AppState) -> AdvancePolicy {
 ///   it was checked against the configured secret anyway, which
 ///   for a default/empty secret meant an empty-key HMAC anyone
 ///   could compute.
+///
+/// Wave 41 (security audit HI-51 + HI-53):
+///
+/// * The amount that may settle is re-derived from the locked
+///   ORDER inside the settlement transaction: an online payment
+///   must equal the order's grand total, and a COD order can
+///   only ever settle its recognised advance — a payment row
+///   whose amount drifted from the order's expectation is
+///   rejected (400, event already logged, nothing moves)
+///   instead of marking the order `paid` for the wrong amount.
+/// * The reference lookup is exact: migration 0036 makes
+///   `gateway_ref` unique, so there is no newest-wins choice
+///   between duplicate rows.
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_payment_callback(
     pool: &PgPool,
@@ -299,9 +348,14 @@ pub async fn apply_payment_callback(
     signature: &str,
     raw_body: &str,
 ) -> Result<Payment, ApiError> {
+    // Wave 41 (audit HI-53): migration 0036's partial UNIQUE
+    // index guarantees at most one row carries a given
+    // reference, so this lookup is exact — the pre-0036
+    // newest-first ORDER BY that resolved duplicates by
+    // insertion order is gone, because duplicates can no
+    // longer exist.
     let payment: Payment = sqlx::query_as(&format!(
-        "SELECT {PAYMENT_COLUMNS} FROM payments WHERE gateway_ref = $1 \
-         ORDER BY created_at DESC LIMIT 1"
+        "SELECT {PAYMENT_COLUMNS} FROM payments WHERE gateway_ref = $1"
     ))
     .bind(payment_ref)
     .fetch_optional(pool)
@@ -378,15 +432,25 @@ pub async fn apply_payment_callback(
 
     // The order row first (the cancel path locks it first too):
     // its status decides whether any money state may move at all.
-    let order_facts: (String, String, String, i64) = sqlx::query_as(
-        "SELECT status, payment_method, payment_status, advance_required_poisha \
+    // Wave 41: the order's grand total rides along — the HI-51
+    // expectation check below is derived from the ORDER, never
+    // from the payment row alone.
+    let order_facts: (String, String, String, i64, i64) = sqlx::query_as(
+        "SELECT status, payment_method, payment_status, advance_required_poisha, \
+         grand_total_poisha \
          FROM orders WHERE id = $1 FOR UPDATE",
     )
     .bind(payment.order_id)
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| ApiError::internal("lock order for settlement", e))?;
-    let (order_status, order_payment_method, order_payment_status, advance_required) = order_facts;
+    let (
+        order_status,
+        order_payment_method,
+        order_payment_status,
+        advance_required,
+        grand_total,
+    ) = order_facts;
 
     // The payment row under the lock: the status checked here —
     // not the unlocked read above — is the one the duplicate and
@@ -417,6 +481,56 @@ pub async fn apply_payment_callback(
         )));
     }
 
+    // Wave 17 branch recognition, computed here from the LOCKED
+    // facts (the branch itself runs after the payment update
+    // below): is this payment the ADVANCE on a COD order? The
+    // rule is deliberately narrow — the order is a COD order,
+    // it required an advance, this payment's amount is exactly
+    // that advance, and the order is still waiting for it. A
+    // full online payment can never match (online orders
+    // require no advance), and neither can a stale callback for
+    // an order whose advance already settled (its status has
+    // moved on, and the duplicate-delivery return above has
+    // already handled a repeat of the same result).
+    let is_advance_payment = order_payment_method == "cod"
+        && advance_required > 0
+        && locked.amount_poisha == advance_required
+        && order_payment_status == "advance_pending";
+
+    // Wave 41 (audit HI-51): the amount that may settle is
+    // derived from the ORDER, never trusted from the payment
+    // row alone. Wave 5 already proved the callback amount
+    // equals the ROW amount; what was never checked is that
+    // the row still equals what the order expects — a row
+    // whose amount drifted (a checkout bug, a later totals
+    // change, a partial-payment row, a manual DB edit) would
+    // otherwise mark the whole order `paid` for a fraction of
+    // its price. The expectation by payment kind:
+    //   * online order — the row must equal the order's grand
+    //     total (checkout snapshots exactly that into both);
+    //   * COD order — the ONLY payment a COD order can carry
+    //     is its advance, so the settlement must be the
+    //     recognised advance above; anything else (a drifted
+    //     amount, an order no longer `advance_pending`) is
+    //     rejected outright instead of falling through to a
+    //     generic `paid` the courier would collect ৳0 against.
+    // The rejection is a 400 like the row-vs-callback mismatch
+    // above; the callback stays in `payment_events` (written
+    // before this transaction) and no money state moves.
+    if order_payment_method == "cod" {
+        if !is_advance_payment {
+            return Err(ApiError::bad_request(
+                "payment amount does not match the advance this order requires \
+                 (পেমেন্টের পরিমাণ এই অর্ডারের প্রয়োজনীয় অগ্রিমের সঙ্গে মিলছে না)",
+            ));
+        }
+    } else if locked.amount_poisha != grand_total {
+        return Err(ApiError::bad_request(
+            "payment amount does not match the order total \
+             (পেমেন্টের পরিমাণ অর্ডারের মোট মূল্যের সঙ্গে মিলছে না)",
+        ));
+    }
+
     let paid_at: Option<DateTime<Utc>> = if target == "paid" {
         Some(Utc::now())
     } else {
@@ -433,22 +547,11 @@ pub async fn apply_payment_callback(
     .await
     .map_err(|e| ApiError::internal("update payment status", e))?;
 
-    // Wave 17 branch: is this payment the ADVANCE on a COD order?
-    // The recognition rule is deliberately narrow — the order is
-    // a COD order, it required an advance, this payment's amount
-    // is exactly that advance, and the order is still waiting for
-    // it. A full online payment can never match (online orders
-    // require no advance), and neither can a stale callback for
-    // an order whose advance already settled (its status has
-    // moved on, and the duplicate-delivery return above has
-    // already handled a repeat of the same result). The facts now
-    // come from the LOCKED order row read at the top of this
-    // transaction.
-    let is_advance_payment = order_payment_method == "cod"
-        && advance_required > 0
-        && locked.amount_poisha == advance_required
-        && order_payment_status == "advance_pending";
-
+    // Wave 17 branch: apply the advance recognition computed
+    // above from the locked facts (Wave 41's HI-51 check has
+    // already rejected every COD settlement that is NOT this
+    // recognised advance, so the branches below only ever see
+    // a legitimate advance or a full online payment).
     if target == "paid" && is_advance_payment {
         // The advance settled; the order is NOT paid — the
         // balance is still COD. Record what was collected so the
