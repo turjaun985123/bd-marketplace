@@ -3616,6 +3616,43 @@ pub fn validate_request_id(id: &str) -> bool {
     id.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
 }
 
+// ---------------------------------------------------------------------------
+// Wave 44 — payout idempotency keys (pure rule; the payout
+// handler validates an inbound `Idempotency-Key` header with
+// it before any money moves)
+// ---------------------------------------------------------------------------
+
+/// The longest idempotency key a payout request may carry
+/// (Wave 44). A key is a client-minted dedup handle — the web
+/// form sends a UUID (36 characters) — so 128 leaves generous
+/// room for namespaced client schemes (`web-<uuid>`,
+/// `app-retry-<n>-<uuid>`) while staying far below anything
+/// that could bloat the payouts row or its unique index.
+pub const IDEMPOTENCY_KEY_MAX_CHARS: usize = 128;
+
+/// Is this string usable as a payout `Idempotency-Key`
+/// (Wave 44)? The value arrives as an HTTP header and is
+/// stored verbatim on the payout row, where the partial
+/// unique index matches it byte-for-byte — so its alphabet
+/// is the strict one: 1..=[`IDEMPOTENCY_KEY_MAX_CHARS`]
+/// characters, every one VISIBLE ASCII (0x21..=0x7E). Unlike
+/// the request-id rule there are no spaces at all, inside or
+/// out: a space in a stored dedup key is an invisible
+/// difference between two keys a human would swear are the
+/// same, and the whole point of the key is that equality is
+/// obvious. Control bytes, DEL and non-ASCII are refused for
+/// the same header-safety reasons as request ids. A refused
+/// key is a client error (the handler answers 400), never a
+/// silently-dropped header — silently ignoring a key the
+/// client believed in would recreate the duplicate it sent
+/// the key to prevent.
+pub fn validate_idempotency_key(key: &str) -> bool {
+    if key.is_empty() || key.len() > IDEMPOTENCY_KEY_MAX_CHARS {
+        return false;
+    }
+    key.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6283,5 +6320,34 @@ mod tests {
         assert!(validate_request_id("two words"));
         assert!(!validate_request_id(" leading"));
         assert!(!validate_request_id("trailing "));
+    }
+
+    #[test]
+    fn idempotency_key_validation_rules() {
+        // Empty and oversized keys are refused; the boundary
+        // itself (128 characters) is accepted.
+        assert!(!validate_idempotency_key(""));
+        assert!(validate_idempotency_key(&"k".repeat(128)));
+        assert!(!validate_idempotency_key(&"k".repeat(129)));
+        assert!(validate_idempotency_key("x"));
+        // The shape the web form actually sends: a dashed
+        // UUID; namespaced client schemes are fine too.
+        assert!(validate_idempotency_key(
+            "550e8400-e29b-41d4-a716-446655440000"
+        ));
+        assert!(validate_idempotency_key("web-retry-2-550e8400"));
+        // NO spaces anywhere — stricter than the request-id
+        // rule, because the key is stored and matched
+        // byte-for-byte and a space is an invisible difference.
+        assert!(!validate_idempotency_key("two words"));
+        assert!(!validate_idempotency_key(" leading"));
+        assert!(!validate_idempotency_key("trailing "));
+        // Control bytes and DEL are refused (header safety).
+        assert!(!validate_idempotency_key("bad\nkey"));
+        assert!(!validate_idempotency_key("bad\tkey"));
+        assert!(!validate_idempotency_key("bad\u{7f}key"));
+        // Non-ASCII is refused: the stored key stays inside
+        // the visible-ASCII header alphabet.
+        assert!(!validate_idempotency_key("ঢাকা-key"));
     }
 }

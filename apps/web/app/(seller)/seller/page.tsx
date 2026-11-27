@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import PriceTag from "@/components/PriceTag";
 import StoreSwitcher from "@/components/StoreSwitcher";
@@ -122,6 +122,15 @@ export default function SellerDashboardPage() {
   // Payout request form state (amount typed in taka).
   const [amountTaka, setAmountTaka] = useState("");
   const [payoutBusy, setPayoutBusy] = useState(false);
+  // Wave 44: ONE idempotency key per payout-form session,
+  // minted lazily at the session's first submit (see
+  // onRequestPayout) and sent with every attempt, so a double
+  // click, a browser retry or a re-submit after a network
+  // error all carry the SAME key and the API hands back the
+  // original payout instead of creating a duplicate request.
+  // Only a SUCCESS rotates the key: the next, genuinely new
+  // request must not be swallowed as a replay of this one.
+  const payoutKeyRef = useRef<string | null>(null);
 
   // Buyer-risk lookup state (Wave 17 fraud shield).
   const [riskPhone, setRiskPhone] = useState("");
@@ -209,7 +218,12 @@ export default function SellerDashboardPage() {
     setPayoutBusy(true);
     setMessage(null);
     try {
-      await requestPayout(token, amountPoisha);
+      const idempotencyKey = payoutKeyRef.current ?? crypto.randomUUID();
+      payoutKeyRef.current = idempotencyKey;
+      await requestPayout(token, amountPoisha, idempotencyKey);
+      // Success: rotate to a fresh key (see the ref's comment)
+      // so the next request is a new request, not a replay.
+      payoutKeyRef.current = crypto.randomUUID();
       setAmountTaka("");
       setMessage("পে-আউট অনুরোধ পাঠানো হয়েছে। (Payout requested.)");
       await load();

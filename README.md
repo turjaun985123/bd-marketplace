@@ -2482,7 +2482,8 @@ earnings inside the transition transaction and refuses
 with a 409 when earnings dropped after the request.
 The audit's third element for this finding, an
 `Idempotency-Key` on payout creation, is deferred
-(below).
+(below). (Follow-up: it landed in Wave 44 — see that
+section.)
 
 **Non-atomic payment settlement (CR-05 executive /
 CR-02 full).** `apply_payment_callback` now settles in
@@ -2604,7 +2605,7 @@ their reasons:
 - The payout `Idempotency-Key` (the third element of
   CR-10's prescription): the race itself is closed by
   the lock; key-based dedup is API surface that needs
-  a client contract first.
+  a client contract first. (Closed in Wave 44.)
 - HI-51 (callback amount is checked against the
   payment row, not re-derived from the order total):
   needs the order-total contract decided alongside
@@ -3027,6 +3028,91 @@ retained beyond the rows themselves. Request ids
 correlate one process's lines; there is no
 cross-service tracing — the SIDRA bridge and the
 courier calls do not propagate the id.
+
+Wave 44 (payout idempotency — the `Idempotency-Key`
+contract):
+
+Payout creation (`POST /v1/seller/payouts`) now
+accepts an optional `Idempotency-Key` header — the
+third element of the audit's payout prescription
+(CR-10), deferred by Wave 39 until a client contract
+existed. This closes that deferral: the race itself
+was closed in Wave 39 (one transaction, the store row
+locked `FOR UPDATE`, the approve-time re-check); what
+remained was the double-submit problem — a seller
+whose browser retries the POST, or who double-clicks,
+created a second `requested` row an admin had to
+reject by hand.
+
+**The contract.** The key is validated before any
+database work by the pure domain rule
+(`domain::validate_idempotency_key`: 1–128
+characters, visible ASCII only — no spaces anywhere,
+unlike the Wave 43 request-id rule, because the key
+is stored and matched byte-for-byte and a space is an
+invisible difference). A present-but-invalid key is a
+400, never silently ignored — silence would recreate
+the duplicate the key was sent to prevent. Inside the
+Wave 39 transaction, after the store lock, the key is
+looked up for the store:
+
+- **Same key, same amount** → the ORIGINAL payout is
+  returned with **200** (not 201), and nothing else
+  happens: no second row, no balance movement. The
+  request body carries only the amount — the account
+  fields are a server-side snapshot, not part of the
+  request's identity — so amount equality is the whole
+  identical/different comparison.
+- **Same key, different amount** → **409**: reusing
+  a key for a different request is a client bug, and
+  the seller hears about it instead of silently
+  getting either payout.
+- **No key** → exactly the pre-Wave-44 behaviour,
+  byte for byte. Keyless rows stay outside every rule
+  below.
+
+**Storage and the race backstop.** Migration 0038
+adds `payouts.idempotency_key` (with a CHECK mirroring
+the domain rule) and a partial UNIQUE index on
+`(store_id, idempotency_key)` WHERE the key is
+present. The scope is per store, not per user column
+and not global: the payouts table has no seller-user
+column — a payout belongs to a store, and the request
+path is owner-only (`manage_payouts`, Wave 34),
+resolving exactly the owner's payout store, so
+(store, key) is precisely "this seller's request with
+this key". Because the lookup runs inside the
+transaction under the store lock, a concurrent
+same-key request through the API resolves as a replay
+at the lookup; the unique index is the backstop for
+any path that ever reaches the insert without the
+lock — an insert that hits it (SQLSTATE 23505) rolls
+its transaction back and retries the WHOLE operation
+once, so the retry's lookup finds the winner's row
+and applies the same replay/conflict rules. The key
+is echoed on the payout view (seller list, admin
+list, export), so a "was I charged twice?" support
+question can be answered from the rows themselves.
+Payout requests remain JWT-only — the Wave 37 route
+exclusions already refuse API-key auth for
+`POST /v1/seller/payouts`, unchanged.
+
+The web seller page plays its part: the payout form
+mints ONE key (`crypto.randomUUID()`) per form
+session, sends it on every submit attempt — double
+clicks and retries included — and rotates to a fresh
+key only after a success, so a genuinely new second
+request is never swallowed as a replay.
+
+**Honest limits.** Keys are scoped per store, not
+global. A key has no expiry or TTL: it lives exactly
+as long as its payout row, so a client that reuses a
+key weeks later still gets the replay/conflict
+answer for that store. Only payout requests are
+covered — other mutating endpoints keep their
+existing duplicate semantics (checkout has its own
+guards; a general idempotency layer is a design of
+its own, not a drive-by).
 
 Wave 8 (reviews, ratings and seller replies):
 
@@ -4517,6 +4603,19 @@ system-status card, and a per-cycle summary line in
 the worker. See the Wave 43 section for the
 definitions and the honest limits (stdio only — no
 exporter, no aggregation, no time series).
+
+**Real (Wave 44):** payout idempotency — an optional
+`Idempotency-Key` on `POST /v1/seller/payouts`
+(validated by the domain rule, stored on the row,
+unique per store via a partial index): same key +
+same amount returns the original payout with 200,
+same key + different amount is a 409, no key is the
+unchanged pre-Wave-44 behaviour; the seller form
+mints one key per session and rotates it only after
+a success. This closes the deferred third element
+of the audit's payout finding (CR-10). See the
+Wave 44 section for the contract and its limits
+(per-store scope, no key TTL, payouts only).
 
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real

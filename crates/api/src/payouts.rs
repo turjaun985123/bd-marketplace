@@ -42,6 +42,17 @@
 //!   store (at least the `basic` tier — see the `verification`
 //!   module). The gate defaults to off, and with it off every
 //!   rule above behaves exactly as it did in Wave 9.
+//! - Idempotency (Wave 44): a payout request may carry a
+//!   client `Idempotency-Key` header (validated by
+//!   `domain::validate_idempotency_key`, stored on the row,
+//!   unique per store among keyed rows — migration 0038).
+//!   A retry with the same key and the same amount returns
+//!   the ORIGINAL payout instead of creating a duplicate;
+//!   the same key with a different amount is a 409. No key
+//!   means exactly the pre-Wave-44 behaviour. This is the
+//!   third element of the audit's payout prescription
+//!   (CR-10), deferred by Wave 39 until a client contract
+//!   existed; see [`request_payout`] for the race structure.
 //!
 //! Scoping: every query starts from the authenticated user. The
 //! payout store is the seller's earliest-created store
@@ -61,12 +72,13 @@
 
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use chrono::{DateTime, Utc};
 use domain::{
-    compute_available_balance, validate_payout_account, validate_payout_amount_with_min,
+    compute_available_balance, validate_idempotency_key, validate_payout_account,
+    validate_payout_amount_with_min,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
@@ -171,6 +183,11 @@ pub struct Payout {
     pub note: Option<String>,
     pub created_at: DateTime<Utc>,
     pub processed_at: Option<DateTime<Utc>>,
+    /// The client's `Idempotency-Key` when the request carried
+    /// one (Wave 44); `None` for keyless requests, which keep
+    /// the pre-Wave-44 semantics. Echoed so a seller (or a
+    /// support lookup) can match a retry to the row it made.
+    pub idempotency_key: Option<String>,
 }
 
 /// A page of payout requests plus the total count.
@@ -428,6 +445,30 @@ pub async fn save_payout_account(
     .map_err(|e| ApiError::internal("save payout account", e))
 }
 
+/// The outcome of ONE attempt at [`request_payout`]'s
+/// transaction (Wave 44). `Done` carries the payout to return
+/// and whether THIS attempt created it (`false` = the request
+/// was an idempotent replay of an earlier one, and the handler
+/// answers 200 instead of 201). `LostIdempotencyRace` means
+/// the INSERT hit the partial unique index (SQLSTATE 23505):
+/// a concurrent request with the same key committed first.
+/// The attempt's transaction is dropped uncommitted, so the
+/// caller retries the WHOLE operation once — the retry's
+/// lookup then finds the winner's row and applies the same
+/// replay/conflict rules, instead of patching a half-finished
+/// transaction back together.
+enum PayoutAttempt {
+    Done(Payout, bool),
+    LostIdempotencyRace,
+}
+
+/// True when a SQLx error is a Postgres unique violation (23505).
+fn is_unique_violation(err: &sqlx::Error) -> bool {
+    err.as_database_error()
+        .map(|db_err| db_err.code().as_deref() == Some("23505"))
+        .unwrap_or(false)
+}
+
 /// Request a payout of `amount_poisha` from a store's available
 /// balance. Requires a saved payout account (its fields are
 /// snapshotted onto the payout row); the domain amount validator
@@ -438,12 +479,29 @@ pub async fn save_payout_account(
 /// Wave 34: the store arrives resolved by the handler under
 /// `manage_payouts` — a right only the owner holds — so this
 /// function never runs for a member.
+///
+/// Wave 44: `idempotency_key` is the client's optional
+/// `Idempotency-Key` (already validated by the handler against
+/// `domain::validate_idempotency_key`). The return is the
+/// payout plus whether this call created it. With a key, the
+/// attempt's transaction first looks the key up for this
+/// store: an existing row with the SAME amount is returned as
+/// a replay (created = false) without touching the balance —
+/// the request body carries only the amount (the account
+/// fields are a server-side snapshot, not part of the
+/// request's identity), so amount equality is the whole
+/// comparison — and an existing row with a DIFFERENT amount
+/// is a 409, because reusing a key for another request is a
+/// client bug the seller must hear about, not a retry. With
+/// no key, nothing is looked up and behaviour is exactly the
+/// pre-Wave-44 semantics.
 pub async fn request_payout(
     pool: &PgPool,
     state: &AppState,
     store: &Store,
     amount_poisha: i64,
-) -> Result<Payout, ApiError> {
+    idempotency_key: Option<&str>,
+) -> Result<(Payout, bool), ApiError> {
     // Wave 21 — the KYC payout gate: when the platform has
     // turned the `kyc_payout_gate` setting on, an unverified
     // store cannot move money out until its seller verifies
@@ -462,6 +520,48 @@ pub async fn request_payout(
         ));
     }
 
+    let min_payout_poisha = crate::admin::effective_min_payout(state).await;
+
+    // One attempt, plus exactly ONE retry after a lost
+    // unique-index race (see `PayoutAttempt`). The retry is
+    // a fresh transaction from the top, so its idempotency
+    // lookup re-reads the winner's committed row. Losing
+    // twice should be impossible — the only inserter holds
+    // the store lock the lookup serializes on — but if it
+    // ever happened, a 409 naming the key is the honest exit:
+    // the key IS taken, and the seller can see the payout in
+    // their list.
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match request_payout_once(pool, store, amount_poisha, min_payout_poisha, idempotency_key)
+            .await?
+        {
+            PayoutAttempt::Done(payout, created) => return Ok((payout, created)),
+            PayoutAttempt::LostIdempotencyRace => {
+                if attempt == 2 {
+                    return Err(ApiError::conflict(
+                        "এই Idempotency-Key দিয়ে ইতিমধ্যে একটি পে-আউট তৈরি হয়েছে — \
+                         পে-আউট তালিকা থেকে যাচাই করুন (a payout with this \
+                         Idempotency-Key already exists — check the payout list)",
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// ONE attempt at the payout transaction: the Wave 39 body
+/// (store lock, account read, earnings, insert) with the
+/// Wave 44 idempotency lookup in front of the balance rules
+/// and the key stored on the insert.
+async fn request_payout_once(
+    pool: &PgPool,
+    store: &Store,
+    amount_poisha: i64,
+    min_payout_poisha: i64,
+    idempotency_key: Option<&str>,
+) -> Result<PayoutAttempt, ApiError> {
     // Wave 39 (security audit CR-10 in the audit's full list —
     // the payout double-spend race): the account read, the
     // earnings computation and the INSERT used to be three
@@ -474,8 +574,6 @@ pub async fn request_payout(
     // concurrent payout requests for a store serialize on that
     // row and each one re-reads earnings that already include
     // every earlier request's pending amount.
-    let min_payout_poisha = crate::admin::effective_min_payout(state).await;
-
     let mut tx = pool
         .begin()
         .await
@@ -485,6 +583,40 @@ pub async fn request_payout(
         .execute(&mut *tx)
         .await
         .map_err(|e| ApiError::internal("lock store for payout request", e))?;
+
+    // Wave 44: the idempotency lookup runs INSIDE the
+    // transaction, after the store lock — so for requests
+    // through this path the lookup already sees every
+    // committed same-store payout, and a concurrent same-key
+    // request resolves as a replay here rather than at the
+    // unique index. The index (and the one retry in
+    // `request_payout`) is the backstop for any path that
+    // ever reaches the insert without this lock.
+    if let Some(key) = idempotency_key {
+        let existing: Option<Payout> = sqlx::query_as(
+            "SELECT id, store_id, amount_poisha, method, account_name, account_number, \
+             status, note, created_at, processed_at, idempotency_key \
+             FROM payouts WHERE store_id = $1 AND idempotency_key = $2",
+        )
+        .bind(store.id)
+        .bind(key)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ApiError::internal("look up payout idempotency key", e))?;
+        if let Some(existing) = existing {
+            if existing.amount_poisha != amount_poisha {
+                return Err(ApiError::conflict(
+                    "এই Idempotency-Key ইতিমধ্যে অন্য অঙ্কের পে-আউট অনুরোধে ব্যবহৃত \
+                     হয়েছে — নতুন কী দিয়ে আবার চেষ্টা করুন (this Idempotency-Key \
+                     was already used for a payout request of a different amount)",
+                ));
+            }
+            // A true retry: hand back the original row. The
+            // transaction has written nothing, so dropping it
+            // (rollback) is the clean exit.
+            return Ok(PayoutAttempt::Done(existing, false));
+        }
+    }
 
     let account: Option<PayoutAccount> = sqlx::query_as(
         "SELECT id, store_id, method, account_name, account_number, created_at, updated_at \
@@ -506,25 +638,41 @@ pub async fn request_payout(
     )
     .map_err(ApiError::bad_request)?;
 
-    let payout: Payout = sqlx::query_as(
-        "INSERT INTO payouts (store_id, amount_poisha, method, account_name, account_number) \
-         VALUES ($1, $2, $3, $4, $5) \
+    let payout: Payout = match sqlx::query_as(
+        "INSERT INTO payouts \
+         (store_id, amount_poisha, method, account_name, account_number, idempotency_key) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
          RETURNING id, store_id, amount_poisha, method, account_name, account_number, \
-                   status, note, created_at, processed_at",
+                   status, note, created_at, processed_at, idempotency_key",
     )
     .bind(store.id)
     .bind(amount_poisha)
     .bind(&account.method)
     .bind(&account.account_name)
     .bind(&account.account_number)
+    .bind(idempotency_key)
     .fetch_one(&mut *tx)
     .await
-    .map_err(|e| ApiError::internal("create payout", e))?;
+    {
+        Ok(payout) => payout,
+        Err(err) => {
+            // Wave 44: a keyed insert that hits the partial
+            // unique index lost the race the module docs
+            // describe — report it as a lost race (the caller
+            // retries once) instead of a 500. Keyless inserts
+            // are outside the index, so their errors keep the
+            // plain internal mapping.
+            if idempotency_key.is_some() && is_unique_violation(&err) {
+                return Ok(PayoutAttempt::LostIdempotencyRace);
+            }
+            return Err(ApiError::internal("create payout", err));
+        }
+    };
 
     tx.commit()
         .await
         .map_err(|e| ApiError::internal("commit payout request", e))?;
-    Ok(payout)
+    Ok(PayoutAttempt::Done(payout, true))
 }
 
 /// The caller's payout requests (their payout store's),
@@ -560,7 +708,7 @@ pub async fn list_payouts_for_store(
 
     let items: Vec<Payout> = sqlx::query_as(
         "SELECT id, store_id, amount_poisha, method, account_name, account_number, \
-         status, note, created_at, processed_at \
+         status, note, created_at, processed_at, idempotency_key \
          FROM payouts WHERE store_id = $1 \
          ORDER BY created_at DESC LIMIT $2 OFFSET $3",
     )
@@ -700,9 +848,39 @@ pub async fn save_payout_account_handler(
 pub async fn request_payout_handler(
     State(state): State<AppState>,
     user: AuthUser,
+    headers: HeaderMap,
     Query(scope): Query<StoreScopeQuery>,
     Json(input): Json<RequestPayoutInput>,
 ) -> Result<(StatusCode, Json<Payout>), ApiError> {
+    // Wave 44: the optional `Idempotency-Key` header is read
+    // and validated FIRST — before the store resolution and
+    // every money rule. A malformed key is a plain client
+    // error: answering it before any database work means a
+    // bad key can neither mask nor be masked by a store or
+    // balance error, and a key the client believes it sent is
+    // never silently ignored (silence would recreate the
+    // duplicate the key exists to prevent). A non-ASCII
+    // header value fails `to_str` and lands in the same 400.
+    let idempotency_key = match headers.get("idempotency-key") {
+        None => None,
+        Some(value) => {
+            let key = value.to_str().map_err(|_| {
+                ApiError::bad_request(
+                    "Idempotency-Key-এর মান সঠিক নয় — 1 থেকে 128টি ছাপাযোগ্য ASCII \
+                     অক্ষর হতে হবে, স্পেস ছাড়া (invalid Idempotency-Key: 1-128 \
+                     printable ASCII characters, no spaces)",
+                )
+            })?;
+            if !validate_idempotency_key(key) {
+                return Err(ApiError::bad_request(
+                    "Idempotency-Key-এর মান সঠিক নয় — 1 থেকে 128টি ছাপাযোগ্য ASCII \
+                     অক্ষর হতে হবে, স্পেস ছাড়া (invalid Idempotency-Key: 1-128 \
+                     printable ASCII characters, no spaces)",
+                ));
+            }
+            Some(key)
+        }
+    };
     let pool = state.require_pool()?;
     // Wave 34: requesting a payout is `manage_payouts` —
     // the owner alone. A manager naming the store is refused
@@ -714,8 +892,18 @@ pub async fn request_payout_handler(
         domain::STORE_ACTION_MANAGE_PAYOUTS,
     )
     .await?;
-    let payout = request_payout(pool, &state, &store, input.amount_poisha).await?;
-    Ok((StatusCode::CREATED, Json(payout)))
+    let (payout, created) =
+        request_payout(pool, &state, &store, input.amount_poisha, idempotency_key).await?;
+    // Wave 44: a fresh creation answers 201 as always; an
+    // idempotent replay answers 200 with the ORIGINAL payout
+    // — the standard signal that the retry was recognised,
+    // not re-executed.
+    let status = if created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(payout)))
 }
 
 pub async fn list_payouts_handler(

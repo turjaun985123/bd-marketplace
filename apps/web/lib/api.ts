@@ -571,11 +571,17 @@ function apiBase(): string {
 
 async function call<T>(
   path: string,
-  options: { method?: string; token?: string | null; body?: unknown } = {}
+  options: {
+    method?: string;
+    token?: string | null;
+    body?: unknown;
+    headers?: Record<string, string>;
+  } = {}
 ): Promise<T> {
   const headers: Record<string, string> = {};
   if (options.body !== undefined) headers["Content-Type"] = "application/json";
   if (options.token) headers["Authorization"] = `Bearer ${options.token}`;
+  if (options.headers) Object.assign(headers, options.headers);
   const res = await fetch(`${apiBase()}${path}`, {
     method: options.method ?? "GET",
     headers,
@@ -1632,6 +1638,8 @@ export interface Payout {
   note: string | null;
   created_at: string;
   processed_at: string | null;
+  /** The Idempotency-Key the request carried (Wave 44), or null. */
+  idempotency_key: string | null;
 }
 
 export interface PayoutList {
@@ -1787,12 +1795,24 @@ export function savePayoutAccount(
  * POST /v1/seller/payouts — request a payout of `amountPoisha`
  * against the available balance. The API enforces the 500-taka
  * minimum and the balance fit; the account is snapshotted.
+ *
+ * Wave 44: `idempotencyKey` goes out as the `Idempotency-Key`
+ * header. The caller mints ONE key per form session and keeps
+ * it across retries, so a double submit or a retried request
+ * returns the original payout (200) instead of creating a
+ * duplicate; the API answers 409 if the key was already used
+ * for a different amount.
  */
-export function requestPayout(token: string, amountPoisha: number): Promise<Payout> {
+export function requestPayout(
+  token: string,
+  amountPoisha: number,
+  idempotencyKey: string
+): Promise<Payout> {
   return call("/v1/seller/payouts", {
     method: "POST",
     token,
     body: { amount_poisha: amountPoisha },
+    headers: { "Idempotency-Key": idempotencyKey },
   });
 }
 
@@ -2400,6 +2420,8 @@ export interface AdminPayout {
   note: string | null;
   created_at: string;
   processed_at: string | null;
+  /** The Idempotency-Key the request carried (Wave 44), or null. */
+  idempotency_key: string | null;
 }
 
 export interface AdminPayoutList {

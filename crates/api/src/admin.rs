@@ -86,7 +86,7 @@ const MAX_MIN_PAYOUT_POISHA: i64 = 10_000_000;
 /// The payout column list shared by the transition UPDATE's
 /// RETURNING clause (matches the `Payout` view in `payouts`).
 const PAYOUT_COLUMNS: &str = "id, store_id, amount_poisha, method, account_name, \
-    account_number, status, note, created_at, processed_at";
+    account_number, status, note, created_at, processed_at, idempotency_key";
 
 // ---------------------------------------------------------------------------
 // The admin guard + settings readers
@@ -554,6 +554,12 @@ pub struct AdminPayout {
     pub note: Option<String>,
     pub created_at: DateTime<Utc>,
     pub processed_at: Option<DateTime<Utc>>,
+    /// The client's `Idempotency-Key` when the request carried
+    /// one (Wave 44) — an admin handling a "charged twice?"
+    /// support question can see at a glance whether the two
+    /// rows a seller is worried about share a key (a recognised
+    /// retry) or not.
+    pub idempotency_key: Option<String>,
 }
 
 /// A page of admin payouts plus the total count.
@@ -588,7 +594,7 @@ pub async fn list_payouts(
     let items: Vec<AdminPayout> = sqlx::query_as(
         "SELECT p.id, p.store_id, s.name AS store_name, u.phone AS owner_phone, \
          p.amount_poisha, p.method, p.account_name, p.account_number, \
-         p.status, p.note, p.created_at, p.processed_at \
+         p.status, p.note, p.created_at, p.processed_at, p.idempotency_key \
          FROM payouts p \
          JOIN stores s ON s.id = p.store_id \
          JOIN users u ON u.id = s.owner_user_id \
