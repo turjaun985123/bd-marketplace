@@ -16,19 +16,33 @@ ignore = [
     # sidechannel in RSA private-key decryption/signing
     # operations (patched in rsa >= 0.10).
     #
-    # Why it is in the tree: `rsa` enters ONLY as a
-    # dependency of jsonwebtoken 10.4's `rust_crypto`
-    # feature (enabled in crates/api/Cargo.toml), which
-    # turns on jsonwebtoken's RSA/ECDSA support alongside
-    # the HMAC support this platform actually uses.
-    # jsonwebtoken 10.4.0 declares `rsa = "^0.9.6"`, so no
-    # lockfile-level bump to rsa 0.10 exists — the ignore
-    # is the only honest route until jsonwebtoken moves.
+    # Why it is STILL in the tree (rewritten in Wave 47):
+    # the Wave 42 version of this note blamed jsonwebtoken,
+    # and Wave 47's jsonwebtoken 12 bump DID move
+    # jsonwebtoken to the patched line — its `rust_crypto`
+    # feature now declares `rsa = "0.10"`, and a fresh
+    # resolution carries rsa 0.10.0 for it. But rsa 0.9.10
+    # remains in the resolved graph with exactly one
+    # remaining parent: `sqlx-mysql` 0.8.6. That is the
+    # Wave 42 welding mechanism again — sqlx 0.8's
+    # migration-macro support (sqlx-macros-core) pulls all
+    # three database drivers into the resolved graph while
+    # `sqlx::migrate!()` is used, and sqlx-mysql's manifest
+    # pins the old rsa line. (The fully-resolved graph
+    # shows sqlx-mysql was a second parent of rsa 0.9.10
+    # all along; the Wave 42 note, written from the
+    # committed lock's records, named only jsonwebtoken.)
     #
-    # Why the vulnerable code never runs: this platform
-    # signs and verifies JWTs with HS256 (HMAC) ONLY —
-    # `EncodingKey::from_secret` / `DecodingKey::from_secret`
-    # and `Validation::new(Algorithm::HS256)` in
+    # Why the risk is accepted: two independent reasons.
+    # (1) Compile-time only — the shipped api/worker
+    # binaries enable sqlx's postgres features only, so
+    # sqlx-mysql (and its rsa) is never linked into them,
+    # exactly like libsqlite3-sys below. (2) Even where
+    # jsonwebtoken's own rsa copy is concerned, this
+    # platform signs and verifies JWTs with HS256 (HMAC)
+    # ONLY — `EncodingKey::from_secret` /
+    # `DecodingKey::from_secret` and
+    # `Validation::new(Algorithm::HS256)` in
     # crates/api/src/auth.rs are the only jsonwebtoken key
     # operations in the codebase. A tree-wide grep finds no
     # `from_rsa` / `from_ec` constructors and no RS*/ES*
@@ -36,34 +50,14 @@ ignore = [
     # (the only path the Marvin Attack measures) can ever
     # execute.
     #
-    # Review trigger: REMOVE this ignore as soon as a
-    # jsonwebtoken release resolves `rsa >= 0.10`; the
+    # Review trigger: REMOVE this ignore when a sqlx
+    # release resolves `rsa >= 0.10` for its MySQL driver,
+    # when sqlx stops welding the drivers into
+    # sqlx-macros-core, or when this platform drops
+    # `sqlx::migrate!()` — whichever comes first. The
     # audit job keeps printing the advisory until then.
     "RUSTSEC-2023-0071",
 
-    # RUSTSEC-2026-0387 — `crypto-bigint` 0.5.5: timing
-    # variability in nominally constant-time operations
-    # (patched in crypto-bigint >= 0.7.6).
-    #
-    # Why it is in the tree: `crypto-bigint` enters ONLY
-    # through the same jsonwebtoken 10.4 `rust_crypto`
-    # subtree — via `p256` / `p384` -> `elliptic-curve`,
-    # i.e. jsonwebtoken's ECDSA support. The 0.5.x line is
-    # pinned by elliptic-curve 0.13, so no lockfile-level
-    # bump to 0.7.6 exists under jsonwebtoken 10.4.
-    #
-    # Why the vulnerable code never runs: same HS256-only
-    # argument as RUSTSEC-2023-0071 above — no ECDSA (or
-    # RSA) key operation exists anywhere in the codebase
-    # (only `from_secret` HMAC keys, `Algorithm::HS256`),
-    # so crypto-bigint's elliptic-curve arithmetic is never
-    # executed with secret material.
-    #
-    # Review trigger: REMOVE this ignore as soon as a
-    # jsonwebtoken release resolves `crypto-bigint >=
-    # 0.7.6`; the audit job keeps printing the advisory
-    # until then.
-    "RUSTSEC-2026-0387",
     # RUSTSEC-2026-0459 — `libsqlite3-sys` 0.30.1, bundled
     # SQLite CVE-2026-119375 (uninitialised page-cache memory
     # returned when opening a database file together with a
@@ -98,6 +92,18 @@ ignore = [
     # comes first.
     "RUSTSEC-2026-0459",
 ]
+
+# Retired ignores:
+#
+# - RUSTSEC-2026-0387 (`crypto-bigint` 0.5.5, timing
+#   variability, patched >= 0.7.6): ignore REMOVED in
+#   Wave 47. Its review trigger fired — jsonwebtoken 12's
+#   tree resolves p256/p384 0.14 -> elliptic-curve 0.14.3,
+#   and a fresh resolution (Dependabot PR #13's lock)
+#   contains crypto-bigint 0.7.11 as the ONLY version;
+#   the vulnerable 0.5.5 left the graph entirely, so the
+#   advisory no longer matches anything and keeping the
+#   ignore would have been stale config.
 
 # Deliberately NOT ignored:
 #

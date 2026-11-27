@@ -130,12 +130,20 @@ pub fn issue_token(state: &AppState, user: &User) -> Result<String, ApiError> {
         role: user.role.clone(),
         exp: exp as usize,
     };
-    encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
-    )
-    .map_err(|e| {
+    // Wave 47 (jsonwebtoken 12): `from_secret` now returns a
+    // `Result` — it fails only on an EMPTY secret
+    // (`ErrorKind::InvalidKeyFormat`). That is a server
+    // misconfiguration, not a client error, so it takes the
+    // same 500 as a signing failure; Wave 28's
+    // `validate_jwt_secret` already keeps a real deployment
+    // from ever reaching it.
+    let key = EncodingKey::from_secret(state.jwt_secret.as_bytes()).map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to sign token: {e}"),
+        )
+    })?;
+    encode(&Header::default(), &claims, &key).map_err(|e| {
         ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to sign token: {e}"),
@@ -184,12 +192,16 @@ pub fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<AuthUser, A
     let token = value
         .strip_prefix("Bearer ")
         .ok_or_else(|| ApiError::unauthorized("Authorization header must be a Bearer token"))?;
-    let data = decode::<Claims>(
-        token,
-        &DecodingKey::from_secret(state.jwt_secret.as_bytes()),
-        &Validation::new(Algorithm::HS256),
-    )
-    .map_err(|_| ApiError::unauthorized("invalid or expired token"))?;
+    // Wave 47 (jsonwebtoken 12): `from_secret` now returns a
+    // `Result` (fails only on an empty secret). It is folded
+    // into this function's single 401 shape, like every other
+    // verification failure — `authenticate` never distinguished
+    // failure causes, and `authenticate_optional` treats any
+    // error as "guest".
+    let key = DecodingKey::from_secret(state.jwt_secret.as_bytes())
+        .map_err(|_| ApiError::unauthorized("invalid or expired token"))?;
+    let data = decode::<Claims>(token, &key, &Validation::new(Algorithm::HS256))
+        .map_err(|_| ApiError::unauthorized("invalid or expired token"))?;
     let user_id = Uuid::parse_str(&data.claims.sub)
         .map_err(|_| ApiError::unauthorized("token subject is not a user id"))?;
     Ok(AuthUser {

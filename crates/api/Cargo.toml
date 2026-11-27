@@ -17,7 +17,13 @@ hmac = "0.12"
 # `rust_crypto` is the provider matching the previous ring-based
 # HS256 usage, and default features (PEM key parsing) are off
 # because this crate only ever uses `from_secret` HMAC keys.
-jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+# Wave 47: jsonwebtoken 12.x — the v12 manifest keeps the same
+# feature layout (default = ["use_pem"]; `rust_crypto` = the
+# RustCrypto provider set), so the declaration below is
+# unchanged apart from the version. v12 resolves rsa 0.10 and
+# crypto-bigint 0.7.11; see the README Wave 47 section for
+# what that did to the Wave 42 audit ignores.
+jsonwebtoken = { version = "12", default-features = false, features = ["rust_crypto"] }
 notify = { path = "../notify" }
 payments = { path = "../payments" }
 rand = "0.8"

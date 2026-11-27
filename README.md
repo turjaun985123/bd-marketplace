@@ -2914,6 +2914,14 @@ removal trigger: the first jsonwebtoken release
 whose tree resolves rsa ≥ 0.10 / crypto-bigint ≥
 0.7.6 — the audit job keeps printing both advisories
 until then, so a stale ignore cannot hide.
+(Follow-up: Wave 47's jsonwebtoken 12 bump fired
+the crypto-bigint trigger in full — 0.7.11 is the
+only resolved version and that ignore is retired.
+The rsa trigger fired only halfway: jsonwebtoken
+now resolves rsa 0.10.0, but rsa 0.9.10 remains in
+the resolved graph via sqlx-mysql, so that ignore
+stays with a rewritten justification — see the
+Wave 47 section.)
 
 **RUSTSEC-2026-0543 (chrono unmaintained) — noted,
 not acted on.** Informational-warning class only,
@@ -3199,6 +3207,106 @@ network behaviour, or Postgres under real load, and
 no capacity numbers are claimed from it. A real
 load test needs a deployed environment and remains
 future work.
+
+Wave 47 (jsonwebtoken 12 — landing Dependabot PR
+#13's bump as a wave, and settling the Wave 42
+audit ignores):
+
+**The bump.** `crates/api` moves jsonwebtoken
+10.4.0 → 12.0.0, the exact bump Dependabot proposed
+in PR #13, landed here as a proper wave on main
+instead of merging the bot PR (PR #13 is closed as
+superseded once this lands — the parent handles the
+PR). The committed `Cargo.lock` entry was
+hand-updated (version + checksum, taken from PR
+#13's lock diff); as in Waves 39/41, cargo completes
+the re-resolution in CI, which does not run
+`--locked`.
+
+**Feature discipline — verified against the v12
+manifest, unchanged.** v12 keeps the layout Wave 39
+chose: `default = ["use_pem"]`, and `rust_crypto`
+is the RustCrypto provider set (ed25519-dalek 3,
+hmac 0.13, p256/p384 0.14, rsa 0.10, sha2 0.11).
+The declaration is therefore byte-identical apart
+from the version: `default-features = false,
+features = ["rust_crypto"]` — exactly one crypto
+backend, which v12's new `CryptoProvider` machinery
+auto-installs as the process default, and PEM key
+parsing stays off because this crate only ever
+constructs `from_secret` HMAC keys. (v12's MSRV is
+1.88, well under the CI toolchain.)
+
+**The one breaking change that reaches us.**
+v12's crypto decoupling made
+`EncodingKey::from_secret` and
+`DecodingKey::from_secret` return `Result` — they
+fail only on an empty secret
+(`ErrorKind::InvalidKeyFormat`). Those are the
+only two call sites in the tree (both in
+`crates/api/src/auth.rs`; a tree-wide grep finds no
+other jsonwebtoken use), and they adapt in place:
+`issue_token` maps the key error into the same 500
+"failed to sign token" as an encode failure (an
+empty secret is a server misconfiguration, and
+Wave 28's `validate_jwt_secret` keeps a real
+deployment from reaching it), while `authenticate`
+folds it into the same 401 as every other
+verification failure, keeping that function's
+single error shape. Everything else this platform
+uses is unchanged in v12 — `encode` / `decode`
+signatures, `Header::default()` (alg HS256),
+`Validation::new(Algorithm::HS256)` with required
+`exp` and 60-second leeway, `TokenData.claims`, and
+the `Claims` struct itself. JWT semantics are
+identical: HS256 only, same claims fields, 7-day
+expiry, secret handling untouched — and because
+HS256 is the standardised JWS HMAC construction,
+tokens issued under 10.4 verify under 12 and vice
+versa. No tests changed: the OTP→JWT flows across
+the wave suites exercise issue/verify as before.
+
+**The audit ignores — one retired, one rewritten.**
+The bump was expected to settle both Wave 42
+ignores; the fully-resolved graph (PR #13's lock)
+shows it settles one and a half:
+
+- **RUSTSEC-2026-0387 (crypto-bigint) — RETIRED.**
+  Its removal trigger fired exactly as written:
+  p256/p384 0.14 → elliptic-curve 0.14.3 resolves
+  crypto-bigint 0.7.11 as the ONLY version in the
+  graph (patched line is ≥ 0.7.6); the vulnerable
+  0.5.5 is gone entirely. The ignore is removed
+  from `.cargo/audit.toml`, with the retirement
+  recorded in that file's footer.
+- **RUSTSEC-2023-0071 (rsa) — KEPT, justification
+  rewritten.** jsonwebtoken's half of the trigger
+  fired: v12 declares `rsa = "0.10"` and resolves
+  rsa 0.10.0 (patched line ≥ 0.10.0). But a fresh
+  resolution still contains rsa 0.9.10, whose only
+  remaining parent is `sqlx-mysql` 0.8.6 — the
+  Wave 42 welding mechanism (sqlx-macros-core pulls
+  all three drivers into the resolved graph while
+  `sqlx::migrate!()` is used; sqlx-mysql's manifest
+  pins the old rsa). The advisory therefore still
+  matches the resolved graph, and since the audit
+  job has been GATING since Wave 45, deleting the
+  ignore would turn CI red over a crate that is
+  compile-time-only (the shipped binaries enable
+  sqlx's postgres features only — sqlx-mysql is
+  never linked) and whose vulnerable operations no
+  code path can reach (HS256-only, as before). The
+  audit.toml entry now says exactly that, with a
+  new removal trigger: a sqlx release resolving
+  rsa ≥ 0.10 for its MySQL driver, sqlx unwelding
+  the drivers, or this platform dropping
+  `sqlx::migrate!()`. One honest correction to the
+  Wave 42 record: the fully-resolved graph shows
+  rsa 0.9.10 had TWO parents all along
+  (jsonwebtoken 10.4 AND sqlx-mysql) — the Wave 42
+  note, written from the committed lock's parent
+  records, named only jsonwebtoken. The HS256-only
+  safety argument was never affected.
 
 Wave 8 (reviews, ratings and seller replies):
 
@@ -4741,6 +4849,24 @@ pathological slowdowns at seed scale — production
 capacity and real load behaviour remain unmeasured
 and need a deployed environment. See the Wave 46
 section.
+
+**Real (Wave 47):** jsonwebtoken 12 — the auth
+crate moves from 10.4.0 to 12.0.0 (Dependabot PR
+#13's bump, landed as a wave; the PR is closed as
+superseded). The Wave 39 feature discipline is
+unchanged (`default-features = false`,
+`rust_crypto` only — verified against the v12
+manifest), and the only call-site adaptation is
+v12's Result-returning `from_secret` constructors
+at the two sites in auth.rs; JWT semantics
+(HS256, same claims, 7-day expiry) are identical.
+The crypto-bigint audit ignore is retired (0.7.11
+is the only resolved version, past the patched
+line); the rsa ignore stays with a rewritten
+justification — jsonwebtoken now resolves the
+patched rsa 0.10.0, but rsa 0.9.10 remains in the
+resolved graph via sqlx-mysql's welded driver,
+compile-time only. See the Wave 47 section.
 
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
