@@ -143,17 +143,12 @@ jobs:
       # cargo-audit parses the lock strictly, so resolve it in-job
       # first or the audit fails on the lock instead of reporting.
       - uses: dtolnay/rust-toolchain@stable
-      # The committed Cargo.lock is the Wave 39 hand-completed one:
-      # cargo builds complete it as needed, but `cargo generate-lockfile`
-      # only updates it minimally and never prunes entries the manifests
-      # no longer reach (e.g. libsqlite3-sys after the Wave 42 sqlx
-      # feature diet — `cargo tree --target all -i libsqlite3-sys`
-      # prints "nothing to print", yet the stale lock kept it and
-      # cargo-audit kept flagging a crate nothing builds). The audit
-      # therefore resolves its lock from scratch: it scans the graph
-      # the manifests actually describe. Caveat: a fresh resolve may
-      # pick newer semver-compatible versions than the committed lock
-      # for some crates — acceptable for this non-gating advisory job.
+      # The audit resolves its lock from scratch so it always scans a
+      # current resolution of the workspace manifests (the committed
+      # lock is the Wave 39 hand-completed one, which cargo completes
+      # at build time). Caveat: a fresh resolve may pick newer
+      # semver-compatible versions than the committed lock for some
+      # crates — acceptable for this non-gating advisory job.
       - name: Resolve a fresh lockfile for the audit
         run: |
           rm -f Cargo.lock
@@ -163,13 +158,11 @@ jobs:
       # can see exactly which declaration pulls it in.
       - name: Reverse-dependency chains for flagged crates
         run: |
-          cargo tree --target all -i libsqlite3-sys || true
-          cargo tree --target all -i sqlx-sqlite || true
-          cargo tree --target all -i sqlx-mysql || true
-          # cargo tree's inverse view printed "nothing to print" even
-          # though a fresh resolve keeps the crate, so read the
-          # generated lock directly: print every package whose
-          # dependency list names a flagged crate.
+          # Read the generated lock directly: print every package whose
+          # dependency list names a flagged crate. (Wave 42 forensics:
+          # `cargo tree -i` printed "nothing to print" for a crate the
+          # resolve provably contains — the lock's parent records were
+          # the decisive evidence, so they are what this step prints.)
           python3 - <<'PYEOF'
           import re
           text = open("Cargo.lock").read()

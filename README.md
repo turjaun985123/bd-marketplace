@@ -2869,16 +2869,20 @@ and `any`, dropped outright (no `sqlx::Any` types
 exist in the tree). In sqlx 0.8.6's published feature
 graph the MySQL/SQLite driver crates are reachable
 only through the `mysql` / `sqlite` / `all-databases`
-features (checked in both the umbrella and
-sqlx-macros-core manifests), none of which survives
-the diet — so sqlx-mysql, sqlx-sqlite and
-libsqlite3-sys leave the resolved graph. The
-committed Cargo.lock is still completed by cargo at
-build/CI time, so the audit job's next report —
-against the in-job-resolved lock — is the verifier
-that they are gone; if the advisory ever reappears
-it is a regression to fix, never an ignore to add
-(the audit.toml says so, in writing, next to the
+features, none of which this workspace enables. CI
+lock forensics then corrected the first reading of
+that graph: the generated lock's parent records show
+`sqlx-sqlite` is ALSO a dependency of
+`sqlx-macros-core` — sqlx 0.8's migration-macro
+support welds all three drivers into the macros
+crate, so the drivers stay in the resolved graph
+while `sqlx::migrate!()` is used, on the
+compile-time side only (never linked into the
+shipped binaries, never opened at runtime). The
+sqlite advisory is therefore an accepted-risk ignore
+in the audit.toml with that mechanism and its
+removal triggers written next to it (the audit.toml
+says so, in writing, next to the
 ignores).
 
 **RUSTSEC-2023-0071 (rsa) + RUSTSEC-2026-0387
@@ -4360,20 +4364,36 @@ the MySQL/SQLite drivers — and libsqlite3-sys's
 bundled-SQLite CVE, RUSTSEC-2026-0459 — in the graph;
 `json` provably unexercised, the jsonb text-cast
 pattern; `any` unused), so the SQLite/MySQL driver
-crates leave every buildable graph — verified in CI:
-`cargo tree --target all -i libsqlite3-sys` prints
-"nothing to print", so no target compiles or links
-them. One subtlety the first audit run exposed: the
-committed lock is the Wave 39 hand-completed one and
-`cargo generate-lockfile` updates it only minimally,
-never pruning entries the manifests no longer reach,
-so cargo-audit kept flagging the stale entry. The
-audit job now resolves its lock from scratch
-(`rm -f Cargo.lock` first) and scans the graph the
-manifests actually describe; a fresh resolve may pick
-newer semver-compatible versions than the committed
-lock for some crates, which is acceptable for this
-non-gating advisory job.
+crates leave the umbrella's feature graph. What CI
+then proved, across three diagnostic runs: the
+advisory survived both the diet and a from-scratch
+lock resolve, and `cargo tree -i` misleadingly
+printed "nothing to print" — the decisive evidence
+was the generated lock's own parent records, now
+printed by the audit job on every run:
+`libsqlite3-sys` ← `sqlx-sqlite` ← `sqlx` AND
+`sqlx-macros-core`. sqlx 0.8's migration-macro
+support welds all three database drivers into the
+macros crate, so the drivers remain in the resolved
+graph for as long as `sqlx::migrate!()` is used —
+on the compile-time (proc-macro) side only: the
+shipped api/worker binaries enable postgres features
+only, SQLite is not linked into them, and no code
+path ever opens a SQLite database (the CVE requires
+opening an attacker-crafted DB + WAL pair). The
+disposition is therefore the third accepted-risk
+ignore in `.cargo/audit.toml`, with the mechanism
+and removal triggers (a sqlx release unwelding the
+drivers, dropping `migrate!`, or any real SQLite
+use) written next to it. The audit job also resolves
+its lock from scratch (`rm -f Cargo.lock` first), so
+it always scans a current resolution; a fresh
+resolve may pick newer semver-compatible versions
+than the committed lock for some crates, acceptable
+for this non-gating advisory job. Final audit
+state: 0 unignored vulnerabilities (2 HS256-only
+ignores + this compile-time-only one), chrono
+unmaintained remains an informational warning.
 `.cargo/audit.toml` records exactly two accepted-risk
 ignores — RUSTSEC-2023-0071 (rsa, via jsonwebtoken's
 rust_crypto; unbumpable, its manifest pins ^0.9.6)

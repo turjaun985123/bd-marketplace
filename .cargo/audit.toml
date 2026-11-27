@@ -64,19 +64,42 @@ ignore = [
     # 0.7.6`; the audit job keeps printing the advisory
     # until then.
     "RUSTSEC-2026-0387",
+    # RUSTSEC-2026-0459 — `libsqlite3-sys` 0.30.1, bundled
+    # SQLite CVE-2026-119375 (uninitialised page-cache memory
+    # returned when opening a database file together with a
+    # sibling WAL file of a different page size).
+    #
+    # Why it is in the graph at all: NOT through any feature
+    # this workspace enables. Wave 42 set
+    # `default-features = false` on every sqlx dependency,
+    # which removed the umbrella's `any`-driven path — but
+    # the generated lock's parent records (printed in the CI
+    # audit job) prove `sqlx-sqlite` is also a dependency of
+    # `sqlx-macros-core`: sqlx 0.8's migration-macro support
+    # welds all three database drivers into the macros
+    # crate, so dropping the `migrate` feature is the only
+    # way to remove it, and `sqlx::migrate!()` is how both
+    # binaries apply migrations.
+    #
+    # Why the risk is accepted: the crate exists only on
+    # the compile-time (proc-macro) side of the build. The
+    # shipped api/worker binaries enable sqlx's postgres
+    # features only — SQLite is not linked into them, and
+    # no code path in this platform ever opens a SQLite
+    # database (runtime storage is PostgreSQL only). The
+    # CVE's precondition — a process opening an
+    # attacker-crafted database + WAL file pair — cannot
+    # occur here.
+    #
+    # Review trigger: REMOVE this ignore when a sqlx
+    # release stops welding the drivers into its macros
+    # crate, when this platform drops `sqlx::migrate!()`,
+    # or if any SQLite use is ever introduced — whichever
+    # comes first.
+    "RUSTSEC-2026-0459",
 ]
 
 # Deliberately NOT ignored:
-#
-# - RUSTSEC-2026-0459 (`libsqlite3-sys` 0.30.1, bundled
-#   SQLite CVE-2026-119375): not accepted-risk — REMOVED.
-#   Wave 42 sets `default-features = false` on every sqlx
-#   dependency (the umbrella's default `any` feature was
-#   what pulled the SQLite/MySQL drivers into the graph),
-#   so sqlx-sqlite and libsqlite3-sys leave the resolved
-#   graph outright. If a future audit report shows this
-#   advisory again, that is a regression to fix, not an
-#   ignore to add.
 #
 # - RUSTSEC-2026-0543 (`chrono` unmaintained):
 #   informational-warning class only, not a vulnerability.
