@@ -357,11 +357,16 @@ async fn wave54_follow_flow_counts_and_lists() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    // The admin is SQL-promoted (the platform's only
+    // promotion path) — but the login must come FIRST so
+    // the user row exists for the UPDATE to land on; the
+    // token issued before promotion works because
+    // require_admin re-reads the row per request.
+    let admin = login(&app, "01710000003").await;
     sqlx::query("UPDATE users SET is_admin = true WHERE phone = '+8801710000003'")
         .execute(&pool)
         .await
         .expect("promote admin");
-    let admin = login(&app, "01710000003").await;
     let (status, body) = call(
         &app,
         Method::PATCH,
