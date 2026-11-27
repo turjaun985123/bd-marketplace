@@ -46,11 +46,24 @@
 //! API's rules live in — there is no second implementation
 //! of the money rules here.
 //!
+//! Wave 48 closes the Wave 29 outbox edge: each cycle now
+//! FIRST runs `notify::reap_stale_sending`, which recovers
+//! rows a previous worker claimed (`sending`) and then
+//! died on — a claim older than
+//! `NOTIFICATION_SENDING_STALE_MINUTES` (default 10) goes
+//! back to `pending`, or to `failed` when the lost claim
+//! spent the row's last attempt. Running it before
+//! `process_pending` means a recovered row can be claimed
+//! and sent in the same cycle it is reaped. Its counts
+//! ride the Wave 43 summary line (`reaped_pending` /
+//! `reaped_failed`, inside the notifications group).
+//!
 //! Wave 43 gives the worker an observability line: each
 //! cycle ends with ONE summary line carrying the three
 //! jobs' headline counts (notifications sent / retried /
-//! failed, shipments checked / advanced / unchanged /
-//! failed, subscriptions checked / renewed / expired).
+//! failed / reaped_pending / reaped_failed, shipments
+//! checked / advanced / unchanged / failed, subscriptions
+//! checked / renewed / expired).
 //! It is printed EVERY cycle, not only when something
 //! moved — the previous per-job lines appeared only on a
 //! non-empty report, so an idle worker and a dead worker
@@ -127,6 +140,31 @@ fn shipment_poll_stale_minutes() -> i64 {
     }
 }
 
+/// How old a notification's claim may get before the
+/// reaper treats the claiming worker as dead, in minutes:
+/// `NOTIFICATION_SENDING_STALE_MINUTES`, default
+/// `notify::DEFAULT_SENDING_STALE_MINUTES` (10); an
+/// unparsable or zero value keeps the default. Zero is
+/// NOT a valid setting here (unlike the shipment
+/// staleness): zero would reap rows another worker
+/// claimed seconds ago and is still sending.
+fn notification_sending_stale_minutes() -> i64 {
+    match std::env::var("NOTIFICATION_SENDING_STALE_MINUTES") {
+        Ok(raw) => match raw.parse::<i64>() {
+            Ok(minutes) if minutes >= 1 => minutes,
+            _ => {
+                eprintln!(
+                    "WARNING: NOTIFICATION_SENDING_STALE_MINUTES='{raw}' is invalid \
+                     — using the default {}",
+                    notify::DEFAULT_SENDING_STALE_MINUTES
+                );
+                notify::DEFAULT_SENDING_STALE_MINUTES
+            }
+        },
+        Err(_) => notify::DEFAULT_SENDING_STALE_MINUTES,
+    }
+}
+
 /// SMS dev mode, read exactly as the API reads it
 /// (`AppState::from_env`): `APP_ENV=dev` or
 /// `SMS_DEV_MODE=true`. One flag drives both processes, so
@@ -197,6 +235,7 @@ async fn main() {
     let sender = notify::sender_from_env(dev_mode);
     let seconds = poll_seconds();
     let stale_minutes = shipment_poll_stale_minutes();
+    let sending_stale_minutes = notification_sending_stale_minutes();
     // Service state for the shipment poller and the
     // subscription sweep, built from the environment exactly
     // as the API server builds its own (courier credentials +
@@ -207,7 +246,7 @@ async fn main() {
     let state = api::AppState::from_env(Some(pool.clone()));
     println!(
         "bd-marketplace worker starting: notification outbox every {seconds}s \
-         (sms sender: {}, batch {})",
+         (sms sender: {}, batch {}, reap 'sending' after {sending_stale_minutes} min)",
         notify::sender_kind(dev_mode),
         notify::DEFAULT_BATCH
     );
@@ -227,6 +266,18 @@ async fn main() {
         // happens), but their reports are collected and the
         // cycle closes with ONE summary line — see the
         // module doc for why it prints every cycle.
+        //
+        // Wave 48: the reaper runs BEFORE the outbox drain,
+        // so rows recovered from a dead worker's claim can
+        // be claimed and sent by this same cycle's
+        // process_pending call.
+        let reap_counts = match notify::reap_stale_sending(&pool, sending_stale_minutes).await {
+            Ok(report) => (report.returned_to_pending, report.marked_failed),
+            Err(error) => {
+                eprintln!("worker: notification reaper failed: {error}");
+                (0, 0)
+            }
+        };
         let notify_counts =
             match notify::process_pending(&pool, sender.as_ref(), notify::DEFAULT_BATCH).await {
                 Ok(report) => (report.sent, report.retried, report.failed),
@@ -262,11 +313,14 @@ async fn main() {
         };
         println!(
             "worker cycle: notifications sent={} retried={} failed={} \
+             reaped_pending={} reaped_failed={} \
              shipments checked={} advanced={} unchanged={} failed={} \
              subscriptions checked={} renewed={} expired={}",
             notify_counts.0,
             notify_counts.1,
             notify_counts.2,
+            reap_counts.0,
+            reap_counts.1,
             poll_counts.0,
             poll_counts.1,
             poll_counts.2,

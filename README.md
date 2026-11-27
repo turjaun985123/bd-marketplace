@@ -1632,7 +1632,9 @@ still 503 before anything is stored. The biggest launch
 blocker remains a real SMS gateway. A worker that dies
 mid-batch leaves its claimed rows in `sending` — counted
 in the admin view, but there is no automatic reaper yet.
-No email or push channels exist yet; payout jobs and COD
+(Closed in Wave 48: the worker reaps stale `sending`
+rows at the top of every cycle — see the Wave 48
+section.) No email or push channels exist yet; payout jobs and COD
 reconciliation remain planned worker jobs, printed at
 worker startup (courier polling landed in Wave 30).
 
@@ -1695,7 +1697,9 @@ manual refresh endpoint. No courier offers this platform
 a webhook receiver yet, so polling is the mechanism, not
 a fallback. The Wave 29 caveat stands: notification rows
 a worker claims and then dies on stay in `sending` with
-no automatic reaper yet.
+no automatic reaper yet. (Closed in Wave 48 — the
+worker now reaps stale claims every cycle; see the
+Wave 48 section.)
 
 Wave 31 (backups + data portability):
 
@@ -3308,6 +3312,84 @@ shows it settles one and a half:
   records, named only jsonwebtoken. The HS256-only
   safety argument was never affected.
 
+Wave 48 (notification reaper — closing the Wave 29
+stuck-`sending` edge):
+
+**The edge.** The Wave 29 outbox claim flips a batch of
+pending rows to `sending` and commits BEFORE any send
+happens — deliberately, so no row lock is held across a
+network call. A worker that dies after claiming (crash,
+deploy, OOM) therefore strands its batch in `sending`
+forever: nothing else ever looks at that status, and the
+only signal was the `sending` count in the Wave 43 admin
+metrics, waiting for a human to notice it never drains.
+
+**A correction the code forced.** The reaper needs to
+know when a row was CLAIMED, and the `notifications`
+table could not say: migration 0029 has no `updated_at`,
+and the claim UPDATE stamped nothing at all — only
+`created_at` (the event's age, not the claim's; judging
+by it would reap rows a live worker claimed seconds ago
+out of a long-queued backlog). **Migration 0039** adds
+`claimed_at timestamptz`: the claim UPDATE stamps it,
+both outcome write-backs clear it, so it is non-NULL
+exactly while a claim is live, and a `(status,
+claimed_at)` index backs the reaper's scan. A `sending`
+row with a NULL stamp is reaped as stale by definition —
+the stamp has existed since this wave, so an unstamped
+claim can only be a pre-Wave-48 one, i.e. precisely the
+stuck population the reaper exists to rescue.
+
+**The fix.** `notify::reap_stale_sending(pool,
+stale_minutes) -> ReapReport { returned_to_pending,
+marked_failed }` — one UPDATE (a single statement, so a
+single transaction) over every `sending` row whose claim
+is older than the threshold. A recovered row goes back
+to `pending` — unless the lost claim spends its last
+attempt, in which case it goes to `failed`. That clause
+needs one honest explanation: `attempts` counts RECORDED
+SEND FAILURES (the claim itself does not increment it —
+verified in the claim SQL), so a row whose worker keeps
+dying before any send completes would otherwise be
+reaped and re-claimed forever at attempts 0. The reap
+therefore consumes one attempt — the claim produced no
+delivery, so it counts against the same `MAX_ATTEMPTS`
+(3) budget as a failed send — and writes a `reaped: …`
+note into `last_error`, so the admin view explains why
+the row moved. The worker runs the reaper at the TOP of
+every cycle, before `process_pending`, so a recovered
+row can be claimed and sent in the same cycle it is
+reaped; its counts ride the Wave 43 summary line as
+`reaped_pending` / `reaped_failed` inside the
+notifications group.
+
+**The tunable.** Staleness defaults to
+`notify::DEFAULT_SENDING_STALE_MINUTES` = 10 minutes,
+overridable via `NOTIFICATION_SENDING_STALE_MINUTES`
+(the worker reads it with the usual pattern: unparsable
+or zero → warning + default; zero is NOT a valid setting
+here, unlike the shipment staleness — zero would reap
+rows another worker claimed seconds ago). The notify
+crate reads no platform settings (it never has), so this
+stays env > const, resolved once in the worker like
+`WORKER_POLL_SECONDS`; there is no DB layer to add.
+
+**Safety.** A legitimate in-flight send is one SMS HTTP
+call measured in seconds, against a 10-minute floor — a
+false reap is practically impossible, and even one could
+only cause a duplicate: the outbox is at-least-once by
+design (a row counts as delivered only when its send
+outcome is written back), so the worst case is a second
+SMS, never a lost one. Covered by
+`crates/api/tests/wave48.rs`, which drives the notify
+crate on the pool exactly as the worker does: a fresh
+claim is never touched, a stale claim with budget left
+returns to `pending` (attempt consumed, note recorded)
+and is then delivered by the same cycle's drain, a stale
+claim with its budget spent lands in `failed` and is
+never claimed again, and an aged-out claim recovers
+through the same path.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -4867,6 +4949,28 @@ justification — jsonwebtoken now resolves the
 patched rsa 0.10.0, but rsa 0.9.10 remains in the
 resolved graph via sqlx-mysql's welded driver,
 compile-time only. See the Wave 47 section.
+
+**Real (Wave 48):** the notification reaper — the
+Wave 29 outbox's stuck-`sending` edge is closed.
+Migration 0039 adds `claimed_at` (the claim stamps
+it, outcome write-backs clear it; the table had no
+claim timestamp at all, and `created_at` is the
+event's age, not the claim's). Each worker cycle
+first runs `notify::reap_stale_sending`: a
+`sending` row whose claim is older than
+`NOTIFICATION_SENDING_STALE_MINUTES` (default 10,
+env > const in the worker — the notify crate reads
+no platform settings) returns to `pending`, or to
+`failed` when the lost claim spends its last
+attempt (a reap consumes one attempt, since the
+claim path itself does not increment `attempts` —
+only recorded send failures do — and a
+crash-looping row must not cycle forever). Reaped
+rows carry a `reaped: …` note in `last_error`, and
+the counts ride the worker's summary line
+(`reaped_pending` / `reaped_failed`). At-least-once
+is unchanged: a false reap could only duplicate an
+SMS, never lose one. See the Wave 48 section.
 
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
