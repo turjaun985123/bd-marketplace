@@ -166,6 +166,21 @@ jobs:
           cargo tree --target all -i libsqlite3-sys || true
           cargo tree --target all -i sqlx-sqlite || true
           cargo tree --target all -i sqlx-mysql || true
+          # cargo tree's inverse view printed "nothing to print" even
+          # though a fresh resolve keeps the crate, so read the
+          # generated lock directly: print every package whose
+          # dependency list names a flagged crate.
+          python3 - <<'PYEOF'
+          import re
+          text = open("Cargo.lock").read()
+          blocks = re.findall(r'\[\[package\]\]\n(.*?)(?=\n\[\[package\]\]|\Z)', text, re.S)
+          for target in ("libsqlite3-sys", "sqlx-sqlite", "sqlx-mysql"):
+              for b in blocks:
+                  name = re.search(r'name = "([^"]+)"', b)
+                  deps = re.search(r'dependencies = \[(.*?)\]', b, re.S)
+                  if deps and f'"{target}"' in deps.group(1) or deps and re.search(rf'"{target} ', deps.group(1)):
+                      print(f"PARENT of {target}: {name.group(1)}")
+          PYEOF
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
