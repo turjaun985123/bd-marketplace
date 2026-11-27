@@ -3869,3 +3869,37 @@ export function getAdminNotifications(
   const qs = search.toString();
   return call(`/v1/admin/notifications${qs ? `?${qs}` : ""}`, { token });
 }
+
+// ---------------------------------------------------------------------------
+// Wave 43 — observability: the admin metrics snapshot. Point-in-time
+// counts from GET /v1/admin/metrics (admin only); the definitions
+// live on the API — orders_today GMV is the Wave 27 formula (goods
+// − discount + delivery over the day's non-cancelled sub-orders),
+// pending payouts are the `requested` queue, open returns are the
+// non-terminal requests, and a non-zero `sending` backlog that
+// never drains is the stuck-worker signal.
+// ---------------------------------------------------------------------------
+
+/** Point-in-time platform health snapshot (GET /v1/admin/metrics). */
+export interface AdminMetrics {
+  orders_today: { count: number; gmv_poisha: number };
+  /** Parent-order counts per status (placed/confirmed/delivered/cancelled). */
+  orders_by_status: Record<string, number>;
+  pending_payouts: { count: number; amount_poisha: number };
+  open_returns: number;
+  notification_backlog: {
+    pending: number;
+    sending: number;
+    sent: number;
+    failed: number;
+  };
+  stale_shipments: number;
+  users_total: number;
+  stores_total: number;
+  products_active: number;
+}
+
+/** GET /v1/admin/metrics — admin only (the API answers 403 otherwise). */
+export function getAdminMetrics(token: string): Promise<AdminMetrics> {
+  return call("/v1/admin/metrics", { token });
+}

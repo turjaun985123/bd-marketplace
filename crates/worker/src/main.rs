@@ -46,6 +46,19 @@
 //! API's rules live in — there is no second implementation
 //! of the money rules here.
 //!
+//! Wave 43 gives the worker an observability line: each
+//! cycle ends with ONE summary line carrying the three
+//! jobs' headline counts (notifications sent / retried /
+//! failed, shipments checked / advanced / unchanged /
+//! failed, subscriptions checked / renewed / expired).
+//! It is printed EVERY cycle, not only when something
+//! moved — the previous per-job lines appeared only on a
+//! non-empty report, so an idle worker and a dead worker
+//! looked exactly alike in the log. A job that errors
+//! still reports on stderr as it happens and counts as
+//! zeroes in that cycle's summary; the summary never
+//! claims work the error line contradicts.
+//!
 //! The worker runs the same embedded migrations as the API
 //! at startup (idempotent — whichever process starts first
 //! applies them). Poll interval: `WORKER_POLL_SECONDS`
@@ -209,44 +222,59 @@ async fn main() {
     }
 
     loop {
-        match notify::process_pending(&pool, sender.as_ref(), notify::DEFAULT_BATCH).await {
-            Ok(report) if report.processed() > 0 => {
-                println!(
-                    "notifications batch: sent {} retried {} failed {}",
-                    report.sent, report.retried, report.failed
-                );
-            }
-            Ok(_) => {}
-            Err(error) => {
-                eprintln!("worker: notification batch failed: {error}");
-            }
-        }
-        match api::shipments::refresh_stale_shipments(&state, stale_minutes, SHIPMENT_POLL_BATCH)
-            .await
+        // Wave 43: the three jobs run as before (each error
+        // still reports itself on stderr the moment it
+        // happens), but their reports are collected and the
+        // cycle closes with ONE summary line — see the
+        // module doc for why it prints every cycle.
+        let notify_counts =
+            match notify::process_pending(&pool, sender.as_ref(), notify::DEFAULT_BATCH).await {
+                Ok(report) => (report.sent, report.retried, report.failed),
+                Err(error) => {
+                    eprintln!("worker: notification batch failed: {error}");
+                    (0, 0, 0)
+                }
+            };
+        let poll_counts = match api::shipments::refresh_stale_shipments(
+            &state,
+            stale_minutes,
+            SHIPMENT_POLL_BATCH,
+        )
+        .await
         {
-            Ok(report) if report.checked > 0 => {
-                println!(
-                    "shipment poll: checked {} advanced {} unchanged {} failed {}",
-                    report.checked, report.advanced, report.unchanged, report.failed
-                );
-            }
-            Ok(_) => {}
+            Ok(report) => (
+                report.checked,
+                report.advanced,
+                report.unchanged,
+                report.failed,
+            ),
             Err(error) => {
                 eprintln!("worker: shipment poll failed: {}", error.message);
+                (0, 0, 0, 0)
             }
-        }
-        match api::subscriptions::process_subscriptions(&state).await {
-            Ok(report) if report.renewed + report.expired > 0 => {
-                println!(
-                    "subscription sweep: checked {} renewed {} expired {}",
-                    report.checked, report.renewed, report.expired
-                );
-            }
-            Ok(_) => {}
+        };
+        let sub_counts = match api::subscriptions::process_subscriptions(&state).await {
+            Ok(report) => (report.checked, report.renewed, report.expired),
             Err(error) => {
                 eprintln!("worker: subscription sweep failed: {}", error.message);
+                (0, 0, 0)
             }
-        }
+        };
+        println!(
+            "worker cycle: notifications sent={} retried={} failed={} \
+             shipments checked={} advanced={} unchanged={} failed={} \
+             subscriptions checked={} renewed={} expired={}",
+            notify_counts.0,
+            notify_counts.1,
+            notify_counts.2,
+            poll_counts.0,
+            poll_counts.1,
+            poll_counts.2,
+            poll_counts.3,
+            sub_counts.0,
+            sub_counts.1,
+            sub_counts.2,
+        );
         tokio::select! {
             _ = shutdown_signal() => {
                 println!("worker: shutdown signal received — exiting");

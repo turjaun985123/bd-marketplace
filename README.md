@@ -2931,6 +2931,103 @@ accepted-risk ignores are live; once the tree is
 clean, making it gating is a one-line CI change
 (drop the job's `continue-on-error`).
 
+Wave 43 (observability — request ids, request logs
+and an admin metrics snapshot):
+
+**Request ids.** Every request the API answers now
+carries an `X-Request-Id`. A client-supplied id is
+honoured when it passes the pure domain rule
+(`domain::validate_request_id`: 1–64 characters,
+printable ASCII only, no leading/trailing padding —
+the value lands in a response header and a log line,
+so its shape is a safety property, not a courtesy);
+anything else (absent, oversized, control bytes,
+non-ASCII) is replaced with a freshly minted UUID in
+simple form, never with an error. The id is echoed
+on the response, so a client report, a proxy log and
+the API's own log can be correlated by one string.
+
+**Request logs.** The outermost middleware
+(`observability::request_logging` in the api crate)
+writes exactly ONE line per request after the
+response completes — `request request_id=… method=…
+path=… status=… latency_ms=…` — to stdout, or to
+stderr when the status is 5xx. `path` is the matched
+route PATTERN (`/v1/orders/:id`), not the raw URL:
+low-cardinality, and it can never contain a value;
+unmatched requests fall back to the raw path.
+Deliberately NEVER logged: query strings (the public
+tracking endpoint takes a phone number in its query —
+that is PII), request/response headers, and bodies.
+The line is printed, not emitted through a logging
+framework: neither binary carries a tracing
+subscriber (every log line in this codebase is
+stdio), so the structured key=value fields are
+written straight to the stdio handles — with
+`writeln!`, so a broken log pipe can never fail a
+request.
+
+**Admin metrics.** `GET /v1/admin/metrics` (admin
+only, behind the one `require_admin`; API keys stay
+locked out by the Wave 37 admin route exclusion)
+returns one point-in-time snapshot, computed per
+request by three aggregate queries
+(`metrics::get_admin_metrics`):
+
+- `orders_today` — parent orders created on the
+  current Asia/Dhaka day, and the day's GMV: the
+  Wave 27 formula, SUM(goods − discount + delivery)
+  over the day's non-cancelled sub-orders.
+- `orders_by_status` — parent-order counts per
+  status (`placed` / `confirmed` / `delivered` /
+  `cancelled`; only statuses present appear).
+- `pending_payouts` — the payout queue an admin
+  still has to decide: status `requested`, count +
+  total poisha (the Wave 10 overview's definition).
+- `open_returns` — return requests in `requested`
+  or `approved`, the returns lifecycle's
+  non-terminal states (`rejected` and `received`
+  are terminal for a request; a received return's
+  refund continues on its own field).
+- `notification_backlog` — the Wave 29 outbox
+  counted per status (`pending` / `sending` /
+  `sent` / `failed`). A `sending` count that never
+  drains is the stuck-batch signal the Wave 29
+  design warned about: a worker that dies mid-batch
+  leaves its claimed rows there.
+- `stale_shipments` — non-manual shipments in a
+  non-terminal status (the Wave 30
+  `POLL_TERMINAL_STATUSES` set, reused rather than
+  re-listed) untouched for over 15 minutes — work
+  the poller owes.
+- `users_total` / `stores_total` /
+  `products_active` — catalogue totals (active =
+  `status = 'active'`).
+
+The admin overview page shows the snapshot as its
+সিস্টেম অবস্থা — System status card.
+
+**Worker cycle line.** Each worker cycle now ends
+with ONE summary line — notifications
+sent/retried/failed, shipments
+checked/advanced/unchanged/failed, subscriptions
+checked/renewed/expired — printed every cycle. The
+previous per-job lines appeared only when something
+moved, so an idle worker and a dead one looked the
+same in the log; a job that errors still reports on
+stderr as it happens and counts as zeroes in that
+cycle's summary.
+
+**Honest limits.** Logs are stdout/stderr text —
+there is no Prometheus or OpenTelemetry exporter,
+no log aggregation and no alerting. The metrics are
+point-in-time database aggregates recomputed on
+each request, not a time series, and nothing is
+retained beyond the rows themselves. Request ids
+correlate one process's lines; there is no
+cross-service tracing — the SIDRA bridge and the
+courier calls do not propagate the id.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -4404,6 +4501,22 @@ carrying its removal trigger. chrono's unmaintained
 warning (RUSTSEC-2026-0543) is noted, with the
 time/jiff migration queued as its own refactor wave.
 See the Wave 42 section for the full triage.
+
+**Real (Wave 43):** observability — an `X-Request-Id`
+on every response (a valid inbound id honoured under
+the domain's printable-ASCII rule, anything else
+replaced by a minted UUID), one structured request
+log line per request (route pattern, status, latency;
+never query strings, headers or bodies), a
+point-in-time admin health snapshot at
+`GET /v1/admin/metrics` (today's orders + Wave 27
+GMV, orders by status, the pending payout queue,
+open returns, the outbox backlog, stale shipments,
+catalogue totals) shown as the admin page's
+system-status card, and a per-cycle summary line in
+the worker. See the Wave 43 section for the
+definitions and the honest limits (stdio only — no
+exporter, no aggregation, no time series).
 
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real

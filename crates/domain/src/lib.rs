@@ -3582,6 +3582,40 @@ pub fn validate_api_key_expiry_days(days: Option<i64>) -> Result<Option<i64>, St
     }
 }
 
+// ---------------------------------------------------------------------------
+// Wave 43 — request ids (pure rule; the API's observability
+// middleware honours a client id that passes it, mints a fresh
+// one otherwise, and echoes the result on the response)
+// ---------------------------------------------------------------------------
+
+/// The longest request id the API will honour from an inbound
+/// `X-Request-Id` header (Wave 43). A request id is a correlation
+/// handle, not a credential: 64 characters fits a dashed UUID
+/// (36) with room to spare, and stays short enough that a log
+/// line remains a log line.
+pub const REQUEST_ID_MAX_CHARS: usize = 64;
+
+/// Is this string usable as a request id (Wave 43)? The rule
+/// exists because the value is echoed into a response header
+/// and printed into the request log, so its shape is a safety
+/// property, not a courtesy: it must hold
+/// 1..=[`REQUEST_ID_MAX_CHARS`] characters, every one of them
+/// printable ASCII (0x20..=0x7E — no control bytes that could
+/// forge a second log line, no DEL, nothing non-ASCII), and it
+/// must not be padded with leading or trailing spaces (a padded
+/// id smuggles a second field into a space-separated log line;
+/// spaces INSIDE the value are fine). A refused id is never an
+/// error — the caller simply mints a fresh one instead.
+pub fn validate_request_id(id: &str) -> bool {
+    if id.is_empty() || id.len() > REQUEST_ID_MAX_CHARS {
+        return false;
+    }
+    if id.trim() != id {
+        return false;
+    }
+    id.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6222,5 +6256,32 @@ mod tests {
         assert!(validate_api_key_expiry_days(Some(0)).is_err());
         assert!(validate_api_key_expiry_days(Some(-30)).is_err());
         assert!(validate_api_key_expiry_days(Some(366)).is_err());
+    }
+
+    #[test]
+    fn request_id_validation_rules() {
+        // Empty and oversized ids are refused; the boundary
+        // itself (64 characters) is accepted.
+        assert!(!validate_request_id(""));
+        assert!(!validate_request_id(&"a".repeat(65)));
+        assert!(validate_request_id(&"a".repeat(64)));
+        assert!(validate_request_id("x"));
+        // The shapes real clients send: a dashed UUID and a
+        // slug-like token.
+        assert!(validate_request_id("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(validate_request_id("wave43-test-request-1"));
+        // Control bytes could forge a second log line or split
+        // the response header — all refused.
+        assert!(!validate_request_id("bad\nid"));
+        assert!(!validate_request_id("bad\tid"));
+        assert!(!validate_request_id("bad\u{7f}id"));
+        // Non-ASCII is refused: the echo must stay inside the
+        // printable-ASCII header alphabet.
+        assert!(!validate_request_id("ঢাকা-request"));
+        // A space inside the value is fine; padding at the
+        // edges is a smuggled field and is refused.
+        assert!(validate_request_id("two words"));
+        assert!(!validate_request_id(" leading"));
+        assert!(!validate_request_id("trailing "));
     }
 }

@@ -286,6 +286,19 @@
 //! fixed-window rate limit held in `AppState` (default 600
 //! requests/minute, `API_KEY_RATE_LIMIT_PER_MIN` overrides;
 //! JWT traffic is never limited by it).
+//! Wave 43: observability (`observability` and `metrics`
+//! modules) — the outermost middleware honours or mints an
+//! `X-Request-Id` per request (the pure validation rule is
+//! the domain's `validate_request_id`), echoes it on the
+//! response, and writes ONE structured log line per request
+//! (method, matched route pattern, status, latency — never
+//! query strings, headers or bodies: the tracking endpoint's
+//! query carries phone numbers). `GET /v1/admin/metrics`
+//! answers "is the platform healthy right now?" with
+//! point-in-time aggregates: today's orders and GMV (the
+//! Wave 27 formula), orders by status, the pending payout
+//! queue, open returns, the notification outbox backlog,
+//! stale shipments, and catalogue totals.
 //! Handlers only parse/validate,
 //! call ONE service function, and return its result — business rules
 //! live in the `domain` crate (pure functions) or in the service
@@ -311,8 +324,10 @@ pub mod inventory;
 pub mod invoices;
 pub mod loyalty;
 pub mod messaging;
+pub mod metrics;
 pub mod notices;
 pub mod notifications;
+pub mod observability;
 pub mod orders;
 pub mod payments;
 pub mod payouts;
@@ -1595,6 +1610,9 @@ pub fn build_app(state: AppState) -> Router {
         )
         // Wave 10 — platform admin: every route behind require_admin.
         .route("/v1/admin/overview", get(admin::overview_handler))
+        // Wave 43 — the observability snapshot: point-in-time
+        // platform health (orders today, backlogs, stale work).
+        .route("/v1/admin/metrics", get(metrics::admin_metrics_handler))
         .route(
             "/v1/admin/analytics",
             get(analytics::admin_analytics_handler),
@@ -1855,15 +1873,24 @@ pub fn build_app(state: AppState) -> Router {
         // hard cap on request bodies for the body extractors.
         .layer(middleware::from_fn(security_headers))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
-        // Wave 32: gzip response compression, added LAST so it
-        // is the OUTERMOST layer — the response flows back out
-        // through the security-headers and CORS layers first
-        // (their headers are set on the plain body), and this
-        // layer compresses the finished body only when the
-        // client sent `Accept-Encoding: gzip`. Requests without
-        // that header are untouched, so the existing test suites
-        // (which never send it) see byte-identical responses.
+        // Wave 32: gzip response compression — the response
+        // flows back out through the security-headers and CORS
+        // layers first (their headers are set on the plain
+        // body), and this layer compresses the finished body
+        // only when the client sent `Accept-Encoding: gzip`.
+        // Requests without that header are untouched, so the
+        // existing test suites (which never send it) see
+        // byte-identical responses. (Wave 43 adds one layer
+        // outside this one; it only stamps a header and logs,
+        // so the compression behaviour is unchanged.)
         .layer(CompressionLayer::new())
+        // Wave 43: request ids + one structured log line per
+        // request, added LAST so it is the OUTERMOST layer —
+        // every request the process answers (health checks,
+        // CORS preflights, body-limit rejections, 404s)
+        // carries an X-Request-Id and leaves exactly one log
+        // line. See the `observability` module.
+        .layer(middleware::from_fn(observability::request_logging))
         .with_state(state)
 }
 
