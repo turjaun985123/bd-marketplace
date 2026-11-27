@@ -286,6 +286,28 @@
 //! fixed-window rate limit held in `AppState` (default 600
 //! requests/minute, `API_KEY_RATE_LIMIT_PER_MIN` overrides;
 //! JWT traffic is never limited by it).
+//! Wave 51: product media (`media` and `product_images`
+//! modules, migration 0040) — the media system the
+//! storefront parity program stands on: a `MediaStore`
+//! trait with a local-disk driver (default; this API
+//! serves the bytes at `/media/*`) and an S3-compatible
+//! SigV4 driver (MinIO-first; honestly `media_not_configured`
+//! without its credential set), one selection rule from
+//! the environment, and one processing pipeline (domain
+//! sniff + size rules, decode, metadata-stripping
+//! re-encode, derived WebP widths that never upscale).
+//! Products carry up to 12 images — uploads or external
+//! hotlinks — with exactly one primary; every product
+//! view gains the primary's `image_url`, the detail gains
+//! the full gallery, variants gain their own `image_url`,
+//! and cart lines carry the product thumbnail. Sellers
+//! manage galleries (upload, attach-by-URL, batch reorder,
+//! delete-with-promotion), a cross-store media library
+//! with bulk delete, and store branding uploads; buyers
+//! attach one photo to their own reviews (migration
+//! 0041); the Facebook import attaches each post's photo
+//! URL best-effort; admin metrics report the library's
+//! footprint.
 //! Wave 43: observability (`observability` and `metrics`
 //! modules) — the outermost middleware honours or mints an
 //! `X-Request-Id` per request (the pure validation rule is
@@ -323,6 +345,7 @@ pub mod fulfillment;
 pub mod inventory;
 pub mod invoices;
 pub mod loyalty;
+pub mod media;
 pub mod messaging;
 pub mod metrics;
 pub mod notices;
@@ -331,6 +354,7 @@ pub mod observability;
 pub mod orders;
 pub mod payments;
 pub mod payouts;
+pub mod product_images;
 pub mod products;
 pub mod promotions;
 pub mod qna;
@@ -480,6 +504,12 @@ pub struct AppState {
     /// from `FULFILLMENT_SHIP_SLA_HOURS`. The FALLBACK value:
     /// see [`AppState::fulfillment_confirm_sla_hours`].
     pub fulfillment_ship_sla_hours: i64,
+    /// The media store (Wave 51): where product / review /
+    /// branding image objects live. Selected ONCE from the
+    /// environment by `media::store_from_env` (the local
+    /// disk driver unless `MEDIA_STORE=s3`), behind an `Arc`
+    /// so every clone of the state shares the one store.
+    pub media_store: std::sync::Arc<dyn media::MediaStore>,
 }
 
 /// SIDRA bridge configuration (Wave 13). See [`AppState::sidra_config`].
@@ -631,7 +661,19 @@ impl AppState {
             api_key_rate_limiter: std::sync::Arc::new(api_keys::ApiKeyRateLimiter::new()),
             fulfillment_confirm_sla_hours: DEFAULT_FULFILLMENT_CONFIRM_SLA_HOURS,
             fulfillment_ship_sla_hours: DEFAULT_FULFILLMENT_SHIP_SLA_HOURS,
+            media_store: media::store_from_env(),
         }
+    }
+
+    /// Replace the media store (Wave 51; used by tests that
+    /// need a specific driver — an unconfigured S3 store, or
+    /// a local store rooted in a scratch directory).
+    pub fn with_media_store(
+        mut self,
+        media_store: std::sync::Arc<dyn media::MediaStore>,
+    ) -> Self {
+        self.media_store = media_store;
+        self
     }
 
     /// Replace the payments configuration (used by `from_env` and by
@@ -1801,6 +1843,95 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/seller/products/:id/variants/:variant_id/adjust-stock",
             post(variants::adjust_variant_stock_handler),
         )
+        // Wave 51 — product media: image upload (multipart;
+        // the 12 MiB body limit is layered on THIS route
+        // only — the global 1 MiB cap still guards every
+        // other route), attach-by-URL, the gallery list and
+        // batch layout update, single delete (the primary
+        // promotes the next image), the cross-store media
+        // library with bulk delete, and store branding
+        // uploads. All seller writes sit behind the
+        // manage_catalog access rule (404 for strangers).
+        .route(
+            "/v1/seller/products/:id/images",
+            post(product_images::upload_image_handler)
+                .layer(DefaultBodyLimit::max(
+                    product_images::IMAGE_UPLOAD_ROUTE_LIMIT_BYTES,
+                )),
+        )
+        .route(
+            "/v1/seller/products/:id/images",
+            get(product_images::list_images_handler)
+                .patch(product_images::update_images_handler),
+        )
+        .route(
+            "/v1/seller/products/:id/images/from-url",
+            post(product_images::attach_image_url_handler),
+        )
+        .route(
+            "/v1/seller/products/:id/images/from-urls",
+            post(product_images::attach_images_from_urls_handler),
+        )
+        .route(
+            "/v1/seller/products/:id/images/from-web",
+            post(product_images::attach_image_from_web_handler),
+        )
+        .route(
+            "/v1/seller/products/:id/images/bulk",
+            post(product_images::bulk_upload_images_handler).layer(
+                DefaultBodyLimit::max(product_images::IMAGE_UPLOAD_ROUTE_LIMIT_BYTES),
+            ),
+        )
+        .route(
+            "/v1/seller/products/:id/images/:image_id",
+            delete(product_images::delete_image_handler),
+        )
+        .route(
+            "/v1/seller/products/:id/images/:image_id",
+            put(product_images::replace_image_handler).layer(
+                DefaultBodyLimit::max(product_images::IMAGE_UPLOAD_ROUTE_LIMIT_BYTES),
+            ),
+        )
+        // Wave 51 extension — admin media moderation: the
+        // cross-store image list and the audited delete.
+        .route(
+            "/v1/admin/media",
+            get(product_images::list_admin_media_handler),
+        )
+        .route(
+            "/v1/admin/media/:image_id",
+            delete(product_images::delete_admin_media_handler),
+        )
+        .route(
+            "/v1/seller/media",
+            get(product_images::list_seller_media_handler),
+        )
+        .route(
+            "/v1/seller/media/bulk-delete",
+            post(product_images::bulk_delete_media_handler),
+        )
+        .route(
+            "/v1/seller/store/branding-image",
+            post(product_images::upload_branding_image_handler).layer(
+                DefaultBodyLimit::max(product_images::IMAGE_UPLOAD_ROUTE_LIMIT_BYTES),
+            ),
+        )
+        // Wave 51 — review photos: the author attaches (or
+        // replaces) and removes the one photo on their own
+        // review; the upload takes the same raised body
+        // limit as the product image upload.
+        .route(
+            "/v1/reviews/:id/image",
+            post(reviews::attach_review_image_handler)
+                .layer(DefaultBodyLimit::max(
+                    product_images::IMAGE_UPLOAD_ROUTE_LIMIT_BYTES,
+                ))
+                .delete(reviews::delete_review_image_handler),
+        )
+        // Wave 51 — media serving: the LOCAL driver's bytes.
+        // (For the S3 driver the handler answers 404; views
+        // carry the endpoint's own URLs in that deployment.)
+        .route("/media/*key", get(product_images::serve_media_handler))
         // Wave 26 — sponsored promotions: the public policy
         // (effective per-day price + the 30-day cap), buying a
         // promotion for an own active product prepaid from the
@@ -1927,7 +2058,7 @@ fn log_config_summary(state: &AppState) {
          facebook_app_configured={} cors_origins={} commission={}bps \
          advance={}bps at/above {} poisha promotion_price={} poisha/day \
          subscription_pro={} subscription_business={} poisha/period \
-         free_plan_cap={} api_key_rate_limit={}/min",
+         free_plan_cap={} api_key_rate_limit={}/min media_store={}",
         state.sms_dev_mode,
         state.payments_config.dev_mode,
         state.couriers_config.dev_mode,
@@ -1944,6 +2075,7 @@ fn log_config_summary(state: &AppState) {
         state.subscription_price_business_poisha,
         state.plan_free_product_cap,
         state.api_key_rate_limit_per_min,
+        state.media_store.driver(),
     );
 }
 

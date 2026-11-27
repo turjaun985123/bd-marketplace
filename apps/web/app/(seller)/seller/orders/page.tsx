@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import PriceTag from "@/components/PriceTag";
+import ProductImage from "@/components/ProductImage";
 import {
   createManualShipment,
   createShipment,
@@ -321,9 +322,17 @@ export default function SellerOrdersPage() {
             </h3>
             <p>{new Date(sub.created_at).toLocaleString("bn-BD")}</p>
             {sub.items.map((item) => (
-              <p key={item.id}>
-                {item.title_snapshot} × {item.quantity} —{" "}
-                <PriceTag amountPoisha={item.line_total_poisha} />
+              <p key={item.id} className="order-item-line">
+                <ProductImage
+                  src={item.image_url}
+                  alt={item.title_snapshot}
+                  placeholderText={item.title_snapshot}
+                  className="order-item-image"
+                />
+                <span>
+                  {item.title_snapshot} × {item.quantity} —{" "}
+                  <PriceTag amountPoisha={item.line_total_poisha} />
+                </span>
               </p>
             ))}
             <p>

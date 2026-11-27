@@ -3653,6 +3653,652 @@ pub fn validate_idempotency_key(key: &str) -> bool {
     key.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
 }
 
+// ---------------------------------------------------------------------------
+// Wave 51 — product media (pure rules; the API stores the
+// bytes, processes the pixels and serves the files)
+// ---------------------------------------------------------------------------
+
+/// The largest single image upload the platform accepts
+/// (Wave 51): 10 MiB. Phone photos — the realistic seller
+/// upload — sit far below this; the cap exists so one
+/// request cannot stream unbounded bytes at the image
+/// decoder. The multipart route's own body limit sits a
+/// little above this (the file plus its form fields), and
+/// the API enforces this exact figure on the file itself.
+pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+
+/// How many images one product may carry (Wave 51). Twelve
+/// is generous for a marketplace gallery (AliExpress shows
+/// fewer on most listings) and bounds both the seller's
+/// upload work and the detail page's payload.
+pub const MAX_IMAGES_PER_PRODUCT: i64 = 12;
+
+/// The longest alt text an image may carry (Wave 51),
+/// counted as characters like every other text rule here.
+pub const MAX_IMAGE_ALT_TEXT_CHARS: usize = 200;
+
+/// The longest external image URL the platform will store
+/// (Wave 51). Real CDN URLs are a few hundred characters;
+/// 2,048 is the de-facto browser ceiling and far above any
+/// honest photo link.
+pub const MAX_EXTERNAL_IMAGE_URL_CHARS: usize = 2_048;
+
+/// The largest width or height (in pixels) an uploaded
+/// image may declare (Wave 51). The decoder's memory use
+/// grows with the pixel count, so an absurd header
+/// (100,000 x 100,000) is refused before a single pixel is
+/// decoded. Real cameras stay far below this.
+pub const MAX_IMAGE_DIMENSION: u32 = 10_000;
+
+/// The widths the media pipeline derives from every upload
+/// (Wave 51), widest first: a zoom view, a gallery view and
+/// a card thumbnail. A width is only ever derived when it
+/// is strictly smaller than the original — the pipeline
+/// never upscales (see [`plan_derived_sizes`]).
+pub const DERIVED_IMAGE_WIDTHS: [u32; 3] = [1_200, 600, 300];
+
+/// The width a product CARD wants (Wave 51): the smallest
+/// derived size, used by every list/rail/cart surface.
+pub const CARD_IMAGE_WIDTH: u32 = 300;
+
+/// The width a product GALLERY (detail page) wants
+/// (Wave 51) — also the width behind every product view's
+/// single `image_url`.
+pub const GALLERY_IMAGE_WIDTH: u32 = 600;
+
+/// The width the gallery's zoom / lightbox wants (Wave 51).
+pub const ZOOM_IMAGE_WIDTH: u32 = 1_200;
+
+/// One accepted image format (Wave 51). The set is
+/// deliberately the three formats every browser renders
+/// and every phone camera produces; anything else (GIF,
+/// BMP, TIFF, SVG) is refused at the sniff, before decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageKind {
+    Jpeg,
+    Png,
+    Webp,
+}
+
+impl ImageKind {
+    /// The wire content type for this format.
+    pub fn content_type(self) -> &'static str {
+        match self {
+            ImageKind::Jpeg => "image/jpeg",
+            ImageKind::Png => "image/png",
+            ImageKind::Webp => "image/webp",
+        }
+    }
+
+    /// The file extension stored objects carry for this
+    /// format (the original upload's re-encode keeps its
+    /// own format; derived sizes are always WebP).
+    pub fn extension(self) -> &'static str {
+        match self {
+            ImageKind::Jpeg => "jpg",
+            ImageKind::Png => "png",
+            ImageKind::Webp => "webp",
+        }
+    }
+
+    /// Parse a declared content type into a kind: the three
+    /// accepted types only, case-insensitive, with any
+    /// `; ...` parameter suffix ignored (multipart fields
+    /// sometimes carry one). Anything else is `None`.
+    pub fn from_content_type(content_type: &str) -> Option<ImageKind> {
+        let base = content_type
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        match base.as_str() {
+            "image/jpeg" | "image/jpg" => Some(ImageKind::Jpeg),
+            "image/png" => Some(ImageKind::Png),
+            "image/webp" => Some(ImageKind::Webp),
+            _ => None,
+        }
+    }
+}
+
+/// Sniff an image's real format from its leading bytes
+/// (Wave 51) — the magic numbers, never the file name or
+/// the declared type: JPEG opens with the SOI marker
+/// `FF D8 FF`, PNG with its fixed 8-byte signature, and
+/// WebP is a RIFF container whose form type at bytes 8..12
+/// is `WEBP`. Returns `None` for anything else, including
+/// input too short to hold a signature.
+pub fn sniff_image_kind(bytes: &[u8]) -> Option<ImageKind> {
+    if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
+        return Some(ImageKind::Jpeg);
+    }
+    if bytes.len() >= 8 && bytes[..8] == [137, 80, 78, 71, 13, 10, 26, 10] {
+        return Some(ImageKind::Png);
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some(ImageKind::Webp);
+    }
+    None
+}
+
+/// Decide the format of an upload (Wave 51) from its bytes
+/// and its declared content type. The BYTES are the truth:
+/// an upload whose bytes sniff as no accepted format is
+/// refused outright. When the client also declared a type,
+/// the declaration must parse as an accepted format AND
+/// agree with the sniff — a PNG wearing a JPEG declaration
+/// is refused rather than silently relabelled, because the
+/// stored objects and their served content types are built
+/// from this answer.
+pub fn resolve_image_kind(
+    declared_content_type: Option<&str>,
+    bytes: &[u8],
+) -> Result<ImageKind, String> {
+    let sniffed = sniff_image_kind(bytes).ok_or_else(|| {
+        "the file is not a supported image (JPEG, PNG or WebP) — \
+         ফাইলটি সমর্থিত ছবি নয় (JPEG, PNG বা WebP হতে হবে)"
+            .to_string()
+    })?;
+    if let Some(declared) = declared_content_type {
+        let declared_kind = ImageKind::from_content_type(declared).ok_or_else(|| {
+            format!(
+                "unsupported image content type '{declared}' — use JPEG, PNG or WebP"
+            )
+        })?;
+        if declared_kind != sniffed {
+            return Err(format!(
+                "the file's contents ({}) do not match its declared type ({})",
+                sniffed.content_type(),
+                declared_kind.content_type()
+            ));
+        }
+    }
+    Ok(sniffed)
+}
+
+/// Validate an upload's byte length (Wave 51): non-empty
+/// and at most [`MAX_IMAGE_BYTES`]. Checked before the
+/// sniff and the decode, so an oversize body costs one
+/// comparison, not a decode.
+pub fn validate_image_size(byte_len: usize) -> Result<(), String> {
+    if byte_len == 0 {
+        return Err("the uploaded file is empty — খালি ফাইল আপলোড করা যাবে না".to_string());
+    }
+    if byte_len > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "the image is too large ({} bytes) — at most {} bytes (10 MiB) — \
+             ছবিটি খুব বড়, সর্বোচ্চ ১০ MiB",
+            byte_len, MAX_IMAGE_BYTES
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a decoded image's dimensions (Wave 51): both
+/// sides at least one pixel and at most
+/// [`MAX_IMAGE_DIMENSION`]. Runs on the decoder's answer,
+/// before any resize work is planned.
+pub fn validate_image_dimensions(width: u32, height: u32) -> Result<(), String> {
+    if width == 0 || height == 0 {
+        return Err("the image has no pixels — ছবিতে কোনো পিক্সেল নেই".to_string());
+    }
+    if width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION {
+        return Err(format!(
+            "the image is {width}x{height} — at most {MAX_IMAGE_DIMENSION} pixels per side"
+        ));
+    }
+    Ok(())
+}
+
+/// May one more image be added to a product that already
+/// has `current_count` (Wave 51)? The count is the stored
+/// row count; the cap is [`MAX_IMAGES_PER_PRODUCT`].
+pub fn can_add_product_image(current_count: i64) -> bool {
+    current_count >= 0 && current_count < MAX_IMAGES_PER_PRODUCT
+}
+
+/// Validate image alt text (Wave 51): optional; a provided
+/// value is trimmed, a blank value becomes `None` (no alt
+/// text), and the stored text is at most
+/// [`MAX_IMAGE_ALT_TEXT_CHARS`] characters. Alt text is
+/// accessibility copy, not a caption field, so the cap is
+/// tight.
+pub fn validate_alt_text(alt: Option<&str>) -> Result<Option<String>, String> {
+    let Some(trimmed) = alt.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if trimmed.chars().count() > MAX_IMAGE_ALT_TEXT_CHARS {
+        return Err(format!(
+            "alt text must be at most {MAX_IMAGE_ALT_TEXT_CHARS} characters"
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+/// Validate an external image URL (Wave 51) — the hotlink
+/// an import or a URL-based seller attaches instead of an
+/// upload. The rule: http or https only (never `ftp:`,
+/// `file:`, `data:` or a scheme-relative URL), a non-empty
+/// host, no whitespace or control characters anywhere, and
+/// at most [`MAX_EXTERNAL_IMAGE_URL_CHARS`] characters.
+/// The URL is stored verbatim (trimmed) and handed to
+/// browsers as-is, so its shape is a safety property: a
+/// `javascript:` or credential-shaped oddity must never
+/// reach an `<img src>` through this field. On success the
+/// trimmed URL is returned for storage.
+pub fn validate_external_image_url(url: &str) -> Result<String, String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err("the image URL must not be empty".to_string());
+    }
+    if trimmed.chars().count() > MAX_EXTERNAL_IMAGE_URL_CHARS {
+        return Err(format!(
+            "the image URL must be at most {MAX_EXTERNAL_IMAGE_URL_CHARS} characters"
+        ));
+    }
+    if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("the image URL must not contain spaces or control characters".to_string());
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let rest = if let Some(rest) = lower.strip_prefix("http://") {
+        rest
+    } else if let Some(rest) = lower.strip_prefix("https://") {
+        rest
+    } else {
+        return Err(
+            "the image URL must start with http:// or https:// — \
+             ছবির URL http:// বা https:// দিয়ে শুরু হতে হবে"
+                .to_string(),
+        );
+    };
+    // The host runs to the first path/query/fragment mark.
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.is_empty() {
+        return Err("the image URL has no host".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+/// One derived size the pipeline should produce (Wave 51):
+/// a target width and the height that keeps the original's
+/// aspect ratio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DerivedSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Plan the derived sizes for an original of `orig_width`
+/// x `orig_height` (Wave 51): every width in
+/// [`DERIVED_IMAGE_WIDTHS`] strictly smaller than the
+/// original's width, widest first, each with its
+/// aspect-preserving height (rounded to the nearest pixel,
+/// at least 1). An original no wider than the smallest
+/// derived width plans NOTHING — the pipeline never
+/// upscales, and small originals are served as-is. A zero
+/// dimension plans nothing too (the dimension validator
+/// refuses such images before planning in practice).
+pub fn plan_derived_sizes(orig_width: u32, orig_height: u32) -> Vec<DerivedSize> {
+    if orig_width == 0 || orig_height == 0 {
+        return Vec::new();
+    }
+    DERIVED_IMAGE_WIDTHS
+        .iter()
+        .copied()
+        .filter(|width| *width < orig_width)
+        .map(|width| {
+            // height = orig_height * width / orig_width,
+            // rounded to nearest, in u64 so the product of
+            // two u32s can never overflow.
+            let height = ((u64::from(orig_height) * u64::from(width)
+                + u64::from(orig_width) / 2)
+                / u64::from(orig_width)) as u32;
+            DerivedSize {
+                width,
+                height: height.max(1),
+            }
+        })
+        .collect()
+}
+
+/// The derived width to serve when a surface wants
+/// `target` pixels from an original of `orig_width`
+/// (Wave 51): the smallest planned width that is at least
+/// the target (never serve a needlessly huge file), else
+/// the largest planned width (the best available), else
+/// `None` — no derived size exists, serve the original.
+pub fn best_derived_width(orig_width: u32, target: u32) -> Option<u32> {
+    let planned: Vec<u32> = plan_derived_sizes(orig_width, orig_width)
+        .into_iter()
+        .map(|size| size.width)
+        .collect();
+    if let Some(width) = planned.iter().copied().filter(|w| *w >= target).min() {
+        return Some(width);
+    }
+    planned.into_iter().max()
+}
+
+/// One image's placement in a gallery reorder (Wave 51):
+/// the caller's key for the image (its id), the requested
+/// position, and whether the caller flagged it primary.
+/// Generic over the key so the domain rule stays free of
+/// the API's id type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageOrderItem<T> {
+    pub key: T,
+    pub position: i32,
+    pub is_primary: bool,
+}
+
+/// Normalise a gallery layout (Wave 51) — THE rule every
+/// reorder, delete-promotion and first-upload path shares:
+///
+/// - Items are ordered by requested position; ties keep
+///   the caller's order (the sort is stable).
+/// - Positions are reassigned densely: 0, 1, 2, ...
+/// - Exactly one item ends primary when the list is
+///   non-empty: the first primary-flagged item in the new
+///   order keeps the flag (later flags are cleared); when
+///   NO item is flagged, the first item becomes primary —
+///   which is what promotes the next image when the
+///   primary is deleted, and what makes a product's first
+///   image its primary.
+///
+/// The input is not mutated; the returned vector is in the
+/// new display order.
+pub fn normalize_image_order<T: Clone>(items: &[ImageOrderItem<T>]) -> Vec<ImageOrderItem<T>> {
+    let mut indexed: Vec<(usize, &ImageOrderItem<T>)> = items.iter().enumerate().collect();
+    indexed.sort_by_key(|(index, item)| (item.position, *index));
+    let primary_index = indexed
+        .iter()
+        .find(|(_, item)| item.is_primary)
+        .map(|(index, _)| *index)
+        .or_else(|| indexed.first().map(|(index, _)| *index));
+    indexed
+        .into_iter()
+        .enumerate()
+        .map(|(new_position, (index, item))| ImageOrderItem {
+            key: item.key.clone(),
+            position: new_position as i32,
+            is_primary: Some(index) == primary_index,
+        })
+        .collect()
+}
+
+/// Validate a media storage key (Wave 51) — the path-like
+/// name an object lives under in the media store
+/// (`products/<product-id>/<image-id>-600.webp`). Keys are
+/// built by the API from ids it minted, and the serve route
+/// takes one from the URL, so the rule is the traversal
+/// guard for both: non-empty, at most 512 characters, only
+/// ASCII letters, digits, `-`, `_`, `.` and `/`, no empty
+/// segment, no `.` or `..` segment, no leading or trailing
+/// slash, no backslash. A key passing this rule names a
+/// file strictly inside the store root.
+pub fn validate_media_key(key: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("the media key must not be empty".to_string());
+    }
+    if key.chars().count() > 512 {
+        return Err("the media key is too long".to_string());
+    }
+    if !key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+    {
+        return Err("the media key contains characters outside [A-Za-z0-9._/-]".to_string());
+    }
+    for segment in key.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err("the media key must not contain empty, '.' or '..' segments".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// The per-store media quota (Wave 51): the total bytes of
+/// UPLOADED product-image originals one store may hold
+/// (500 MiB). External hotlinks cost the platform no
+/// storage and never count. The cap exists so one store
+/// cannot fill the disk the whole marketplace shares; it
+/// is enforced on the upload paths (single, bulk, fetch
+/// and replace) against the store's current usage.
+pub const MAX_STORE_MEDIA_BYTES: i64 = 500 * 1024 * 1024;
+
+/// Would adding `adding_bytes` of uploads to a store
+/// already holding `current_bytes` stay within the media
+/// quota? (Wave 51.) Exactly-at-the-cap is allowed; the
+/// arithmetic is saturating so a corrupt usage figure
+/// fails closed rather than wrapping.
+pub fn store_media_within_quota(current_bytes: i64, adding_bytes: i64) -> bool {
+    within_media_quota(current_bytes, adding_bytes, MAX_STORE_MEDIA_BYTES)
+}
+
+/// The quota rule against an explicit cap (Wave 51
+/// extension): the platform settings may move the cap
+/// (see `validate_media_store_quota_mb`), and this is the
+/// arithmetic every enforcement point shares.
+pub fn within_media_quota(current_bytes: i64, adding_bytes: i64, quota_bytes: i64) -> bool {
+    current_bytes.saturating_add(adding_bytes) <= quota_bytes
+}
+
+/// Is this a legal platform-set per-product image cap
+/// (Wave 51 extension)? The settings surface accepts
+/// 1..=50 — wide enough for any real catalogue, narrow
+/// enough that a typo cannot uncap the gallery.
+pub fn validate_media_max_images(value: i64) -> bool {
+    (1..=50).contains(&value)
+}
+
+/// Validate (and normalise) an uploaded file's original
+/// name (Wave 51 extension): display metadata the media
+/// library shows back to the seller. A name is a NAME —
+/// path separators and control characters are refused
+/// outright (the value is never used as a path, and the
+/// rule keeps it that way), the length is capped at 120
+/// characters, and an empty/blank name normalises to
+/// `None` (the file field simply carried none).
+pub fn validate_original_filename(raw: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let name = raw.trim();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    if name.chars().count() > 120 {
+        return Err("the file name is too long (max 120 characters)".to_string());
+    }
+    if name
+        .chars()
+        .any(|c| c == '/' || c == '\\' || c.is_control())
+    {
+        return Err("the file name must be a name, not a path".to_string());
+    }
+    Ok(Some(name.to_string()))
+}
+
+/// Is this a legal platform-set per-store media quota,
+/// in megabytes (Wave 51 extension)? 10 MiB ..= 100 GiB.
+pub fn validate_media_store_quota_mb(value: i64) -> bool {
+    (10..=102_400).contains(&value)
+}
+
+/// Suggest alt text from an uploaded file's name (Wave 51
+/// extension): sellers upload `red-running-shoe_front.JPG`
+/// and leave the alt blank, which screen readers and
+/// search engines then get nothing from. The suggestion
+/// drops the extension, turns `-`/`_`/`.` separators into
+/// spaces, collapses whitespace, and capitalises the
+/// first letter — a starting point the seller can edit,
+/// never a claim about the photo's content. Returns
+/// `None` when nothing usable remains (a name of pure
+/// separators, or the result would exceed the alt cap).
+pub fn suggest_alt_text(filename: &str) -> Option<String> {
+    let stem = filename.rsplit_once('.').map_or(filename, |(stem, _)| stem);
+    let mut words: Vec<String> = Vec::new();
+    for word in stem.split(['-', '_', '.', ' ']) {
+        let word = word.trim();
+        if !word.is_empty() {
+            words.push(word.to_string());
+        }
+    }
+    if words.is_empty() {
+        return None;
+    }
+    let joined = words.join(" ");
+    let mut chars = joined.chars();
+    let suggestion = match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => return None,
+    };
+    if suggestion.chars().count() > MAX_IMAGE_ALT_TEXT_CHARS {
+        return None;
+    }
+    Some(suggestion)
+}
+
+/// Quality warnings for one stored image (Wave 51
+/// extension), as stable codes the clients render in
+/// their own words: `low_resolution` (either side under
+/// 300px, or the long side under 600 — the gallery will
+/// look soft), `extreme_aspect` (wider or taller than
+/// 4:1 — cards crop hard), `very_large` (a side over
+/// 4,000px — decode cost on low-end phones). Unknown
+/// dimensions (external images) warn about nothing: the
+/// platform never measured them.
+pub fn image_quality_warnings(width: Option<i32>, height: Option<i32>) -> Vec<&'static str> {
+    let (Some(w), Some(h)) = (width, height) else {
+        return Vec::new();
+    };
+    if w <= 0 || h <= 0 {
+        return Vec::new();
+    }
+    let mut warnings = Vec::new();
+    if w < 300 || h < 300 || w.max(h) < 600 {
+        warnings.push("low_resolution");
+    }
+    if w > h * 4 || h > w * 4 {
+        warnings.push("extreme_aspect");
+    }
+    if w > 4_000 || h > 4_000 {
+        warnings.push("very_large");
+    }
+    warnings
+}
+
+/// The first image URL in a block of free text (Wave 51
+/// extension): Facebook posts carry their photo as a bare
+/// link in the post body, and the import preview lifts it
+/// into the draft's `image_url`. A candidate is an
+/// http(s) URL whose path ends in a known image extension
+/// (query strings allowed); trailing sentence punctuation
+/// stuck to the URL is trimmed. `None` when the text
+/// carries no image link.
+pub fn extract_image_url(text: &str) -> Option<String> {
+    for token in text.split_whitespace() {
+        let candidate = token.trim_matches(|c| matches!(c, '"' | '\'' | '<' | '>' | '(' | ')'));
+        let candidate = candidate.trim_end_matches(|c| matches!(c, '.' | ',' | ';' | '!'));
+        if !(candidate.starts_with("https://") || candidate.starts_with("http://")) {
+            continue;
+        }
+        let path = candidate
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(candidate)
+            .to_ascii_lowercase();
+        if [".jpg", ".jpeg", ".png", ".webp"]
+            .iter()
+            .any(|ext| path.ends_with(ext))
+        {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+/// Validate a URL the server itself will FETCH an image
+/// from (Wave 51, the from-web attach) — stricter than
+/// [`validate_external_image_url`] (which only ever
+/// renders a hotlink in a browser): the scheme must be
+/// http/https, credentials in the URL are refused (they
+/// would leak to logs and the fetch log line), the host
+/// must be present and must not be a loopback NAME
+/// (`localhost`, `*.localhost`, `*.local` mDNS names).
+/// The resolved-IP half of the SSRF rule is
+/// [`is_blocked_fetch_ip`], applied by the caller to every
+/// address the host resolves to. Returns the URL trimmed.
+pub fn validate_fetch_url(raw: &str) -> Result<String, String> {
+    let url = validate_external_image_url(raw)?;
+    let after_scheme = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or_default();
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    if authority.contains('@') {
+        return Err(
+            "the image URL must not contain credentials — \
+             ছবির URL-এ লগইন তথ্য থাকা যাবে না"
+                .to_string(),
+        );
+    }
+    let host = authority
+        .rsplit_once(':')
+        .map(|(host, _port)| host)
+        .unwrap_or(authority)
+        .trim_matches(['[', ']'])
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        return Err("the image URL has no host".to_string());
+    }
+    if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") {
+        return Err(
+            "the image URL host is not a public host — \
+             ছবির URL-এর হোস্ট পাবলিক হতে হবে"
+                .to_string(),
+        );
+    }
+    Ok(url)
+}
+
+/// Is this IP address one a server-side image fetch must
+/// never connect to (Wave 51, the SSRF half of the
+/// from-web rule)? Blocked: loopback, private (RFC 1918 +
+/// IPv6 unique-local), link-local (incl. the cloud
+/// metadata 169.254.169.254), multicast, unspecified, and
+/// the IPv4 documentation/reserved ranges this platform
+/// treats as non-public. An unparseable string is blocked
+/// (fail closed — a fetch target we cannot classify is a
+/// fetch we do not make).
+pub fn is_blocked_fetch_ip(raw: &str) -> bool {
+    let Ok(ip) = raw.trim().parse::<std::net::IpAddr>() else {
+        return true;
+    };
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.octets()[0] == 0
+        }
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_multicast() || v6.is_unspecified() {
+                return true;
+            }
+            let segments = v6.segments();
+            // Unique-local fc00::/7 and link-local fe80::/10.
+            (segments[0] & 0xfe00) == 0xfc00 || (segments[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6349,5 +6995,455 @@ mod tests {
         // Non-ASCII is refused: the stored key stays inside
         // the visible-ASCII header alphabet.
         assert!(!validate_idempotency_key("ঢাকা-key"));
+    }
+
+    // -----------------------------------------------------------------
+    // Wave 51 — product media rules
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn image_kind_content_types_and_extensions() {
+        assert_eq!(ImageKind::Jpeg.content_type(), "image/jpeg");
+        assert_eq!(ImageKind::Png.content_type(), "image/png");
+        assert_eq!(ImageKind::Webp.content_type(), "image/webp");
+        assert_eq!(ImageKind::Jpeg.extension(), "jpg");
+        assert_eq!(ImageKind::Png.extension(), "png");
+        assert_eq!(ImageKind::Webp.extension(), "webp");
+        // Declared types parse case-insensitively, tolerate a
+        // parameter suffix, and accept the common jpg alias.
+        assert_eq!(
+            ImageKind::from_content_type("image/jpeg"),
+            Some(ImageKind::Jpeg)
+        );
+        assert_eq!(
+            ImageKind::from_content_type("IMAGE/PNG"),
+            Some(ImageKind::Png)
+        );
+        assert_eq!(
+            ImageKind::from_content_type("image/webp; charset=binary"),
+            Some(ImageKind::Webp)
+        );
+        assert_eq!(
+            ImageKind::from_content_type("image/jpg"),
+            Some(ImageKind::Jpeg)
+        );
+        // Everything else is not an accepted upload format.
+        assert_eq!(ImageKind::from_content_type("image/gif"), None);
+        assert_eq!(ImageKind::from_content_type("image/svg+xml"), None);
+        assert_eq!(ImageKind::from_content_type("application/octet-stream"), None);
+        assert_eq!(ImageKind::from_content_type(""), None);
+    }
+
+    #[test]
+    fn sniff_image_kind_reads_magic_bytes() {
+        // JPEG: SOI marker FF D8 FF (the fourth byte varies).
+        assert_eq!(
+            sniff_image_kind(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0]),
+            Some(ImageKind::Jpeg)
+        );
+        // PNG: the fixed 8-byte signature.
+        assert_eq!(
+            sniff_image_kind(&[137, 80, 78, 71, 13, 10, 26, 10, 0, 0]),
+            Some(ImageKind::Png)
+        );
+        // WebP: RIFF + size + WEBP form type.
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&[36, 0, 0, 0]);
+        webp.extend_from_slice(b"WEBP");
+        webp.extend_from_slice(b"VP8 ");
+        assert_eq!(sniff_image_kind(&webp), Some(ImageKind::Webp));
+        // A RIFF container that is not WebP (e.g. WAV) is not
+        // an image here.
+        let mut wave = b"RIFF".to_vec();
+        wave.extend_from_slice(&[36, 0, 0, 0]);
+        wave.extend_from_slice(b"WAVE");
+        assert_eq!(sniff_image_kind(&wave), None);
+        // Non-images and too-short inputs sniff as nothing.
+        assert_eq!(sniff_image_kind(b"%PDF-1.7"), None);
+        assert_eq!(sniff_image_kind(&[0xFF, 0xD8]), None);
+        assert_eq!(sniff_image_kind(&[]), None);
+        assert_eq!(sniff_image_kind(b"GIF89a"), None);
+    }
+
+    #[test]
+    fn resolve_image_kind_trusts_bytes_over_declaration() {
+        let png = [137, 80, 78, 71, 13, 10, 26, 10];
+        // No declaration: the sniff alone decides.
+        assert_eq!(resolve_image_kind(None, &png), Ok(ImageKind::Png));
+        // A matching declaration is fine.
+        assert_eq!(
+            resolve_image_kind(Some("image/png"), &png),
+            Ok(ImageKind::Png)
+        );
+        // A mismatched declaration is refused, not relabelled.
+        assert!(resolve_image_kind(Some("image/jpeg"), &png).is_err());
+        // An unaccepted declared type is refused even when the
+        // bytes are a fine image.
+        assert!(resolve_image_kind(Some("image/gif"), &png).is_err());
+        // Bytes that are no accepted image are refused with or
+        // without a declaration.
+        assert!(resolve_image_kind(None, b"plain text").is_err());
+        assert!(resolve_image_kind(Some("image/png"), b"plain text").is_err());
+    }
+
+    #[test]
+    fn image_size_and_dimension_bounds() {
+        assert!(validate_image_size(1).is_ok());
+        assert!(validate_image_size(MAX_IMAGE_BYTES).is_ok());
+        assert!(validate_image_size(MAX_IMAGE_BYTES + 1).is_err());
+        assert!(validate_image_size(0).is_err());
+
+        assert!(validate_image_dimensions(1, 1).is_ok());
+        assert!(validate_image_dimensions(4_000, 3_000).is_ok());
+        assert!(validate_image_dimensions(MAX_IMAGE_DIMENSION, 1).is_ok());
+        assert!(validate_image_dimensions(0, 100).is_err());
+        assert!(validate_image_dimensions(100, 0).is_err());
+        assert!(validate_image_dimensions(MAX_IMAGE_DIMENSION + 1, 1).is_err());
+    }
+
+    #[test]
+    fn product_image_count_cap() {
+        assert!(can_add_product_image(0));
+        assert!(can_add_product_image(MAX_IMAGES_PER_PRODUCT - 1));
+        assert!(!can_add_product_image(MAX_IMAGES_PER_PRODUCT));
+        assert!(!can_add_product_image(MAX_IMAGES_PER_PRODUCT + 5));
+        // A nonsense negative count never opens the gate.
+        assert!(!can_add_product_image(-1));
+    }
+
+    #[test]
+    fn alt_text_validation_rules() {
+        assert_eq!(validate_alt_text(None), Ok(None));
+        assert_eq!(validate_alt_text(Some("")), Ok(None));
+        assert_eq!(validate_alt_text(Some("   ")), Ok(None));
+        // Provided text is trimmed for storage.
+        assert_eq!(
+            validate_alt_text(Some("  লাল শাড়ি  ")),
+            Ok(Some("লাল শাড়ি".to_string()))
+        );
+        // The cap counts characters, not bytes: 200 Bangla
+        // characters pass, 201 fail.
+        assert!(validate_alt_text(Some(&"ক".repeat(200))).is_ok());
+        assert!(validate_alt_text(Some(&"ক".repeat(201))).is_err());
+    }
+
+    #[test]
+    fn external_image_url_rules() {
+        // Ordinary http/https photo URLs pass, trimmed.
+        assert_eq!(
+            validate_external_image_url("  https://cdn.example.com/a/b.jpg  "),
+            Ok("https://cdn.example.com/a/b.jpg".to_string())
+        );
+        assert!(validate_external_image_url("http://localhost:9000/x.png").is_ok());
+        assert!(
+            validate_external_image_url("HTTPS://EXAMPLE.COM/x.webp?w=600").is_ok()
+        );
+        // Dangerous or unusable schemes are refused.
+        assert!(validate_external_image_url("ftp://example.com/x.jpg").is_err());
+        assert!(validate_external_image_url("file:///etc/passwd").is_err());
+        assert!(validate_external_image_url("data:image/png;base64,AAAA").is_err());
+        assert!(validate_external_image_url("javascript:alert(1)").is_err());
+        assert!(validate_external_image_url("//example.com/x.jpg").is_err());
+        // Missing host, spaces and empties are refused.
+        assert!(validate_external_image_url("https://").is_err());
+        assert!(validate_external_image_url("https:///path-only").is_err());
+        assert!(validate_external_image_url("https://exa mple.com/x.jpg").is_err());
+        assert!(validate_external_image_url("").is_err());
+        // The length cap is exact.
+        let long = format!("https://example.com/{}", "a".repeat(2_048));
+        assert!(validate_external_image_url(&long).is_err());
+    }
+
+    #[test]
+    fn derived_size_planning_never_upscales() {
+        // A large original plans all three widths, widest
+        // first, heights proportional (2000x1000 -> halves).
+        assert_eq!(
+            plan_derived_sizes(2_000, 1_000),
+            vec![
+                DerivedSize { width: 1_200, height: 600 },
+                DerivedSize { width: 600, height: 300 },
+                DerivedSize { width: 300, height: 150 },
+            ]
+        );
+        // 700x60: 1200 is not derived (never upscale); 600
+        // and 300 are, heights rounded (60*600/700 = 51.4).
+        assert_eq!(
+            plan_derived_sizes(700, 60),
+            vec![
+                DerivedSize { width: 600, height: 51 },
+                DerivedSize { width: 300, height: 26 },
+            ]
+        );
+        // An original exactly AT a width does not derive it
+        // (strictly smaller only).
+        assert_eq!(
+            plan_derived_sizes(600, 400),
+            vec![DerivedSize { width: 300, height: 200 }]
+        );
+        // Small originals plan nothing — served as-is.
+        assert!(plan_derived_sizes(300, 200).is_empty());
+        assert!(plan_derived_sizes(4, 4).is_empty());
+        // Zero dimensions plan nothing.
+        assert!(plan_derived_sizes(0, 100).is_empty());
+        assert!(plan_derived_sizes(100, 0).is_empty());
+        // A very flat image still gets a height of at least 1.
+        assert_eq!(
+            plan_derived_sizes(2_000, 3),
+            vec![
+                DerivedSize { width: 1_200, height: 2 },
+                DerivedSize { width: 600, height: 1 },
+                DerivedSize { width: 300, height: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn best_derived_width_picks_the_smallest_sufficient() {
+        // From a 2000px original: exact targets pick exact
+        // sizes; in-between targets round UP to the next
+        // planned width, never down.
+        assert_eq!(best_derived_width(2_000, CARD_IMAGE_WIDTH), Some(300));
+        assert_eq!(best_derived_width(2_000, GALLERY_IMAGE_WIDTH), Some(600));
+        assert_eq!(best_derived_width(2_000, ZOOM_IMAGE_WIDTH), Some(1_200));
+        assert_eq!(best_derived_width(2_000, 450), Some(600));
+        // Beyond the widest plan, the widest plan is the best
+        // available (the original is the only larger source).
+        assert_eq!(best_derived_width(2_000, 1_600), Some(1_200));
+        // From a 700px original the zoom target falls back to
+        // the largest planned width.
+        assert_eq!(best_derived_width(700, ZOOM_IMAGE_WIDTH), Some(600));
+        assert_eq!(best_derived_width(700, CARD_IMAGE_WIDTH), Some(300));
+        // No plan -> no derived width (serve the original).
+        assert_eq!(best_derived_width(250, CARD_IMAGE_WIDTH), None);
+    }
+
+    #[test]
+    fn image_quality_warning_rules() {
+        // A healthy product photo warns about nothing.
+        assert!(image_quality_warnings(Some(1200), Some(900)).is_empty());
+        // Unknown dimensions warn about nothing.
+        assert!(image_quality_warnings(None, None).is_empty());
+        assert!(image_quality_warnings(Some(0), Some(0)).is_empty());
+        // Small images are soft in the gallery.
+        assert_eq!(image_quality_warnings(Some(200), Some(200)), ["low_resolution"]);
+        assert_eq!(image_quality_warnings(Some(500), Some(400)), ["low_resolution"]);
+        // A banner strip is an extreme aspect.
+        assert_eq!(
+            image_quality_warnings(Some(2000), Some(300)),
+            ["extreme_aspect"]
+        );
+        // Both at once, in rule order.
+        assert_eq!(
+            image_quality_warnings(Some(100), Some(500)),
+            ["low_resolution", "extreme_aspect"]
+        );
+        // Oversized originals cost decode time.
+        assert_eq!(image_quality_warnings(Some(5000), Some(3000)), ["very_large"]);
+    }
+
+    #[test]
+    fn alt_text_suggestion_from_filenames() {
+        assert_eq!(
+            suggest_alt_text("red-running-shoe_front.JPG").as_deref(),
+            Some("Red running shoe front")
+        );
+        assert_eq!(suggest_alt_text("IMG_2041.png").as_deref(), Some("IMG 2041"));
+        assert_eq!(suggest_alt_text("photo.webp").as_deref(), Some("Photo"));
+        // Nothing usable in the name -> no suggestion.
+        assert_eq!(suggest_alt_text("---___.png"), None);
+        assert_eq!(suggest_alt_text(""), None);
+        // A suggestion never exceeds the alt cap.
+        let long = format!("{}.png", "word ".repeat(60));
+        assert_eq!(suggest_alt_text(&long), None);
+    }
+
+    #[test]
+    fn image_url_extraction_from_post_text() {
+        assert_eq!(
+            extract_image_url("দাম ১৫০০ টাকা https://fbcdn.example.com/p/shoe.jpg?size=large order now")
+                .as_deref(),
+            Some("https://fbcdn.example.com/p/shoe.jpg?size=large")
+        );
+        // Trailing punctuation is not part of the URL.
+        assert_eq!(
+            extract_image_url("see this: http://x.example.com/a.PNG.").as_deref(),
+            Some("http://x.example.com/a.PNG")
+        );
+        // Non-image links and bare text yield nothing.
+        assert_eq!(extract_image_url("visit https://example.com/page.html"), None);
+        assert_eq!(extract_image_url("no links here"), None);
+        assert_eq!(extract_image_url("ftp://x.example.com/a.jpg"), None);
+    }
+
+    #[test]
+    fn image_order_normalisation_rules() {
+        let item = |key: &str, position: i32, is_primary: bool| ImageOrderItem {
+            key: key.to_string(),
+            position,
+            is_primary,
+        };
+        // Empty stays empty.
+        assert!(normalize_image_order::<String>(&[]).is_empty());
+        // A single unflagged item becomes primary at 0 (the
+        // first-upload rule).
+        assert_eq!(
+            normalize_image_order(&[item("a", 7, false)]),
+            vec![item("a", 0, true)]
+        );
+        // Positions are reassigned densely in requested
+        // order; ties keep the caller's order; the flagged
+        // item keeps primary.
+        assert_eq!(
+            normalize_image_order(&[
+                item("c", 5, false),
+                item("a", 1, false),
+                item("b", 1, true),
+            ]),
+            vec![item("a", 0, false), item("b", 1, true), item("c", 2, false)]
+        );
+        // Multiple flags: the first flagged item in the new
+        // order wins, the rest are cleared.
+        assert_eq!(
+            normalize_image_order(&[item("a", 0, true), item("b", 1, true)]),
+            vec![item("a", 0, true), item("b", 1, false)]
+        );
+        // No flags at all (the delete-the-primary case): the
+        // first item by position is promoted.
+        assert_eq!(
+            normalize_image_order(&[item("b", 3, false), item("a", 1, false)]),
+            vec![item("a", 0, true), item("b", 1, false)]
+        );
+        // The input vector is not mutated.
+        let input = vec![item("b", 3, false), item("a", 1, true)];
+        let _ = normalize_image_order(&input);
+        assert_eq!(input, vec![item("b", 3, false), item("a", 1, true)]);
+    }
+
+    #[test]
+    fn media_key_traversal_rules() {
+        // Ordinary store keys pass.
+        assert!(validate_media_key("products/abc/img-600.webp").is_ok());
+        assert!(validate_media_key("reviews/r1/photo-orig.png").is_ok());
+        assert!(validate_media_key("a").is_ok());
+        // Traversal and absolute paths are refused.
+        assert!(validate_media_key("../secret").is_err());
+        assert!(validate_media_key("products/../../secret").is_err());
+        assert!(validate_media_key("/etc/passwd").is_err());
+        assert!(validate_media_key("products//x.webp").is_err());
+        assert!(validate_media_key("products/./x.webp").is_err());
+        assert!(validate_media_key("products/x.webp/").is_err());
+        assert!(validate_media_key("").is_err());
+        // Backslashes and odd characters are refused.
+        assert!(validate_media_key("products\\x.webp").is_err());
+        assert!(validate_media_key("products/x y.webp").is_err());
+        assert!(validate_media_key("products/x%2e%2e").is_err());
+        // The length cap is enforced.
+        assert!(validate_media_key(&"a/".repeat(300)).is_err());
+    }
+
+    #[test]
+    fn original_filename_rules() {
+        assert_eq!(validate_original_filename(None).unwrap(), None);
+        assert_eq!(validate_original_filename(Some("  ")).unwrap(), None);
+        assert_eq!(
+            validate_original_filename(Some(" IMG_2041.jpg ")).unwrap(),
+            Some("IMG_2041.jpg".to_string())
+        );
+        assert_eq!(
+            validate_original_filename(Some("লাল-জুতা.png")).unwrap(),
+            Some("লাল-জুতা.png".to_string())
+        );
+        // Paths and control characters are refused.
+        assert!(validate_original_filename(Some("a/b.jpg")).is_err());
+        assert!(validate_original_filename(Some("a\\b.jpg")).is_err());
+        assert!(validate_original_filename(Some("a\tb.jpg")).is_err());
+        assert!(validate_original_filename(Some(&"x".repeat(121))).is_err());
+        assert!(validate_original_filename(Some(&"x".repeat(120))).is_ok());
+    }
+
+    #[test]
+    fn media_limit_setting_validators() {
+        assert!(validate_media_max_images(1));
+        assert!(validate_media_max_images(12));
+        assert!(validate_media_max_images(50));
+        assert!(!validate_media_max_images(0));
+        assert!(!validate_media_max_images(51));
+        assert!(validate_media_store_quota_mb(10));
+        assert!(validate_media_store_quota_mb(500));
+        assert!(validate_media_store_quota_mb(102_400));
+        assert!(!validate_media_store_quota_mb(9));
+        assert!(!validate_media_store_quota_mb(102_401));
+        // The explicit-cap arithmetic matches the default rule.
+        assert!(within_media_quota(90, 10, 100));
+        assert!(!within_media_quota(90, 11, 100));
+    }
+
+    #[test]
+    fn store_media_quota_rule() {
+        // Under and exactly-at the cap are allowed.
+        assert!(store_media_within_quota(0, 1));
+        assert!(store_media_within_quota(MAX_STORE_MEDIA_BYTES - 10, 10));
+        assert!(store_media_within_quota(MAX_STORE_MEDIA_BYTES, 0));
+        // One byte over is refused.
+        assert!(!store_media_within_quota(MAX_STORE_MEDIA_BYTES - 10, 11));
+        assert!(!store_media_within_quota(MAX_STORE_MEDIA_BYTES, 1));
+        // A corrupt (huge) usage figure fails closed, no wrap.
+        assert!(!store_media_within_quota(i64::MAX, 1));
+    }
+
+    #[test]
+    fn fetch_url_rules() {
+        // Ordinary public URLs pass, trimmed.
+        assert_eq!(
+            validate_fetch_url("  https://cdn.example.com/a.jpg ").unwrap(),
+            "https://cdn.example.com/a.jpg"
+        );
+        assert!(validate_fetch_url("http://images.shop.com.bd/x.png?w=800").is_ok());
+        assert!(validate_fetch_url("https://example.com:8443/x.jpg").is_ok());
+        // Scheme and shape rules (inherited from the external rule).
+        assert!(validate_fetch_url("ftp://cdn.example.com/a.jpg").is_err());
+        assert!(validate_fetch_url("file:///etc/passwd").is_err());
+        assert!(validate_fetch_url("https://").is_err());
+        // Credentials in the URL are refused.
+        assert!(validate_fetch_url("https://user:pass@example.com/a.jpg").is_err());
+        assert!(validate_fetch_url("https://user@example.com/a.jpg").is_err());
+        // Loopback NAMES are refused before any DNS happens.
+        assert!(validate_fetch_url("http://localhost:9000/a.jpg").is_err());
+        assert!(validate_fetch_url("http://minio.localhost/a.jpg").is_err());
+        assert!(validate_fetch_url("http://printer.local/a.jpg").is_err());
+        // An IPv6 literal host is fine at THIS layer — the
+        // resolved-IP rule judges addresses.
+        assert!(validate_fetch_url("https://[2606:4700:4700::1111]/a.jpg").is_ok());
+    }
+
+    #[test]
+    fn blocked_fetch_ip_rules() {
+        // Public addresses pass.
+        assert!(!is_blocked_fetch_ip("8.8.8.8"));
+        assert!(!is_blocked_fetch_ip("93.184.216.34"));
+        assert!(!is_blocked_fetch_ip("2606:4700:4700::1111"));
+        // Loopback, private and this-network are blocked.
+        assert!(is_blocked_fetch_ip("127.0.0.1"));
+        assert!(is_blocked_fetch_ip("10.0.0.5"));
+        assert!(is_blocked_fetch_ip("172.16.4.1"));
+        assert!(is_blocked_fetch_ip("192.168.1.1"));
+        assert!(is_blocked_fetch_ip("0.0.0.0"));
+        assert!(is_blocked_fetch_ip("0.1.2.3"));
+        // Link-local — including the cloud metadata address.
+        assert!(is_blocked_fetch_ip("169.254.169.254"));
+        assert!(is_blocked_fetch_ip("169.254.0.1"));
+        // Multicast, broadcast and documentation ranges.
+        assert!(is_blocked_fetch_ip("224.0.0.1"));
+        assert!(is_blocked_fetch_ip("255.255.255.255"));
+        assert!(is_blocked_fetch_ip("192.0.2.1"));
+        // IPv6: loopback, unique-local, link-local.
+        assert!(is_blocked_fetch_ip("::1"));
+        assert!(is_blocked_fetch_ip("fd00::1"));
+        assert!(is_blocked_fetch_ip("fe80::1"));
+        assert!(is_blocked_fetch_ip("::"));
+        // Unparseable input fails closed.
+        assert!(is_blocked_fetch_ip("not-an-ip"));
+        assert!(is_blocked_fetch_ip(""));
     }
 }

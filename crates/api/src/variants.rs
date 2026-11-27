@@ -77,6 +77,11 @@ pub struct ProductVariant {
     pub stock: i32,
     pub is_active: bool,
     pub sort: i32,
+    /// The display URL of the first image assigned to this
+    /// variant (Wave 51); null when the variant has no image
+    /// of its own. Filled by the read paths from the
+    /// product_images table — it is not a variant column.
+    pub image_url: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -92,6 +97,11 @@ pub struct PublicVariant {
     pub price_delta_poisha: i64,
     pub final_price_poisha: i64,
     pub stock: i32,
+    /// The display URL of the first image assigned to this
+    /// variant (Wave 51), so the picker can show the red
+    /// shoe's photo when the buyer picks red; null when the
+    /// variant has no image of its own.
+    pub image_url: Option<String>,
 }
 
 /// What the variant adjust-stock endpoint returns: the
@@ -138,6 +148,9 @@ impl VariantRow {
             stock: self.stock,
             is_active: self.is_active,
             sort: self.sort,
+            // Filled by the read paths that can query the
+            // images table; a bare row conversion has none.
+            image_url: None,
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
@@ -207,6 +220,9 @@ pub async fn load_public_variants(
     .fetch_all(pool)
     .await
     .map_err(|e| ApiError::internal("load public variants", e))?;
+    // Wave 51: each variant's own first image, one batch
+    // query for the whole picker.
+    let image_urls = crate::product_images::image_urls_by_variant(pool, product.id).await?;
     Ok(rows
         .into_iter()
         .filter_map(|row| {
@@ -218,6 +234,7 @@ pub async fn load_public_variants(
                     price_delta_poisha: row.price_delta_poisha,
                     final_price_poisha: price,
                     stock: row.stock,
+                    image_url: image_urls.get(&row.id).cloned(),
                 }
             })
         })
@@ -332,9 +349,16 @@ pub async fn list_variants_for_seller(
     .fetch_all(pool)
     .await
     .map_err(|e| ApiError::internal("list variants", e))?;
+    // Wave 51: variant images, one batch query (see
+    // `load_public_variants` for the buyer-side twin).
+    let image_urls = crate::product_images::image_urls_by_variant(pool, product_id).await?;
     Ok(rows
         .into_iter()
-        .map(|row| row.into_view(product.price_poisha))
+        .map(|row| {
+            let mut view = row.into_view(product.price_poisha);
+            view.image_url = image_urls.get(&view.id).cloned();
+            view
+        })
         .collect())
 }
 
@@ -383,7 +407,9 @@ pub async fn update_variant_for_seller(
     .fetch_one(pool)
     .await
     .map_err(|e| ApiError::internal("update variant", e))?;
-    Ok(row.into_view(product.price_poisha))
+    let mut view = row.into_view(product.price_poisha);
+    view.image_url = crate::product_images::image_url_for_variant(pool, variant_id).await?;
+    Ok(view)
 }
 
 /// Deactivate one variant (the DELETE verb): the row stays
@@ -407,7 +433,9 @@ pub async fn deactivate_variant_for_seller(
     .fetch_one(pool)
     .await
     .map_err(|e| ApiError::internal("deactivate variant", e))?;
-    Ok(row.into_view(product.price_poisha))
+    let mut view = row.into_view(product.price_poisha);
+    view.image_url = crate::product_images::image_url_for_variant(pool, variant_id).await?;
+    Ok(view)
 }
 
 /// Apply one manual stock adjustment to a VARIANT, for its
@@ -504,9 +532,10 @@ pub async fn adjust_variant_stock_for_seller(
         .map_err(|e| ApiError::internal("commit variant adjust-stock", e))?;
 
     let product = get_product_by_id(pool, product_id).await?;
-    let variant = load_variant(pool, product_id, variant_id)
+    let mut variant = load_variant(pool, product_id, variant_id)
         .await?
         .into_view(product.price_poisha);
+    variant.image_url = crate::product_images::image_url_for_variant(pool, variant_id).await?;
     Ok(VariantAdjustStockResult {
         variant,
         adjustment,

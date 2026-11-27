@@ -32,6 +32,8 @@ export default function ProductRail({
             ratingAvg={p.rating_avg}
             ratingCount={p.rating_count}
             isPromoted={p.is_promoted}
+            imageUrl={p.image_url}
+            hoverImageUrl={p.hover_image_url}
           />
         ))}
       </div>

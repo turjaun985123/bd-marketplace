@@ -5,12 +5,24 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-axum = "0.7"
+# Wave 51: `multipart` for the image upload endpoints.
+axum = { version = "0.7", features = ["multipart"] }
+# Wave 51: the media store trait is object-safe async
+# (`Arc<dyn MediaStore>` in AppState) — the same crate the
+# notify crate's senders use.
+async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 courier = { path = "../courier" }
 domain = { path = "../domain" }
 hex = "0.4"
 hmac = "0.12"
+# Wave 51: image decode + resize + re-encode for the media
+# pipeline. Default features OFF: only the three accepted
+# formats are compiled in (the domain sniff refuses
+# everything else before decode anyway), and no format's
+# decoder can be reached with a format the platform does
+# not accept.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 # Wave 39 (security audit CR-02): jsonwebtoken 10.x — 9.3.1 is
 # CVE-2026-25537 (type confusion lets a crafted JWK header bypass
 # verification). v10 splits the crypto backend behind features;

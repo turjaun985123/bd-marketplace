@@ -3529,6 +3529,188 @@ home in `auth.rs`), the Deployment Honest limits (the
 worker bullet still claimed the worker does no jobs),
 and Verification status (below).
 
+Wave 51 (product media system — the Shopify-parity program opens):
+
+**The first wave of the post-50 Shopify-parity program
+(branch `shopify-parity`): products get real images, end
+to end.** Until this wave the data model had no image
+field at all — every card, rail and detail page rendered
+text only. The wave adds the complete media system:
+
+- **Model (migration 0040):** `product_images` — one row
+  per image, either an UPLOAD (`storage_key`) or an
+  EXTERNAL hotlink (`external_url`), never both (a CHECK
+  enforces exactly one); width/height/size facts, dense
+  `position`, `is_primary` under a partial UNIQUE index
+  (at most one primary per product), optional
+  `variant_id` (SET NULL on variant delete) and alt text.
+  Cap: 12 images per product. Migration 0041 adds the
+  review photo columns (`image_storage_key` + dims).
+- **Domain rules (pure, unit-tested):** the 10 MiB file
+  cap, magic-byte sniffing for JPEG/PNG/WebP with
+  declared-type agreement, dimension caps, alt-text and
+  external-URL validation (http/https only), the derived
+  size planner (1200/600/300, never upscale, aspect kept),
+  the best-size picker every view uses, the primary/
+  position normalisation that the reorder, delete and
+  bulk paths all run through, and the media-key rule
+  that makes path traversal unrepresentable.
+- **Storage + processing (`media` module):** a
+  `MediaStore` trait with two drivers — `LocalDiskStore`
+  (default; files under `MEDIA_DIR`, served by the API
+  itself at `GET /media/*key` with sniffed content type
+  and `Cache-Control: public, max-age=31536000,
+  immutable`) and `S3Store` (a hand-rolled SigV4
+  PUT/GET/DELETE for MinIO or any S3-compatible
+  endpoint; selected via `MEDIA_STORE=s3`). Uploads are
+  decoded with the `image` crate and re-encoded — the
+  original with metadata stripped, plus one WebP per
+  planned derived width (Lanczos3). Object keys are
+  deterministic (`products/<product>/<image>-orig`,
+  `-<width>.webp`), so views, deletes and serving never
+  need a key table. An S3 selection with an incomplete
+  `MEDIA_S3_*` set fails every operation with the typed
+  `media_not_configured` 503 — never a fake success.
+- **Seller endpoints** (behind `manage_catalog`; a
+  product the caller has no relationship with is the
+  same 404 as a missing one): multipart upload
+  (`POST /v1/seller/products/:id/images`, 12 MiB body
+  limit layered on this route only — the global 1 MiB
+  cap stands elsewhere; first image auto-primary),
+  attach-by-URL (`.../images/from-url`), the management
+  list, ONE-transaction batch update (`PATCH
+  .../images`: reorder + primary + alt + variant
+  assignment, normalised by the domain rule; primary
+  flagging is opt-in — a batch that flags nothing, like
+  an alt-text edit, preserves the stored primary), and
+  delete (`DELETE .../images/:image_id` — the row goes,
+  the survivors renormalise so the next image promotes,
+  the objects are removed after commit). Plus the
+  extras: the cross-store media library
+  (`GET /v1/seller/media` + `POST
+  /v1/seller/media/bulk-delete`, per-id skip semantics),
+  store branding uploads (`POST
+  /v1/seller/store/branding-image?kind=logo|banner` —
+  real files behind the Wave 18 `logo_url`/`banner_url`
+  fields), and one photo per review (`POST`/`DELETE
+  /v1/reviews/:id/image`, author-only) shown in review
+  lists.
+- **Every product surface carries imagery:** product
+  JSON everywhere (list, detail, search, storefront,
+  related, recommendations, wishlist) gains `image_url`
+  (the primary image's gallery-size URL, or null) from
+  the shared `PRODUCT_COLUMNS`; cart lines carry it
+  too; the detail gains the full ordered `images`
+  gallery (card/gallery/zoom URLs per image); variant
+  views (public picker + seller list) gain their
+  assigned image's `image_url`. Facebook import drafts
+  accept an optional `image_url`, attached through the
+  from-url path after insert — a bad photo URL is
+  logged and skipped, never fails the import. Admin
+  metrics gain a `media` block (image totals, stored
+  vs external, stored bytes).
+- **Web:** `ProductImage` (srcset over the derived
+  sizes, lazy, initial-letter placeholder when null),
+  `ProductGallery` (stage, thumbnail strip, prev/next,
+  keyboard navigation, lightbox at the zoom size),
+  `ImageUploader` (multi-file + drag-and-drop with
+  per-file XHR progress, URL attach, star-primary,
+  move left/right, alt editing, variant assignment,
+  delete with confirm) embedded per product on the
+  seller products page; cards render the primary image
+  across the grid, rails, search and wishlist; the
+  detail page uses the gallery and shows review photos
+  with author attach/remove; a new seller media-library
+  page with bulk delete; the admin system-status card
+  shows the media footprint; the PWA worker treats
+  `/media/` as cache-first immutable (VERSION `w51-v1`).
+
+- **Wave 51 extension (same wave, second half):** the
+  pipeline grew the production edges — EXIF orientation
+  is read from JPEG uploads and baked into the pixels
+  before the metadata-stripping re-encode (a phone photo
+  can no longer land sideways); a SHA-256 `content_hash`
+  (migration 0042) powers the duplicate guard (the same
+  bytes twice on one product are a bilingual 400); a
+  per-store media quota (500 MiB of uploaded originals,
+  a domain rule) gates every upload path; images can be
+  REPLACED in place (`PUT .../images/:image_id` — slot,
+  primary, alt and variant survive), uploaded in BULK
+  (`POST .../images/bulk` — per-file outcomes by name),
+  or FETCHED from a URL (`POST .../images/from-web` —
+  the server downloads and stores the photo; the fetch
+  is SSRF-guarded by domain rules: scheme/credential/
+  loopback-name checks plus a blocked-IP check over
+  every resolved address, with a documented
+  `MEDIA_FETCH_ALLOW_PRIVATE_HOSTS` hatch that exists
+  for development/tests and must stay off in
+  production); the worker reaps orphaned media objects
+  every cycle (objects no `product_images` / `reviews` /
+  `stores` row names — `MediaStore::list` enumerates the
+  local tree or S3 ListObjectsV2); and admins get a
+  moderation surface (`GET /v1/admin/media` +
+  audited `DELETE /v1/admin/media/:image_id`, with an
+  admin web page). The web grew with it: fetch-and-store
+  and replace controls in the uploader, a storage-usage
+  meter in the media library, branding-file uploads on
+  the branding page (replacing its "no upload yet"
+  note), cart-line thumbnails, and variant-focus in the
+  gallery (picking a variant shows its photo).
+- **Wave 51 extension, third pass (same wave):** order
+  lines (buyer receipt, seller orders, invoices) carry
+  the product's CURRENT primary image as a live
+  thumbnail — deliberately not a snapshot, unlike the
+  title/price beside it; the media limits are platform
+  SETTINGS (`media_max_images_per_product` 1..=50,
+  `media_store_quota_mb` 10..=102400, edited on the
+  admin settings page, defaults 12 / 500); uploads
+  remember the file's original name (migration 0043),
+  shown in the uploader, the library and admin media,
+  and a blank alt falls back to a humanised suggestion
+  from that name ("red-running-shoe_front.jpg" → "Red
+  running shoe front"); bulk URL attach
+  (`POST .../images/from-urls`, per-URL outcomes); S3
+  private-bucket mode — `MEDIA_S3_PRESIGN_SECONDS` > 0
+  makes public URLs presigned GETs (query-string SigV4,
+  clock-pinned unit tests); cards cross-fade to the
+  product's SECOND image on hover (`hover_image_url`
+  on every product view); the gallery gained hover-zoom
+  pan, touch swipe, fullscreen lightbox, an all-photos
+  grid, and variant-first ordering; the library filters
+  by source and product and sorts newest/oldest/largest;
+  admin media filters by store slug and the metrics
+  snapshot names the five heaviest stores by media
+  bytes; the import preview lifts a photo link out of
+  the post text into the draft; stored images carry
+  quality warnings (`low_resolution`, `extreme_aspect`,
+  `very_large`) computed by a domain rule and badged in
+  the seller surfaces; the serve route answers
+  `?download=1` with an attachment disposition (key name
+  + sniffed extension); the worker's cycle line reports
+  the media library's image/byte totals; and the product
+  page emits schema.org Product JSON-LD with the full
+  gallery, price and availability.
+
+**Honest limits.** The S3 driver is implemented and its
+signing is unit-pinned (fixed-clock header shape +
+determinism), and its put/get/delete/list round-trip is
+exercised against an in-process mock endpoint in unit
+tests — but it has never run against a real bucket: no
+MinIO/S3 credentials exist yet; the local driver is the
+default and the one CI exercises end to end. The
+from-web fetch checks resolved IPs before connecting,
+but reqwest re-resolves at connect time, so a narrow
+DNS-rebinding window remains (documented at the fetch
+function). JPEG coverage in the integration suite is
+PNG fixtures plus one EXIF-tagged JPEG built in-test.
+Search suggestions carry no thumbnail (the suggestion
+query dedupes by title, so a per-title image is
+ill-defined). Order lines keep their title/price
+snapshots; their thumbnails are the product's live
+primary image (documented on the field — a replaced
+photo updates old receipts' pictures, never their
+prices).
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -5187,6 +5369,29 @@ entry above and corrects the stale current-state
 framing in the Monorepo layout, the Deployment
 Honest limits and Verification status. See the
 Wave 50 section.
+
+**Real (Wave 51):** the complete product media system —
+migration 0040 `product_images` (+ 0041 review photo
+columns), pure domain image rules (sniff, caps, derived
+planner, order normalisation, key safety), the
+`MediaStore` trait with the local-disk driver (default,
+served at `/media/*` immutable) and the hand-rolled
+SigV4 S3 driver (honest `media_not_configured` until
+credentials exist), seller upload/attach/list/batch/
+delete endpoints behind `manage_catalog`, `image_url`
+on every product JSON + cart lines, the detail gallery,
+variant images, Facebook import photo wiring that never
+fails an import, the media library + bulk delete,
+branding uploads, review photos, admin media metrics,
+and the web gallery/uploader/card wiring with the PWA
+cache-first `/media/` rule — plus the same-wave
+extensions: EXIF orientation, the duplicate-hash guard,
+the per-store quota, replace/bulk/from-web (SSRF-
+guarded) uploads, the orphan reaper, admin moderation,
+order-line thumbnails, settings-driven media limits,
+original filenames + alt suggestions, bulk URL attach,
+S3 presigned URLs, hover second-image, quality
+warnings, and Product JSON-LD. See the Wave 51 section.
 
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real

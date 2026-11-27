@@ -101,6 +101,8 @@ export default function ProductGrid({
             ratingAvg={p.rating_avg}
             ratingCount={p.rating_count}
             isPromoted={p.is_promoted}
+            imageUrl={p.image_url}
+            hoverImageUrl={p.hover_image_url}
             variant={
               layout === "list" ? "row" : layout === "large" ? "large" : "card"
             }

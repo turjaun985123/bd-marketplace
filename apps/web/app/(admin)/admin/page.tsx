@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
 import AdminShell from "@/components/AdminShell";
 import PriceTag from "@/components/PriceTag";
 import {
@@ -112,6 +113,9 @@ function SystemStatus() {
   return (
     <>
       <h2>সিস্টেম অবস্থা — System status</h2>
+      <p>
+        <Link href="/admin/media">ছবি মডারেশন — Media moderation</Link>
+      </p>
       {message ? (
         <p>{message}</p>
       ) : !metrics ? (
@@ -147,6 +151,26 @@ function SystemStatus() {
               {" · "}স্টোর: <strong>{metrics.stores_total}</strong>
               {" · "}সক্রিয় পণ্য: <strong>{metrics.products_active}</strong>
             </p>
+            <p>
+              ছবি: মোট <strong>{metrics.media.images_total}</strong>
+              {" · "}আপলোড <strong>{metrics.media.stored_images}</strong>
+              {" · "}বাইরের URL <strong>{metrics.media.external_images}</strong>
+              {" · "}সংরক্ষিত আকার{" "}
+              <strong>{(metrics.media.stored_bytes / 1024).toFixed(1)} KB</strong>
+            </p>
+            {metrics.media.top_stores.length > 0 && (
+              <>
+                <p>সবচেয়ে বেশি ছবির স্টোর — Top stores by media:</p>
+                <ul>
+                  {metrics.media.top_stores.map((store) => (
+                    <li key={store.store_id}>
+                      {store.store_name} ({store.store_slug}) — {store.images}{" "}
+                      ছবি, {(store.stored_bytes / 1024).toFixed(1)} KB
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )}
           </div>
         </>
       )}

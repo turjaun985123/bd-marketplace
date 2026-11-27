@@ -138,6 +138,16 @@ pub struct OrderItem {
     pub unit_price_poisha: i64,
     pub quantity: i32,
     pub line_total_poisha: i64,
+    /// The product's CURRENT primary image URL (Wave 51
+    /// extension) — a live thumbnail for the order and
+    /// invoice pages, filled by `load_order_items` in one
+    /// batch query. Deliberately NOT a snapshot: the title
+    /// and price freeze at checkout (they are the contract),
+    /// while the photo is presentation — if the seller
+    /// replaces it, the newer photo shows. Null when the
+    /// product has no image.
+    #[sqlx(default)]
+    pub image_url: Option<String>,
 }
 
 /// One seller's slice of an order, with its own status and money split.
@@ -335,7 +345,7 @@ const SUB_ORDER_COLUMNS: &str = "so.id, so.order_id, so.store_id, s.slug AS stor
     so.seller_payout_poisha, so.created_at";
 
 async fn load_order_items(pool: &PgPool, sub_order_id: Uuid) -> Result<Vec<OrderItem>, ApiError> {
-    sqlx::query_as(
+    let mut items: Vec<OrderItem> = sqlx::query_as(
         "SELECT id, sub_order_id, product_id, variant_id, variant_name, title_snapshot, \
          unit_price_poisha, quantity, line_total_poisha \
          FROM order_items WHERE sub_order_id = $1 ORDER BY id",
@@ -343,7 +353,15 @@ async fn load_order_items(pool: &PgPool, sub_order_id: Uuid) -> Result<Vec<Order
     .bind(sub_order_id)
     .fetch_all(pool)
     .await
-    .map_err(|e| ApiError::internal("load order items", e))
+    .map_err(|e| ApiError::internal("load order items", e))?;
+    // Wave 51 extension: fill every line's product
+    // thumbnail in ONE batch query (never per-item).
+    let product_ids: Vec<Uuid> = items.iter().map(|item| item.product_id).collect();
+    let urls = crate::product_images::primary_image_urls(pool, &product_ids).await?;
+    for item in &mut items {
+        item.image_url = urls.get(&item.product_id).cloned();
+    }
+    Ok(items)
 }
 
 async fn sub_order_from_row(pool: &PgPool, row: SubOrderRow) -> Result<SubOrder, ApiError> {

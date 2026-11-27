@@ -44,6 +44,8 @@ function Settings() {
   const [advanceThresholdTaka, setAdvanceThresholdTaka] = useState("");
   const [kycGate, setKycGate] = useState(false);
   const [promotionPriceTaka, setPromotionPriceTaka] = useState("");
+  const [mediaMaxImages, setMediaMaxImages] = useState("");
+  const [mediaQuotaMb, setMediaQuotaMb] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -60,6 +62,8 @@ function Settings() {
       setPromotionPriceTaka(
         String(current.promotion_price_per_day_poisha / 100)
       );
+      setMediaMaxImages(String(current.media_max_images_per_product));
+      setMediaQuotaMb(String(current.media_store_quota_mb));
     } catch (err) {
       setMessage(err instanceof Error ? err.message : "সেটিংস লোড করা যায়নি।");
     }
@@ -97,6 +101,16 @@ function Settings() {
       setMessage("প্রমোশনের দৈনিক দাম একটি সঠিক ধনাত্মক টাকার পরিমাণ হতে হবে।");
       return;
     }
+    const maxImages = Number(mediaMaxImages);
+    if (!Number.isInteger(maxImages) || maxImages < 1 || maxImages > 50) {
+      setMessage("পণ্যপ্রতি ছবির সীমা ১ থেকে ৫০ এর মধ্যে হতে হবে।");
+      return;
+    }
+    const quotaMb = Number(mediaQuotaMb);
+    if (!Number.isInteger(quotaMb) || quotaMb < 10 || quotaMb > 102400) {
+      setMessage("স্টোরের মিডিয়া কোটা ১০ থেকে ১০২৪০০ MB এর মধ্যে হতে হবে।");
+      return;
+    }
     setBusy(true);
     setMessage(null);
     try {
@@ -107,6 +121,8 @@ function Settings() {
         advance_threshold_poisha: thresholdPoisha,
         kyc_payout_gate: kycGate,
         promotion_price_per_day_poisha: promotionPoisha,
+        media_max_images_per_product: maxImages,
+        media_store_quota_mb: quotaMb,
       });
       setSettings(updated);
       setMessage("সেটিংস সংরক্ষিত হয়েছে।");
@@ -181,6 +197,22 @@ function Settings() {
             value={promotionPriceTaka}
             onChange={(e) => setPromotionPriceTaka(e.target.value)}
             inputMode="decimal"
+          />
+        </label>
+        <label>
+          পণ্যপ্রতি সর্বোচ্চ ছবি (১–৫০) — Max images per product
+          <input
+            value={mediaMaxImages}
+            onChange={(e) => setMediaMaxImages(e.target.value)}
+            inputMode="numeric"
+          />
+        </label>
+        <label>
+          স্টোরপ্রতি মিডিয়া কোটা (MB) — Media quota per store
+          <input
+            value={mediaQuotaMb}
+            onChange={(e) => setMediaQuotaMb(e.target.value)}
+            inputMode="numeric"
           />
         </label>
         <button type="submit" disabled={busy}>

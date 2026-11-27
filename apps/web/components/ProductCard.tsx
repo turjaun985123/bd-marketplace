@@ -1,5 +1,6 @@
 import Link from "next/link";
 import PriceTag from "./PriceTag";
+import ProductImage from "./ProductImage";
 import WishlistButton from "./WishlistButton";
 
 export interface ProductCardProps {
@@ -30,6 +31,20 @@ export interface ProductCardProps {
    * presentations — the variant only changes the CSS class.
    */
   variant?: "card" | "row" | "large";
+  /**
+   * Wave 51: the product's primary image URL (the API's
+   * `image_url`). Null or omitted renders the initial-letter
+   * placeholder tile — the card layout never depends on a
+   * photo existing.
+   */
+  imageUrl?: string | null;
+  /**
+   * Wave 51 extension: the product's second image URL.
+   * When set, the card cross-fades to it on hover (fine
+   * pointers only) — the marketplace "see the back of the
+   * shoe" gesture, with zero layout cost when absent.
+   */
+  hoverImageUrl?: string | null;
 }
 
 /**
@@ -47,9 +62,36 @@ export default function ProductCard({
   ratingCount,
   isPromoted,
   variant = "card",
+  imageUrl,
+  hoverImageUrl,
 }: ProductCardProps) {
+  const image = (
+    <span className="product-card-image-stack">
+      <ProductImage
+        src={imageUrl ?? null}
+        alt={name}
+        placeholderText={name}
+        className="product-card-image"
+      />
+      {hoverImageUrl ? (
+        <ProductImage
+          src={hoverImageUrl}
+          alt=""
+          placeholderText={name}
+          className="product-card-image product-card-image--hover"
+        />
+      ) : null}
+    </span>
+  );
   return (
     <article className={variant === "card" ? "card" : `card card--${variant}`}>
+      {href ? (
+        <Link href={href} className="product-card-image-link" aria-label={name}>
+          {image}
+        </Link>
+      ) : (
+        image
+      )}
       {isPromoted && (
         <p>
           <span className="sponsored-badge">স্পন্সরড — Sponsored</span>

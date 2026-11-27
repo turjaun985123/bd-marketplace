@@ -2,6 +2,7 @@
 
 import { useCallback, useState } from "react";
 import Link from "next/link";
+import ImageUploader from "@/components/ImageUploader";
 import ProductCard from "@/components/ProductCard";
 import VariantManager from "@/components/VariantManager";
 import {
@@ -32,6 +33,8 @@ export default function SellerProductsPage() {
   const [message, setMessage] = useState<string | null>(null);
   // Wave 33: which products have their variant manager open.
   const [variantOpen, setVariantOpen] = useState<Record<string, boolean>>({});
+  // Wave 51: which products have their image manager open.
+  const [imagesOpen, setImagesOpen] = useState<Record<string, boolean>>({});
 
   // Create-product form state (price typed in taka for humans).
   const [title, setTitle] = useState("");
@@ -155,7 +158,27 @@ export default function SellerProductsPage() {
                   storeName={p.store_slug}
                   pricePoisha={p.price_poisha}
                   isPromoted={p.is_promoted}
+                  imageUrl={p.image_url}
                 />
+                <p>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setImagesOpen((prev) => ({
+                        ...prev,
+                        [p.id]: !prev[p.id],
+                      }))
+                    }
+                  >
+                    {imagesOpen[p.id]
+                      ? "ছবি লুকান"
+                      : "ছবি পরিচালনা — Manage images"}
+                    {p.image_url ? " (আছে)" : " (নেই — যোগ করুন!)"}
+                  </button>
+                </p>
+                {imagesOpen[p.id] && token && (
+                  <ImageUploader token={token} productId={p.id} />
+                )}
                 {p.status === "active" && (
                   <p>
                     <Link href={`/seller/promotions?product=${p.id}`}>

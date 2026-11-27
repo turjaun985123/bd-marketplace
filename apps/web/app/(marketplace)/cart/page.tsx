@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import PriceTag from "@/components/PriceTag";
+import ProductImage from "@/components/ProductImage";
 import { useAuth } from "@/hooks/useAuth";
 import { useCart } from "@/hooks/useCart";
 
@@ -53,6 +54,13 @@ export default function CartPage() {
               key={`${item.product_id}:${item.variant_id ?? ""}`}
               className="card"
             >
+              {/* Wave 51: the line's product thumbnail. */}
+              <ProductImage
+                src={item.image_url}
+                alt={item.title_bn ?? item.title}
+                placeholderText={item.title_bn ?? item.title}
+                className="cart-item-image"
+              />
               <h3>
                 {item.title_bn ?? item.title}
                 {item.variant_name && <> — {item.variant_name}</>}

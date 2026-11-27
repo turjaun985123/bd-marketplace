@@ -55,6 +55,28 @@ pub struct CartItemView {
     pub stock: i32,
     /// Weight of one unit in grams (Wave 4 — checkout preview sums it).
     pub weight_grams: i32,
+    /// The product's primary image base key (Wave 51) — an
+    /// intermediate for `image_url`; never serialized.
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub product_image_key: Option<String>,
+    /// The product's primary image external URL (Wave 51)
+    /// when it is a hotlink; never serialized.
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub product_image_external_url: Option<String>,
+    /// The product's primary image original width (Wave
+    /// 51); never serialized.
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub product_image_width: Option<i32>,
+    /// The product's primary image display URL (Wave 51),
+    /// computed by `load_cart_items` through the media
+    /// module's one URL rule — the cart renders the same
+    /// thumbnail the catalogue showed. Null when the
+    /// product has no image.
+    #[sqlx(default)]
+    pub image_url: Option<String>,
 }
 
 impl CartItemView {
@@ -87,7 +109,19 @@ const CART_ITEMS_SQL: &str = "SELECT ci.product_id, ci.variant_id, \
          ELSE p.price_poisha + v.price_delta_poisha END AS unit_price_poisha, \
     ci.quantity, \
     CASE WHEN ci.variant_id IS NULL THEN p.stock ELSE v.stock END AS stock, \
-    p.weight_grams \
+    p.weight_grams, \
+    (SELECT pi.storage_key FROM product_images pi \
+      WHERE pi.product_id = p.id \
+      ORDER BY pi.is_primary DESC, pi.position ASC, pi.created_at ASC LIMIT 1) \
+        AS product_image_key, \
+    (SELECT pi.external_url FROM product_images pi \
+      WHERE pi.product_id = p.id \
+      ORDER BY pi.is_primary DESC, pi.position ASC, pi.created_at ASC LIMIT 1) \
+        AS product_image_external_url, \
+    (SELECT pi.width FROM product_images pi \
+      WHERE pi.product_id = p.id \
+      ORDER BY pi.is_primary DESC, pi.position ASC, pi.created_at ASC LIMIT 1) \
+        AS product_image_width \
     FROM cart_items ci \
     JOIN products p ON p.id = ci.product_id \
     JOIN stores s ON s.id = p.store_id \
@@ -121,11 +155,24 @@ pub async fn load_cart_items(pool: &PgPool, user_id: Uuid) -> Result<Vec<CartIte
     let Some(cart_id) = find_cart_id(pool, user_id).await? else {
         return Ok(Vec::new());
     };
-    sqlx::query_as(CART_ITEMS_SQL)
+    let rows: Vec<CartItemView> = sqlx::query_as(CART_ITEMS_SQL)
         .bind(cart_id)
         .fetch_all(pool)
         .await
-        .map_err(|e| ApiError::internal("load cart items", e))
+        .map_err(|e| ApiError::internal("load cart items", e))?;
+    // Wave 51: fill each line's image_url from its product's
+    // primary image facts (the media module's one URL rule).
+    Ok(rows
+        .into_iter()
+        .map(|mut item| {
+            item.image_url = crate::media::product_image_url(
+                item.product_image_key.as_deref(),
+                item.product_image_external_url.as_deref(),
+                item.product_image_width,
+            );
+            item
+        })
+        .collect())
 }
 
 /// THE cart view builder: the GET endpoint and every cart mutation

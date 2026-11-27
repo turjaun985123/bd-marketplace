@@ -27,7 +27,10 @@
 use std::collections::HashSet;
 
 use axum::{extract::State, http::StatusCode, Json};
-use domain::{draft_from_fb_post, validate_product_input, ProductInput, DEFAULT_WEIGHT_GRAMS};
+use domain::{
+    draft_from_fb_post, extract_image_url, validate_product_input, ProductInput,
+    DEFAULT_WEIGHT_GRAMS,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -170,6 +173,10 @@ pub struct ImportDraftView {
     pub price_poisha: Option<i64>,
     pub weight_grams: i64,
     pub stock: i32,
+    /// The photo URL lifted from the post text (Wave 51
+    /// extension), when the post carries one — the import
+    /// page pre-fills the draft's photo field with it.
+    pub image_url: Option<String>,
     pub valid: bool,
     pub errors: Vec<String>,
 }
@@ -241,6 +248,7 @@ pub fn preview_import(posts: &[ImportPostInput]) -> Result<ImportPreview, ApiErr
             price_poisha: parsed.price_poisha,
             weight_grams: DEFAULT_WEIGHT_GRAMS,
             stock: 0,
+            image_url: extract_image_url(&post.text),
             valid: errors.is_empty(),
             errors,
         });
@@ -261,6 +269,13 @@ pub struct ImportDraftInput {
     pub price_poisha: i64,
     pub weight_grams: Option<i64>,
     pub stock: i32,
+    /// The post's photo URL (Wave 51): when present, the
+    /// import attaches it to the created product as an
+    /// external image through the shared media path, so an
+    /// imported product arrives WITH its photo. A bad or
+    /// over-cap URL never fails the import — the attach is
+    /// per-item best-effort (logged, skipped).
+    pub image_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -313,7 +328,9 @@ pub async fn import_products_for_owner(
     let existing: HashSet<String> = existing.into_iter().collect();
 
     let mut claimed: HashSet<String> = HashSet::new();
-    let mut ready: Vec<NewProduct> = Vec::new();
+    // Wave 51: each ready product travels with its optional
+    // photo URL, attached after the insert commits.
+    let mut ready: Vec<(NewProduct, Option<String>)> = Vec::new();
     let mut skipped: Vec<SkippedImport> = Vec::new();
     for draft in drafts {
         let source_ref = draft.source_ref.trim().to_string();
@@ -349,20 +366,28 @@ pub async fn import_products_for_owner(
         let weight_grams = i32::try_from(weight_grams)
             .map_err(|_| ApiError::bad_request("weight_grams out of range"))?;
         claimed.insert(source_ref.clone());
-        ready.push(NewProduct {
-            store_id: store.id,
-            title: draft.title.trim().to_string(),
-            title_bn: draft.title_bn.clone(),
-            description: draft.description.clone(),
-            category: None,
-            price_poisha: draft.price_poisha,
-            compare_at_poisha: None,
-            stock: draft.stock,
-            status: IMPORTED_PRODUCT_STATUS.to_string(),
-            weight_grams,
-            source: "facebook".to_string(),
-            source_ref: Some(source_ref),
-        });
+        ready.push((
+            NewProduct {
+                store_id: store.id,
+                title: draft.title.trim().to_string(),
+                title_bn: draft.title_bn.clone(),
+                description: draft.description.clone(),
+                category: None,
+                price_poisha: draft.price_poisha,
+                compare_at_poisha: None,
+                stock: draft.stock,
+                status: IMPORTED_PRODUCT_STATUS.to_string(),
+                weight_grams,
+                source: "facebook".to_string(),
+                source_ref: Some(source_ref),
+            },
+            draft
+                .image_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+                .map(str::to_string),
+        ));
     }
 
     let mut tx = pool
@@ -370,12 +395,37 @@ pub async fn import_products_for_owner(
         .await
         .map_err(|e| ApiError::internal("begin import", e))?;
     let mut created_ids: Vec<Uuid> = Vec::with_capacity(ready.len());
-    for product in &ready {
+    for (product, _image_url) in &ready {
         created_ids.push(insert_product(&mut *tx, product).await?);
     }
     tx.commit()
         .await
         .map_err(|e| ApiError::internal("commit import", e))?;
+
+    // Wave 51: attach each created product's photo AFTER
+    // the products exist. The attach is best-effort per
+    // item by design: a photo URL that fails validation (or
+    // a product already at its image cap) is logged and
+    // skipped — an import must never fail because a photo
+    // link was bad. The products are re-read AFTER the
+    // attaches so the returned views carry their image_url.
+    for (index, (_product, image_url)) in ready.iter().enumerate() {
+        let Some(url) = image_url else { continue };
+        if let Err(err) = crate::product_images::attach_external_image(
+            pool,
+            created_ids[index],
+            url,
+            None,
+            None,
+        )
+        .await
+        {
+            eprintln!(
+                "facebook import: photo attach failed for product {} ({}): {}",
+                created_ids[index], err.status, err.message
+            );
+        }
+    }
 
     let mut created = Vec::with_capacity(created_ids.len());
     for id in created_ids {

@@ -5,6 +5,7 @@ import Link from "next/link";
 import {
   getSellerDashboard,
   updateStoreBranding,
+  uploadBrandingImage,
   type Store,
   type StoreTheme,
 } from "@/lib/api";
@@ -88,6 +89,29 @@ export default function SellerBrandingPage() {
       cancelled = true;
     };
   }, [token, fillForm]);
+
+  // Wave 51: upload a logo/banner file through the media
+  // pipeline; the API stores it and points the store's
+  // logo_url / banner_url at the served file, and the form
+  // refills from the returned store.
+  async function onUploadBranding(kind: "logo" | "banner", file: File) {
+    if (!token) return;
+    setBusy(true);
+    setMessage(null);
+    try {
+      const updated = await uploadBrandingImage(token, kind, file);
+      fillForm(updated);
+      setMessage(
+        kind === "logo"
+          ? "লোগো আপলোড হয়েছে। (Logo uploaded.)"
+          : "ব্যানার আপলোড হয়েছে। (Banner uploaded.)"
+      );
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "আপলোড করা যায়নি।");
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function onSave(e: React.FormEvent) {
     e.preventDefault();
@@ -197,9 +221,10 @@ export default function SellerBrandingPage() {
 
           <h2>লোগো ও ব্যানার — Logo &amp; banner</h2>
           <p>
-            ছবির URL দিন (https:// দিয়ে শুরু হতে হবে)। ছবি আপলোডের
-            সুবিধা এখনো নেই — URL-এর ছবিটিই সরাসরি দেখানো হয়। খালি
-            রাখলে ছবি মুছে যাবে।
+            ছবি আপলোড করুন (Wave 51 — ফাইলটি মিডিয়া পাইপলাইনে
+            সংরক্ষিত হয়), অথবা ছবির URL দিন (https:// দিয়ে শুরু হতে
+            হবে — URL-এর ছবিটিই সরাসরি দেখানো হয়)। URL খালি রাখলে
+            ছবি মুছে যাবে।
           </p>
           <label>
             লোগোর URL (logo URL)
@@ -220,6 +245,18 @@ export default function SellerBrandingPage() {
             </p>
           )}
           <label>
+            লোগো আপলোড — Upload logo
+            <input
+              type="file"
+              accept="image/jpeg,image/png,image/webp"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                e.target.value = "";
+                if (file) void onUploadBranding("logo", file);
+              }}
+            />
+          </label>
+          <label>
             ব্যানারের URL (banner URL)
             <input
               value={bannerUrl}
@@ -237,6 +274,18 @@ export default function SellerBrandingPage() {
               />
             </p>
           )}
+          <label>
+            ব্যানার আপলোড — Upload banner
+            <input
+              type="file"
+              accept="image/jpeg,image/png,image/webp"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                e.target.value = "";
+                if (file) void onUploadBranding("banner", file);
+              }}
+            />
+          </label>
 
           <h2>ঘোষণা — Announcement</h2>
           <label>

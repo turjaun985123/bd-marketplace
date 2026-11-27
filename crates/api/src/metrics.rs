@@ -50,6 +50,7 @@ use std::collections::BTreeMap;
 use axum::{extract::State, Json};
 use serde::Serialize;
 use sqlx::{FromRow, PgPool};
+use uuid::Uuid;
 
 use crate::admin::require_admin;
 use crate::auth::AuthUser;
@@ -91,6 +92,34 @@ pub struct NotificationBacklog {
     pub failed: i64,
 }
 
+/// The media library's footprint (Wave 51): how many
+/// product images exist, how many are stored uploads vs
+/// external hotlinks, and the total bytes of the original
+/// uploads (external images carry no byte count — the
+/// platform never held their bytes). The operator's
+/// storage-growth signal for the media store.
+#[derive(Debug, Serialize)]
+pub struct MediaUsage {
+    pub images_total: i64,
+    pub stored_images: i64,
+    pub external_images: i64,
+    pub stored_bytes: i64,
+    /// The five stores holding the most stored bytes
+    /// (Wave 51 extension) — where a storage bill would
+    /// come from, named.
+    pub top_stores: Vec<StoreMediaUsage>,
+}
+
+/// One store's media footprint (Wave 51 extension).
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct StoreMediaUsage {
+    pub store_id: Uuid,
+    pub store_slug: String,
+    pub store_name: String,
+    pub images: i64,
+    pub stored_bytes: i64,
+}
+
 /// The whole snapshot (Wave 43). Every field is defined in
 /// the module doc; nothing here is a time series — each
 /// value is the database's state at the instant of the call.
@@ -105,6 +134,9 @@ pub struct AdminMetrics {
     pub users_total: i64,
     pub stores_total: i64,
     pub products_active: i64,
+    /// Wave 51: the media library's footprint (see
+    /// [`MediaUsage`]).
+    pub media: MediaUsage,
 }
 
 /// One (status, count) row, shared by the two GROUP BY
@@ -142,6 +174,10 @@ pub async fn get_admin_metrics(pool: &PgPool) -> Result<AdminMetrics, ApiError> 
         users_total: i64,
         stores_total: i64,
         products_active: i64,
+        media_images_total: i64,
+        media_stored_images: i64,
+        media_external_images: i64,
+        media_stored_bytes: i64,
     }
 
     let scalars: ScalarRow = sqlx::query_as(&format!(
@@ -173,7 +209,14 @@ pub async fn get_admin_metrics(pool: &PgPool) -> Result<AdminMetrics, ApiError> 
            (SELECT COUNT(*) FROM users) AS users_total, \
            (SELECT COUNT(*) FROM stores) AS stores_total, \
            (SELECT COUNT(*) FROM products WHERE status = 'active') \
-             AS products_active"
+             AS products_active, \
+           (SELECT COUNT(*) FROM product_images) AS media_images_total, \
+           (SELECT COUNT(*) FROM product_images \
+             WHERE storage_key IS NOT NULL) AS media_stored_images, \
+           (SELECT COUNT(*) FROM product_images \
+             WHERE external_url IS NOT NULL) AS media_external_images, \
+           (SELECT COALESCE(SUM(size_bytes), 0)::bigint FROM product_images) \
+             AS media_stored_bytes"
     ))
     .bind(STALE_SHIPMENT_MINUTES)
     .fetch_one(pool)
@@ -233,6 +276,26 @@ pub async fn get_admin_metrics(pool: &PgPool) -> Result<AdminMetrics, ApiError> 
         users_total: scalars.users_total,
         stores_total: scalars.stores_total,
         products_active: scalars.products_active,
+        media: MediaUsage {
+            images_total: scalars.media_images_total,
+            stored_images: scalars.media_stored_images,
+            external_images: scalars.media_external_images,
+            stored_bytes: scalars.media_stored_bytes,
+            top_stores: sqlx::query_as(
+                "SELECT s.id AS store_id, s.slug AS store_slug, s.name AS store_name, \
+                 COUNT(*)::bigint AS images, \
+                 COALESCE(SUM(pi.size_bytes), 0)::bigint AS stored_bytes \
+                 FROM product_images pi \
+                 JOIN products p ON p.id = pi.product_id \
+                 JOIN stores s ON s.id = p.store_id \
+                 WHERE pi.storage_key IS NOT NULL \
+                 GROUP BY s.id, s.slug, s.name \
+                 ORDER BY stored_bytes DESC LIMIT 5",
+            )
+            .fetch_all(pool)
+            .await
+            .map_err(|e| ApiError::internal("media top stores", e))?,
+        },
     })
 }
 

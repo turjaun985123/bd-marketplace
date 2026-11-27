@@ -4,15 +4,19 @@ import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import PriceTag from "@/components/PriceTag";
+import ProductGallery from "@/components/ProductGallery";
+import ProductImage from "@/components/ProductImage";
 import ProductRail from "@/components/ProductRail";
 import Stars from "@/components/Stars";
 import VerificationBadge from "@/components/VerificationBadge";
 import WishlistButton from "@/components/WishlistButton";
 import {
   askQuestion,
+  attachReviewImage,
   createConversation,
   createReview,
   deleteReview,
+  deleteReviewImage,
   getAlsoBought,
   getProduct,
   getProductQuestions,
@@ -252,6 +256,50 @@ export default function ProductDetailPage({
       </p>
       <h1>{product.title_bn ?? product.title}</h1>
       {product.title_bn && <p>{product.title}</p>}
+      {/* Wave 51 extension: schema.org Product structured
+          data — search engines render the photo, price and
+          availability in rich results. Built from the same
+          loaded product; image lists every gallery URL. */}
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{
+          __html: JSON.stringify({
+            "@context": "https://schema.org",
+            "@type": "Product",
+            name: product.title,
+            description: product.description ?? undefined,
+            image: product.images.map((image) => image.url_zoom),
+            offers: {
+              "@type": "Offer",
+              priceCurrency: "BDT",
+              price: (product.price_poisha / 100).toFixed(2),
+              availability:
+                product.stock_status === "in_stock"
+                  ? "https://schema.org/InStock"
+                  : "https://schema.org/OutOfStock",
+            },
+            ...(product.rating_count > 0
+              ? {
+                  aggregateRating: {
+                    "@type": "AggregateRating",
+                    ratingValue: product.rating_avg ?? 0,
+                    reviewCount: product.rating_count,
+                  },
+                }
+              : {}),
+          }),
+        }}
+      />
+      {/* Wave 51: the full image gallery (stage, thumbs,
+          keyboard nav, lightbox) — or the placeholder tile
+          while the product has no photos. Picking a variant
+          focuses its assigned photo. */}
+      <ProductGallery
+        images={product.images}
+        title={product.title_bn ?? product.title}
+        focusUrl={selectedVariant?.image_url ?? null}
+        variantId={selectedVariant?.id ?? null}
+      />
       {product.variants.length > 0 && (
         <div>
           <p>আকার/রং বেছে নিন — Choose a variant:</p>
@@ -497,6 +545,7 @@ function ReviewItem({
   const [replyText, setReplyText] = useState("");
   const [editingReply, setEditingReply] = useState(false);
   const [itemError, setItemError] = useState<string | null>(null);
+  const [photoZoom, setPhotoZoom] = useState(false);
 
   async function onSaveEdit() {
     if (!token) return;
@@ -551,6 +600,86 @@ function ReviewItem({
         <small>{new Date(review.created_at).toLocaleDateString("en-GB")}</small>
       </p>
       {review.body && <p>{review.body}</p>}
+      {/* Wave 51: the reviewer's photo, when they attached one. */}
+      {review.image_url && (
+        <button
+          type="button"
+          className="review-photo-button"
+          onClick={() => setPhotoZoom(true)}
+          aria-label="রিভিউয়ের ছবি বড় করে দেখুন — Enlarge review photo"
+        >
+          <ProductImage
+            src={review.image_url}
+            alt="রিভিউয়ের ছবি — Review photo"
+            className="review-photo"
+          />
+        </button>
+      )}
+      {photoZoom && review.image_url && (
+        <div
+          className="product-gallery-lightbox"
+          role="dialog"
+          aria-modal="true"
+          aria-label="রিভিউয়ের ছবি — Review photo"
+          onClick={() => setPhotoZoom(false)}
+        >
+          <button
+            type="button"
+            className="product-gallery-lightbox-close"
+            aria-label="বন্ধ করুন — Close"
+            onClick={() => setPhotoZoom(false)}
+          >
+            ✕
+          </button>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={review.image_url}
+            alt="রিভিউয়ের ছবি — Review photo"
+            className="product-gallery-lightbox-image"
+          />
+        </div>
+      )}
+      {isOwn && token && (
+        <p className="review-photo-actions">
+          <label>
+            {review.image_url ? "ছবি বদলান — Replace photo" : "ছবি যোগ করুন — Add a photo"}{" "}
+            <input
+              type="file"
+              accept="image/jpeg,image/png,image/webp"
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                event.target.value = "";
+                if (!file) return;
+                setItemError(null);
+                attachReviewImage(token, review.id, file)
+                  .then(() => onChanged())
+                  .catch((err) =>
+                    setItemError(
+                      err instanceof Error ? err.message : "ছবি যোগ করা যায়নি।"
+                    )
+                  );
+              }}
+            />
+          </label>
+          {review.image_url && (
+            <button
+              type="button"
+              onClick={() => {
+                setItemError(null);
+                deleteReviewImage(token, review.id)
+                  .then(() => onChanged())
+                  .catch((err) =>
+                    setItemError(
+                      err instanceof Error ? err.message : "ছবি মোছা যায়নি।"
+                    )
+                  );
+              }}
+            >
+              ছবি মুছুন — Remove photo
+            </button>
+          )}
+        </p>
+      )}
 
       {review.reply && !editingReply && (
         <div className="card">

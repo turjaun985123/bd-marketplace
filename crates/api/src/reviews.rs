@@ -59,6 +59,11 @@ pub struct Review {
     pub order_id: Uuid,
     pub rating: i16,
     pub body: Option<String>,
+    /// The review's photo (Wave 51), when the author
+    /// attached one: the gallery display URL, derived from
+    /// the stored key by the media module's one URL rule.
+    /// Null for the (majority) photo-less reviews.
+    pub image_url: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub reply: Option<ReviewReply>,
@@ -86,6 +91,12 @@ struct ReviewRow {
     order_id: Uuid,
     rating: i16,
     body: Option<String>,
+    /// Wave 51: the review photo's stored base key and the
+    /// original's dimensions (migration 0041); all null
+    /// when the review has no photo.
+    image_storage_key: Option<String>,
+    image_width: Option<i32>,
+    image_height: Option<i32>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     reply_id: Option<Uuid>,
@@ -124,6 +135,10 @@ impl ReviewRow {
             order_id: self.order_id,
             rating: self.rating,
             body: self.body,
+            image_url: self
+                .image_storage_key
+                .as_deref()
+                .map(|key| crate::media::sized_url(key, self.image_width, domain::GALLERY_IMAGE_WIDTH)),
             created_at: self.created_at,
             updated_at: self.updated_at,
             reply,
@@ -135,7 +150,8 @@ impl ReviewRow {
 /// from `REVIEW_FROM` so all views are built identically.
 const REVIEW_COLUMNS: &str = "r.id, r.product_id, r.buyer_id, \
     u.name AS buyer_name, u.phone AS buyer_phone, \
-    r.order_id, r.rating, r.body, r.created_at, r.updated_at, \
+    r.order_id, r.rating, r.body, r.image_storage_key, r.image_width, \
+    r.image_height, r.created_at, r.updated_at, \
     rp.id AS reply_id, rp.store_id AS reply_store_id, rp.body AS reply_body, \
     rp.created_at AS reply_created_at, rp.updated_at AS reply_updated_at";
 
@@ -347,23 +363,116 @@ pub async fn update_own_review(
 }
 
 /// Delete the caller's own review (its reply goes with it via the
-/// foreign-key cascade). Not the author's review: 404.
+/// foreign-key cascade). Not the author's review: 404. A Wave 51
+/// review photo's stored objects are removed after the row is
+/// gone (best-effort — an orphaned object is inert, a row pointing
+/// at removed objects would not be).
 pub async fn delete_own_review(
-    pool: &PgPool,
+    state: &AppState,
     user: &AuthUser,
     review_id: Uuid,
 ) -> Result<(), ApiError> {
-    let affected = sqlx::query("DELETE FROM reviews WHERE id = $1 AND buyer_id = $2")
+    let pool = state.require_pool()?;
+    let photo: Option<(Option<String>, Option<i32>)> = sqlx::query_as(
+        "SELECT image_storage_key, image_width FROM reviews WHERE id = $1 AND buyer_id = $2",
+    )
+    .bind(review_id)
+    .bind(user.user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ApiError::internal("load review for delete", e))?;
+    let (photo_key, photo_width) = photo.ok_or_else(|| ApiError::not_found("review not found"))?;
+    sqlx::query("DELETE FROM reviews WHERE id = $1 AND buyer_id = $2")
         .bind(review_id)
         .bind(user.user_id)
         .execute(pool)
         .await
-        .map_err(|e| ApiError::internal("delete review", e))?
-        .rows_affected();
-    if affected == 0 {
-        return Err(ApiError::not_found("review not found"));
+        .map_err(|e| ApiError::internal("delete review", e))?;
+    if let Some(key) = photo_key {
+        crate::media::delete_stored_image(state.media_store.as_ref(), &key, photo_width).await;
     }
     Ok(())
+}
+
+/// Load a review's photo facts for its AUTHOR (Wave 51): a
+/// review that does not exist — or belongs to someone else —
+/// is the module's usual 404.
+async fn own_review_photo_facts(
+    pool: &PgPool,
+    user: &AuthUser,
+    review_id: Uuid,
+) -> Result<(Option<String>, Option<i32>), ApiError> {
+    let facts: Option<(Option<String>, Option<i32>)> = sqlx::query_as(
+        "SELECT image_storage_key, image_width FROM reviews WHERE id = $1 AND buyer_id = $2",
+    )
+    .bind(review_id)
+    .bind(user.user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ApiError::internal("load review photo facts", e))?;
+    facts.ok_or_else(|| ApiError::not_found("review not found"))
+}
+
+/// Attach (or replace) the caller's photo on their own
+/// review (Wave 51): ONE photo per review, through the same
+/// media pipeline as product images, under the deterministic
+/// key `reviews/<review_id>/photo` — a replacement clears the
+/// old objects first (a smaller replacement must not leave a
+/// stale larger derived size behind), stores the new ones,
+/// and only then points the row at them.
+pub async fn attach_review_image(
+    state: &AppState,
+    user: &AuthUser,
+    review_id: Uuid,
+    bytes: &[u8],
+    declared_content_type: Option<&str>,
+) -> Result<Review, ApiError> {
+    let pool = state.require_pool()?;
+    let (old_key, old_width) = own_review_photo_facts(pool, user, review_id).await?;
+    let base_key = format!("reviews/{review_id}/photo");
+    let processed = crate::media::process_upload(&base_key, bytes, declared_content_type)?;
+    if old_key.is_some() {
+        crate::media::delete_stored_image(state.media_store.as_ref(), &base_key, old_width)
+            .await;
+    }
+    crate::media::store_processed(state.media_store.as_ref(), &processed).await?;
+    sqlx::query(
+        "UPDATE reviews SET image_storage_key = $2, image_width = $3, \
+         image_height = $4, updated_at = now() WHERE id = $1",
+    )
+    .bind(review_id)
+    .bind(&base_key)
+    .bind(processed.width as i32)
+    .bind(processed.height as i32)
+    .execute(pool)
+    .await
+    .map_err(|e| ApiError::internal("attach review image", e))?;
+    get_review_by_id(pool, review_id).await
+}
+
+/// Remove the caller's photo from their own review (Wave
+/// 51): the columns clear first, then the objects are
+/// removed best-effort. A review with no photo is a
+/// successful no-op — the end state is the same.
+pub async fn delete_review_image(
+    state: &AppState,
+    user: &AuthUser,
+    review_id: Uuid,
+) -> Result<Review, ApiError> {
+    let pool = state.require_pool()?;
+    let (old_key, old_width) = own_review_photo_facts(pool, user, review_id).await?;
+    sqlx::query(
+        "UPDATE reviews SET image_storage_key = NULL, image_width = NULL, \
+         image_height = NULL, updated_at = now() WHERE id = $1",
+    )
+    .bind(review_id)
+    .execute(pool)
+    .await
+    .map_err(|e| ApiError::internal("delete review image", e))?;
+    if let Some(key) = old_key {
+        crate::media::delete_stored_image(state.media_store.as_ref(), &key, old_width).await;
+    }
+    get_review_by_id(pool, review_id).await
 }
 
 /// Resolve a review to the store that sells its product, requiring
@@ -508,9 +617,34 @@ pub async fn delete_review_handler(
     user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    let pool = state.require_pool()?;
-    delete_own_review(pool, &user, id).await?;
+    delete_own_review(&state, &user, id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /v1/reviews/:id/image (Wave 51) — attach or replace
+/// the author's photo on their own review (multipart, the
+/// shared upload form of the product image endpoints).
+pub async fn attach_review_image_handler(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+    multipart: axum::extract::Multipart,
+) -> Result<Json<Review>, ApiError> {
+    let form = crate::product_images::read_upload_form(multipart).await?;
+    Ok(Json(
+        attach_review_image(&state, &user, id, &form.bytes, form.content_type.as_deref())
+            .await?,
+    ))
+}
+
+/// DELETE /v1/reviews/:id/image (Wave 51) — remove the
+/// author's photo from their own review.
+pub async fn delete_review_image_handler(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Review>, ApiError> {
+    Ok(Json(delete_review_image(&state, &user, id).await?))
 }
 
 pub async fn create_reply_handler(

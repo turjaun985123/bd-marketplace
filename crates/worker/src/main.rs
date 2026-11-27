@@ -311,11 +311,42 @@ async fn main() {
                 (0, 0, 0)
             }
         };
+        // Wave 51 extension: the media orphan reaper —
+        // objects no product_images / reviews / stores row
+        // accounts for (left by uploads that died between
+        // the object writes and the row insert) are
+        // deleted. Idempotent and conservative (an object
+        // dies only when the database positively does not
+        // name it), so it runs every cycle like the rest.
+        let media_counts = match api::product_images::reap_orphan_media(&state).await {
+            Ok(report) => (report.scanned, report.deleted),
+            Err(error) => {
+                eprintln!("worker: media reaper failed: {}", error.message);
+                (0, 0)
+            }
+        };
+        // The media library's size at this cycle (Wave 51
+        // extension): the operator's growth signal in the
+        // same one-line summary — stored uploads and their
+        // total original bytes, straight from the rows.
+        let media_library = match &state.pool {
+            Some(pool) => sqlx::query_as::<_, (i64, i64)>(
+                "SELECT COUNT(*)::bigint, \
+                 COALESCE(SUM(size_bytes), 0)::bigint \
+                 FROM product_images WHERE storage_key IS NOT NULL",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap_or((0, 0)),
+            None => (0, 0),
+        };
         println!(
             "worker cycle: notifications sent={} retried={} failed={} \
              reaped_pending={} reaped_failed={} \
              shipments checked={} advanced={} unchanged={} failed={} \
-             subscriptions checked={} renewed={} expired={}",
+             subscriptions checked={} renewed={} expired={} \
+             media scanned={} orphans_deleted={} \
+             media_library images={} bytes={}",
             notify_counts.0,
             notify_counts.1,
             notify_counts.2,
@@ -328,6 +359,10 @@ async fn main() {
             sub_counts.0,
             sub_counts.1,
             sub_counts.2,
+            media_counts.0,
+            media_counts.1,
+            media_library.0,
+            media_library.1,
         );
         tokio::select! {
             _ = shutdown_signal() => {

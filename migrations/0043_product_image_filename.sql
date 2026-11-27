@@ -1,0 +1,11 @@
+-- Wave 51 (extension): the original filename of an upload.
+--
+-- Sellers think in files ("IMG_2041.jpg", "red-front.png");
+-- until now the platform forgot the name the moment the
+-- bytes landed, so the media library could not answer
+-- "which file was this?". `original_filename` keeps it —
+-- display metadata only, validated by the domain rule
+-- (length-capped, no path separators: a filename is a
+-- name, never a path). Null for external images and for
+-- rows written before this migration.
+ALTER TABLE product_images ADD COLUMN original_filename text;

@@ -126,6 +126,50 @@ pub struct Product {
     /// every product surface agrees and the flag can never be a
     /// stale stored value.
     pub is_promoted: bool,
+    /// The primary image's stored base key (Wave 51) — an
+    /// intermediate for computing `image_url`, selected by
+    /// `PRODUCT_COLUMNS`; never serialized.
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub primary_image_key: Option<String>,
+    /// The primary image's external URL (Wave 51) when it
+    /// is a hotlink rather than an upload; never serialized
+    /// (it reaches clients as `image_url` itself).
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub primary_image_external_url: Option<String>,
+    /// The primary image's original width (Wave 51); null
+    /// for external images and image-less products. Never
+    /// serialized.
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub primary_image_width: Option<i32>,
+    /// The primary image's gallery display URL (Wave 51),
+    /// computed by `with_stock_status` from the three
+    /// `primary_image_*` facts via the media module's one
+    /// URL rule; null when the product has no image.
+    #[sqlx(default)]
+    pub image_url: Option<String>,
+    /// The SECOND image's stored base key (Wave 51
+    /// extension) — the hover-swap image on cards; never
+    /// serialized.
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub hover_image_key: Option<String>,
+    /// The second image's external URL when hotlinked;
+    /// never serialized.
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub hover_image_external_url: Option<String>,
+    /// The second image's original width; never serialized.
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub hover_image_width: Option<i32>,
+    /// The second image's gallery URL (Wave 51 extension),
+    /// computed like `image_url`; cards swap to it on
+    /// hover. Null when the product has fewer than 2 images.
+    #[sqlx(default)]
+    pub hover_image_url: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -158,30 +202,73 @@ pub(crate) const PRODUCT_COLUMNS: &str = "p.id, p.store_id, s.slug AS store_slug
     p.created_at, p.updated_at, \
     EXISTS (SELECT 1 FROM promotions pr \
             WHERE pr.product_id = p.id AND pr.status = 'active' \
-              AND pr.starts_at <= now() AND pr.ends_at > now()) AS is_promoted";
+              AND pr.starts_at <= now() AND pr.ends_at > now()) AS is_promoted, \
+    (SELECT pi.storage_key FROM product_images pi \
+      WHERE pi.product_id = p.id \
+      ORDER BY pi.is_primary DESC, pi.position ASC, pi.created_at ASC LIMIT 1) \
+        AS primary_image_key, \
+    (SELECT pi.external_url FROM product_images pi \
+      WHERE pi.product_id = p.id \
+      ORDER BY pi.is_primary DESC, pi.position ASC, pi.created_at ASC LIMIT 1) \
+        AS primary_image_external_url, \
+    (SELECT pi.width FROM product_images pi \
+      WHERE pi.product_id = p.id \
+      ORDER BY pi.is_primary DESC, pi.position ASC, pi.created_at ASC LIMIT 1) \
+        AS primary_image_width, \
+    (SELECT pi.storage_key FROM product_images pi \
+      WHERE pi.product_id = p.id \
+      ORDER BY pi.is_primary DESC, pi.position ASC, pi.created_at ASC LIMIT 1 OFFSET 1) \
+        AS hover_image_key, \
+    (SELECT pi.external_url FROM product_images pi \
+      WHERE pi.product_id = p.id \
+      ORDER BY pi.is_primary DESC, pi.position ASC, pi.created_at ASC LIMIT 1 OFFSET 1) \
+        AS hover_image_external_url, \
+    (SELECT pi.width FROM product_images pi \
+      WHERE pi.product_id = p.id \
+      ORDER BY pi.is_primary DESC, pi.position ASC, pi.created_at ASC LIMIT 1 OFFSET 1) \
+        AS hover_image_width";
 
 /// The product DETAIL shape (Wave 33): the shared product
 /// view flattened, plus the ACTIVE variants a buyer can pick
 /// (ordered by sort, then name — see the `variants` module).
 /// Only the detail endpoint builds this; list views carry
 /// `has_variants` and never the variant rows.
+///
+/// Wave 51: the detail also carries the full image gallery
+/// (`images`, in display order) — list views carry only the
+/// primary image's `image_url`, never the gallery rows.
 #[derive(Debug, Serialize)]
 pub struct ProductDetail {
     #[serde(flatten)]
     pub product: Product,
     pub variants: Vec<PublicVariant>,
+    pub images: Vec<crate::product_images::GalleryImageView>,
 }
 
-/// Fill a loaded product's computed `stock_status` from the
-/// domain rule (Wave 23). Every query site that materialises
-/// a `Product` runs its rows through here, so the field is
-/// always the rule's answer for the row's stock and threshold.
+/// Fill a loaded product's computed fields from their
+/// rules: `stock_status` from the domain rule (Wave 23) and
+/// `image_url` from the media module's URL rule over the
+/// primary image's stored facts (Wave 51). Every query site
+/// that materialises a `Product` runs its rows through
+/// here, so the fields are always the rules' answers for
+/// the row — a product surface can never disagree with
+/// another about either.
 pub(crate) fn with_stock_status(mut product: Product) -> Product {
     product.stock_status = stock_status(
         i64::from(product.stock),
         product.low_stock_threshold.map(i64::from),
     )
     .to_string();
+    product.image_url = crate::media::product_image_url(
+        product.primary_image_key.as_deref(),
+        product.primary_image_external_url.as_deref(),
+        product.primary_image_width,
+    );
+    product.hover_image_url = crate::media::product_image_url(
+        product.hover_image_key.as_deref(),
+        product.hover_image_external_url.as_deref(),
+        product.hover_image_width,
+    );
     product
 }
 
@@ -719,7 +806,13 @@ pub async fn get_product(
     // Wave 33: the detail view carries the ACTIVE variants
     // (the list views never do — see `ProductDetail`).
     let variants = load_public_variants(pool, &product).await?;
-    let detail = ProductDetail { product, variants };
+    // Wave 51: and the full image gallery, in display order.
+    let images = crate::product_images::load_product_gallery(pool, id).await?;
+    let detail = ProductDetail {
+        product,
+        variants,
+        images,
+    };
     // Wave 32: an anonymous read that passed the gates is by
     // definition the public view, so it may be cached publicly;
     // a signed-in read (above all the owner's view of a draft)

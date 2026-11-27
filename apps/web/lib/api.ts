@@ -101,6 +101,14 @@ export interface Product {
    * is paid and labelled, never disguised.
    */
   is_promoted: boolean;
+  /**
+   * Primary image's gallery-size URL (Wave 51): the stored
+   * derived WebP for uploads, the hotlink itself for external
+   * images, null when the product has no image at all.
+   */
+  image_url: string | null;
+  /** Second image's gallery URL (Wave 51 ext): cards swap to it on hover. */
+  hover_image_url: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -126,11 +134,101 @@ export interface ProductVariant {
   /** Base price + delta — what one unit of this variant costs. */
   final_price_poisha: number;
   stock: number;
+  /** Gallery URL of the image assigned to this variant (Wave 51). */
+  image_url: string | null;
+}
+
+/**
+ * One image in a product's public gallery (Wave 51). Stored
+ * uploads carry the derived WebP sizes; external (hotlinked)
+ * images repeat the external URL at every size.
+ */
+export interface GalleryImageView {
+  id: string;
+  url_card: string;
+  url_gallery: string;
+  url_zoom: string;
+  alt_text: string | null;
+  variant_id: string | null;
+  is_primary: boolean;
 }
 
 /** The product detail shape (Wave 33): the product plus its variants. */
 export interface ProductDetail extends Product {
   variants: ProductVariant[];
+  /** The full ordered image gallery (Wave 51); empty when imageless. */
+  images: GalleryImageView[];
+}
+
+/**
+ * One product image in the SELLER's management view (Wave 51):
+ * the gallery fields plus the source facts the uploader needs
+ * (upload vs external, dimensions, stored bytes).
+ */
+export interface ProductImageView {
+  id: string;
+  product_id: string;
+  variant_id: string | null;
+  source: "upload" | "external";
+  url_card: string;
+  url_gallery: string;
+  url_zoom: string;
+  url_original: string;
+  width: number | null;
+  height: number | null;
+  size_bytes: number | null;
+  position: number;
+  is_primary: boolean;
+  alt_text: string | null;
+  /** The uploaded file's original name, when known (Wave 51 ext). */
+  original_filename: string | null;
+  /** Quality warning codes (Wave 51 ext): low_resolution | extreme_aspect | very_large. */
+  warnings: string[];
+  created_at: string;
+}
+
+/** One row of the seller media library (Wave 51). */
+export interface SellerMediaItem extends ProductImageView {
+  product_title: string;
+  store_id: string;
+}
+
+/** GET /v1/seller/media — the media library page (Wave 51). */
+export interface SellerMediaPage {
+  items: SellerMediaItem[];
+  total: number;
+  /** Uploaded bytes across the seller's stores (Wave 51 ext). */
+  storage_bytes: number;
+  /** The per-store media quota in bytes (Wave 51 ext). */
+  storage_quota_bytes: number;
+}
+
+/** One image in the ADMIN media list (Wave 51 extension). */
+export interface AdminMediaItem extends ProductImageView {
+  product_title: string;
+  store_id: string;
+  store_slug: string;
+}
+
+/** One failed file of a bulk upload (Wave 51 extension). */
+export interface BulkUploadFailure {
+  filename: string;
+  error: string;
+}
+
+/** The bulk upload's answer (Wave 51 extension). */
+export interface BulkUploadResult {
+  created: ProductImageView[];
+  failed: BulkUploadFailure[];
+}
+
+/** One item of the batch image update (Wave 51). */
+export interface ProductImageUpdate {
+  id: string;
+  position?: number;
+  is_primary?: boolean;
+  alt_text?: string | null;
+  variant_id?: string | null;
 }
 
 /**
@@ -145,6 +243,8 @@ export interface SellerVariant {
   price_delta_poisha: number;
   final_price_poisha: number;
   stock: number;
+  /** Gallery URL of the image assigned to this variant (Wave 51). */
+  image_url: string | null;
   is_active: boolean;
   sort: number;
   created_at: string;
@@ -194,6 +294,8 @@ export interface CartItem {
   store_slug: string;
   title: string;
   title_bn: string | null;
+  /** The product's primary image URL (Wave 51); null when imageless. */
+  image_url: string | null;
   /** The variant's FINAL price for variant lines (Wave 33). */
   unit_price_poisha: number;
   quantity: number;
@@ -220,6 +322,8 @@ export interface OrderItem {
   unit_price_poisha: number;
   quantity: number;
   line_total_poisha: number;
+  /** The product's current primary image URL (Wave 51 ext). */
+  image_url: string | null;
 }
 
 /** The courier shipment on a sub-order (Wave 6). */
@@ -594,6 +698,320 @@ async function call<T>(
   return data;
 }
 
+/**
+ * The multipart sibling of `call` (Wave 51): sends a FormData
+ * body (the browser sets the boundary Content-Type itself) and
+ * applies the same error convention. Used by every upload.
+ */
+async function callForm<T>(
+  path: string,
+  form: FormData,
+  options: { method?: string; token?: string | null } = {}
+): Promise<T> {
+  const headers: Record<string, string> = {};
+  if (options.token) headers["Authorization"] = `Bearer ${options.token}`;
+  const res = await fetch(`${apiBase()}${path}`, {
+    method: options.method ?? "POST",
+    headers,
+    body: form,
+  });
+  const data = (await res.json().catch(() => ({}))) as { error?: string } & T;
+  if (!res.ok) {
+    throw new Error(data.error ?? `API returned ${res.status}`);
+  }
+  return data;
+}
+
+// ---- Product media (Wave 51) ----
+
+/** GET /v1/seller/products/{id}/images — the owner's full image list. */
+export function listProductImages(
+  token: string,
+  productId: string
+): Promise<ProductImageView[]> {
+  return call(`/v1/seller/products/${encodeURIComponent(productId)}/images`, {
+    token,
+  });
+}
+
+/**
+ * POST /v1/seller/products/{id}/images — upload one image file
+ * (multipart). The API sniffs, decodes, re-encodes and derives
+ * the WebP sizes; the first image of a product becomes primary.
+ */
+export function uploadProductImage(
+  token: string,
+  productId: string,
+  file: File,
+  options?: { altText?: string; variantId?: string }
+): Promise<ProductImageView> {
+  const form = new FormData();
+  form.append("file", file);
+  if (options?.altText) form.append("alt_text", options.altText);
+  if (options?.variantId) form.append("variant_id", options.variantId);
+  return callForm(`/v1/seller/products/${encodeURIComponent(productId)}/images`, form, {
+    token,
+  });
+}
+
+/**
+ * The progress-reporting sibling of `uploadProductImage`
+ * (Wave 51): fetch cannot report upload progress, so this one
+ * call rides XMLHttpRequest and invokes `onProgress` with the
+ * sent fraction (0..1) as the file goes up. Same endpoint,
+ * same error convention.
+ */
+export function uploadProductImageWithProgress(
+  token: string,
+  productId: string,
+  file: File,
+  onProgress: (fraction: number) => void,
+  options?: { altText?: string; variantId?: string }
+): Promise<ProductImageView> {
+  const form = new FormData();
+  form.append("file", file);
+  if (options?.altText) form.append("alt_text", options.altText);
+  if (options?.variantId) form.append("variant_id", options.variantId);
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(
+      "POST",
+      `${apiBase()}/v1/seller/products/${encodeURIComponent(productId)}/images`
+    );
+    xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable && event.total > 0) {
+        onProgress(event.loaded / event.total);
+      }
+    };
+    xhr.onload = () => {
+      let data: { error?: string } & ProductImageView = {} as ProductImageView;
+      try {
+        data = JSON.parse(xhr.responseText) as { error?: string } & ProductImageView;
+      } catch {
+        // fall through to the status-based error below
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(data);
+      } else {
+        reject(new Error(data.error ?? `API returned ${xhr.status}`));
+      }
+    };
+    xhr.onerror = () => reject(new Error("আপলোড ব্যর্থ — Upload failed"));
+    xhr.send(form);
+  });
+}
+
+/** POST /v1/seller/products/{id}/images/from-url — attach a hotlinked image. */
+export function attachProductImageUrl(
+  token: string,
+  productId: string,
+  url: string,
+  options?: { altText?: string; variantId?: string }
+): Promise<ProductImageView> {
+  return call(`/v1/seller/products/${encodeURIComponent(productId)}/images/from-url`, {
+    method: "POST",
+    token,
+    body: {
+      url,
+      alt_text: options?.altText,
+      variant_id: options?.variantId,
+    },
+  });
+}
+
+/**
+ * PATCH /v1/seller/products/{id}/images — batch update
+ * (order, primary, alt text, variant assignment) in one call.
+ * Returns the full re-read list.
+ */
+export function updateProductImages(
+  token: string,
+  productId: string,
+  items: ProductImageUpdate[]
+): Promise<ProductImageView[]> {
+  return call(`/v1/seller/products/${encodeURIComponent(productId)}/images`, {
+    method: "PATCH",
+    token,
+    body: { items },
+  });
+}
+
+/**
+ * DELETE /v1/seller/products/{id}/images/{imageId} — removes
+ * the image and its stored objects; returns the remaining list.
+ */
+export function deleteProductImage(
+  token: string,
+  productId: string,
+  imageId: string
+): Promise<ProductImageView[]> {
+  return call(
+    `/v1/seller/products/${encodeURIComponent(productId)}/images/${encodeURIComponent(imageId)}`,
+    { method: "DELETE", token }
+  );
+}
+
+/** GET /v1/seller/media — every image across the seller's stores. */
+export function listSellerMedia(
+  token: string,
+  productId?: string,
+  source?: "upload" | "external",
+  sort?: "newest" | "oldest" | "largest"
+): Promise<SellerMediaPage> {
+  const params = new URLSearchParams();
+  if (productId) params.set("product_id", productId);
+  if (source) params.set("source", source);
+  if (sort) params.set("sort", sort);
+  const qs = params.toString();
+  return call(`/v1/seller/media${qs ? `?${qs}` : ""}`, { token });
+}
+
+/** The bulk URL attach outcome (Wave 51 extension). */
+export interface BulkAttachOutcome {
+  created: ProductImageView[];
+  failed: { filename: string; error: string }[];
+}
+
+/** POST …/images/from-urls — attach many external images at once. */
+export function attachProductImageUrls(
+  token: string,
+  productId: string,
+  urls: string[]
+): Promise<BulkAttachOutcome> {
+  return call(`/v1/seller/products/${productId}/images/from-urls`, {
+    token,
+    method: "POST",
+    body: { urls },
+  });
+}
+
+/** POST /v1/seller/media/bulk-delete — delete many images at once. */
+export function bulkDeleteSellerMedia(
+  token: string,
+  imageIds: string[]
+): Promise<{ deleted: number; skipped: number }> {
+  return call("/v1/seller/media/bulk-delete", {
+    method: "POST",
+    token,
+    body: { image_ids: imageIds },
+  });
+}
+
+/**
+ * POST /v1/seller/store/branding-image?kind=logo|banner —
+ * upload a store logo or banner through the media pipeline
+ * (replaces the hotlink-only branding fields with real files).
+ */
+export function uploadBrandingImage(
+  token: string,
+  kind: "logo" | "banner",
+  file: File
+): Promise<Store> {
+  const form = new FormData();
+  form.append("file", file);
+  return callForm(`/v1/seller/store/branding-image?kind=${kind}`, form, { token });
+}
+
+/** POST /v1/reviews/{id}/image — attach (or replace) my review's photo. */
+export function attachReviewImage(
+  token: string,
+  reviewId: string,
+  file: File
+): Promise<Review> {
+  const form = new FormData();
+  form.append("file", file);
+  return callForm(`/v1/reviews/${encodeURIComponent(reviewId)}/image`, form, {
+    token,
+  });
+}
+
+/** DELETE /v1/reviews/{id}/image — remove my review's photo. */
+export function deleteReviewImage(token: string, reviewId: string): Promise<Review> {
+  return call(`/v1/reviews/${encodeURIComponent(reviewId)}/image`, {
+    method: "DELETE",
+    token,
+  });
+}
+
+/**
+ * PUT /v1/seller/products/{id}/images/{imageId} — replace an
+ * uploaded image's photo in place (Wave 51 extension): the
+ * row keeps its position, primary flag, alt text and
+ * variant; only the bytes change.
+ */
+export function replaceProductImage(
+  token: string,
+  productId: string,
+  imageId: string,
+  file: File
+): Promise<ProductImageView> {
+  const form = new FormData();
+  form.append("file", file);
+  return callForm(
+    `/v1/seller/products/${encodeURIComponent(productId)}/images/${encodeURIComponent(imageId)}`,
+    form,
+    { method: "PUT", token }
+  );
+}
+
+/**
+ * POST /v1/seller/products/{id}/images/bulk — upload many
+ * files in one request (Wave 51 extension); each file lands
+ * or fails on its own and the answer names every failure.
+ */
+export function bulkUploadProductImages(
+  token: string,
+  productId: string,
+  files: File[]
+): Promise<BulkUploadResult> {
+  const form = new FormData();
+  for (const file of files) form.append("file", file);
+  return callForm(`/v1/seller/products/${encodeURIComponent(productId)}/images/bulk`, form, {
+    token,
+  });
+}
+
+/**
+ * POST /v1/seller/products/{id}/images/from-web — the
+ * server FETCHES the URL (SSRF-guarded) and stores the
+ * image (Wave 51 extension): the durable form of the
+ * hotlink attach.
+ */
+export function attachProductImageFromWeb(
+  token: string,
+  productId: string,
+  url: string,
+  options?: { altText?: string; variantId?: string }
+): Promise<ProductImageView> {
+  return call(`/v1/seller/products/${encodeURIComponent(productId)}/images/from-web`, {
+    method: "POST",
+    token,
+    body: {
+      url,
+      alt_text: options?.altText,
+      variant_id: options?.variantId,
+    },
+  });
+}
+
+/** GET /v1/admin/media — the newest images across all stores (admin). */
+export function listAdminMedia(
+  token: string,
+  storeSlug?: string
+): Promise<AdminMediaItem[]> {
+  const qs = storeSlug ? `?store=${encodeURIComponent(storeSlug)}` : "";
+  return call(`/v1/admin/media${qs}`, { token });
+}
+
+/** DELETE /v1/admin/media/{imageId} — audited moderation delete (admin). */
+export function deleteAdminMedia(token: string, imageId: string): Promise<void> {
+  return call(`/v1/admin/media/${encodeURIComponent(imageId)}`, {
+    method: "DELETE",
+    token,
+  });
+}
+
 /** POST /v1/auth/request-otp — step 1 of phone login. */
 export function requestOtp(phone: string): Promise<RequestOtpResult> {
   return call("/v1/auth/request-otp", { method: "POST", body: { phone } });
@@ -773,6 +1191,8 @@ export interface Review {
   order_id: string;
   rating: number;
   body: string | null;
+  /** The reviewer's photo, gallery size (Wave 51); null when none. */
+  image_url: string | null;
   created_at: string;
   updated_at: string;
   reply: ReviewReply | null;
@@ -2395,6 +2815,8 @@ export interface AdminStore {
   /** active | suspended */
   status: string;
   product_count: number;
+  /** The store's logo URL (Wave 51 ext); null when unset. */
+  logo_url: string | null;
   created_at: string;
 }
 
@@ -2468,6 +2890,10 @@ export interface AdminSettings {
    * the effective value new promotions are charged at.
    */
   promotion_price_per_day_poisha: number;
+  /** Per-product image cap (Wave 51 extension). */
+  media_max_images_per_product: number;
+  /** Per-store media quota in megabytes (Wave 51 extension). */
+  media_store_quota_mb: number;
   platform_name: string;
 }
 
@@ -2628,6 +3054,8 @@ export interface ImportDraft {
   price_poisha: number | null;
   weight_grams: number;
   stock: number;
+  /** Photo URL lifted from the post text (Wave 51 ext). */
+  image_url: string | null;
   valid: boolean;
   errors: string[];
 }
@@ -2641,6 +3069,12 @@ export interface ImportDraftInput {
   price_poisha: number;
   weight_grams?: number;
   stock: number;
+  /**
+   * Photo URL to attach as the product's first image (Wave 51).
+   * A bad URL never fails the import — the product is created
+   * without the image.
+   */
+  image_url?: string;
 }
 
 /** One draft the import skipped, with the reason. */
@@ -2722,6 +3156,8 @@ export function updateAdminSettings(
     advance_threshold_poisha?: number;
     kyc_payout_gate?: boolean;
     promotion_price_per_day_poisha?: number;
+    media_max_images_per_product?: number;
+    media_store_quota_mb?: number;
   }
 ): Promise<AdminSettings> {
   return call("/v1/admin/settings", { method: "PUT", token, body: patch });
@@ -3919,6 +4355,21 @@ export interface AdminMetrics {
   users_total: number;
   stores_total: number;
   products_active: number;
+  /** Media footprint (Wave 51): product-image counts + stored bytes. */
+  media: {
+    images_total: number;
+    stored_images: number;
+    external_images: number;
+    stored_bytes: number;
+    /** The five heaviest stores by stored bytes (Wave 51 ext). */
+    top_stores: {
+      store_id: string;
+      store_slug: string;
+      store_name: string;
+      images: number;
+      stored_bytes: number;
+    }[];
+  };
 }
 
 /** GET /v1/admin/metrics — admin only (the API answers 403 otherwise). */

@@ -347,6 +347,8 @@ export default function SellerDashboardPage() {
         {" · "}
         <Link href="/seller/api-keys">API কী — API keys</Link>
         {" · "}
+        <Link href="/seller/media">মিডিয়া লাইব্রেরি — Media library</Link>
+        {" · "}
         <Link href="/seller/analytics">অ্যানালিটিক্স — Analytics</Link>
         {" · "}
         <Link href="/seller/returns">রিটার্ন — Returns</Link>

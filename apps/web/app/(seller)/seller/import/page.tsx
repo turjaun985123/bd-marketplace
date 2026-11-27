@@ -37,6 +37,8 @@ interface DraftRow {
   description: string;
   /** Price as typed taka text; converted to poisha at import. */
   priceTaka: string;
+  /** Photo URL to attach on import (Wave 51); empty = none. */
+  imageUrl: string;
   stock: string;
   weightGrams: string;
   valid: boolean;
@@ -54,6 +56,7 @@ function toDraftRow(draft: ImportDraft): DraftRow {
     title: draft.title,
     description: draft.description ?? "",
     priceTaka: poishaToTakaInput(draft.price_poisha),
+    imageUrl: draft.image_url ?? "",
     stock: String(draft.stock),
     weightGrams: String(draft.weight_grams),
     valid: draft.valid,
@@ -173,6 +176,10 @@ export default function SellerImportPage() {
           price_poisha: parseTakaToPoisha(row.priceTaka) ?? 0,
           stock: Number(row.stock) || 0,
           weight_grams: Number(row.weightGrams) || 1000,
+          // Wave 51: the photo URL attaches on import; a
+          // bad URL never fails the import (the product is
+          // created without the image).
+          image_url: row.imageUrl.trim() || undefined,
         }))
       );
       setResult(outcome);
@@ -327,6 +334,25 @@ export default function SellerImportPage() {
                   placeholder="1500"
                 />
               </label>
+              <label>
+                ছবির URL — Photo URL (ঐচ্ছিক)
+                <input
+                  value={row.imageUrl}
+                  onChange={(e) => updateDraft(index, { imageUrl: e.target.value })}
+                  placeholder="https://…"
+                  inputMode="url"
+                />
+              </label>
+              {row.imageUrl.trim() && (
+                <p>
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={row.imageUrl.trim()}
+                    alt="ছবির প্রিভিউ — Photo preview"
+                    style={{ height: 72, borderRadius: 6 }}
+                  />
+                </p>
+              )}
               <label>
                 স্টক
                 <input

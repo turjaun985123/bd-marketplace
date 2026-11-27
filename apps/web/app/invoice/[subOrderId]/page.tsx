@@ -167,7 +167,26 @@ export default function InvoicePage({
           <tbody>
             {invoice.items.map((item) => (
               <tr key={item.id}>
-                <td>{item.title_snapshot}</td>
+                <td>
+                  {item.image_url ? (
+                    <>
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img
+                        src={item.image_url}
+                        alt=""
+                        style={{
+                          height: 36,
+                          width: 36,
+                          objectFit: "cover",
+                          borderRadius: 4,
+                          verticalAlign: "middle",
+                          marginRight: 8,
+                        }}
+                      />
+                    </>
+                  ) : null}
+                  {item.title_snapshot}
+                </td>
                 <td className="num">{item.quantity}</td>
                 <td className="num">
                   <PriceTag amountPoisha={item.unit_price_poisha} />

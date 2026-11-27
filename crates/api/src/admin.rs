@@ -375,6 +375,9 @@ pub struct AdminStore {
     pub description: Option<String>,
     pub status: String,
     pub product_count: i64,
+    /// The store's logo URL (Wave 51 extension) — the
+    /// admin list shows the mark it moderates.
+    pub logo_url: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -414,7 +417,7 @@ pub async fn list_stores(
         "SELECT s.id, s.owner_user_id, u.phone AS owner_phone, s.slug, s.name, \
          s.description, s.status, \
          (SELECT COUNT(*) FROM products p WHERE p.store_id = s.id) AS product_count, \
-         s.created_at \
+         s.logo_url, s.created_at \
          FROM stores s JOIN users u ON u.id = s.owner_user_id \
          WHERE ($1::text IS NULL OR s.name ILIKE $1 OR s.slug ILIKE $1) \
          ORDER BY s.created_at DESC LIMIT $2 OFFSET $3",
@@ -858,11 +861,28 @@ pub struct AdminSettings {
     /// The free plan's product cap (Wave 36) — see
     /// [`effective_plan_free_product_cap`].
     pub plan_free_product_cap: i64,
+    /// Per-product image cap (Wave 51 extension) — see
+    /// `product_images::effective_media_limits`.
+    pub media_max_images_per_product: i64,
+    /// Per-store media quota in megabytes (Wave 51
+    /// extension) — see
+    /// `product_images::effective_media_limits`.
+    pub media_store_quota_mb: i64,
     pub platform_name: &'static str,
 }
 
 /// The current effective settings.
 pub async fn get_settings(state: &AppState) -> AdminSettings {
+    // Wave 51 extension: the media limits live in the
+    // product_images module (their enforcement home); the
+    // settings view surfaces them like every other limit.
+    let media_limits = match &state.pool {
+        Some(pool) => crate::product_images::effective_media_limits(pool).await,
+        None => crate::product_images::MediaLimits {
+            max_images_per_product: domain::MAX_IMAGES_PER_PRODUCT,
+            store_quota_bytes: domain::MAX_STORE_MEDIA_BYTES,
+        },
+    };
     AdminSettings {
         commission_bps: i64::from(effective_commission_bps(state).await),
         min_payout_poisha: effective_min_payout(state).await,
@@ -874,6 +894,8 @@ pub async fn get_settings(state: &AppState) -> AdminSettings {
         subscription_price_business_poisha: effective_subscription_price(state, PLAN_BUSINESS)
             .await,
         plan_free_product_cap: effective_plan_free_product_cap(state).await,
+        media_max_images_per_product: media_limits.max_images_per_product,
+        media_store_quota_mb: media_limits.store_quota_bytes / (1024 * 1024),
         platform_name: PLATFORM_NAME,
     }
 }
@@ -1001,6 +1023,34 @@ pub async fn update_settings(
         save_setting(&mut *tx, SUBSCRIPTION_PRICE_BUSINESS_KEY, business_price).await?;
         changed_keys.push(SUBSCRIPTION_PRICE_BUSINESS_KEY);
     }
+    if let Some(max_images) = input.media_max_images_per_product {
+        if !domain::validate_media_max_images(max_images) {
+            return Err(ApiError::bad_request(
+                "media_max_images_per_product must be between 1 and 50",
+            ));
+        }
+        save_setting(
+            &mut *tx,
+            crate::product_images::MEDIA_MAX_IMAGES_SETTING_KEY,
+            max_images,
+        )
+        .await?;
+        changed_keys.push(crate::product_images::MEDIA_MAX_IMAGES_SETTING_KEY);
+    }
+    if let Some(quota_mb) = input.media_store_quota_mb {
+        if !domain::validate_media_store_quota_mb(quota_mb) {
+            return Err(ApiError::bad_request(
+                "media_store_quota_mb must be between 10 and 102400",
+            ));
+        }
+        save_setting(
+            &mut *tx,
+            crate::product_images::MEDIA_STORE_QUOTA_MB_SETTING_KEY,
+            quota_mb,
+        )
+        .await?;
+        changed_keys.push(crate::product_images::MEDIA_STORE_QUOTA_MB_SETTING_KEY);
+    }
     if let Some(free_cap) = input.plan_free_product_cap {
         if !validate_plan_free_product_cap(free_cap) {
             return Err(ApiError::bad_request(
@@ -1097,6 +1147,12 @@ pub struct UpdateSettingsInput {
     /// Wave 36: free plan product cap override, validated by
     /// the domain rule.
     pub plan_free_product_cap: Option<i64>,
+    /// Wave 51 extension: per-product image cap override,
+    /// validated by the domain rule (1..=50).
+    pub media_max_images_per_product: Option<i64>,
+    /// Wave 51 extension: per-store media quota override
+    /// in megabytes, validated by the domain rule.
+    pub media_store_quota_mb: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------

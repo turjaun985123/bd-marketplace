@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import PriceTag from "@/components/PriceTag";
+import ProductImage from "@/components/ProductImage";
 import {
   getOrderReceipt,
   paymentStatusLabel,
@@ -124,9 +125,17 @@ export default function OrderReceiptPage({
               {sub.store_name} ({sub.store_slug}) — {sub.status}
             </h2>
             {sub.items.map((item) => (
-              <p key={item.id}>
-                {item.title_snapshot} × {item.quantity} —{" "}
-                <PriceTag amountPoisha={item.line_total_poisha} />
+              <p key={item.id} className="order-item-line">
+                <ProductImage
+                  src={item.image_url}
+                  alt={item.title_snapshot}
+                  placeholderText={item.title_snapshot}
+                  className="order-item-image"
+                />
+                <span>
+                  {item.title_snapshot} × {item.quantity} —{" "}
+                  <PriceTag amountPoisha={item.line_total_poisha} />
+                </span>
               </p>
             ))}
             <p>

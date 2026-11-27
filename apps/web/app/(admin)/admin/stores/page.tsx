@@ -89,6 +89,23 @@ function Stores() {
           {stores.map((store) => (
             <tr key={store.id}>
               <td>
+                {store.logo_url ? (
+                  <>
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={store.logo_url}
+                      alt=""
+                      style={{
+                        height: 28,
+                        width: 28,
+                        objectFit: "cover",
+                        borderRadius: 6,
+                        verticalAlign: "middle",
+                        marginRight: 8,
+                      }}
+                    />
+                  </>
+                ) : null}
                 {store.name} <small>({store.slug})</small>
               </td>
               <td>{store.owner_phone}</td>

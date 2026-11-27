@@ -25,7 +25,11 @@
  *
  * 3. CACHE-FIRST (immutable build assets): /_next/static/*
  *    (content-hashed by Next), /icons/*, and
- *    /manifest.webmanifest.
+ *    /manifest.webmanifest. Wave 51 adds /media/* — the
+ *    API serves product images there with
+ *    `Cache-Control: immutable`, and a media key's bytes
+ *    never change (a replaced image gets a new key), so
+ *    cache-first is exact, not approximate.
  *
  * 4. NETWORK-FIRST, CACHE FALLBACK (public catalogue):
  *    navigations, and GETs for the public read paths in
@@ -40,12 +44,12 @@
  * 5. OFFLINE FALLBACK: a navigation that fails with no
  *    cached copy gets the precached /offline page.
  *
- * Caches are versioned (w38-v1): bump VERSION on any
+ * Caches are versioned (w51-v1): bump VERSION on any
  * rule change — activate deletes every older cache.
  */
 "use strict";
 
-var VERSION = "w38-v1";
+var VERSION = "w51-v1";
 var STATIC_CACHE = "bdm-static-" + VERSION;
 var PAGE_CACHE = "bdm-pages-" + VERSION;
 var API_CACHE = "bdm-api-" + VERSION;
@@ -70,8 +74,10 @@ var NEVER_CACHE_PREFIXES = [
 // Rule 4 — public, per-user-data-free API reads.
 var PUBLIC_API_PREFIXES = ["/v1/products", "/v1/search", "/v1/stores"];
 
-// Rule 3 — immutable static assets.
-var STATIC_PREFIXES = ["/_next/static/", "/icons/"];
+// Rule 3 — immutable static assets (Wave 51: /media/ joins
+// them — product images are content-addressed by key and
+// served immutable by the API).
+var STATIC_PREFIXES = ["/_next/static/", "/icons/", "/media/"];
 var STATIC_EXACT = ["/manifest.webmanifest"];
 
 function startsWithAny(path, prefixes) {
