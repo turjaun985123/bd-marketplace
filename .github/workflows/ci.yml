@@ -150,8 +150,9 @@ jobs:
       # can see exactly which declaration pulls it in.
       - name: Reverse-dependency chains for flagged crates
         run: |
-          cargo tree -i libsqlite3-sys || true
-          cargo tree -i sqlx-sqlite || true
+          cargo tree --target all -i libsqlite3-sys || true
+          cargo tree --target all -i sqlx-sqlite || true
+          cargo tree --target all -i sqlx-mysql || true
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
