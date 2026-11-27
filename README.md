@@ -59,8 +59,12 @@ crates/payments/        PaymentAdapter trait + COD (records intent),
                         Nagad, SslCommerz, ShurjoPay), the DEV gateway
                         simulator + HMAC callback signing, and the
                         payment_adapter_for factory
+crates/notify/          notification outbox + the SmsSender trait
+                        (dev log sender + unconfigured sender;
+                        sender_from_env is the one selection rule)
 crates/api/             Axum API — thin handlers over service functions
-  src/auth.rs           phone + OTP + JWT service functions + SmsSender trait
+  src/auth.rs           phone + OTP + JWT service functions (OTPs are
+                        sent through the notify crate's SmsSender)
   src/stores.rs         store create/get service functions
   src/products.rs       product CRUD + the ONE shared listing function
   src/cart.rs           one cart per buyer: add/set/remove/clear + cart view
@@ -87,7 +91,9 @@ migrations/             SQLx migrations (users, stores, otp_codes, products,
                         payouts)
 infra/docker-compose.yml  Postgres + Redis + MinIO
 .env.example            every environment variable, no real values
-.github/workflows/ci.yml  Rust tests/clippy (with a Postgres service) + Next.js build
+.github/workflows/ci.yml  Rust tests/clippy (with a Postgres service),
+                        Next.js build, Docker image builds, gating
+                        cargo audit (since Wave 45)
 ```
 
 ## API endpoints
@@ -3425,6 +3431,104 @@ breaks. Everything in it is derived from the repo's
 own sources; where this README and the runbook
 disagree, this README (and the code) wins.
 
+Wave 50 (program complete — final consolidation):
+
+**Docs only — no code, no config.** This is the final
+wave of the 50-wave program the project was built
+under, and it closes the record rather than adding a
+feature.
+
+**The arc.** Waves 1–10 built the core commerce: the
+poisha-exact domain, phone+OTP auth, stores and
+products, split-cart checkout with COD, the online
+payments foundation, the first three courier adapters
+behind one trait with smart routing, reviews, seller
+earnings and payouts, and the platform admin. Waves
+11–20 were the Bangladesh growth layer: the remaining
+API couriers (eCourier, Paperfly), Facebook Page
+import with its Bangla price parser, buyer↔store
+messaging with the SIDRA bridge, coupons, Postgres
+search, public tracking and returns, the COD partial
+advance and fraud shield, storefront themes, the four
+manual couriers, and deployment readiness. Waves
+21–36 were scale and trust: seller KYC tiers,
+per-store invoices, inventory with an audited stock
+ledger, wishlist and recommendations, product Q&A,
+sponsored promotions, analytics, security hardening
+with the admin audit log, the notification outbox and
+the real worker, automatic courier polling, backups
+and data export, the performance pass, product
+variants, multi-store team access, loyalty points and
+seller subscription plans. Waves 37–45 opened the
+platform up and answered the security audit:
+third-party API keys with rate limiting, the PWA
+shell, the two security-fix waves (39 and 41) that
+closed the audit's named money-path Criticals and
+Highs (payout idempotency followed in Wave 44), the
+seller fulfillment center, dependency hygiene,
+observability (request IDs, structured request logs,
+admin metrics), payout idempotency, and supply-chain
+maturity — the cargo-audit job made gating and
+Dependabot switched on. Waves 46–49 finished the
+maturity list: the CI load smoke, the jsonwebtoken 12
+migration, the notification reaper, and the launch
+runbook.
+
+**Final state — counted, not remembered** (counted
+from this repo at this wave): **39 migrations**
+(0001–0039), **6 Rust workspace crates** (`api`,
+`courier`, `domain`, `notify`, `payments`, `worker`)
+plus the Next.js web app, and **44 integration test
+files** in `crates/api/tests/` (43 wave-numbered files
+plus `ci_gate.rs`), alongside the crates' unit tests.
+CI is 4 jobs: `rust` (workspace tests + clippy
+`-D warnings` against a Postgres 16 service, plus the
+backup/restore proof), `web` (Next.js build + the PWA
+wiring check), `docker` (the three image builds) and
+`security-audit` (cargo audit — **gating** since
+Wave 45, with the two documented accepted-risk ignores
+in `.cargo/audit.toml`). Per the project's CI-only
+rule, nothing in this program was built or tested on
+a development machine: every wave's verdict was
+verified from GitHub Actions at job/step level,
+twice, before the wave was called closed.
+
+**What "done" means — and what it does not.** The
+platform is feature-complete per the 50-wave program
+and launch-ready per `docs/LAUNCH.md`. Going live is
+not a development task any more, but it is not done:
+it still needs the credentials and the owner
+decisions listed in the runbook — a real SMS gateway
+first among them (without one, OTP login and every
+notification stay in dev mode), then the payment and
+courier merchant accounts with their written-confirm
+items, the Meta app review for Page import, the
+SIDRA configuration, and the owner's calls on CR-15,
+the commission defaults and the product name.
+Post-50 work is named here as future work, NOT
+silently queued: the remaining Dependabot majors
+(Next 16, rand 0.10, tower 0.5, TypeScript 7, React —
+PRs #2–#14, minus #13, which landed as Wave 47), the
+CR-13 test-isolation redesign, a real load test in a
+deployed environment (Wave 46 is a smoke, not a
+benchmark), the remaining audit backlog in the
+audit's priority order, and a frontend audit (the
+Wave 39/41 audit covered the backend only).
+
+**Record repairs in this wave.** Verifying the counts
+above surfaced one gap in this README itself: the
+Scope summary was missing its **Real (Wave 29)**
+entry — the Wave 29 section always existed, its
+summary line did not. The entry has been restored
+(distilled from the section, nothing invented), and
+three framing areas that present themselves as
+current state were corrected to match the record:
+the Monorepo layout (the `notify` crate was missing
+and the `SmsSender` trait still showed its pre-Wave-29
+home in `auth.rs`), the Deployment Honest limits (the
+worker bullet still claimed the worker does no jobs),
+and Verification status (below).
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -3875,11 +3979,14 @@ broken or unsafe without it.
   so it *could* be replicated behind a load balancer, but
   that topology is untested and the web/worker services are
   single-instance here.
-- **The worker still does no jobs.** It logs its planned
-  jobs (courier status polling, payout jobs, notifications,
-  COD reconciliation) and exits cleanly; automatic courier
-  polling in particular does not exist yet — sellers refresh
-  tracking through the API.
+- **The worker runs most, not all, of its planned jobs.**
+  Every poll cycle it drains the notification outbox
+  (Wave 29), polls courier statuses (Wave 30), renews
+  subscriptions (Wave 36) and reaps stale notification
+  claims (Wave 48). Two planned jobs are still printed at
+  startup as TODO, not implemented — payout jobs and COD
+  reconciliation — so payouts stay an admin-driven flow
+  and COD stays reconciled by the order/payment records.
 - **Live gateway calls are still not implemented** (see the
   Scope section): configured payment adapters report
   NotImplemented honestly, so "credentials set" does not yet
@@ -4563,6 +4670,39 @@ filter, pagination, detail summaries) with the
 AdminShell nav link, the api.ts client, and the web
 app's own header subset in `next.config.js`.
 
+**Real (Wave 29):** the notification outbox + a real
+worker — a new workspace crate (`crates/notify`) owns
+the `SmsSender` trait (moved out of `auth.rs`; the OTP
+path uses it unchanged), the ONE selection rule
+(`sender_from_env`: dev mode → the log sender; anything
+else → the unconfigured sender, whose sends fail with
+`sms_not_configured`) and the outbox (migration 0029:
+`notifications` — pending/sending/sent/failed,
+`attempts`, `last_error`, the body rendered at enqueue
+time by the pure domain `render_body` over seven kinds
+and stored rendered). Enqueue happens in the SAME
+transaction as the state change at exactly one funnel
+per event: checkout → `order_placed`; the seller status
+PATCH, bookings and the shared shipment sync →
+`sub_order_shipped` / `sub_order_delivered` /
+`sub_order_cancelled` / `sub_order_returned`; the
+payout transition to paid → `payout_paid`; return
+approve / reject / received → `return_update`. The
+worker binary connects to `DATABASE_URL` (absent →
+exit 2), runs the same embedded migrations as the API,
+and every `WORKER_POLL_SECONDS` (default 10) claims a
+batch of 20 pending rows (`FOR UPDATE SKIP LOCKED`,
+committed BEFORE any send), sends each and writes the
+outcome back — `sent` + `sent_at`, or `attempts + 1`
+back to `pending`, `failed` after `MAX_ATTEMPTS` (3).
+Admins watch it at `GET /v1/admin/notifications` and
+`/admin/notifications`. SMS is still dev-only — a real
+SMS gateway remains the biggest launch blocker (the
+stuck-`sending` edge this design left open was closed
+in Wave 48). *(This entry was restored in Wave 50: the
+Wave 29 section always existed, but its Scope summary
+line was missing.)*
+
 **Real (Wave 30):** automatic courier status polling —
 the refresh core factored into `refresh_shipment_by_id`
 (shared by the participant endpoint and the new
@@ -5022,6 +5162,32 @@ Docs only; every claim in it traces to this README,
 `.env.example`, the audit doc or the code. See the
 Wave 49 section.
 
+**Real (Wave 50):** program complete — docs only. The
+closing consolidation: the 50-wave arc (1–10 core
+commerce, 11–20 Bangladesh growth, 21–36 scale &
+trust, 37–45 third-party API + the security-audit
+response + supply-chain maturity, 46–49 the load
+smoke, jsonwebtoken 12, the notification reaper and
+the launch runbook) and the final counted state —
+39 migrations, 6 Rust crates + the Next.js app, 44
+API integration test files, 4 CI jobs with cargo
+audit gating since Wave 45 — every wave's verdict
+verified from GitHub Actions at job/step level,
+twice, under the project's CI-only rule. "Done"
+means feature-complete per the program and
+launch-ready per `docs/LAUNCH.md`; it does not mean
+live — going live still needs the runbook's
+credentials and owner decisions, the SMS gateway
+first. Post-50 work is named as future, not queued:
+the remaining Dependabot majors, CR-13 test
+isolation, a deployed-environment load test, the
+remaining audit backlog, a frontend audit. This wave
+also restores the summary's missing **Real (Wave 29)**
+entry above and corrects the stale current-state
+framing in the Monorepo layout, the Deployment
+Honest limits and Verification status. See the
+Wave 50 section.
+
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
 credential-gated adapters, and the four manual couriers run
@@ -5051,8 +5217,8 @@ the external service at the other end of it, configured by
 
 ## Verification status
 
-- **Next.js: verified on this machine** — `npm ci && npm run build`
-  passes (Wave 10 admin pages included: /admin, /admin/stores,
+- **Next.js: verified in CI** — the CI `web` job runs
+  `npm ci && npm run build` on every push (Wave 10 admin pages included: /admin, /admin/stores,
   /admin/payouts, /admin/users, /admin/settings; Wave 12 adds
   /seller/import; Wave 13 adds /messages, /messages/[id] and
   /seller/inbox; Wave 14 adds /seller/coupons and /admin/coupons;
@@ -5091,24 +5257,21 @@ the external service at the other end of it, configured by
   buyer orders page; Wave 40 adds /seller/fulfillment
   and /seller/fulfillment/labels, the dashboard
   fulfillment card and the seller nav link).
-- **Rust unit tests: verified on this machine** — cargo 1.100.0 is
-  installed here after all; `cargo test --workspace` passes locally
-  (domain 118, courier 31, payments 8 unit tests, plus the API
-  crate's JWT-secret unit tests; the `DATABASE_URL`-
-  gated integration tests skip cleanly without a database). The API
-  binary was also smoke-tested locally without a database: routes
-  build, `/v1/couriers` answers, auth rejects unauthenticated calls
-  (including the Wave 13 messaging endpoints), and the SIDRA
-  callback answers 503 without a database.
-- **Rust integration + clippy: CI-only** — the Wave 2–35 integration
-  tests (including the Wave 29 outbox test in the `notify`
-  crate) against a real Postgres 16 service and clippy
-  `-D warnings` are verified via **GitHub Actions CI**
-  (`.github/workflows/ci.yml`)
-  on push. Waves 1–34 are green there; Wave 35 awaits its first CI run.
-  Waves 33–35 were additionally verified locally against a
-  scratch Postgres 16 cluster on this machine: the full workspace
-  suite (202 tests) passes with `DATABASE_URL` set.
+- **Rust unit tests: verified in CI** — the CI `rust` job runs
+  `cargo test --workspace` on every push (the domain, courier,
+  payments and notify crates' unit tests, plus the API crate's
+  in-module tests; the `DATABASE_URL`-gated integration tests
+  run against the job's Postgres 16 service and skip cleanly
+  without a database). Per the project's CI-only rule, nothing
+  is built or tested on a development machine — GitHub Actions
+  is the only verifier.
+- **Rust integration + clippy: CI-only** — the Wave 2–49
+  integration tests (including the Wave 29 outbox test in the
+  `notify` crate) against a real Postgres 16 service and
+  clippy `-D warnings` are verified via **GitHub Actions CI**
+  (`.github/workflows/ci.yml`) on push. Waves 1–49 are green
+  there, every verdict checked at job/step level twice;
+  Wave 50's own run is the program's closing gate.
 - **Docker images: CI-only** — Docker is not installed on the
   development machine, so `Dockerfile.api`, `Dockerfile.worker`
   and `apps/web/Dockerfile` are verified by the CI `docker` job
