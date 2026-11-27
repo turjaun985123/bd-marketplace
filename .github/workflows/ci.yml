@@ -135,6 +135,12 @@ jobs:
   security-audit:
     name: Security audit (cargo audit, non-gating)
     runs-on: ubuntu-24.04
+    # The audit-check action reports by creating a GitHub check
+    # run; without checks:write its step failed with "Resource not
+    # accessible by integration" even on a clean report (Wave 42).
+    permissions:
+      contents: read
+      checks: write
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
