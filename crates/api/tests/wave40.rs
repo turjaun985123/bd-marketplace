@@ -414,12 +414,12 @@ async fn wave40_fulfillment_center_flow() {
     // confirm SLA (24h) bites before the ship SLA (48h), and a
     // platform setting override re-judges the same rows.
     // ---------------------------------------------------------------
-    sqlx::query("UPDATE sub_orders SET created_at = now() - interval '30 hours' WHERE id = $1")
+    sqlx::query("UPDATE sub_orders SET created_at = now() - interval '30 hours' WHERE id = $1::uuid")
         .bind(&sub_placed)
         .execute(&pool)
         .await
         .expect("backdate placed");
-    sqlx::query("UPDATE sub_orders SET created_at = now() - interval '30 hours' WHERE id = $1")
+    sqlx::query("UPDATE sub_orders SET created_at = now() - interval '30 hours' WHERE id = $1::uuid")
         .bind(&sub_toship)
         .execute(&pool)
         .await
@@ -434,7 +434,7 @@ async fn wave40_fulfillment_center_flow() {
     assert_eq!(item["sla_breached"], false, "30h < 48h ship SLA: {item}");
     assert_eq!(queue["counts"]["breached"], 1);
 
-    sqlx::query("UPDATE sub_orders SET created_at = now() - interval '50 hours' WHERE id = $1")
+    sqlx::query("UPDATE sub_orders SET created_at = now() - interval '50 hours' WHERE id = $1::uuid")
         .bind(&sub_toship)
         .execute(&pool)
         .await
@@ -466,7 +466,7 @@ async fn wave40_fulfillment_center_flow() {
     // 3. Done retention: a delivered sub-order backdated past
     // seven days leaves the queue (and its count).
     // ---------------------------------------------------------------
-    sqlx::query("UPDATE sub_orders SET created_at = now() - interval '8 days' WHERE id = $1")
+    sqlx::query("UPDATE sub_orders SET created_at = now() - interval '8 days' WHERE id = $1::uuid")
         .bind(&sub_done)
         .execute(&pool)
         .await
