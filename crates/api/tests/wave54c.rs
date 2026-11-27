@@ -34,7 +34,8 @@ use tower::ServiceExt;
 /// convention); cargo runs one binary's fns on parallel
 /// threads, so each fn holds this lock for its whole run —
 /// files stay independent, fns inside a file serialise.
-static DB_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::new(());
+static DB_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 /// Send one JSON request through the router and return (status, body).
 async fn call(
