@@ -87,7 +87,7 @@ export default function ImageUploader({
 
   /** The full list as update items, with one image's fields changed. */
   const fullList = useCallback(
-    (change: (image: ProductImageView) => ProductImageUpdate) =>
+    (change: (image: ProductImageView) => Partial<ProductImageUpdate>) =>
       images.map((image) => ({
         position: image.position,
         is_primary: image.is_primary,

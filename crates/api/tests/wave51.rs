@@ -413,13 +413,25 @@ async fn create_product(
     body["id"].as_str().expect("product id").to_string()
 }
 
-/// Add a product to the buyer's cart.
-async fn add_to_cart(app: &Router, token: &str, product_id: &str, quantity: i64) {
+/// Add a product to the buyer's cart. Products with active variants
+/// require a chosen variant (Wave 33 rule), so the caller passes the
+/// variant id when the product has one.
+async fn add_to_cart(
+    app: &Router,
+    token: &str,
+    product_id: &str,
+    variant_id: Option<&str>,
+    quantity: i64,
+) {
     let (status, body) = call(
         app,
         Method::POST,
         "/v1/cart/items",
-        Some(json!({ "product_id": product_id, "quantity": quantity })),
+        Some(json!({
+            "product_id": product_id,
+            "variant_id": variant_id,
+            "quantity": quantity
+        })),
         Some(token),
     )
     .await;
@@ -466,8 +478,14 @@ async fn set_sub_order_status(
 
 /// Buy one unit of the product and drive the order all the way to
 /// delivered through the DEV courier; returns the order id.
-async fn buy_and_deliver(app: &Router, buyer: &str, seller: &str, product_id: &str) {
-    add_to_cart(app, buyer, product_id, 1).await;
+async fn buy_and_deliver(
+    app: &Router,
+    buyer: &str,
+    seller: &str,
+    product_id: &str,
+    variant_id: Option<&str>,
+) {
+    add_to_cart(app, buyer, product_id, variant_id, 1).await;
     let order = checkout_cod(app, buyer).await;
     let sub_order_id = order["sub_orders"][0]["id"]
         .as_str()
@@ -1081,7 +1099,7 @@ async fn wave51_product_media_system() {
     // 17. Review photo: the buyer receives the product,
     // reviews it, attaches a photo (shown publicly), a
     // non-author cannot, and removing it clears the URL.
-    buy_and_deliver(&app, &buyer, &seller, &product).await;
+    buy_and_deliver(&app, &buyer, &seller, &product, Some(&variant_id)).await;
     let (status, review) = call(
         &app,
         Method::POST,
