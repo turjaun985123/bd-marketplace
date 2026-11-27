@@ -3854,7 +3854,7 @@ pub fn validate_image_dimensions(width: u32, height: u32) -> Result<(), String> 
 /// has `current_count` (Wave 51)? The count is the stored
 /// row count; the cap is [`MAX_IMAGES_PER_PRODUCT`].
 pub fn can_add_product_image(current_count: i64) -> bool {
-    current_count >= 0 && current_count < MAX_IMAGES_PER_PRODUCT
+    (0..MAX_IMAGES_PER_PRODUCT).contains(&current_count)
 }
 
 /// Validate image alt text (Wave 51): optional; a provided
@@ -4148,9 +4148,9 @@ pub fn suggest_alt_text(filename: &str) -> Option<String> {
     }
     let joined = words.join(" ");
     let mut chars = joined.chars();
-    let suggestion = match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => return None,
+    let suggestion = {
+        let first = chars.next()?;
+        first.to_uppercase().collect::<String>() + chars.as_str()
     };
     if suggestion.chars().count() > MAX_IMAGE_ALT_TEXT_CHARS {
         return None;
@@ -4198,7 +4198,7 @@ pub fn image_quality_warnings(width: Option<i32>, height: Option<i32>) -> Vec<&'
 pub fn extract_image_url(text: &str) -> Option<String> {
     for token in text.split_whitespace() {
         let candidate = token.trim_matches(|c| matches!(c, '"' | '\'' | '<' | '>' | '(' | ')'));
-        let candidate = candidate.trim_end_matches(|c| matches!(c, '.' | ',' | ';' | '!'));
+        let candidate = candidate.trim_end_matches(['.', ',', ';', '!']);
         if !(candidate.starts_with("https://") || candidate.starts_with("http://")) {
             continue;
         }

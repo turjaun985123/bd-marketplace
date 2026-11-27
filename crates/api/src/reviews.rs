@@ -64,6 +64,11 @@ pub struct Review {
     /// the stored key by the media module's one URL rule.
     /// Null for the (majority) photo-less reviews.
     pub image_url: Option<String>,
+    /// The review photo's original pixel dimensions (Wave 51),
+    /// so clients can reserve its layout space before it loads;
+    /// null when there is no photo.
+    pub image_width: Option<i32>,
+    pub image_height: Option<i32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub reply: Option<ReviewReply>,
@@ -139,6 +144,8 @@ impl ReviewRow {
                 .image_storage_key
                 .as_deref()
                 .map(|key| crate::media::sized_url(key, self.image_width, domain::GALLERY_IMAGE_WIDTH)),
+            image_width: self.image_width,
+            image_height: self.image_height,
             created_at: self.created_at,
             updated_at: self.updated_at,
             reply,
