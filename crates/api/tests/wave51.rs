@@ -707,7 +707,7 @@ async fn wave51_product_media_system() {
         .clone();
     assert_eq!(listed["image_url"], first_gallery);
 
-    add_to_cart(&app, &buyer, &product, 1).await;
+    add_to_cart(&app, &buyer, &product, None, 1).await;
     let (status, cart) = call(&app, Method::GET, "/v1/cart", None, Some(&buyer)).await;
     assert_eq!(status, StatusCode::OK, "cart: {cart}");
     assert_eq!(cart["items"][0]["image_url"], first_gallery);
