@@ -459,7 +459,7 @@ pub async fn resolve_product_category(
 ) -> Result<(Option<Uuid>, Option<String>), ApiError> {
     match category_id {
         Some(id) => {
-            let row = sqlx::query_as(&format!(
+            let row: CategoryRow = sqlx::query_as(&format!(
                 "SELECT {CATEGORY_COLUMNS} FROM categories WHERE id = $1"
             ))
             .bind(id)
@@ -559,7 +559,7 @@ async fn admin_views(
     let flats = rows_to_flat(rows);
     let by_id: HashMap<String, &CategoryRow> =
         rows.iter().map(|row| (row.id.to_string(), row)).collect();
-    let mut ordered: Vec<&CategoryFlat> = Vec::new();
+    let mut ordered: Vec<&domain::CategoryFlat> = Vec::new();
     fn walk<'f>(
         nodes: &[domain::CategoryNode],
         flats: &'f [domain::CategoryFlat],

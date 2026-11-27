@@ -100,7 +100,7 @@ pub struct Product {
     /// browse, the admin category drill-in); empty for
     /// unlinked products and on card rails that never render
     /// a breadcrumb.
-    #[sqlx(default)]
+    #[sqlx(skip)]
     pub category_path: Vec<crate::categories::CategoryPathEntry>,
     pub price_poisha: i64,
     pub compare_at_poisha: Option<i64>,
