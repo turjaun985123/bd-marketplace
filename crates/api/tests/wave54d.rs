@@ -25,6 +25,12 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
+/// The fns in this file share ONE database (the suite's
+/// convention); cargo runs one binary's fns on parallel
+/// threads, so each fn holds this lock for its whole run —
+/// files stay independent, fns inside a file serialise.
+static DB_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::new(());
+
 /// Send one JSON request through the router and return (status, body).
 async fn call(
     app: &Router,
@@ -170,6 +176,7 @@ async fn test_app() -> Option<Router> {
 
 #[tokio::test]
 async fn wave54_store_collections_crud_membership_and_public_reads() {
+    let _db_guard = DB_LOCK.lock().await;
     let Some(app) = test_app().await else {
         return;
     };
@@ -366,6 +373,7 @@ async fn wave54_store_collections_crud_membership_and_public_reads() {
 
 #[tokio::test]
 async fn wave54_inbox_feed_suggestions_and_follower_stats() {
+    let _db_guard = DB_LOCK.lock().await;
     let Some(app) = test_app().await else {
         return;
     };

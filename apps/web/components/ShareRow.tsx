@@ -24,9 +24,17 @@ export default function ShareRow({
   async function onShare() {
     const url = `${window.location.origin}${path}`;
     setNote(null);
-    if (typeof navigator !== "undefined" && "share" in navigator) {
+    // Read the optional share method through a widened
+    // type: an `"share" in navigator` check narrows the
+    // fall-through `navigator` to `never` in the DOM lib
+    // (share is declared non-optional there), which then
+    // rejects the clipboard access below at type-check.
+    const nav = navigator as Navigator & {
+      share?: (data: { title: string; url: string }) => Promise<void>;
+    };
+    if (typeof nav.share === "function") {
       try {
-        await navigator.share({ title, url });
+        await nav.share({ title, url });
         return;
       } catch {
         // A dismissed share sheet is not an error to
