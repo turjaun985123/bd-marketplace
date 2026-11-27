@@ -1,0 +1,50 @@
+# Dependabot — automated dependency update proposals
+# (Wave 45). The contract:
+#
+# - These PRs are PROPOSALS, never auto-merged. A PR merges
+#   only when CI is fully green — including the cargo-audit
+#   job, which has been GATING since Wave 45 — and a human
+#   has looked at it.
+# - Minor and patch updates are grouped into one PR per
+#   ecosystem per round; major updates arrive individually,
+#   so each one gets its own review and its own CI run.
+# - Cargo major bumps of security-relevant crates
+#   (jsonwebtoken, sqlx, axum) deserve a human read of the
+#   changelog before merging, not just a green run.
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Dhaka"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    groups:
+      cargo-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+  - package-ecosystem: "npm"
+    directory: "/apps/web"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:30"
+      timezone: "Asia/Dhaka"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(web)"
+    groups:
+      npm-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(ci)"

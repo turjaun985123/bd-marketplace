@@ -126,14 +126,15 @@ jobs:
   # RustSec advisory database on every run, so a vulnerable
   # dependency (the class of finding CR-02/jsonwebtoken was)
   # is SEEN the day it is published instead of at the next
-  # manual audit. Deliberately NON-GATING for now: this job
-  # is separate (no `needs` either way) and marked
-  # continue-on-error, so its result never blocks the
-  # rust/web/docker jobs or the run's conclusion — the first
-  # reports get triaged first, and making it gating is a
-  # follow-up decision (see the Wave 41 README section).
+  # manual audit. The job started deliberately NON-GATING
+  # (separate, marked continue-on-error) while the first
+  # reports were triaged; Wave 42 cleaned the tree to 0
+  # unignored vulnerabilities, and Wave 45 made it GATING:
+  # still separate (no `needs` either way, so it runs in
+  # parallel), but a new unignored advisory now fails the
+  # run's conclusion (see the Wave 45 README section).
   security-audit:
-    name: Security audit (cargo audit, non-gating)
+    name: Security audit (cargo audit)
     runs-on: ubuntu-24.04
     # The audit-check action reports by creating a GitHub check
     # run; without checks:write its step failed with "Resource not
@@ -141,7 +142,6 @@ jobs:
     permissions:
       contents: read
       checks: write
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       # The committed Cargo.lock is intentionally minimal around the
@@ -154,7 +154,8 @@ jobs:
       # lock is the Wave 39 hand-completed one, which cargo completes
       # at build time). Caveat: a fresh resolve may pick newer
       # semver-compatible versions than the committed lock for some
-      # crates — acceptable for this non-gating advisory job.
+      # crates — acceptable for this advisory job, which scans the
+      # graph the manifests describe and (since Wave 45) gates on it.
       - name: Resolve a fresh lockfile for the audit
         run: |
           rm -f Cargo.lock

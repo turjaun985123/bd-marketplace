@@ -2784,8 +2784,8 @@ marked continue-on-error, so it reports without
 blocking. Making it gating is a follow-up once the
 first reports are triaged; no unrelated dependency
 advisories were fixed in this wave. (Follow-up: the
-first report was triaged in Wave 42 — see that
-section.)
+first report was triaged in Wave 42, and the gating
+flip landed in Wave 45 — see those sections.)
 
 **Refunds reach the payment record (HI-52, migration
 0037).** `refunded` existed in the schema and the
@@ -2927,10 +2927,11 @@ wave.
 triaged per wave: bump or remove where the graph
 allows it; ignore only with a written justification
 and a removal trigger in `.cargo/audit.toml`. The
-audit job stays NON-GATING while the two
-accepted-risk ignores are live; once the tree is
-clean, making it gating is a one-line CI change
-(drop the job's `continue-on-error`).
+audit job stayed NON-GATING while the accepted-risk
+ignores were new; once the tree was clean, making it
+gating was a one-line CI change (drop the job's
+`continue-on-error`). (Follow-up: that flip landed
+in Wave 45 — see that section.)
 
 Wave 43 (observability — request ids, request logs
 and an admin metrics snapshot):
@@ -3113,6 +3114,58 @@ covered — other mutating endpoints keep their
 existing duplicate semantics (checkout has its own
 guards; a general idempotency layer is a design of
 its own, not a drive-by).
+
+Wave 45 (supply-chain & CI maturity — the audit job
+gates, and Dependabot keeps the tree current):
+
+**The audit job is GATING now.** The `security-audit`
+job drops its `continue-on-error` and its
+"(non-gating)" name: a new unignored RustSec advisory
+now fails the CI run's conclusion. Why now: the tree
+has been clean since Wave 42 — 0 unignored
+vulnerabilities, with the three accepted-risk ignores
+documented in `.cargo/audit.toml` (two HS256-only JWT
+subtree advisories, one compile-time-only sqlite) —
+and the job has run fully green since, including its
+check-run reporting once Wave 42 gave it
+`checks: write`. Nothing else about the job changed:
+it still resolves a fresh lockfile in-job, still
+prints the lock-parent diagnostic, and still runs in
+parallel — no job `needs` it, so a red audit fails
+the run without serialising the pipeline. This is
+the one-line flip the Wave 41 and Wave 42 sections
+promised, landed once its precondition (a clean,
+triaged tree) actually held.
+
+**Dependabot.** `.github/dependabot.yml` opens the
+update PRs that keep the tree current: cargo (repo
+root) and npm (`apps/web`) weekly — Monday 09:00 /
+09:30 Asia/Dhaka — with minor and patch updates
+grouped into one PR per ecosystem and majors arriving
+individually; github-actions monthly. The contract,
+also written at the top of that file: a Dependabot PR
+is a proposal, never an auto-merge — it merges only
+when CI is fully green, the now-gating audit
+included, and a human has looked at it; a cargo major
+bump of a security-relevant crate (jsonwebtoken,
+sqlx, axum) gets a human read of the changelog first,
+not just a green run.
+
+**Honest limits.** The gate covers Rust advisories
+via cargo-audit only: `npm audit` is not wired as a
+gate, though Dependabot still surfaces npm security
+updates as PRs like any other update. The
+accepted-risk ignores remain the documented
+exception path, under the Wave 42 discipline: an
+ignore is acceptable only with a written
+justification and a removal trigger next to it in
+`.cargo/audit.toml` — a bare ignore is not. And
+gating means exactly what it says: a freshly
+published RUSTSEC advisory can turn main red until
+it is triaged. That pressure is intended. The triage
+order of preference is: fix it, bump past it, or —
+only when neither is honestly possible — a
+documented ignore.
 
 Wave 8 (reviews, ratings and seller replies):
 
@@ -4616,6 +4669,29 @@ a success. This closes the deferred third element
 of the audit's payout finding (CR-10). See the
 Wave 44 section for the contract and its limits
 (per-store scope, no key TTL, payouts only).
+
+**Real (Wave 45):** supply-chain & CI maturity — no
+new endpoints and no behaviour changes; CI config
+and docs only. The `security-audit` job is GATING:
+its `continue-on-error` is dropped and the
+"(non-gating)" name with it, so a new unignored
+RustSec advisory fails the run — the flip the
+Wave 41/42 sections promised, landed on the tree
+Wave 42 cleaned (0 unignored vulnerabilities, the
+three accepted-risk ignores on record in
+`.cargo/audit.toml`). The job still runs in parallel
+(no `needs`), still resolves a fresh lock in-job and
+still prints the lock-parent diagnostic. And
+`.github/dependabot.yml` automates the update
+proposals that keep the tree current: cargo and npm
+weekly with minor/patch grouped and majors
+individual, github-actions monthly — proposals only,
+merged solely on a fully green CI (gating audit
+included) after a human look, with changelog reads
+for security-relevant cargo majors. See the Wave 45
+section for the contract and the honest limits
+(Rust-only gate, ignore discipline, red-main
+pressure by design).
 
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
