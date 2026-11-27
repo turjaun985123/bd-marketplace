@@ -282,7 +282,7 @@ async fn wave56_seed_integrity_and_resolution_matrix() {
     // names are unique across the seed (the resolution
     // rule's determinism); exactly Fashion and
     // Electronics are featured.
-    let (status, list) = call(app, Method::GET, "/v1/admin/categories", None, Some(&admin)).await;
+    let (status, list) = call(&app, Method::GET, "/v1/admin/categories", None, Some(&admin)).await;
     assert_eq!(status, StatusCode::OK, "admin list: {list}");
     let items = list["items"].as_array().expect("admin items");
     let view_of = |slug: &str| {
