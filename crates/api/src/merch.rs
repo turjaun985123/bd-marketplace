@@ -152,7 +152,7 @@ const FLASH_UNITS_SOLD_SQL: &str = "SELECT oi.product_id, \
 /// column in the shared product SELECT.
 pub(crate) const FLASH_PRICE_JOIN: &str = "LEFT JOIN LATERAL (\
     SELECT fsi.sale_price_poisha AS flash_price_poisha \
-    FROM (SELECT id, starts_at, ends_at FROM flash_sales \
+    FROM (SELECT id, starts_at, ends_at, created_at FROM flash_sales \
           WHERE is_active AND starts_at <= now() AND now() < ends_at \
           ORDER BY ends_at ASC, created_at ASC LIMIT 1) fs \
     JOIN flash_sale_items fsi \
