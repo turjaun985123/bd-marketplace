@@ -415,7 +415,7 @@ async fn wave55i_address_checkout_keeps_the_money_canon() {
         "loyalty never reduces the seller payout"
     );
     assert_eq!(
-        sub["cod_collect_poisha"], 105_000,
+        receipt_cod_due(&app, &buyer, &redeemed).await, 105_000,
         "COD collection nets the loyalty discount out"
     );
 }
