@@ -17,7 +17,7 @@ hmac = "0.12"
 # `rust_crypto` is the provider matching the previous ring-based
 # HS256 usage, and default features (PEM key parsing) are off
 # because this crate only ever uses `from_secret` HMAC keys.
-jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+jsonwebtoken = { version = "12", default-features = false, features = ["rust_crypto"] }
 notify = { path = "../notify" }
 payments = { path = "../payments" }
 rand = "0.8"
