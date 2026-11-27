@@ -84,6 +84,9 @@ pub struct InvoiceBuyer {
     pub phone: String,
     pub address: String,
     pub zone: String,
+    /// The order's delivery district (Wave 55), when the
+    /// order recorded one; null for zone-only orders.
+    pub district: Option<String>,
 }
 
 /// The invoice's money block, all in poisha and all scoped to
@@ -122,6 +125,9 @@ pub struct Invoice {
     pub sub_order_status: String,
     pub store: InvoiceStore,
     pub buyer: InvoiceBuyer,
+    /// The buyer's order note (Wave 55) from the parent
+    /// order; null when none was written.
+    pub order_note: Option<String>,
     pub items: Vec<OrderItem>,
     pub money: InvoiceMoney,
     pub payment_method: String,
@@ -392,7 +398,9 @@ async fn build_invoice_view(
             phone: order.delivery_phone,
             address: order.delivery_address,
             zone: order.delivery_zone,
+            district: order.delivery_district.clone(),
         },
+        order_note: order.order_note.clone(),
         items: sub.items.clone(),
         money: InvoiceMoney {
             goods_subtotal_poisha: sub.goods_subtotal_poisha,

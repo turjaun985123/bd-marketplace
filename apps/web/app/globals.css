@@ -611,3 +611,26 @@ a { color: var(--brand-600); }
 .notification-bell { text-align: right; padding: 0 var(--space-4); margin: var(--space-2) 0; }
 .notification-badge { color: var(--brand-700); font-weight: 600; }
 .notification-kind { font-weight: 600; color: var(--brand-700); }
+
+/* Wave 55: cart / checkout / tracking polish — the
+   tracking stepper + event timeline, the address book
+   cards and the checkout address picker, the
+   save-for-later shelf and the buy-again rail. All
+   values come from the Wave 52 token layer. */
+.timeline-steps { display: flex; flex-wrap: wrap; gap: var(--space-2) var(--space-4); list-style: none; padding: 0; margin: var(--space-3) 0; }
+.timeline-steps li { color: var(--text-faint); font-size: var(--text-sm); }
+.timeline-steps li[data-state="done"] { color: var(--brand-700); font-weight: 600; }
+.timeline-steps li[data-state="current"] { color: var(--text); font-weight: 700; }
+.timeline-steps li[data-state="alert"] { color: var(--danger-700); font-weight: 700; }
+.timeline-events { list-style: none; padding: 0; margin: var(--space-2) 0 var(--space-4); color: var(--text-muted); font-size: var(--text-sm); }
+.timeline-events li { padding: var(--space-1) 0; border-bottom: 1px dashed var(--border); }
+.timeline-events li:last-child { border-bottom: none; }
+.address-card { border: 1px solid var(--border); border-radius: var(--radius); padding: var(--space-3); margin-bottom: var(--space-3); background: var(--surface); }
+.address-card--default { border-color: var(--brand-700); }
+.address-picker { display: flex; flex-direction: column; gap: var(--space-2); margin-bottom: var(--space-4); }
+.address-picker-option { display: flex; gap: var(--space-2); align-items: flex-start; border: 1px solid var(--border); border-radius: var(--radius); padding: var(--space-3); background: var(--surface); cursor: pointer; }
+.address-picker-option[data-selected="true"] { border-color: var(--brand-700); box-shadow: var(--shadow-lg); }
+.order-note-input { width: 100%; min-height: 4.5rem; }
+.saved-shelf { margin-top: var(--space-6); }
+.buy-again-rail { margin-top: var(--space-6); }
+.label-district { font-weight: 600; }

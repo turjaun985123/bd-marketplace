@@ -110,6 +110,12 @@ export default function FulfillmentLabelsPage() {
           </p>
           <h2>{label.delivery_name}</h2>
           <p>{label.delivery_address}</p>
+          {label.delivery_district && (
+            <p className="label-district">জেলা — District: {label.delivery_district}</p>
+          )}
+          {label.order_note && (
+            <p className="label-note">নোট — Note: {label.order_note}</p>
+          )}
           <p>
             ফোন: <strong>{label.delivery_phone}</strong> · এলাকা:{" "}
             {ZONE_LABELS[label.delivery_zone] ?? label.delivery_zone}

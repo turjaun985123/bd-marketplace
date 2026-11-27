@@ -13,11 +13,13 @@ import {
   paymentStatusLabel,
   refreshShipment,
   refundStatusLabel,
+  reorderOrder,
   retryPayment,
   returnStatusLabel,
   shipmentStatusLabel,
   type LoyaltyView,
   type Order,
+  type ReorderReport,
   type ReturnRequest,
   type SubOrder,
 } from "@/lib/api";
@@ -52,6 +54,14 @@ import InstallAppButton from "@/components/InstallAppButton";
  * from delivered orders, redemptions, and the adjustments a
  * cancel or a received return writes) — and an order that was
  * paid partly in points shows its loyalty discount line.
+ *
+ * Wave 55: each order gains a "deliver to" line (the stored
+ * recipient + district/address), the order note when one was
+ * written, and a "আবার কিনুন — Buy again" button: the
+ * reorder endpoint re-adds the order's lines at TODAY's
+ * prices and reports per line what came back and what was
+ * skipped (gone, inactive, out of stock, cart full) — the
+ * report renders under the order, never a silent partial.
  */
 export default function BuyerOrdersPage() {
   const { ready, token } = useAuth();
@@ -70,6 +80,12 @@ export default function BuyerOrdersPage() {
   const [exportBusy, setExportBusy] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
   const [loyalty, setLoyalty] = useState<LoyaltyView | null>(null);
+  // Wave 55: reorder ("buy again") — the order being
+  // re-added, and each order's last report.
+  const [reorderingId, setReorderingId] = useState<string | null>(null);
+  const [reorderReports, setReorderReports] = useState<
+    Record<string, ReorderReport>
+  >({});
 
   // Wave 31: download the buyer's own record as one JSON file.
   async function onDownloadExport() {
@@ -178,6 +194,25 @@ export default function BuyerOrdersPage() {
     }
   }
 
+  // Wave 55: "buy again" — the server re-adds the order's
+  // lines at today's prices and answers the per-line
+  // report; the report renders under the order.
+  async function onReorder(orderId: string) {
+    if (!token) return;
+    setReorderingId(orderId);
+    setError(null);
+    try {
+      const report = await reorderOrder(token, orderId);
+      setReorderReports((prev) => ({ ...prev, [orderId]: report }));
+    } catch (err) {
+      setError(
+        `আবার কেনা যায়নি। ${err instanceof Error ? err.message : ""}`.trim()
+      );
+    } finally {
+      setReorderingId(null);
+    }
+  }
+
   async function onCancel(orderId: string) {
     if (!token) return;
     setCancellingId(orderId);
@@ -267,6 +302,10 @@ export default function BuyerOrdersPage() {
         আপনার প্রোফাইল, অর্ডার, রিভিউ, উইশলিস্ট আর প্রশ্ন — সব এক
         ফাইলে।
       </p>
+      <p>
+        <Link href="/addresses">আমার ঠিকানা — My addresses</Link> —
+        সংরক্ষিত ঠিকানা থেকে চেকআউট আরও দ্রুত হয়।
+      </p>
       {/* Wave 38: the shared install affordance, same
           component as the home nav (renders only when the
           browser offers an install). */}
@@ -323,6 +362,13 @@ export default function BuyerOrdersPage() {
               অর্ডার <code>{order.id.slice(0, 8)}…</code> — {order.status}
             </h3>
             <p>{new Date(order.created_at).toLocaleString("bn-BD")}</p>
+            <p>
+              ডেলিভারি যাবে — Deliver to: {order.delivery_name} ·{" "}
+              {order.delivery_district ?? order.delivery_address}
+            </p>
+            {order.order_note && (
+              <p>আপনার নোট — Your note: {order.order_note}</p>
+            )}
             {order.sub_orders.map((sub) => (
               <div key={sub.id}>
                 <h4>
@@ -452,6 +498,52 @@ export default function BuyerOrdersPage() {
                 রসিদ / বিবরণ দেখুন — Receipt & details
               </Link>
             </p>
+            {order.status !== "cancelled" && (
+              <p>
+                <button
+                  type="button"
+                  disabled={reorderingId === order.id}
+                  onClick={() => void onReorder(order.id)}
+                >
+                  {reorderingId === order.id
+                    ? "কার্টে যোগ হচ্ছে…"
+                    : "আবার কিনুন — Buy again"}
+                </button>{" "}
+                এই অর্ডারের পণ্যগুলো আজকের দামে কার্টে যোগ হবে।
+              </p>
+            )}
+            {reorderReports[order.id] && (
+              <div>
+                <p>
+                  <strong>আবার কেনার ফলাফল — Reorder result:</strong>
+                </p>
+                {reorderReports[order.id].added.length > 0 && (
+                  <ul>
+                    {reorderReports[order.id].added.map((line) => (
+                      <li
+                        key={`${line.product_id}:${line.variant_id ?? ""}`}
+                      >
+                        ✓ কার্টে যোগ হয়েছে: {line.title} × {line.quantity}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {reorderReports[order.id].skipped.length > 0 && (
+                  <ul>
+                    {reorderReports[order.id].skipped.map((line) => (
+                      <li key={line.title}>
+                        ✗ {line.title} — {line.message}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {reorderReports[order.id].added.length > 0 && (
+                  <p>
+                    <Link href="/cart">কার্ট দেখুন — View cart</Link>
+                  </p>
+                )}
+              </div>
+            )}
             {order.sub_orders.length > 0 &&
               order.sub_orders.every((sub) => sub.status === "placed") && (
                 <p>

@@ -16,6 +16,19 @@
 //! for existence and availability at add time; the stock
 //! ceiling itself is enforced at checkout, exactly as
 //! product stock always was (adds never checked stock).
+//!
+//! Wave 55: save-for-later + the quantity stock cap. A
+//! line's `saved` flag (migration 0059) parks it on the
+//! buyer's shelf: the cart view returns saved lines as
+//! their own array, checkout locks/totals/clears only
+//! active lines, and adding a product whose line sits on
+//! the shelf revives it into the active cart. Moving a
+//! line is one flag UPDATE (`set_cart_item_saved`) — the
+//! line's identity never changes. And setting a line's
+//! quantity now respects the REAL stock cap (the line's
+//! pool: variant stock for variant lines, product stock
+//! otherwise): past it is a bilingual 400, where before
+//! the ceiling was only enforced at checkout.
 
 use axum::{
     extract::{Path, Query, State},
@@ -50,6 +63,10 @@ pub struct CartItemView {
     /// variant's FINAL price (base + delta) for variant lines.
     pub unit_price_poisha: i64,
     pub quantity: i32,
+    /// Whether the line is parked on the save-for-later
+    /// shelf (Wave 55). Active cart lines are `false`;
+    /// the view's `saved_items` array carries `true`.
+    pub saved: bool,
     /// The pool this line draws from: the variant's stock
     /// for variant lines, the product's stock otherwise.
     pub stock: i32,
@@ -117,12 +134,15 @@ pub struct CartItemJson {
     pub line_total_poisha: i64,
 }
 
-/// The full cart response: items plus the goods total (delivery is
-/// quoted at checkout, per seller group — not here).
+/// The full cart response: the active lines plus the goods total
+/// (delivery is quoted at checkout, per seller group — not here),
+/// and the save-for-later shelf (Wave 55) as its own array — saved
+/// lines never enter the total and never reach checkout.
 #[derive(Debug, Serialize)]
 pub struct CartView {
     pub items: Vec<CartItemJson>,
     pub goods_total_poisha: i64,
+    pub saved_items: Vec<CartItemJson>,
 }
 
 const CART_ITEMS_SQL: &str = "SELECT ci.product_id, ci.variant_id, \
@@ -132,7 +152,7 @@ const CART_ITEMS_SQL: &str = "SELECT ci.product_id, ci.variant_id, \
          ELSE p.price_poisha + v.price_delta_poisha END AS unit_price_poisha, \
     p.price_poisha AS base_price_poisha, \
     v.price_delta_poisha AS variant_delta_poisha, \
-    ci.quantity, \
+    ci.quantity, ci.saved, \
     CASE WHEN ci.variant_id IS NULL THEN p.stock ELSE v.stock END AS stock, \
     p.weight_grams, \
     (SELECT pi.storage_key FROM product_images pi \
@@ -223,23 +243,34 @@ pub async fn load_cart_items(pool: &PgPool, user_id: Uuid) -> Result<Vec<CartIte
 }
 
 /// THE cart view builder: the GET endpoint and every cart mutation
-/// return exactly this shape, built by this one function.
+/// return exactly this shape, built by this one function. Wave 55:
+/// the loaded lines split by their `saved` flag — the goods total
+/// sums the ACTIVE lines only.
 pub async fn cart_view(pool: &PgPool, user_id: Uuid) -> Result<CartView, ApiError> {
     let rows = load_cart_items(pool, user_id).await?;
-    let goods_total_poisha = rows.iter().map(CartItemView::line_total_poisha).sum();
-    let items = rows
-        .into_iter()
-        .map(|item| {
-            let line_total_poisha = item.line_total_poisha();
-            CartItemJson {
-                item,
-                line_total_poisha,
-            }
-        })
-        .collect();
+    let goods_total_poisha = rows
+        .iter()
+        .filter(|item| !item.saved)
+        .map(CartItemView::line_total_poisha)
+        .sum();
+    let mut items = Vec::new();
+    let mut saved_items = Vec::new();
+    for item in rows {
+        let line_total_poisha = item.line_total_poisha();
+        let json = CartItemJson {
+            item,
+            line_total_poisha,
+        };
+        if json.item.saved {
+            saved_items.push(json);
+        } else {
+            items.push(json);
+        }
+    }
     Ok(CartView {
         items,
         goods_total_poisha,
+        saved_items,
     })
 }
 
@@ -319,11 +350,15 @@ pub async fn add_cart_item(
     let new_qty =
         validate_cart_quantity(i64::from(existing) + i64::from(add_qty)).map_err(ApiError::bad_request)?;
 
+    // Wave 55: the upsert also clears the saved flag — a
+    // line parked on the shelf that gets added again
+    // revives into the active cart (with the accumulated
+    // quantity the checks above just validated).
     sqlx::query(
         "INSERT INTO cart_items (cart_id, product_id, variant_id, quantity) \
          VALUES ($1, $2, $3, $4) \
          ON CONFLICT (cart_id, product_id, variant_id) \
-         DO UPDATE SET quantity = EXCLUDED.quantity",
+         DO UPDATE SET quantity = EXCLUDED.quantity, saved = false",
     )
     .bind(cart_id)
     .bind(product_id)
@@ -343,6 +378,16 @@ pub async fn add_cart_item(
 /// must already be in the cart (404 otherwise). A caller that
 /// omits the variant addresses the variant-less line, exactly
 /// as before this wave.
+///
+/// Wave 55: the quantity also respects the line's REAL stock
+/// cap — the variant's stock for a variant line, the
+/// product's stock otherwise (the same CASE the cart read
+/// uses). Past the cap is a bilingual 400 naming what IS
+/// available; checkout keeps its own lock-time enforcement
+/// as the final word (stock can move between the two).
+/// Only ACTIVE lines take quantity edits — a saved line
+/// must be moved back first (the shelf's own actions are
+/// move + remove), so it reads as "not in the cart" here.
 pub async fn set_cart_item_quantity(
     pool: &PgPool,
     user: &AuthUser,
@@ -358,9 +403,31 @@ pub async fn set_cart_item_quantity(
         .await?
         .ok_or_else(|| ApiError::not_found("product is not in the cart"))?;
 
+    let stock: Option<i32> = sqlx::query_scalar(
+        "SELECT CASE WHEN ci.variant_id IS NULL THEN p.stock ELSE v.stock END \
+         FROM cart_items ci \
+         JOIN products p ON p.id = ci.product_id \
+         LEFT JOIN product_variants v ON v.id = ci.variant_id \
+         WHERE ci.cart_id = $1 AND ci.product_id = $2 \
+           AND ci.variant_id IS NOT DISTINCT FROM $3 AND NOT ci.saved",
+    )
+    .bind(cart_id)
+    .bind(product_id)
+    .bind(variant_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ApiError::internal("load cart line stock", e))?;
+    let stock = stock.ok_or_else(|| ApiError::not_found("product is not in the cart"))?;
+    if i64::from(qty) > i64::from(stock) {
+        return Err(ApiError::bad_request(format!(
+            "স্টকে মাত্র {stock}টি আছে — only {stock} in stock for this item"
+        )));
+    }
+
     let result = sqlx::query(
         "UPDATE cart_items SET quantity = $4 \
-         WHERE cart_id = $1 AND product_id = $2 AND variant_id IS NOT DISTINCT FROM $3",
+         WHERE cart_id = $1 AND product_id = $2 AND variant_id IS NOT DISTINCT FROM $3 \
+           AND NOT saved",
     )
     .bind(cart_id)
     .bind(product_id)
@@ -374,6 +441,77 @@ pub async fn set_cart_item_quantity(
     }
 
     touch_cart(pool, cart_id).await?;
+    cart_view(pool, user.user_id).await
+}
+
+/// Move one cart line between the active cart and the
+/// save-for-later shelf (Wave 55): one flag UPDATE on the
+/// (product, variant) line. Moving to the state the line
+/// is already in is a successful no-op returning the
+/// current view — the end state the caller asked for
+/// already holds. A line that exists in neither state is
+/// a 404.
+pub async fn set_cart_item_saved(
+    pool: &PgPool,
+    user: &AuthUser,
+    product_id: Uuid,
+    variant_id: Option<Uuid>,
+    saved: bool,
+) -> Result<CartView, ApiError> {
+    let cart_id = find_cart_id(pool, user.user_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("product is not in the cart"))?;
+
+    let result = sqlx::query(
+        "UPDATE cart_items SET saved = $4 \
+         WHERE cart_id = $1 AND product_id = $2 AND variant_id IS NOT DISTINCT FROM $3",
+    )
+    .bind(cart_id)
+    .bind(product_id)
+    .bind(variant_id)
+    .bind(saved)
+    .execute(pool)
+    .await
+    .map_err(|e| ApiError::internal("move cart item", e))?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("product is not in the cart"));
+    }
+
+    touch_cart(pool, cart_id).await?;
+    cart_view(pool, user.user_id).await
+}
+
+/// Move EVERY saved line back into the active cart
+/// (Wave 55 bulk op): one UPDATE over the shelf. An
+/// empty shelf is a successful no-op — the end state
+/// the caller asked for already holds.
+pub async fn move_all_saved_to_cart(
+    pool: &PgPool,
+    user: &AuthUser,
+) -> Result<CartView, ApiError> {
+    if let Some(cart_id) = find_cart_id(pool, user.user_id).await? {
+        sqlx::query("UPDATE cart_items SET saved = false WHERE cart_id = $1 AND saved")
+            .bind(cart_id)
+            .execute(pool)
+            .await
+            .map_err(|e| ApiError::internal("move all saved to cart", e))?;
+        touch_cart(pool, cart_id).await?;
+    }
+    cart_view(pool, user.user_id).await
+}
+
+/// Empty the save-for-later shelf (Wave 55 bulk op):
+/// deletes only the saved lines; the active cart is
+/// untouched. An empty shelf is a successful no-op.
+pub async fn clear_saved_items(pool: &PgPool, user: &AuthUser) -> Result<CartView, ApiError> {
+    if let Some(cart_id) = find_cart_id(pool, user.user_id).await? {
+        sqlx::query("DELETE FROM cart_items WHERE cart_id = $1 AND saved")
+            .bind(cart_id)
+            .execute(pool)
+            .await
+            .map_err(|e| ApiError::internal("clear saved items", e))?;
+        touch_cart(pool, cart_id).await?;
+    }
     cart_view(pool, user.user_id).await
 }
 
@@ -407,10 +545,14 @@ pub async fn remove_cart_item(
     cart_view(pool, user.user_id).await
 }
 
-/// Empty the cart (the cart row itself stays — one cart per user).
+/// Empty the ACTIVE cart (the cart row itself stays — one cart per
+/// user). Wave 55: saved-for-later lines survive a clear — the
+/// shelf is a deliberate keep, and silently deleting it under a
+/// "clear cart" button would destroy buyer data the button never
+/// mentioned. Saved lines leave through their own remove action.
 pub async fn clear_cart(pool: &PgPool, user: &AuthUser) -> Result<CartView, ApiError> {
     if let Some(cart_id) = find_cart_id(pool, user.user_id).await? {
-        sqlx::query("DELETE FROM cart_items WHERE cart_id = $1")
+        sqlx::query("DELETE FROM cart_items WHERE cart_id = $1 AND NOT saved")
             .bind(cart_id)
             .execute(pool)
             .await
@@ -456,6 +598,14 @@ pub struct SetCartItemRequest {
 pub struct RemoveCartItemQuery {
     /// Which line to remove (Wave 33); omitted addresses the
     /// variant-less line.
+    #[serde(default)]
+    pub variant_id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+pub struct MoveCartItemRequest {
+    /// Which line to move (Wave 55); omitted addresses the
+    /// variant-less line, exactly like the quantity write.
     #[serde(default)]
     pub variant_id: Option<Uuid>,
 }
@@ -508,4 +658,52 @@ pub async fn clear(
 ) -> Result<Json<CartView>, ApiError> {
     let pool = state.require_pool()?;
     Ok(Json(clear_cart(pool, &user).await?))
+}
+
+/// POST /v1/cart/items/:product_id/save — park the line
+/// on the save-for-later shelf (Wave 55).
+pub async fn save_item(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(product_id): Path<Uuid>,
+    Json(req): Json<MoveCartItemRequest>,
+) -> Result<Json<CartView>, ApiError> {
+    let pool = state.require_pool()?;
+    Ok(Json(
+        set_cart_item_saved(pool, &user, product_id, req.variant_id, true).await?,
+    ))
+}
+
+/// POST /v1/cart/items/:product_id/unsave — move the
+/// line back into the active cart (Wave 55).
+pub async fn unsave_item(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(product_id): Path<Uuid>,
+    Json(req): Json<MoveCartItemRequest>,
+) -> Result<Json<CartView>, ApiError> {
+    let pool = state.require_pool()?;
+    Ok(Json(
+        set_cart_item_saved(pool, &user, product_id, req.variant_id, false).await?,
+    ))
+}
+
+/// POST /v1/cart/saved/move-all — bring the whole shelf
+/// back into the active cart (Wave 55).
+pub async fn move_all_saved(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Json<CartView>, ApiError> {
+    let pool = state.require_pool()?;
+    Ok(Json(move_all_saved_to_cart(pool, &user).await?))
+}
+
+/// DELETE /v1/cart/saved — empty the shelf (Wave 55);
+/// the active cart is untouched.
+pub async fn clear_saved(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Json<CartView>, ApiError> {
+    let pool = state.require_pool()?;
+    Ok(Json(clear_saved_items(pool, &user).await?))
 }

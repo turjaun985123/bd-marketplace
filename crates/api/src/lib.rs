@@ -332,6 +332,7 @@
 //! endpoints; DB-backed endpoints return a clear 503 instead of panicking.
 
 pub mod access;
+pub mod addresses;
 pub mod admin;
 pub mod analytics;
 pub mod api_keys;
@@ -371,6 +372,7 @@ pub mod shipments;
 pub mod store_collections;
 pub mod stores;
 pub mod subscriptions;
+pub mod timeline;
 pub mod tracking;
 pub mod variants;
 pub mod verification;
@@ -1549,6 +1551,28 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/buyer/saved-searches/:id",
             delete(saved_searches::delete_saved_search_handler),
         )
+        // Wave 55 — the buyer address book + the public
+        // district table (the table is reference data;
+        // the book itself is per-buyer authenticated).
+        .route(
+            "/v1/addresses",
+            get(addresses::list_addresses_handler).post(addresses::create_address_handler),
+        )
+        .route(
+            "/v1/addresses/:id",
+            get(addresses::get_address_handler)
+                .patch(addresses::update_address_handler)
+                .delete(addresses::delete_address_handler),
+        )
+        .route(
+            "/v1/addresses/:id/default",
+            post(addresses::set_default_handler),
+        )
+        .route(
+            "/v1/buyer/default-address",
+            get(addresses::default_address_handler),
+        )
+        .route("/v1/districts", get(addresses::districts_handler))
         // Wave 3 — cart (one cart per signed-in buyer).
         .route("/v1/cart", get(cart::get_cart).delete(cart::clear))
         .route("/v1/cart/items", post(cart::add_item))
@@ -1556,6 +1580,11 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/cart/items/:product_id",
             patch(cart::set_item_quantity).delete(cart::remove_item),
         )
+        // Wave 55 — save-for-later moves.
+        .route("/v1/cart/items/:product_id/save", post(cart::save_item))
+        .route("/v1/cart/items/:product_id/unsave", post(cart::unsave_item))
+        .route("/v1/cart/saved/move-all", post(cart::move_all_saved))
+        .route("/v1/cart/saved", delete(cart::clear_saved))
         // Wave 3 — checkout + buyer orders.
         .route(
             "/v1/orders",
@@ -1565,6 +1594,12 @@ pub fn build_app(state: AppState) -> Router {
         // Wave 4 — buyer cancel (with restock) + receipt view.
         .route("/v1/orders/:id/cancel", post(orders::cancel_order))
         .route("/v1/orders/:id/receipt", get(orders::get_receipt))
+        // Wave 55 — "buy again": re-add the order's lines
+        // at today's prices, with the per-line report.
+        .route("/v1/orders/:id/reorder", post(orders::reorder_order_handler))
+        // Wave 55 — the buy-again rail: products from the
+        // buyer's past orders that can be bought again today.
+        .route("/v1/buyer/buy-again", get(orders::buy_again_handler))
         // Wave 35 — loyalty: the caller's points balance,
         // the programme rules and their recent ledger.
         .route("/v1/loyalty", get(loyalty::get_loyalty_handler))

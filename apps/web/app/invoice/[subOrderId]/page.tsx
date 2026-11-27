@@ -152,7 +152,11 @@ export default function InvoicePage({
           <br />
           {invoice.buyer.address} ·{" "}
           {ZONE_LABELS[invoice.buyer.zone] ?? invoice.buyer.zone}
+          {invoice.buyer.district && <> · জেলা: {invoice.buyer.district}</>}
         </p>
+        {invoice.order_note && (
+          <p>ক্রেতার নোট — Buyer note: {invoice.order_note}</p>
+        )}
 
         <h2>পণ্যের বিবরণ</h2>
         <table>

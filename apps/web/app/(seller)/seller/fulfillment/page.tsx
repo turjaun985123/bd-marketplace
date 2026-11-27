@@ -375,11 +375,19 @@ export default function FulfillmentPage() {
                   )}
                 </p>
                 <p>
-                  ক্রেতা: {item.delivery_name} ({item.delivery_phone}) ·
-                  ক্যাশ অন ডেলিভারি:{" "}
+                  ক্রেতা: {item.delivery_name} ({item.delivery_phone})
+                  {item.delivery_district &&
+                    ` · জেলা: ${item.delivery_district}`}{" "}
+                  · ক্যাশ অন ডেলিভারি:{" "}
                   <strong>
                     <PriceTag amountPoisha={item.cod_due_poisha} />
                   </strong>
+                  {item.order_note && (
+                    <>
+                      <br />
+                      ক্রেতার নোট — Buyer note: <strong>{item.order_note}</strong>
+                    </>
+                  )}
                   {item.order_payment_status === "advance_pending" && (
                     <>
                       {" "}

@@ -19,6 +19,14 @@
 //! it carries the timeline a recipient needs (per-store status,
 //! items, the courier shipment with its full event history) and
 //! none of the money split (no commission, no payout, no address).
+//!
+//! Wave 55: the view gains TIMELINES — the order-level
+//! event list (placement + payment/advance events) and a
+//! per-sub-order event list, both built by the shared
+//! `timeline` module, the same events the buyer's order
+//! page renders. The shipment's own event array stays
+//! (it is the courier leg in full); the timeline is the
+//! whole story around it.
 
 use axum::{
     extract::{Query, State},
@@ -82,6 +90,13 @@ pub struct TrackedSubOrder {
     pub items: Vec<TrackedItem>,
     /// The courier shipment, or `None` until the seller books one.
     pub shipment: Option<TrackedShipment>,
+    /// The sub-order's event timeline (Wave 55), from the
+    /// shared `timeline` module — placement, confirm,
+    /// booking, courier events, delivery, returns.
+    pub timeline: Vec<crate::timeline::TimelineEvent>,
+    /// The tracking stepper (Wave 55), from the domain's
+    /// one derivation.
+    pub steps: Vec<crate::timeline::TimelineStep>,
 }
 
 /// The public tracking view of one order.
@@ -93,6 +108,10 @@ pub struct TrackedOrder {
     pub payment_status: String,
     pub payment_method: String,
     pub grand_total_poisha: i64,
+    /// The order-level timeline (Wave 55): placement and
+    /// the payment/advance events. The per-store story
+    /// rides each sub-order's own timeline.
+    pub timeline: Vec<crate::timeline::TimelineEvent>,
     /// Sub-orders ordered by store slug.
     pub sub_orders: Vec<TrackedSubOrder>,
 }
@@ -102,6 +121,9 @@ struct TrackedSubOrderRow {
     id: Uuid,
     store_slug: String,
     status: String,
+    /// The sub-order's placement instant — the timeline's
+    /// first event (Wave 55).
+    created_at: DateTime<Utc>,
 }
 
 /// The one 404 every tracking failure shares — see the module
@@ -134,7 +156,7 @@ pub async fn track_order(
     }
 
     let sub_rows: Vec<TrackedSubOrderRow> = sqlx::query_as(
-        "SELECT so.id, s.slug AS store_slug, so.status FROM sub_orders so \
+        "SELECT so.id, s.slug AS store_slug, so.status, so.created_at FROM sub_orders so \
          JOIN stores s ON s.id = so.store_id \
          WHERE so.order_id = $1 ORDER BY s.slug, so.id",
     )
@@ -187,13 +209,33 @@ pub async fn track_order(
             }
         };
 
+        // Wave 55: the per-sub-order timeline, from the
+        // one shared builder.
+        let timeline =
+            crate::timeline::sub_order_timeline(pool, sub.id, &sub.status, sub.created_at)
+                .await?;
+        // Wave 55: the stepper over the same facts the
+        // timeline was built from (the shipment view's
+        // unified status is the courier leg).
+        let steps = crate::timeline::sub_order_steps(
+            &sub.status,
+            shipment.as_ref().map(|view| view.status.as_str()),
+        );
+
         sub_orders.push(TrackedSubOrder {
             store_slug: sub.store_slug,
             status: sub.status,
             items,
             shipment,
+            timeline,
+            steps,
         });
     }
+
+    // Wave 55: the order-level timeline (placement +
+    // payment/advance events), same builder family.
+    let timeline =
+        crate::timeline::order_timeline(pool, order_id, placed_at, &payment_method).await?;
 
     Ok(TrackedOrder {
         order_id,
@@ -201,6 +243,7 @@ pub async fn track_order(
         payment_status,
         payment_method,
         grand_total_poisha,
+        timeline,
         sub_orders,
     })
 }

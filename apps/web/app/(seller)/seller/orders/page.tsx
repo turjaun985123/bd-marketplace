@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
+import OrderTimeline from "@/components/OrderTimeline";
 import PriceTag from "@/components/PriceTag";
 import ProductImage from "@/components/ProductImage";
 import {
@@ -348,7 +349,19 @@ export default function SellerOrdersPage() {
             <p>
               ডেলিভারি: {sub.delivery_name}, {sub.delivery_phone},{" "}
               {sub.delivery_address} ({sub.delivery_zone})
+              {sub.delivery_district && <> · জেলা: {sub.delivery_district}</>}
             </p>
+            {sub.order_note && (
+              <p>
+                ক্রেতার নোট — Buyer note: <strong>{sub.order_note}</strong>
+              </p>
+            )}
+            <OrderTimeline
+              status={sub.status}
+              shipmentStatus={sub.shipment?.status ?? null}
+              events={sub.timeline}
+              steps={sub.steps}
+            />
             {(sub.status === "delivered" || sub.status === "returned") && (
               <p>
                 <Link href={`/invoice/${sub.id}?as=seller`}>

@@ -2,20 +2,28 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import DistrictSelect from "@/components/DistrictSelect";
 import PriceTag from "@/components/PriceTag";
 import { formatBdt } from "@/lib/format";
 import {
+  createAddress,
   devSimulateSuccess,
   getAdvancePolicy,
+  getDeliveryEstimate,
+  getDistricts,
   getLoyalty,
   getOrder,
   getPaymentMethods,
+  listAddresses,
   paymentStatusLabel,
   placeOrder,
   previewCoupon,
+  type Address,
   type AdvancePolicy,
   type CartItem,
   type CouponPreview,
+  type DeliveryEstimate,
+  type District,
   type LoyaltyView,
   type Order,
   type PaymentMethodInfo,
@@ -111,6 +119,16 @@ function groupByStore(items: CartItem[]): SellerGroup[] {
  * with the same arithmetic), and an opt-in amount. The request
  * rides along with the order; the server clamps it and the
  * placed order reports the points actually used.
+ *
+ * Wave 55: the delivery form gains the address book and the
+ * district table. A saved address can be picked (radio cards)
+ * — the order then sends only its id and the server takes the
+ * fields + zone from the address itself, so the manual fields
+ * lock while one is picked. On the manual path a district
+ * select (GET /v1/districts) derives the zone automatically.
+ * An order note (≤ 500 chars) rides along for the sellers,
+ * and the chosen zone's delivery estimate (Wave 54 endpoint)
+ * is shown as a day range.
  */
 export default function CheckoutPage() {
   const { ready, token } = useAuth();
@@ -161,8 +179,50 @@ export default function CheckoutPage() {
   const [loyalty, setLoyalty] = useState<LoyaltyView | null>(null);
   const [useLoyalty, setUseLoyalty] = useState(false);
   const [loyaltyPointsInput, setLoyaltyPointsInput] = useState("");
+  // Address book + districts (Wave 55): the buyer's saved
+  // addresses, the picked one's id (null = type a new
+  // address), the district table, and the manually picked
+  // district ("" = none — the zone select then rules).
+  const [addresses, setAddresses] = useState<Address[]>([]);
+  const [selectedAddressId, setSelectedAddressId] = useState<string | null>(
+    null
+  );
+  const [districts, setDistricts] = useState<District[]>([]);
+  const [districtName, setDistrictName] = useState("");
+  // Order note (Wave 55): free text for the sellers, ≤ 500 chars.
+  const [orderNote, setOrderNote] = useState("");
+  // The chosen zone's delivery estimate (Wave 54 endpoint).
+  const [estimate, setEstimate] = useState<DeliveryEstimate | null>(null);
+  // Save-this-address offer on the success screen (Wave
+  // 55): after a MANUAL checkout with a district picked,
+  // the buyer can keep the address in the book. The book
+  // wants area + line separately while checkout's form
+  // has one address field, so the offer asks for the
+  // area and pre-fills the rest — the buyer makes the
+  // one split only they know.
+  const [saveLabel, setSaveLabel] = useState("বাসা");
+  const [saveArea, setSaveArea] = useState("");
+  const [savingAddress, setSavingAddress] = useState(false);
+  const [savedAddress, setSavedAddress] = useState(false);
+  const [saveAddressError, setSaveAddressError] = useState<string | null>(
+    null
+  );
 
   const groups = useMemo(() => groupByStore(items), [items]);
+
+  const selectedAddress =
+    addresses.find((entry) => entry.id === selectedAddressId) ?? null;
+  const selectedDistrict =
+    districts.find((entry) => entry.name_en === districtName) ?? null;
+  // The zone every preview prices against: a picked address
+  // brings its district's zone; a picked district derives
+  // its zone; otherwise the manual zone select rules. The
+  // server applies the same precedence at order time.
+  const effectiveZone = selectedAddress
+    ? (ZONES.find((z) => z.value === selectedAddress.zone) ?? ZONES[0])
+    : selectedDistrict
+      ? (ZONES.find((z) => z.value === selectedDistrict.zone) ?? ZONES[0])
+      : zone;
 
   // Quote one delivery charge per seller group whenever the cart or the
   // zone changes (preview only — the server recomputes at order time).
@@ -176,7 +236,7 @@ export default function CheckoutPage() {
       const next: Record<string, number | null> = {};
       for (const group of groups) {
         next[group.storeSlug] = await quoteAmount(
-          zone.apiZone,
+          effectiveZone.apiZone,
           group.weightKg,
           group.goodsPoisha
         );
@@ -186,7 +246,7 @@ export default function CheckoutPage() {
     return () => {
       cancelled = true;
     };
-  }, [groups, zone, quoteAmount]);
+  }, [groups, effectiveZone, quoteAmount]);
 
   // Load the payment method availability once.
   useEffect(() => {
@@ -238,6 +298,65 @@ export default function CheckoutPage() {
       cancelled = true;
     };
   }, [token]);
+
+  // Load the address book + district table (Wave 55). The
+  // default address (the API lists it first when flagged)
+  // starts picked — the picker is in picker order, so the
+  // flagged default is the natural preselection; the buyer
+  // can always switch to typing a new address.
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    listAddresses(token)
+      .then((book) => {
+        if (cancelled) return;
+        setAddresses(book.items);
+        const flagged = book.items.find((entry) => entry.is_default);
+        if (flagged) setSelectedAddressId(flagged.id);
+      })
+      .catch(() => {
+        if (!cancelled) setAddresses([]);
+      });
+    getDistricts()
+      .then((table) => {
+        if (!cancelled) setDistricts(table.items);
+      })
+      .catch(() => {
+        if (!cancelled) setDistricts([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token]);
+
+  // The delivery estimate for the effective zone (Wave 55):
+  // the Wave 54 endpoint over the cart's total weight. A
+  // failed estimate simply hides the line — checkout never
+  // depends on it.
+  const totalWeightGrams = items.reduce(
+    (sum, item) => sum + item.weight_grams * item.quantity,
+    0
+  );
+  useEffect(() => {
+    if (items.length === 0) {
+      setEstimate(null);
+      return;
+    }
+    let cancelled = false;
+    getDeliveryEstimate(
+      effectiveZone.value as DeliveryEstimate["zone"],
+      Math.max(1, totalWeightGrams)
+    )
+      .then((loaded) => {
+        if (!cancelled) setEstimate(loaded);
+      })
+      .catch(() => {
+        if (!cancelled) setEstimate(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [effectiveZone, totalWeightGrams, items.length]);
 
   const previewDelivery = groups.reduce(
     (sum, g) => sum + (charges[g.storeSlug] ?? 0),
@@ -341,8 +460,20 @@ export default function CheckoutPage() {
         delivery_name: name.trim(),
         delivery_phone: phone.trim(),
         delivery_address: address.trim(),
-        delivery_zone: zone.value,
+        delivery_zone: effectiveZone.value,
         payment_method: method,
+        // Wave 55: a picked address sends ONLY its id —
+        // the server takes the fields + zone from the
+        // address itself and ignores the fields above.
+        address_id: selectedAddress ? selectedAddress.id : undefined,
+        // Wave 55: on the manual path a picked district
+        // derives the zone server-side.
+        delivery_district:
+          !selectedAddress && selectedDistrict
+            ? selectedDistrict.name_en
+            : undefined,
+        // Wave 55: the order note for the sellers.
+        order_note: orderNote.trim() ? orderNote.trim() : undefined,
         // Only a preview-valid code is sent; checkout re-checks it
         // and its response is the final authority either way.
         coupon_code: coupon?.valid ? coupon.code : undefined,
@@ -372,6 +503,33 @@ export default function CheckoutPage() {
       setError(message);
     } finally {
       setPlacing(false);
+    }
+  }
+
+  // Wave 55: keep the just-used manual address in the
+  // book. Only offered when a district was picked (the
+  // book cannot store a zone-only address — it derives
+  // the zone FROM a district).
+  async function onSaveAddress() {
+    if (!token || !placed || !selectedDistrict) return;
+    setSavingAddress(true);
+    setSaveAddressError(null);
+    try {
+      await createAddress(token, {
+        label: saveLabel.trim() || "বাসা",
+        recipient_name: placed.delivery_name,
+        phone: placed.delivery_phone,
+        district: selectedDistrict.name_en,
+        area: saveArea.trim(),
+        address_line: address.trim(),
+      });
+      setSavedAddress(true);
+    } catch (err) {
+      setSaveAddressError(
+        err instanceof Error ? err.message : "ঠিকানা রাখা যায়নি।"
+      );
+    } finally {
+      setSavingAddress(false);
     }
   }
 
@@ -514,6 +672,50 @@ export default function CheckoutPage() {
               </p>
             </article>
           )}
+        {!selectedAddress && selectedDistrict && !savedAddress && (
+          <article className="card">
+            <h3>ঠিকানাটি সংরক্ষণ করবেন? — Save this address</h3>
+            <p>
+              পরের বার চেকআউটে এক ক্লিকেই এই ঠিকানা ব্যবহার করা
+              যাবে। এলাকা/থানা আলাদা করে লিখুন — বাকি তথ্য এই
+              অর্ডার থেকেই নেওয়া হয়েছে। (Save it for one-click
+              checkout next time; only the area needs adding.)
+            </p>
+            <p>
+              <label>
+                লেবেল
+                <input
+                  value={saveLabel}
+                  onChange={(e) => setSaveLabel(e.target.value)}
+                  maxLength={40}
+                />
+              </label>{" "}
+              <label>
+                এলাকা / থানা
+                <input
+                  value={saveArea}
+                  onChange={(e) => setSaveArea(e.target.value)}
+                  placeholder="যেমন: মিরপুর"
+                  maxLength={80}
+                />
+              </label>{" "}
+              <button
+                type="button"
+                disabled={savingAddress || !saveArea.trim()}
+                onClick={() => void onSaveAddress()}
+              >
+                {savingAddress ? "রাখা হচ্ছে…" : "সংরক্ষণ করুন — Save"}
+              </button>
+            </p>
+            {saveAddressError && <p role="alert">{saveAddressError}</p>}
+          </article>
+        )}
+        {savedAddress && (
+          <p>
+            ঠিকানা সংরক্ষিত হয়েছে ✓ —{" "}
+            <Link href="/addresses">ঠিকানার বই দেখুন</Link>
+          </p>
+        )}
         {placed.sub_orders.map((sub) => (
           <article key={sub.id} className="card">
             <h3>{sub.store_slug}</h3>
@@ -689,12 +891,51 @@ export default function CheckoutPage() {
 
           <h2>ডেলিভারির তথ্য — Delivery details</h2>
           <form onSubmit={onPlaceOrder}>
+            {addresses.length > 0 && (
+              <>
+                <h3>সংরক্ষিত ঠিকানা — Saved addresses</h3>
+                <label>
+                  <input
+                    type="radio"
+                    name="delivery-address"
+                    checked={selectedAddressId === null}
+                    onChange={() => setSelectedAddressId(null)}
+                  />{" "}
+                  নতুন ঠিকানা লিখুন — Enter a new address
+                </label>
+                {addresses.map((entry) => (
+                  <label key={entry.id}>
+                    <input
+                      type="radio"
+                      name="delivery-address"
+                      checked={selectedAddressId === entry.id}
+                      onChange={() => setSelectedAddressId(entry.id)}
+                    />{" "}
+                    <strong>{entry.label}</strong>
+                    {entry.is_default && " (ডিফল্ট)"} — {entry.recipient_name}
+                    , {entry.phone}
+                    <br />
+                    {entry.full_address}
+                    {entry.district_bn ? ` · ${entry.district_bn}` : ""} ·{" "}
+                    {ZONES.find((z) => z.value === entry.zone)?.label ??
+                      entry.zone}
+                  </label>
+                ))}
+                <p>
+                  ঠিকানা বেছে নিলে নিচের ফরম লক থাকে — অর্ডারে ঠিকানার
+                  তথ্যই যাবে। (With an address picked, the order uses the
+                  address book's fields; the form below is locked.){" "}
+                  <Link href="/addresses">ঠিকানা পরিচালনা — Manage addresses</Link>
+                </p>
+              </>
+            )}
             <label>
               আপনার নাম
               <input
                 value={name}
                 onChange={(e) => setName(e.target.value)}
-                required
+                disabled={!!selectedAddress}
+                required={!selectedAddress}
               />
             </label>
             <label>
@@ -704,7 +945,8 @@ export default function CheckoutPage() {
                 onChange={(e) => setPhone(e.target.value)}
                 placeholder="01712345678"
                 inputMode="tel"
-                required
+                disabled={!!selectedAddress}
+                required={!selectedAddress}
               />
             </label>
             <label>
@@ -712,16 +954,28 @@ export default function CheckoutPage() {
               <input
                 value={address}
                 onChange={(e) => setAddress(e.target.value)}
-                required
+                disabled={!!selectedAddress}
+                required={!selectedAddress}
+              />
+            </label>
+            <label>
+              জেলা (District)
+              <DistrictSelect
+                districts={districts}
+                value={districtName}
+                onChange={setDistrictName}
+                disabled={!!selectedAddress}
+                optional
               />
             </label>
             <label>
               এলাকা (Zone)
               <select
-                value={zone.value}
+                value={effectiveZone.value}
                 onChange={(e) =>
                   setZone(ZONES.find((z) => z.value === e.target.value) ?? ZONES[0])
                 }
+                disabled={!!selectedAddress || !!selectedDistrict}
               >
                 {ZONES.map((z) => (
                   <option key={z.value} value={z.value}>
@@ -730,6 +984,34 @@ export default function CheckoutPage() {
                 ))}
               </select>
             </label>
+            {(selectedAddress || selectedDistrict) && (
+              <p>
+                জোনটি জেলা থেকে নির্ধারিত — Zone set from the district:{" "}
+                {effectiveZone.label}
+              </p>
+            )}
+            {estimate && (
+              <p>
+                আনুমানিক ডেলিভারি সময় — Estimated delivery:{" "}
+                {estimate.min_days}–{estimate.max_days} দিন (days) এই জোনে,
+                চার্জ <PriceTag amountPoisha={estimate.delivery_charge_poisha} />{" "}
+                থেকে শুরু (প্রতি বিক্রেতার পার্সেল অনুযায়ী উপরের হিসাবই
+                দেখুন)।
+              </p>
+            )}
+
+            <h3>বিক্রেতার জন্য নোট — Note for the sellers</h3>
+            <label>
+              নোট (সর্বোচ্চ ৫০০ অক্ষর)
+              <textarea
+                value={orderNote}
+                onChange={(e) => setOrderNote(e.target.value)}
+                maxLength={500}
+                rows={3}
+                placeholder="যেমন: সন্ধ্যার পর ডেলিভারি দিলে ভালো হয়"
+              />
+            </label>
+            <p>{orderNote.length}/500</p>
 
             <h2>পেমেন্ট — Payment</h2>
             {methods === null ? (

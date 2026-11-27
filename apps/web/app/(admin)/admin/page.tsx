@@ -306,6 +306,42 @@ function SystemStatus() {
               </>
             )}
           </div>
+          <div className="card">
+            <p>
+              <strong>জেলা অনুযায়ী অর্ডার — Orders by district (Wave 55)</strong>
+            </p>
+            <p>
+              শুধু যেসব অর্ডারে জেলা জানা আছে সেগুলোই গণনা করা হয়েছে —
+              জোন-মাত্র চেকআউটে কোনো জেলা দাবি করা হয় না, তাই সেগুলো
+              এই তালিকায় নেই। (Only orders that named a district are
+              counted; zone-only orders are not attributed a district.)
+            </p>
+            {metrics.orders_by_district.length === 0 ? (
+              <p>এখনো কোনো জেলা-জানা অর্ডার নেই।</p>
+            ) : (
+              <ul>
+                {metrics.orders_by_district.map((row) => (
+                  <li key={row.district}>
+                    {row.district} — <strong>{row.orders}</strong> টি অর্ডার
+                  </li>
+                ))}
+              </ul>
+            )}
+            <p>
+              জোন অনুযায়ী (সব অর্ডার) — By zone (all orders):{" "}
+              {metrics.orders_by_zone
+                .map((row) => `${row.zone}: ${row.orders}`)
+                .join(" · ")}
+            </p>
+            <p>
+              ঠিকানার বই — Address book: মোট সংরক্ষিত ঠিকানা{" "}
+              <strong>{metrics.address_book.total_addresses}</strong>
+              {" · "}ঠিকানা আছে এমন ক্রেতা{" "}
+              <strong>{metrics.address_book.buyers_with_addresses}</strong>
+              {" · "}ডিফল্টসহ বই{" "}
+              <strong>{metrics.address_book.defaults_count}</strong>
+            </p>
+          </div>
         </>
       )}
     </>

@@ -8,8 +8,24 @@ import {
   getOrderReceipt,
   paymentStatusLabel,
   type Receipt,
+  type TimelineEvent,
 } from "@/lib/api";
 import { useAuth } from "@/hooks/useAuth";
+import OrderTimeline from "@/components/OrderTimeline";
+
+/**
+ * The courier's latest unified status on a sub-order, read
+ * off its timeline (the receipt carries no shipment object;
+ * the timeline's shipment_status events are the courier
+ * leg). Null until the courier reports anything.
+ */
+function lastShipmentStatus(events: TimelineEvent[]): string | null {
+  let status: string | null = null;
+  for (const event of events) {
+    if (event.kind === "shipment_status") status = event.status;
+  }
+  return status;
+}
 
 /** Zone values with their Bangla labels (display only). */
 const ZONE_LABELS: Record<string, string> = {
@@ -23,6 +39,12 @@ const ZONE_LABELS: Record<string, string> = {
  * receipt endpoint's view-model — the API has already left out
  * commission and payout, so this page can never show them. The Print
  * button uses window.print(); print CSS hides it and the back link.
+ *
+ * Wave 55: the page doubles as the buyer's tracking view —
+ * each store's section gains the shared OrderTimeline
+ * (stepper + event list from the receipt's per-sub-order
+ * timeline), and the buyer's order note shows under the
+ * delivery block.
  */
 export default function OrderReceiptPage({
   params,
@@ -118,6 +140,9 @@ export default function OrderReceiptPage({
           {receipt.delivery.address} ·{" "}
           {ZONE_LABELS[receipt.delivery.zone] ?? receipt.delivery.zone}
         </p>
+        {receipt.order_note && (
+          <p>আপনার নোট — Your note for the sellers: {receipt.order_note}</p>
+        )}
 
         {receipt.sub_orders.map((sub) => (
           <section key={sub.store_slug}>
@@ -144,6 +169,13 @@ export default function OrderReceiptPage({
               ডেলিভারি চার্জ:{" "}
               <PriceTag amountPoisha={sub.delivery_charge_poisha} />
             </p>
+            <h3>ট্র্যাকিং — Tracking</h3>
+            <OrderTimeline
+              status={sub.status}
+              shipmentStatus={lastShipmentStatus(sub.timeline)}
+              events={sub.timeline}
+              steps={sub.steps}
+            />
           </section>
         ))}
 

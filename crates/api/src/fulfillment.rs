@@ -39,6 +39,12 @@
 //!   label must say; rendering is the web print view's job.
 //!   Courier-native label PDFs need per-courier label APIs
 //!   that are merchant-onboarding items, not platform code.
+//! - **The buyer's order note rides along (Wave 55).** The
+//!   note checkout stores on the order surfaces on both the
+//!   queue rows and the label data — a packing note the
+//!   seller only sees AFTER the parcel ships would be
+//!   worthless, so it is on the two surfaces the seller
+//!   works from before booking.
 //!
 //! Scope is the Wave 34 store scope at `manage_orders`: the
 //! owner, or a member whose role carries it (every member role
@@ -302,6 +308,14 @@ pub struct FulfillmentItem {
     pub delivery_name: String,
     pub delivery_phone: String,
     pub delivery_zone: String,
+    /// The order's delivery district (Wave 55), when the
+    /// order recorded one — sellers plan courier runs by
+    /// district; null for zone-only orders.
+    pub delivery_district: Option<String>,
+    /// The buyer's order note (Wave 55), from the parent
+    /// order — packing instructions live where the
+    /// packer works.
+    pub order_note: Option<String>,
     /// The parent order's payment status (the Wave 17 advance
     /// states surface here exactly as on the seller list).
     pub order_payment_status: String,
@@ -335,6 +349,8 @@ struct FulfillmentRow {
     delivery_name: String,
     delivery_phone: String,
     delivery_zone: String,
+    delivery_district: Option<String>,
+    order_note: Option<String>,
     order_payment_status: String,
     shipment_id: Option<Uuid>,
     shipment_courier: Option<String>,
@@ -365,7 +381,8 @@ pub async fn list_fulfillment(
          so.created_at, so.goods_subtotal_poisha, so.discount_poisha, \
          so.loyalty_discount_poisha, so.delivery_charge_poisha, \
          (SELECT COUNT(*) FROM order_items oi WHERE oi.sub_order_id = so.id) AS items_count, \
-         o.delivery_name, o.delivery_phone, o.delivery_zone, \
+         o.delivery_name, o.delivery_phone, o.delivery_zone, o.delivery_district, \
+         o.order_note, \
          o.payment_status AS order_payment_status, \
          sh.id AS shipment_id, sh.courier AS shipment_courier, \
          sh.consignment_id AS shipment_consignment_id, \
@@ -430,6 +447,8 @@ pub async fn list_fulfillment(
             delivery_name: row.delivery_name,
             delivery_phone: row.delivery_phone,
             delivery_zone: row.delivery_zone,
+            delivery_district: row.delivery_district,
+            order_note: row.order_note,
             order_payment_status: row.order_payment_status,
             shipment,
         });
@@ -620,6 +639,12 @@ pub struct FulfillmentLabel {
     pub delivery_phone: String,
     pub delivery_address: String,
     pub delivery_zone: String,
+    /// The buyer's order note (Wave 55), printed with
+    /// the label so it travels with the parcel.
+    pub order_note: Option<String>,
+    /// The order's district (Wave 55); null for
+    /// zone-only orders.
+    pub delivery_district: Option<String>,
     /// The courier's key as stored (`steadfast`, `manual`, …).
     pub courier: String,
     /// The human courier name: the manual courier's display
@@ -664,6 +689,8 @@ struct LabelRow {
     delivery_phone: String,
     delivery_address: String,
     delivery_zone: String,
+    order_note: Option<String>,
+    delivery_district: Option<String>,
     courier: Option<String>,
     consignment_id: Option<String>,
     manual_courier_name: Option<String>,
@@ -720,6 +747,7 @@ pub async fn list_fulfillment_labels(
              st.name AS store_name, st.slug AS store_slug, \
              u.phone AS seller_phone, \
              o.delivery_name, o.delivery_phone, o.delivery_address, o.delivery_zone, \
+             o.order_note, o.delivery_district, \
              sh.courier, sh.consignment_id, sh.manual_courier_name, \
              sh.manual_tracking_id, sh.cod_amount_poisha, \
              (SELECT COUNT(*) FROM order_items oi WHERE oi.sub_order_id = so.id) AS items_count \
@@ -766,6 +794,8 @@ pub async fn list_fulfillment_labels(
             delivery_phone: row.delivery_phone,
             delivery_address: row.delivery_address,
             delivery_zone: row.delivery_zone,
+            order_note: row.order_note,
+            delivery_district: row.delivery_district,
             courier_display_name: row
                 .manual_courier_name
                 .clone()

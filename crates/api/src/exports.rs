@@ -39,8 +39,10 @@
 //!   name, role and account creation time.
 //! - `orders`: the newest 1_000 orders with sub-orders and
 //!   items nested. Delivery details live on the order rows,
-//!   so the buyer's addresses travel with the orders — there
-//!   is no separate address book to export.
+//!   so the addresses orders shipped to travel with them.
+//! - `addresses` (Wave 55): the buyer's saved address
+//!   book, in the book's own served shape — the book is
+//!   the buyer's data exactly like the wishlist.
 //! - `reviews`, `wishlist` (product ids + titles) and
 //!   `questions`: the buyer's own contributions.
 //!
@@ -480,6 +482,11 @@ pub async fn buyer_export(pool: &PgPool, user: &AuthUser) -> Result<ExportDownlo
     .await
     .map_err(|e| ApiError::internal("export followed stores", e))?;
 
+    // Wave 55: the address book joins the document, in
+    // the book's own served shape (the addresses module's
+    // list — derived zone and composed address included).
+    let addresses = crate::addresses::list_addresses(pool, user).await?.items;
+
     let now = Utc::now();
     let filename = export_filename("buyer", &profile.phone, &now.format("%Y%m%d").to_string());
     let document = json!({
@@ -491,6 +498,7 @@ pub async fn buyer_export(pool: &PgPool, user: &AuthUser) -> Result<ExportDownlo
         "wishlist": wishlist,
         "questions": questions,
         "followed_stores": followed_stores,
+        "addresses": addresses,
     });
     Ok(ExportDownload { filename, document })
 }

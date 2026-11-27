@@ -4435,6 +4435,188 @@ by followers then ratings only — there is no
 personalisation model behind them, and the label says
 exactly what they are.
 
+Wave 55 (cart / checkout / tracking polish — the
+Shopify-parity program continues):
+
+**The buyer gains an address book, checkout learns
+districts, the cart gains a save-for-later shelf, past
+orders can be bought again, and tracking grows a real
+timeline.** The address book (migration 0057,
+`buyer_addresses`) sits behind `GET`/`POST
+/v1/addresses`, `PATCH`/`DELETE /v1/addresses/{id}` and
+`POST /v1/addresses/{id}/default` — own rows only,
+another buyer's id is a 404 on every verb. Every write
+passes the domain's one validation
+(`validate_address_input`): label ≤ 40 chars, recipient
+≤ 80, area ≤ 80, address line ≤ 200, the phone through
+the existing BD normaliser (stored canonical), and the
+district against the domain's district table. A buyer
+keeps at most 10 addresses (the domain cap, counted
+inside a transaction that locks the buyer's user row);
+exactly one may be the default (a partial unique index
+makes it a database fact, and writes switch it inside
+one transaction). The FIRST address saved becomes the
+default automatically; deleting the default leaves NO
+default — the platform does not silently promote an
+address the buyer did not choose. The list orders
+default-first, then most recently used at checkout,
+then newest.
+
+**Districts are platform policy, stated here.** The
+domain carries all 64 districts of Bangladesh with
+English + Bangla names, each mapped to one of the three
+delivery zones (`GET /v1/districts`, public): Dhaka
+district → Inside Dhaka; the five districts that BORDER
+Dhaka district — Gazipur, Narayanganj, Munshiganj,
+Narsingdi, Manikganj — → Dhaka Suburb; every other
+district → Outside Dhaka. Tangail is deliberately
+Outside Dhaka: it does not border Dhaka district.
+Granularity is the district — thana-level refinement
+(Keraniganj-style splits inside a district) is a known
+limit, not a silent approximation: a Dhaka-district
+address in a far thana is priced Inside Dhaka until a
+thana table exists. The zone is NEVER stored on an
+address and never accepted from a client; it derives
+from the district through the table at read time, so a
+mapping change moves every saved address at once.
+
+**Checkout gains three additive inputs; the money canon
+(advance Wave 17, coupons Wave 14, loyalty Wave 35,
+flash Wave 52) is untouched.** `address_id`: the server
+loads the buyer's own address (another buyer's id is a
+404 and no order is created) and the order's delivery
+name/phone/address/zone/district come from THAT row —
+the client-sent delivery fields are ignored on this
+path — and the address's `last_used_at` is stamped
+inside the checkout transaction (migration 0057's
+column; a rolled-back checkout stamps nothing).
+`delivery_district` on the manual path: the district is
+validated against the table (unknown → bilingual 400)
+and the zone derives from it, so a district and a zone
+that disagree can never both reach an order. With
+neither input, the pre-Wave-55 body-fields path runs
+byte-identically. `order_note` (migration 0058, with
+`orders.delivery_district`): the buyer's note to the
+sellers, domain-capped at 500 chars (over → 400 before
+anything writes), stored on the order and shown on the
+buyer's order + receipt, the seller's sub-order list,
+the fulfillment queue AND the packing-label data — the
+two surfaces a seller works from before booking.
+Checkout's page mirrors all of it: an address picker
+(radio cards; picking one locks the manual form), a
+district select that sets the zone, the note field, and
+the Wave 54 delivery estimate for the chosen zone. The
+admin metrics snapshot gains `orders_by_district` —
+only orders that NAMED a district are counted; a
+zone-only order has no district to attribute and
+inventing one from the zone would fabricate geography.
+
+**Cart v2.** Migration 0059 adds `cart_items.saved`.
+`POST /v1/cart/items/{product_id}/save` and `/unsave`
+(body carries `variant_id`, like the quantity write)
+move a line between the active cart and the shelf; the
+cart response gains `saved_items` as its own array.
+Saved lines are out of the goods total, invisible to
+checkout (the lock scan and the post-checkout clear
+both filter them — a cart of only saved lines is
+"empty"), and survive DELETE /v1/cart. Adding a saved
+product again revives its line into the active cart
+(the add upsert clears the flag). The quantity PATCH
+now respects real stock: past the line's stock — the
+variant's stock for a variant line, the product's
+otherwise — it answers the bilingual 400 "স্টকে মাত্র
+{n}টি আছে"; exactly-at-stock is accepted. The cart page
+renders the shelf with move-back/remove, and per-line
+"পরে কিনুন — Save for later".
+
+**Reorder ("buy again").** `POST /v1/orders/{id}/reorder`
+re-adds a past order's lines at CURRENT prices through
+the cart module's one add path — old prices are never
+consulted; the order contributes only (product,
+variant, quantity). The domain's `reorder_decision`
+names every skip: `product_unavailable` (gone or not
+active), `variant_unavailable` (the bought variant was
+deactivated or removed, or the product has since gained
+variants so the old variant-less line no longer names a
+buyable thing), `out_of_stock`, `cart_limit` (the cart
+line is already at the 99 cap). Partial adds clamp to
+min(ordered, today's stock, cart headroom). The report
+is honest partial success — `{added, skipped: [{title,
+reason, message}], cart}` — and the buyer orders page
+renders it under the order, next to a "deliver to"
+summary line. A cancelled order is a 409; another
+buyer's order is a 404.
+
+**Tracking v2.** The public tracking response and the
+buyer order/receipt views gain TIMELINES, built by one
+shared builder (the API's `timeline` module): the
+order-level list (placement, then per payment row the
+initiation/settlement events — named `advance_*` on COD
+orders, where a payment row is by construction the
+Wave 17 advance) and a per-sub-order list (placed,
+confirmed, shipment booked with courier + consignment,
+one event per `shipment_events` row, delivered,
+returned/cancelled, and the return request + decision
+when they exist). The web renders a stepper whose
+derivation mirrors the domain's
+`sub_order_tracking_steps` branch for branch.
+**Timestamp honesty:** an event carries a time only
+when a real column recorded the moment. Placement,
+booking, every courier event, payment settlement and
+the return rows have one; a seller's confirm (or a
+manual delivered/cancel flip) has NONE — orders and
+sub-orders carry no status-change timestamps — so
+those events ship `at: null` in their logical position.
+No surface invents a time.
+
+**Wave 55 extensions.** The stepper is also computed
+SERVER-side: every sub-order view (buyer order, receipt,
+seller list, public track) carries `steps` from the
+domain derivation itself, and the web prefers them,
+keeping its local mirror only as a fallback. The seller
+sub-order list carries the same timeline + steps, plus
+the order's district; so do the fulfillment queue item
+and the packing label. The shelf gains bulk operations
+(`POST /v1/cart/saved/move-all`, `DELETE
+/v1/cart/saved`). A buy-again rail (`GET
+/v1/buyer/buy-again`) lists products from the buyer's
+past orders that can be bought again TODAY — active and
+in stock, flash-resolved current prices, `times_ordered`
+and an `in_cart` flag; archived or sold-out products
+simply leave the rail rather than failing at add time.
+The address book gains a single-address `GET
+/v1/addresses/{id}` and a checkout-prefill endpoint
+`GET /v1/buyer/default-address` (404 when the book has
+no default; it lives under `/v1/buyer/` because axum
+0.7 cannot register a static `default` segment beside
+`/v1/addresses/:id`). `GET /v1/districts?q=` narrows
+the table through the domain's `search_districts`
+(English prefix, then substring, then Bangla name). The
+per-store invoice shows the order's district and note;
+the buyer data export (Wave 31) gains an `addresses`
+section — its doc comment previously claimed no address
+book existed, which this wave made false; the admin
+metrics gain `orders_by_zone` (complete — every order
+has a zone) and an `address_book` adoption block
+(total saved, buyers holding any, defaults in force).
+Checkout's success screen offers to save a manually
+typed address into the book (asking only for the area,
+the one split the single checkout field cannot know),
+and the address form + checkout share one
+`DistrictSelect` component so their district lists can
+never drift.
+
+Honest limits: the district mapping is district-level
+policy (above); deleting the default address leaves
+the book without one until the buyer picks another;
+reorder prices are whatever the product costs NOW —
+including a live flash sale, since reorder adds through
+the same cart path as a manual add; timeline
+granularity is bounded by the recorded columns (the
+confirm/manual-flip moments are unknowable from the
+schema, stated above rather than papered over); the
+district statistics count only district-known orders.
+
 ## How to run
 
 With a database (Wave 2 features):
@@ -5946,6 +6128,34 @@ answered-first sort + unanswered count, the admin
 per-store follower list, the analytics community totals,
 the header notification bell, and the cart-page delivery
 estimate. See the Wave 54 section.
+
+**Real (Wave 55):** the buyer address book (migration
+0057, CRUD + one-default rules + 10-address cap +
+ownership 404s + `last_used_at` stamped by checkout),
+the 64-district table with its zone policy (Dhaka
+inside; the five Dhaka-bordering districts suburb;
+Tangail outside — stated in the Wave 55 section) behind
+public `GET /v1/districts`, checkout's address path
+(server-side fields + zone from the saved address) and
+district path (zone derived), the order note (migration
+0058, ≤ 500 chars) on the buyer, seller, fulfillment
+and label surfaces, save-for-later (migration 0059,
+save/unsave endpoints, checkout- and clear-proof) with
+the stock-capped quantity write, reorder at current
+prices with the per-line skip report, order + sub-order
+timelines on the buyer order, receipt and public
+tracking views (timestamps only where recorded), the
+/districts-driven checkout form with address picker and
+delivery estimate, the /addresses page, and the admin
+orders-by-district aggregate. Extensions: API-computed
+tracking `steps` on every sub-order view, the seller
+timeline, shelf bulk move-all/clear, the buy-again rail
+(`GET /v1/buyer/buy-again`), single-address GET +
+`GET /v1/buyer/default-address`, district search
+(`?q=`), invoice district + note, the export's
+`addresses` section, admin orders-by-zone + address-book
+stats, and the shared DistrictSelect. See the Wave 55
+section.
 
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real

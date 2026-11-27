@@ -5440,6 +5440,592 @@ pub fn price_drop_percent(base_price_poisha: i64, sale_price_poisha: i64) -> i64
     drop as i64
 }
 
+// ---------------------------------------------------------------------------
+// Bangladesh districts + delivery zones (Wave 55)
+// ---------------------------------------------------------------------------
+
+/// One of Bangladesh's 64 districts (Wave 55), with the
+/// delivery zone the platform assigns it. The mapping is
+/// PLATFORM POLICY at district granularity:
+///
+/// - `InsideDhaka` is the Dhaka district alone — the
+///   metro courier zone every Bangladeshi courier prices
+///   as "inside Dhaka".
+/// - `DhakaSuburb` is the five districts that BORDER
+///   Dhaka district (Gazipur, Narayanganj, Munshiganj,
+///   Narsingdi, Manikganj) — the ring couriers price as
+///   the Dhaka periphery. Tangail is deliberately NOT in
+///   the ring: it does not border Dhaka district (Gazipur
+///   sits between), so it prices as outside.
+/// - Everything else is `OutsideDhaka`.
+///
+/// Thana-level refinement (Keraniganj pricing as suburb
+/// although it sits inside Dhaka district, say) is a
+/// documented limit of this wave: the district is the
+/// finest geography the address book records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct District {
+    /// Canonical English name — the value stored on
+    /// addresses and orders and sent by clients.
+    pub name_en: &'static str,
+    /// The district's Bangla name, for the picker UI.
+    pub name_bn: &'static str,
+    /// The delivery zone this district prices under.
+    pub zone: DeliveryZone,
+}
+
+/// The 64 districts of Bangladesh (Wave 55), alphabetical
+/// by canonical English name, each with its zone under
+/// the policy on [`District`]. This table is the ONE
+/// district → zone mapping: the address book validates
+/// against it, checkout derives zones from it, and the
+/// public `GET /v1/districts` serves it verbatim.
+pub const DISTRICTS: &[District] = &[
+    District { name_en: "Bagerhat", name_bn: "বাগেরহাট", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Bandarban", name_bn: "বান্দরবান", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Barguna", name_bn: "বরগুনা", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Barishal", name_bn: "বরিশাল", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Bhola", name_bn: "ভোলা", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Bogura", name_bn: "বগুড়া", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Brahmanbaria", name_bn: "ব্রাহ্মণবাড়িয়া", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Chandpur", name_bn: "চাঁদপুর", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Chapai Nawabganj", name_bn: "চাঁপাইনবাবগঞ্জ", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Chattogram", name_bn: "চট্টগ্রাম", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Chuadanga", name_bn: "চুয়াডাঙ্গা", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Cox's Bazar", name_bn: "কক্সবাজার", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Cumilla", name_bn: "কুমিল্লা", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Dhaka", name_bn: "ঢাকা", zone: DeliveryZone::InsideDhaka },
+    District { name_en: "Dinajpur", name_bn: "দিনাজপুর", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Faridpur", name_bn: "ফরিদপুর", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Feni", name_bn: "ফেনী", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Gaibandha", name_bn: "গাইবান্ধা", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Gazipur", name_bn: "গাজীপুর", zone: DeliveryZone::DhakaSuburb },
+    District { name_en: "Gopalganj", name_bn: "গোপালগঞ্জ", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Habiganj", name_bn: "হবিগঞ্জ", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Jamalpur", name_bn: "জামালপুর", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Jashore", name_bn: "যশোর", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Jhalokati", name_bn: "ঝালকাঠি", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Jhenaidah", name_bn: "ঝিনাইদহ", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Joypurhat", name_bn: "জয়পুরহাট", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Khagrachari", name_bn: "খাগড়াছড়ি", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Khulna", name_bn: "খুলনা", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Kishoreganj", name_bn: "কিশোরগঞ্জ", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Kurigram", name_bn: "কুড়িগ্রাম", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Kushtia", name_bn: "কুষ্টিয়া", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Lakshmipur", name_bn: "লক্ষ্মীপুর", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Lalmonirhat", name_bn: "লালমনিরহাট", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Madaripur", name_bn: "মাদারীপুর", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Magura", name_bn: "মাগুরা", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Manikganj", name_bn: "মানিকগঞ্জ", zone: DeliveryZone::DhakaSuburb },
+    District { name_en: "Meherpur", name_bn: "মেহেরপুর", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Moulvibazar", name_bn: "মৌলভীবাজার", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Munshiganj", name_bn: "মুন্সীগঞ্জ", zone: DeliveryZone::DhakaSuburb },
+    District { name_en: "Mymensingh", name_bn: "ময়মনসিংহ", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Naogaon", name_bn: "নওগাঁ", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Narail", name_bn: "নড়াইল", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Narayanganj", name_bn: "নারায়ণগঞ্জ", zone: DeliveryZone::DhakaSuburb },
+    District { name_en: "Narsingdi", name_bn: "নরসিংদী", zone: DeliveryZone::DhakaSuburb },
+    District { name_en: "Natore", name_bn: "নাটোর", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Netrokona", name_bn: "নেত্রকোনা", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Nilphamari", name_bn: "নীলফামারী", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Noakhali", name_bn: "নোয়াখালী", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Pabna", name_bn: "পাবনা", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Panchagarh", name_bn: "পঞ্চগড়", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Patuakhali", name_bn: "পটুয়াখালী", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Pirojpur", name_bn: "পিরোজপুর", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Rajbari", name_bn: "রাজবাড়ী", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Rajshahi", name_bn: "রাজশাহী", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Rangamati", name_bn: "রাঙ্গামাটি", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Rangpur", name_bn: "রংপুর", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Satkhira", name_bn: "সাতক্ষীরা", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Shariatpur", name_bn: "শরীয়তপুর", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Sherpur", name_bn: "শেরপুর", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Sirajganj", name_bn: "সিরাজগঞ্জ", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Sunamganj", name_bn: "সুনামগঞ্জ", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Sylhet", name_bn: "সিলেট", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Tangail", name_bn: "টাঙ্গাইল", zone: DeliveryZone::OutsideDhaka },
+    District { name_en: "Thakurgaon", name_bn: "ঠাকুরগাঁও", zone: DeliveryZone::OutsideDhaka },
+];
+
+/// Look a district up by name (Wave 55): the canonical
+/// English name matched case-insensitively after
+/// trimming, or the Bangla name matched exactly. Anything
+/// else is `None` — a free-typed district the table does
+/// not know can never silently acquire a zone.
+pub fn district_by_name(name: &str) -> Option<&'static District> {
+    let trimmed = name.trim();
+    DISTRICTS.iter().find(|district| {
+        district.name_en.eq_ignore_ascii_case(trimmed) || district.name_bn == trimmed
+    })
+}
+
+/// The delivery zone of a district by name (Wave 55) —
+/// [`district_by_name`] projected to its zone.
+pub fn zone_for_district(name: &str) -> Option<DeliveryZone> {
+    district_by_name(name).map(|district| district.zone)
+}
+
+/// Search the district table by a free-text query (Wave
+/// 55) — for the address form's picker, where scrolling
+/// 64 entries on a phone is miserable. Matching is
+/// deliberately simple and predictable: the query is
+/// trimmed; a district matches when its English name
+/// STARTS with the query (rank 0, case-insensitive),
+/// CONTAINS it (rank 1), or its Bangla name contains it
+/// (rank 2). Results sort by rank, then by the table's
+/// canonical order, capped at `limit` (zero yields
+/// nothing). An empty query returns the first `limit`
+/// districts in canonical order — a picker's initial
+/// state.
+pub fn search_districts(query: &str, limit: usize) -> Vec<&'static District> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return DISTRICTS.iter().take(limit).collect();
+    }
+    let trimmed = query.trim();
+    let mut ranked: Vec<(u8, usize, &'static District)> = DISTRICTS
+        .iter()
+        .enumerate()
+        .filter_map(|(index, district)| {
+            let en = district.name_en.to_lowercase();
+            let rank = if en.starts_with(&needle) {
+                0
+            } else if en.contains(&needle) {
+                1
+            } else if district.name_bn.contains(trimmed) {
+                2
+            } else {
+                return None;
+            };
+            Some((rank, index, district))
+        })
+        .collect();
+    ranked.sort_by_key(|(rank, index, _)| (*rank, *index));
+    ranked
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, district)| district)
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Buyer address book (Wave 55)
+// ---------------------------------------------------------------------------
+
+/// Longest address-book label, in characters (Wave 55) —
+/// "বাসা", "অফিস", "আম্মুর বাসা" are short by nature.
+pub const MAX_ADDRESS_LABEL_CHARS: usize = 40;
+
+/// Longest recipient name on an address (Wave 55).
+pub const MAX_ADDRESS_RECIPIENT_CHARS: usize = 80;
+
+/// Longest thana/area text on an address (Wave 55).
+pub const MAX_ADDRESS_AREA_CHARS: usize = 80;
+
+/// Longest street-address line on an address (Wave 55).
+pub const MAX_ADDRESS_LINE_CHARS: usize = 200;
+
+/// How many addresses one buyer may keep (Wave 55): a
+/// book, not a database — the cap keeps the checkout
+/// picker a short radio list.
+pub const MAX_ADDRESSES_PER_USER: i64 = 10;
+
+/// The raw address payload, as the API receives it
+/// (Wave 55) — every field unvalidated text; the
+/// validated form is [`ValidatedAddress`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddressInput {
+    pub label: String,
+    pub recipient_name: String,
+    pub phone: String,
+    pub district: String,
+    pub area: String,
+    pub address_line: String,
+}
+
+/// An address that passed [`validate_address_input`]
+/// (Wave 55): trimmed fields, the phone in canonical
+/// `+880…` form, the district in its canonical English
+/// spelling, and the zone the district table assigns it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidatedAddress {
+    pub label: String,
+    pub recipient_name: String,
+    /// Canonical phone (`+8801…`), via
+    /// [`normalize_bd_phone`].
+    pub phone: String,
+    /// Canonical English district name from
+    /// [`DISTRICTS`].
+    pub district: String,
+    pub area: String,
+    pub address_line: String,
+    /// The district's zone — derived, never stored.
+    pub zone: DeliveryZone,
+}
+
+/// Trim one address text field and enforce its length
+/// cap (Wave 55): blank is an error (every address field
+/// is required — a half-known address misdelivers), over
+/// the cap is an error naming the field in both
+/// languages.
+fn validate_address_field(
+    raw: &str,
+    max_chars: usize,
+    label_bn: &str,
+    label_en: &str,
+) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{label_bn} দিতে হবে — {label_en} is required"));
+    }
+    if trimmed.chars().count() > max_chars {
+        return Err(format!(
+            "{label_bn} সর্বোচ্চ {max_chars} অক্ষরের হতে হবে — \
+             {label_en} must be at most {max_chars} characters"
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Validate one address-book entry (Wave 55): every text
+/// field present and within its cap, the phone a valid
+/// Bangladeshi mobile (the platform's one phone rule),
+/// and the district a real district from [`DISTRICTS`] —
+/// its zone comes from the table, so a stored address
+/// can never carry a zone the district disagrees with.
+pub fn validate_address_input(input: &AddressInput) -> Result<ValidatedAddress, String> {
+    let label = validate_address_field(
+        &input.label,
+        MAX_ADDRESS_LABEL_CHARS,
+        "লেবেল",
+        "label",
+    )?;
+    let recipient_name = validate_address_field(
+        &input.recipient_name,
+        MAX_ADDRESS_RECIPIENT_CHARS,
+        "গ্রহীতার নাম",
+        "recipient name",
+    )?;
+    let area = validate_address_field(
+        &input.area,
+        MAX_ADDRESS_AREA_CHARS,
+        "থানা/এলাকা",
+        "thana/area",
+    )?;
+    let address_line = validate_address_field(
+        &input.address_line,
+        MAX_ADDRESS_LINE_CHARS,
+        "ঠিকানা",
+        "address",
+    )?;
+    let phone = normalize_bd_phone(&input.phone).ok_or_else(|| {
+        "সঠিক বাংলাদেশি মোবাইল নম্বর দিন — enter a valid Bangladeshi mobile number"
+            .to_string()
+    })?;
+    let district = district_by_name(&input.district).ok_or_else(|| {
+        "জেলাটি তালিকায় নেই — choose a district from the list".to_string()
+    })?;
+    Ok(ValidatedAddress {
+        label,
+        recipient_name,
+        phone,
+        district: district.name_en.to_string(),
+        area,
+        address_line,
+        zone: district.zone,
+    })
+}
+
+/// May this buyer save one more address (Wave 55)? At
+/// [`MAX_ADDRESSES_PER_USER`] the next save is refused;
+/// the count is the caller's CURRENT row count.
+pub fn validate_address_count(current_addresses: i64) -> Result<(), String> {
+    if current_addresses < 0 {
+        return Err("address count cannot be negative".to_string());
+    }
+    if current_addresses >= MAX_ADDRESSES_PER_USER {
+        return Err(format!(
+            "আপনার সর্বোচ্চ {MAX_ADDRESSES_PER_USER}টি ঠিকানা সংরক্ষিত আছে — \
+             you already keep the maximum of {MAX_ADDRESSES_PER_USER} addresses; \
+             delete one first"
+        ));
+    }
+    Ok(())
+}
+
+/// Compose the one-line delivery address an order
+/// stores (Wave 55): street line, thana/area, district —
+/// the same composition the courier label prints, so
+/// the order's free-text address and the address book
+/// can never drift apart in format.
+pub fn compose_delivery_address(address_line: &str, area: &str, district: &str) -> String {
+    format!("{address_line}, {area}, {district}")
+}
+
+// ---------------------------------------------------------------------------
+// Order note (Wave 55)
+// ---------------------------------------------------------------------------
+
+/// Longest buyer order note, in characters (Wave 55) —
+/// a delivery instruction, not a letter.
+pub const MAX_ORDER_NOTE_CHARS: usize = 500;
+
+/// Validate a buyer's order note (Wave 55): `None` and
+/// blank become `None` (no note), a present note is
+/// trimmed, and over [`MAX_ORDER_NOTE_CHARS`] is an
+/// error. The note rides the ORDER (every seller of a
+/// split order reads the same note — it is addressed to
+/// whoever delivers, and checkout has one note box, not
+/// one per seller).
+pub fn validate_order_note(note: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = note else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().count() > MAX_ORDER_NOTE_CHARS {
+        return Err(format!(
+            "অর্ডার নোট সর্বোচ্চ {MAX_ORDER_NOTE_CHARS} অক্ষরের হতে হবে — \
+             the order note must be at most {MAX_ORDER_NOTE_CHARS} characters"
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Reorder / buy-again (Wave 55)
+// ---------------------------------------------------------------------------
+
+/// Why one line of a past order could not be re-added
+/// (Wave 55). The codes are the API's report vocabulary;
+/// [`ReorderSkipReason::message`] is the buyer-facing
+/// bilingual explanation the orders page prints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReorderSkipReason {
+    /// The product is gone or no longer sells (draft /
+    /// archived / suspended-store stock is not buyable).
+    ProductUnavailable,
+    /// The bought variant no longer exists as an active
+    /// variant, or the product has since gained variants
+    /// the buyer never picked.
+    VariantUnavailable,
+    /// The line's stock pool is empty.
+    OutOfStock,
+    /// The cart line is already at the platform's
+    /// per-line maximum — nothing more may be added.
+    CartLimit,
+}
+
+impl ReorderSkipReason {
+    /// The stable machine code for the report.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReorderSkipReason::ProductUnavailable => "product_unavailable",
+            ReorderSkipReason::VariantUnavailable => "variant_unavailable",
+            ReorderSkipReason::OutOfStock => "out_of_stock",
+            ReorderSkipReason::CartLimit => "cart_limit",
+        }
+    }
+
+    /// The buyer-facing bilingual explanation.
+    pub fn message(&self) -> &'static str {
+        match self {
+            ReorderSkipReason::ProductUnavailable => {
+                "পণ্যটি এখন আর বিক্রি হচ্ছে না — the product is no longer sold"
+            }
+            ReorderSkipReason::VariantUnavailable => {
+                "আকার/রংটি এখন আর নেই — that size/colour is no longer available"
+            }
+            ReorderSkipReason::OutOfStock => "স্টক শেষ — out of stock",
+            ReorderSkipReason::CartLimit => {
+                "কার্টে ইতিমধ্যে সর্বোচ্চ পরিমাণ আছে — the cart already holds the maximum"
+            }
+        }
+    }
+}
+
+/// What reorder should do with one past-order line
+/// (Wave 55): add this many units at TODAY's price, or
+/// skip the line with a named reason. A partial add
+/// (fewer units than the original line) is an `Add`
+/// with the clamped quantity — the report shows the
+/// number actually added, never the number wished for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReorderDecision {
+    Add { quantity: i64 },
+    Skip(ReorderSkipReason),
+}
+
+/// The state of the variant a past-order line bought
+/// (Wave 55), as the reorder service reads it today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReorderVariantState {
+    /// The line bought no variant, and the product has
+    /// none to pick today either.
+    NotApplicable,
+    /// The bought variant exists and is active.
+    Active,
+    /// The bought variant exists but is deactivated.
+    Inactive,
+    /// The bought variant row is gone entirely.
+    Missing,
+    /// The line bought no variant, but the product has
+    /// since gained active variants — the buyer must
+    /// re-pick (the same stale-line rule checkout
+    /// enforces in Wave 33).
+    ProductGainedVariants,
+}
+
+/// Decide one reorder line (Wave 55) from today's
+/// facts: the product's current status (`None` = the
+/// row is gone), the bought variant's state, the stock
+/// of the line's pool (variant stock for a variant
+/// line, product stock otherwise), the originally
+/// ordered quantity, and the room left in the cart
+/// line under [`MAX_CART_QUANTITY`] (0 when the line
+/// already sits at the cap). Checks run in report
+/// order: product, variant, stock, cart room — the
+/// FIRST failing one is the reported reason.
+pub fn reorder_decision(
+    product_status: Option<&str>,
+    variant_state: ReorderVariantState,
+    stock: i64,
+    requested: i64,
+    cart_headroom: i64,
+) -> ReorderDecision {
+    if product_status != Some("active") {
+        return ReorderDecision::Skip(ReorderSkipReason::ProductUnavailable);
+    }
+    match variant_state {
+        ReorderVariantState::NotApplicable | ReorderVariantState::Active => {}
+        ReorderVariantState::Inactive
+        | ReorderVariantState::Missing
+        | ReorderVariantState::ProductGainedVariants => {
+            return ReorderDecision::Skip(ReorderSkipReason::VariantUnavailable);
+        }
+    }
+    if stock <= 0 {
+        return ReorderDecision::Skip(ReorderSkipReason::OutOfStock);
+    }
+    let quantity = requested.min(stock).min(cart_headroom);
+    if quantity <= 0 {
+        return ReorderDecision::Skip(ReorderSkipReason::CartLimit);
+    }
+    ReorderDecision::Add { quantity }
+}
+
+// ---------------------------------------------------------------------------
+// Order tracking steps (Wave 55)
+// ---------------------------------------------------------------------------
+
+/// Where one tracking step stands (Wave 55): `Done` —
+/// it happened; `Current` — the parcel is here now;
+/// `Upcoming` — still ahead; `Alert` — the branch that
+/// ended the happy path (cancelled / returned), shown
+/// distinctly rather than as a failure of the buyer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TrackingStepState {
+    Done,
+    Current,
+    Upcoming,
+    Alert,
+}
+
+impl TrackingStepState {
+    /// The wire string the steppers render from.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TrackingStepState::Done => "done",
+            TrackingStepState::Current => "current",
+            TrackingStepState::Upcoming => "upcoming",
+            TrackingStepState::Alert => "alert",
+        }
+    }
+}
+
+/// One step of a sub-order's tracking stepper (Wave 55):
+/// a stable `kind` (`placed`, `confirmed`, `shipped`,
+/// `delivered`, `returned`, `cancelled`) and its state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackingStep {
+    pub kind: &'static str,
+    pub state: TrackingStepState,
+}
+
+/// The tracking stepper of one sub-order (Wave 55): the
+/// steps are derived from the sub-order's status ALONE
+/// (plus whether a courier shipment is under way, which
+/// distinguishes a seller-marked `shipped` from a
+/// courier-carried one only in copy, never in shape) —
+/// the SAME derivation the buyer order page, the public
+/// tracking page and this crate's tests all read, so no
+/// surface invents its own progress model.
+///
+/// The happy path is placed → confirmed → shipped →
+/// delivered. `returned` keeps the travelled steps Done
+/// and ends in an Alert step (a return may follow a
+/// delivery or a courier RTO — the status alone cannot
+/// say which, so no `delivered` step is claimed for it).
+/// `cancelled` ends the path where it stands.
+pub fn sub_order_tracking_steps(
+    status: &str,
+    shipment_status: Option<&str>,
+) -> Vec<TrackingStep> {
+    use TrackingStepState::{Alert, Current, Done, Upcoming};
+    let step = |kind: &'static str, state: TrackingStepState| TrackingStep { kind, state };
+    // A courier leg in a terminal failure state (the
+    // shipment itself was cancelled) reads as the
+    // cancelled branch even before the sub-order's own
+    // status catches up.
+    if shipment_status == Some("cancelled") && status != "delivered" && status != "returned" {
+        return vec![
+            step("placed", Done),
+            step("confirmed", Done),
+            step("cancelled", Alert),
+        ];
+    }
+    match status {
+        "confirmed" => vec![
+            step("placed", Done),
+            step("confirmed", Current),
+            step("shipped", Upcoming),
+            step("delivered", Upcoming),
+        ],
+        "shipped" => vec![
+            step("placed", Done),
+            step("confirmed", Done),
+            step("shipped", Current),
+            step("delivered", Upcoming),
+        ],
+        "delivered" => vec![
+            step("placed", Done),
+            step("confirmed", Done),
+            step("shipped", Done),
+            step("delivered", Done),
+        ],
+        "returned" => vec![
+            step("placed", Done),
+            step("confirmed", Done),
+            step("shipped", Done),
+            step("returned", Alert),
+        ],
+        "cancelled" => vec![step("placed", Done), step("cancelled", Alert)],
+        // `placed` — and, defensively, any status this
+        // crate does not know: the path has only begun.
+        _ => vec![
+            step("placed", Current),
+            step("confirmed", Upcoming),
+            step("shipped", Upcoming),
+            step("delivered", Upcoming),
+        ],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9463,5 +10049,601 @@ mod tests {
         assert!(validate_collection_product_count(MAX_COLLECTION_PRODUCTS).is_ok());
         assert!(validate_collection_product_count(MAX_COLLECTION_PRODUCTS + 1).is_err());
         assert!(validate_collection_product_count(-1).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Wave 55: districts, addresses, order notes, reorder, tracking
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn district_table_has_64_unique_districts_all_zoned() {
+        assert_eq!(DISTRICTS.len(), 64, "Bangladesh has 64 districts");
+        let mut names: Vec<&str> = DISTRICTS.iter().map(|d| d.name_en).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), 64, "district names are unique");
+        // Every district resolves by its own name (any
+        // case) and by its Bangla name.
+        for district in DISTRICTS {
+            let found = district_by_name(district.name_en)
+                .expect("district resolves by English name");
+            assert_eq!(found.name_en, district.name_en);
+            assert_eq!(found.zone, district.zone);
+            assert_eq!(
+                district_by_name(&district.name_en.to_lowercase()).map(|d| d.name_en),
+                Some(district.name_en),
+                "lookup is case-insensitive"
+            );
+            assert_eq!(
+                district_by_name(district.name_bn).map(|d| d.name_en),
+                Some(district.name_en),
+                "lookup accepts the Bangla name"
+            );
+        }
+        assert!(district_by_name("Not A District").is_none());
+        assert!(district_by_name("").is_none());
+    }
+
+    #[test]
+    fn district_zone_policy_dhaka_ring_and_outside() {
+        assert_eq!(zone_for_district("Dhaka"), Some(DeliveryZone::InsideDhaka));
+        // The suburb ring is exactly the five districts
+        // bordering Dhaka district.
+        for name in ["Gazipur", "Narayanganj", "Munshiganj", "Narsingdi", "Manikganj"] {
+            assert_eq!(
+                zone_for_district(name),
+                Some(DeliveryZone::DhakaSuburb),
+                "{name} is in the suburb ring"
+            );
+        }
+        let suburb_count = DISTRICTS
+            .iter()
+            .filter(|d| d.zone == DeliveryZone::DhakaSuburb)
+            .count();
+        assert_eq!(suburb_count, 5, "exactly five suburb districts");
+        // Tangail does not border Dhaka district — outside.
+        assert_eq!(zone_for_district("Tangail"), Some(DeliveryZone::OutsideDhaka));
+        assert_eq!(zone_for_district("Khulna"), Some(DeliveryZone::OutsideDhaka));
+        assert_eq!(zone_for_district("Sylhet"), Some(DeliveryZone::OutsideDhaka));
+        assert_eq!(zone_for_district("Atlantis"), None);
+    }
+
+    fn sample_address_input() -> AddressInput {
+        AddressInput {
+            label: " বাসা ".to_string(),
+            recipient_name: " Rahim Uddin ".to_string(),
+            phone: "01712345678".to_string(),
+            district: "dhaka".to_string(),
+            area: " Mirpur 10 ".to_string(),
+            address_line: " House 9, Road 3 ".to_string(),
+        }
+    }
+
+    #[test]
+    fn address_validation_trims_canonicalises_and_zones() {
+        let validated = validate_address_input(&sample_address_input())
+            .expect("the sample address is valid");
+        assert_eq!(validated.label, "বাসা");
+        assert_eq!(validated.recipient_name, "Rahim Uddin");
+        // The phone lands in the canonical +880 form and
+        // the district in its canonical spelling + zone.
+        assert_eq!(validated.phone, "+8801712345678");
+        assert_eq!(validated.district, "Dhaka");
+        assert_eq!(validated.zone, DeliveryZone::InsideDhaka);
+        assert_eq!(validated.area, "Mirpur 10");
+        assert_eq!(validated.address_line, "House 9, Road 3");
+        assert_eq!(
+            compose_delivery_address(&validated.address_line, &validated.area, &validated.district),
+            "House 9, Road 3, Mirpur 10, Dhaka"
+        );
+
+        // A suburb district derives the suburb zone.
+        let mut suburb = sample_address_input();
+        suburb.district = "Gazipur".to_string();
+        assert_eq!(
+            validate_address_input(&suburb).expect("suburb address").zone,
+            DeliveryZone::DhakaSuburb
+        );
+    }
+
+    #[test]
+    fn address_validation_rejects_bad_phone_district_and_lengths() {
+        let mut bad_phone = sample_address_input();
+        bad_phone.phone = "01212345678".to_string();
+        assert!(validate_address_input(&bad_phone).is_err());
+
+        let mut bad_district = sample_address_input();
+        bad_district.district = "Dhaka City".to_string();
+        assert!(validate_address_input(&bad_district).is_err());
+
+        let mut blank_label = sample_address_input();
+        blank_label.label = "   ".to_string();
+        assert!(validate_address_input(&blank_label).is_err());
+
+        let mut long_line = sample_address_input();
+        long_line.address_line = "x".repeat(MAX_ADDRESS_LINE_CHARS + 1);
+        assert!(validate_address_input(&long_line).is_err());
+        long_line.address_line = "x".repeat(MAX_ADDRESS_LINE_CHARS);
+        assert!(validate_address_input(&long_line).is_ok());
+
+        let mut long_label = sample_address_input();
+        long_label.label = "x".repeat(MAX_ADDRESS_LABEL_CHARS + 1);
+        assert!(validate_address_input(&long_label).is_err());
+    }
+
+    #[test]
+    fn address_count_cap() {
+        assert!(validate_address_count(0).is_ok());
+        assert!(validate_address_count(MAX_ADDRESSES_PER_USER - 1).is_ok());
+        assert!(validate_address_count(MAX_ADDRESSES_PER_USER).is_err());
+        assert!(validate_address_count(-1).is_err());
+    }
+
+    #[test]
+    fn order_note_validation() {
+        assert_eq!(validate_order_note(None), Ok(None));
+        assert_eq!(validate_order_note(Some("   ")), Ok(None));
+        assert_eq!(
+            validate_order_note(Some("  গার্ডের কাছে দিন  ")),
+            Ok(Some("গার্ডের কাছে দিন".to_string()))
+        );
+        let at_cap = "x".repeat(MAX_ORDER_NOTE_CHARS);
+        assert!(validate_order_note(Some(&at_cap)).is_ok());
+        let over_cap = "x".repeat(MAX_ORDER_NOTE_CHARS + 1);
+        assert!(validate_order_note(Some(&over_cap)).is_err());
+    }
+
+    #[test]
+    fn reorder_decision_branches() {
+        use ReorderVariantState::{Active, Inactive, Missing, NotApplicable, ProductGainedVariants};
+        // Happy path: full quantity when stock and cart
+        // room both allow it.
+        assert_eq!(
+            reorder_decision(Some("active"), NotApplicable, 10, 3, 99),
+            ReorderDecision::Add { quantity: 3 }
+        );
+        // Partial stock clamps the add — never a skip
+        // while anything can be added.
+        assert_eq!(
+            reorder_decision(Some("active"), Active, 2, 5, 99),
+            ReorderDecision::Add { quantity: 2 }
+        );
+        // Cart headroom clamps too.
+        assert_eq!(
+            reorder_decision(Some("active"), NotApplicable, 10, 5, 1),
+            ReorderDecision::Add { quantity: 1 }
+        );
+        // Product gone / draft / archived.
+        for status in [None, Some("draft"), Some("archived")] {
+            assert_eq!(
+                reorder_decision(status, NotApplicable, 10, 1, 99),
+                ReorderDecision::Skip(ReorderSkipReason::ProductUnavailable)
+            );
+        }
+        // Variant problems beat the stock check.
+        for state in [Inactive, Missing, ProductGainedVariants] {
+            assert_eq!(
+                reorder_decision(Some("active"), state, 0, 1, 99),
+                ReorderDecision::Skip(ReorderSkipReason::VariantUnavailable)
+            );
+        }
+        // Empty pool.
+        assert_eq!(
+            reorder_decision(Some("active"), NotApplicable, 0, 1, 99),
+            ReorderDecision::Skip(ReorderSkipReason::OutOfStock)
+        );
+        // A cart line already at the cap.
+        assert_eq!(
+            reorder_decision(Some("active"), NotApplicable, 10, 1, 0),
+            ReorderDecision::Skip(ReorderSkipReason::CartLimit)
+        );
+        // Reason codes are the report vocabulary.
+        assert_eq!(ReorderSkipReason::OutOfStock.as_str(), "out_of_stock");
+        assert!(!ReorderSkipReason::ProductUnavailable.message().is_empty());
+    }
+
+    #[test]
+    fn tracking_steps_follow_the_sub_order_status() {
+        use TrackingStepState::{Alert, Current, Done, Upcoming};
+        let kinds: Vec<(&str, TrackingStepState)> = sub_order_tracking_steps("placed", None)
+            .iter()
+            .map(|s| (s.kind, s.state))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("placed", Current),
+                ("confirmed", Upcoming),
+                ("shipped", Upcoming),
+                ("delivered", Upcoming)
+            ]
+        );
+        let confirmed = sub_order_tracking_steps("confirmed", None);
+        assert_eq!(confirmed[1].state, Current);
+        let shipped = sub_order_tracking_steps("shipped", Some("in_transit"));
+        assert_eq!(shipped[2].state, Current);
+        assert_eq!(shipped[3].state, Upcoming);
+        let delivered = sub_order_tracking_steps("delivered", Some("delivered"));
+        assert!(delivered.iter().all(|s| s.state == Done));
+        // Returned keeps the travelled steps and ends in
+        // the alert step — no delivered step is claimed.
+        let returned = sub_order_tracking_steps("returned", Some("returned"));
+        assert_eq!(returned.len(), 4);
+        assert_eq!(returned[3].kind, "returned");
+        assert_eq!(returned[3].state, Alert);
+        let cancelled = sub_order_tracking_steps("cancelled", None);
+        assert_eq!(cancelled.len(), 2);
+        assert_eq!(cancelled[1].state, Alert);
+        // A courier-cancelled shipment reads as the
+        // cancelled branch even mid-path.
+        let courier_cancelled = sub_order_tracking_steps("shipped", Some("cancelled"));
+        assert_eq!(courier_cancelled[2].kind, "cancelled");
+        assert_eq!(courier_cancelled[2].state, Alert);
+        assert_eq!(TrackingStepState::Done.as_str(), "done");
+    }
+
+    #[test]
+    fn district_table_bangla_names_and_zone_counts() {
+        // Every district carries BOTH names — the Bangla
+        // name is what the buyer reads in the select, so
+        // an empty or duplicated one is a data bug.
+        let mut bangla_names: Vec<&str> = DISTRICTS.iter().map(|d| d.name_bn).collect();
+        for district in DISTRICTS {
+            assert!(!district.name_en.trim().is_empty());
+            assert!(!district.name_bn.trim().is_empty());
+        }
+        bangla_names.sort_unstable();
+        bangla_names.dedup();
+        assert_eq!(bangla_names.len(), 64, "Bangla names are unique too");
+
+        // The zone policy as COUNTS: exactly one inside
+        // district, exactly the five bordering districts
+        // in the suburb ring, the other 58 outside.
+        let count = |zone: DeliveryZone| DISTRICTS.iter().filter(|d| d.zone == zone).count();
+        assert_eq!(count(DeliveryZone::InsideDhaka), 1);
+        assert_eq!(count(DeliveryZone::DhakaSuburb), 5);
+        assert_eq!(count(DeliveryZone::OutsideDhaka), 58);
+        for suburb in ["Gazipur", "Narayanganj", "Munshiganj", "Narsingdi", "Manikganj"] {
+            assert_eq!(
+                zone_for_district(suburb),
+                Some(DeliveryZone::DhakaSuburb),
+                "{suburb} borders Dhaka district"
+            );
+        }
+
+        // Lookup works by Bangla name and trims padding.
+        assert_eq!(
+            district_by_name("  ঢাকা ").map(|d| d.name_en),
+            Some("Dhaka")
+        );
+        assert_eq!(district_by_name("খুলনা").map(|d| d.name_en), Some("Khulna"));
+        assert_eq!(zone_for_district("atlantis"), None);
+    }
+
+    #[test]
+    fn address_validation_field_caps_at_the_boundary() {
+        let at_caps = AddressInput {
+            label: "x".repeat(MAX_ADDRESS_LABEL_CHARS),
+            recipient_name: "x".repeat(MAX_ADDRESS_RECIPIENT_CHARS),
+            phone: "01712345678".to_string(),
+            district: "Dhaka".to_string(),
+            area: "x".repeat(MAX_ADDRESS_AREA_CHARS),
+            address_line: "x".repeat(MAX_ADDRESS_LINE_CHARS),
+        };
+        assert!(validate_address_input(&at_caps).is_ok(), "exactly at the caps passes");
+        let over_label = AddressInput {
+            label: "x".repeat(MAX_ADDRESS_LABEL_CHARS + 1),
+            ..at_caps.clone()
+        };
+        assert!(validate_address_input(&over_label).is_err(), "label over its cap fails");
+        let over_line = AddressInput {
+            address_line: "x".repeat(MAX_ADDRESS_LINE_CHARS + 1),
+            ..at_caps.clone()
+        };
+        assert!(validate_address_input(&over_line).is_err(), "line over its cap fails");
+        // Every field is required: an all-whitespace area
+        // is as missing as an empty one.
+        let blank_area = AddressInput {
+            area: "   ".to_string(),
+            ..at_caps
+        };
+        assert!(validate_address_input(&blank_area).is_err());
+    }
+
+    #[test]
+    fn order_note_boundaries() {
+        assert_eq!(validate_order_note(None), Ok(None));
+        assert_eq!(validate_order_note(Some("   ")), Ok(None), "blank is no note");
+        assert_eq!(
+            validate_order_note(Some("  ring the bell  ")),
+            Ok(Some("ring the bell".to_string())),
+            "the stored note is trimmed"
+        );
+        let at_cap = "x".repeat(MAX_ORDER_NOTE_CHARS);
+        assert_eq!(
+            validate_order_note(Some(&at_cap)).map(|n| n.map(|s| s.len())),
+            Ok(Some(MAX_ORDER_NOTE_CHARS)),
+            "exactly at the cap passes"
+        );
+        let over_cap = "x".repeat(MAX_ORDER_NOTE_CHARS + 1);
+        assert!(validate_order_note(Some(&over_cap)).is_err(), "one over fails");
+        // The cap counts CHARACTERS, not bytes — 500 Bangla
+        // chars (3 bytes each in UTF-8) are within it.
+        let bangla = "অ".repeat(MAX_ORDER_NOTE_CHARS);
+        assert!(validate_order_note(Some(&bangla)).is_ok());
+    }
+
+    #[test]
+    fn reorder_decision_matrix() {
+        use ReorderSkipReason::*;
+        // A product that gained variants since the order:
+        // the old variant-less line names nothing buyable.
+        assert_eq!(
+            reorder_decision(
+                Some("active"),
+                ReorderVariantState::ProductGainedVariants,
+                10,
+                1,
+                99
+            ),
+            ReorderDecision::Skip(VariantUnavailable)
+        );
+        // A full cart line refuses even a healthy product.
+        assert_eq!(
+            reorder_decision(Some("active"), ReorderVariantState::NotApplicable, 10, 1, 0),
+            ReorderDecision::Skip(CartLimit)
+        );
+        // Partial stock clamps the add to what exists.
+        assert_eq!(
+            reorder_decision(Some("active"), ReorderVariantState::NotApplicable, 2, 5, 99),
+            ReorderDecision::Add { quantity: 2 }
+        );
+        // Cart headroom clamps below stock when tighter.
+        assert_eq!(
+            reorder_decision(Some("active"), ReorderVariantState::Active, 50, 5, 3),
+            ReorderDecision::Add { quantity: 3 }
+        );
+        // Draft products are as unbuyable as archived ones,
+        // and a deleted product (no row) likewise.
+        assert_eq!(
+            reorder_decision(Some("draft"), ReorderVariantState::NotApplicable, 5, 1, 99),
+            ReorderDecision::Skip(ProductUnavailable)
+        );
+        assert_eq!(
+            reorder_decision(None, ReorderVariantState::NotApplicable, 5, 1, 99),
+            ReorderDecision::Skip(ProductUnavailable)
+        );
+        // A missing variant row (hard-removed since) skips
+        // like a deactivated one.
+        assert_eq!(
+            reorder_decision(Some("active"), ReorderVariantState::Missing, 5, 1, 99),
+            ReorderDecision::Skip(VariantUnavailable)
+        );
+        // The wire codes + bilingual messages are stable.
+        assert_eq!(ProductUnavailable.as_str(), "product_unavailable");
+        assert_eq!(VariantUnavailable.as_str(), "variant_unavailable");
+        assert_eq!(OutOfStock.as_str(), "out_of_stock");
+        assert_eq!(CartLimit.as_str(), "cart_limit");
+        for reason in [ProductUnavailable, VariantUnavailable, OutOfStock, CartLimit] {
+            assert!(reason.message().contains('—'), "bilingual message: {reason:?}");
+        }
+    }
+
+    #[test]
+    fn tracking_steps_edge_branches() {
+        use TrackingStepState::{Alert, Current, Done};
+        // An unknown status takes the placed branch
+        // (defensive — the path has only begun).
+        let unknown = sub_order_tracking_steps("mystery", None);
+        assert_eq!(unknown[0].kind, "placed");
+        assert_eq!(unknown[0].state, Current);
+        // A courier-cancelled leg does NOT rewrite a
+        // delivered or returned story.
+        let delivered = sub_order_tracking_steps("delivered", Some("cancelled"));
+        assert!(delivered.iter().all(|s| s.state == Done));
+        let returned = sub_order_tracking_steps("returned", Some("cancelled"));
+        assert_eq!(returned[3].kind, "returned");
+        assert_eq!(returned[3].state, Alert);
+        // Every state has its wire string.
+        assert_eq!(TrackingStepState::Current.as_str(), "current");
+        assert_eq!(TrackingStepState::Upcoming.as_str(), "upcoming");
+        assert_eq!(TrackingStepState::Alert.as_str(), "alert");
+    }
+
+    #[test]
+    fn compose_delivery_address_joins_line_area_district() {
+        assert_eq!(
+            compose_delivery_address("House 5", "Uttara", "Gazipur"),
+            "House 5, Uttara, Gazipur"
+        );
+    }
+
+    #[test]
+    fn district_search_ranks_prefix_then_substring_then_bangla() {
+        // Prefix beats substring: "dha" finds Dhaka first,
+        // and every result contains the needle somewhere.
+        let hits = search_districts("dha", 10);
+        assert_eq!(hits[0].name_en, "Dhaka");
+        assert!(hits
+            .iter()
+            .all(|d| d.name_en.to_lowercase().contains("dha")));
+        // Case does not matter for the English side.
+        assert_eq!(search_districts("DHAKA", 5)[0].name_en, "Dhaka");
+        // A Bangla query matches on the Bangla name.
+        let hits = search_districts("ঢাকা", 10);
+        assert!(hits.iter().any(|d| d.name_en == "Dhaka"));
+        // A substring-only match still lands (rank 1).
+        let hits = search_districts("ganj", 10);
+        assert!(hits.iter().any(|d| d.name_en == "Narayanganj"));
+        assert!(hits.iter().any(|d| d.name_en == "Munshiganj"));
+        // No match is an empty list, never a panic or the
+        // whole table.
+        assert!(search_districts("Zxqwvbn", 10).is_empty());
+        // The limit is honoured, and zero yields nothing.
+        assert_eq!(search_districts("a", 3).len(), 3);
+        assert!(search_districts("a", 0).is_empty());
+        // An empty query is the picker's initial state:
+        // the canonical head of the table.
+        let initial = search_districts("  ", 4);
+        assert_eq!(initial.len(), 4);
+        assert_eq!(initial[0].name_en, DISTRICTS[0].name_en);
+    }
+
+    #[test]
+    fn reorder_decision_exact_boundaries_add_in_full() {
+        use ReorderVariantState::NotApplicable;
+        // Stock exactly equal to the request adds in full —
+        // the clamp is a ceiling, not a haircut.
+        assert_eq!(
+            reorder_decision(Some("active"), NotApplicable, 4, 4, 99),
+            ReorderDecision::Add { quantity: 4 }
+        );
+        // Headroom exactly equal to the request adds in full.
+        assert_eq!(
+            reorder_decision(Some("active"), NotApplicable, 10, 4, 4),
+            ReorderDecision::Add { quantity: 4 }
+        );
+        // One unit of headroom with plenty of stock adds
+        // exactly one.
+        assert_eq!(
+            reorder_decision(Some("active"), NotApplicable, 10, 4, 1),
+            ReorderDecision::Add { quantity: 1 }
+        );
+        // A zero-quantity request can only be a skip
+        // (defensive: order lines are never zero, but the
+        // rule must not Add{0}) — it lands on the
+        // quantity<=0 guard, reported as the cart limit.
+        assert_eq!(
+            reorder_decision(Some("active"), NotApplicable, 10, 0, 99),
+            ReorderDecision::Skip(ReorderSkipReason::CartLimit)
+        );
+    }
+
+    #[test]
+    fn tracking_steps_confirmed_with_cancelled_shipment_alerts() {
+        use TrackingStepState::{Alert, Done};
+        // Confirmed, then the courier cancelled the leg:
+        // the cancelled branch wins over the in-flight one
+        // (the parcel is NOT on its way).
+        let steps = sub_order_tracking_steps("confirmed", Some("cancelled"));
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].kind, "placed");
+        assert_eq!(steps[0].state, Done);
+        assert_eq!(steps[1].kind, "confirmed");
+        assert_eq!(steps[1].state, Done);
+        assert_eq!(steps[2].kind, "cancelled");
+        assert_eq!(steps[2].state, Alert);
+        // A shipped sub-order reads placed/confirmed done,
+        // shipped current.
+        let steps = sub_order_tracking_steps("shipped", Some("in_transit"));
+        assert_eq!(steps[2].kind, "shipped");
+        assert_eq!(steps[2].state, TrackingStepState::Current);
+        assert_eq!(steps[3].state, TrackingStepState::Upcoming);
+    }
+
+    #[test]
+    fn address_validation_canonicalises_bangla_district_and_phone_forms() {
+        // The district may arrive as its Bangla name; the
+        // stored form is the canonical English name and the
+        // zone follows it.
+        let validated = validate_address_input(&AddressInput {
+            label: "বাসা".to_string(),
+            recipient_name: "Karim".to_string(),
+            phone: "8801712345678".to_string(),
+            district: "ঢাকা".to_string(),
+            area: "মিরপুর".to_string(),
+            address_line: "ব্লক সি".to_string(),
+        })
+        .expect("bangla district validates");
+        assert_eq!(validated.district, "Dhaka");
+        assert_eq!(validated.zone, DeliveryZone::InsideDhaka);
+        assert_eq!(validated.phone, "+8801712345678");
+        // The +880 form normalises identically.
+        let validated = validate_address_input(&AddressInput {
+            phone: "+8801712345678".to_string(),
+            ..sample_address_input()
+        })
+        .expect("international form validates");
+        assert_eq!(validated.phone, "+8801712345678");
+        // An unknown district is refused, never zoned by
+        // guesswork.
+        let unknown = AddressInput {
+            district: "Atlantis".to_string(),
+            ..sample_address_input()
+        };
+        assert!(validate_address_input(&unknown).is_err());
+        assert_eq!(zone_for_district("Atlantis"), None);
+    }
+
+    #[test]
+    fn order_note_trims_edges_and_keeps_the_middle() {
+        assert_eq!(
+            validate_order_note(Some("  গেটে  ফোন  করুন  ")).expect("note ok"),
+            Some("গেটে  ফোন  করুন".to_string())
+        );
+        assert_eq!(validate_order_note(None).expect("no note"), None);
+        assert_eq!(validate_order_note(Some("")).expect("empty note"), None);
+    }
+
+    #[test]
+    fn reorder_skip_messages_are_bilingual_for_every_reason() {
+        for reason in [
+            ReorderSkipReason::ProductUnavailable,
+            ReorderSkipReason::VariantUnavailable,
+            ReorderSkipReason::OutOfStock,
+            ReorderSkipReason::CartLimit,
+        ] {
+            let message = reason.message();
+            assert!(message.contains(" — "), "{reason:?} message: {message}");
+            assert!(
+                message.chars().any(|c| ('\u{0980}'..='\u{09FF}').contains(&c)),
+                "{reason:?} message carries Bangla: {message}"
+            );
+            assert!(
+                message.chars().any(|c| c.is_ascii_alphabetic()),
+                "{reason:?} message carries English: {message}"
+            );
+            assert!(!reason.as_str().is_empty());
+        }
+    }
+
+    #[test]
+    fn district_search_limit_above_match_count_returns_all_matches() {
+        let hits = search_districts("khulna", 64);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name_en, "Khulna");
+        // Every district is reachable by its own name.
+        for district in DISTRICTS.iter() {
+            let hits = search_districts(district.name_en, 64);
+            assert!(
+                hits.iter().any(|hit| hit.name_en == district.name_en),
+                "{} finds itself",
+                district.name_en
+            );
+        }
+    }
+
+    #[test]
+    fn suburb_five_are_exactly_the_dhaka_bordering_districts() {
+        // The platform policy, pinned by name: the suburb
+        // ring is the five districts that share a border
+        // with Dhaka district. Tangail is the famous
+        // near-miss — it does NOT border Dhaka and stays
+        // Outside Dhaka (documented in the README).
+        for name in ["Gazipur", "Narayanganj", "Munshiganj", "Narsingdi", "Manikganj"] {
+            assert_eq!(
+                zone_for_district(name),
+                Some(DeliveryZone::DhakaSuburb),
+                "{name} is suburb"
+            );
+        }
+        assert_eq!(
+            zone_for_district("Tangail"),
+            Some(DeliveryZone::OutsideDhaka)
+        );
+        // Keraniganj is a thana of Dhaka district, not a
+        // district — the table is district-level, so the
+        // name is unknown here (Dhaka district covers it).
+        assert!(district_by_name("Keraniganj").is_none());
     }
 }

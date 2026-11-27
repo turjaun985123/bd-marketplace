@@ -349,10 +349,18 @@ export interface CartItem {
   /** Weight of one unit in grams (Wave 4). */
   weight_grams: number;
   line_total_poisha: number;
+  /**
+   * Save-for-later flag (Wave 55): true on the lines in
+   * `Cart.saved_items`, false on the active lines. A saved
+   * line is not part of the goods total and never checks out.
+   */
+  saved: boolean;
 }
 
 export interface Cart {
   items: CartItem[];
+  /** Lines parked on the save-for-later shelf (Wave 55). */
+  saved_items: CartItem[];
   goods_total_poisha: number;
 }
 
@@ -484,6 +492,37 @@ export function shipmentStatusLabel(status: string): string {
   }
 }
 
+/**
+ * One step of the tracking stepper (Wave 55), computed by
+ * the API from the domain's one derivation — clients
+ * render these verbatim.
+ */
+export interface TimelineStep {
+  /** placed | confirmed | shipped | delivered | returned | cancelled */
+  kind: string;
+  /** done | current | upcoming | alert */
+  state: "done" | "current" | "upcoming" | "alert";
+}
+
+/**
+ * One event on an order timeline (Wave 55). `at` is null
+ * when the platform records no timestamp for the moment
+ * (a seller's confirm, a manual delivery flip) — the UI
+ * shows the step without inventing a time.
+ */
+export interface TimelineEvent {
+  /** placed | confirmed | shipment_booked | shipment_status |
+   * delivered | returned | cancelled | return_requested |
+   * return_decided | order_placed | payment_initiated |
+   * payment_paid | advance_initiated | advance_paid */
+  kind: string;
+  at: string | null;
+  /** Sub-state for kinds that carry one (courier status, return status). */
+  status: string | null;
+  /** Human detail (courier + consignment, raw courier text, method). */
+  note: string | null;
+}
+
 export interface SubOrder {
   id: string;
   order_id: string;
@@ -500,6 +539,10 @@ export interface SubOrder {
   seller_payout_poisha: number;
   created_at: string;
   items: OrderItem[];
+  /** The sub-order's event timeline (Wave 55). */
+  timeline: TimelineEvent[];
+  /** The tracking stepper (Wave 55), API-computed. */
+  steps: TimelineStep[];
   /** Courier shipment (Wave 6); null until the seller books one. */
   shipment: ShipmentSummary | null;
   /**
@@ -589,6 +632,14 @@ export interface Order {
   delivery_phone: string;
   delivery_address: string;
   delivery_zone: string;
+  /**
+   * The district the order ships to (Wave 55), when known —
+   * from the saved address used or the district picked at
+   * checkout; null for zone-only checkouts.
+   */
+  delivery_district: string | null;
+  /** The buyer's note to the sellers (Wave 55); null when none. */
+  order_note: string | null;
   goods_total_poisha: number;
   /** Coupon code applied at checkout (Wave 14); null when none. */
   coupon_code: string | null;
@@ -633,7 +684,15 @@ export interface SellerSubOrder {
   delivery_phone: string;
   delivery_address: string;
   delivery_zone: string;
+  /** The parent order's buyer note (Wave 55); null when none. */
+  order_note: string | null;
+  /** The parent order's district (Wave 55); null for zone-only orders. */
+  delivery_district: string | null;
   items: OrderItem[];
+  /** The sub-order's event timeline (Wave 55). */
+  timeline: TimelineEvent[];
+  /** The tracking stepper (Wave 55), API-computed. */
+  steps: TimelineStep[];
   /** Courier shipment (Wave 6); null until the seller books one. */
   shipment: ShipmentSummary | null;
   /**
@@ -680,6 +739,21 @@ export interface PlaceOrderInput {
    * points actually used.
    */
   loyalty_points?: number;
+  /**
+   * A saved address to deliver to (Wave 55). When sent, the
+   * server takes the delivery fields + zone from THAT
+   * address (it must be the buyer's own) and ignores the
+   * delivery fields above.
+   */
+  address_id?: string;
+  /**
+   * The delivery district (Wave 55), manual path: when sent,
+   * the zone derives from the district and `delivery_zone`
+   * is not consulted. Ignored when `address_id` is sent.
+   */
+  delivery_district?: string;
+  /** The buyer's note to the sellers (Wave 55), ≤ 500 chars. */
+  order_note?: string;
 }
 
 /** One loyalty ledger movement (GET /v1/loyalty history, Wave 35). */
@@ -1831,9 +1905,254 @@ export function clearCart(token: string): Promise<Cart> {
   return call("/v1/cart", { method: "DELETE", token });
 }
 
+/**
+ * POST /v1/cart/items/{productId}/save — park one line on
+ * the save-for-later shelf (Wave 55). The line is (product,
+ * variant); omitting `variantId` addresses the variant-less
+ * line. Saved lines leave the goods total and never check
+ * out; clearing the cart leaves them on the shelf.
+ */
+export function saveCartItem(
+  token: string,
+  productId: string,
+  variantId?: string | null
+): Promise<Cart> {
+  return call(`/v1/cart/items/${encodeURIComponent(productId)}/save`, {
+    method: "POST",
+    token,
+    body: { variant_id: variantId ?? null },
+  });
+}
+
+/** POST /v1/cart/items/{productId}/unsave — move a saved line back into the cart (Wave 55). */
+export function unsaveCartItem(
+  token: string,
+  productId: string,
+  variantId?: string | null
+): Promise<Cart> {
+  return call(`/v1/cart/items/${encodeURIComponent(productId)}/unsave`, {
+    method: "POST",
+    token,
+    body: { variant_id: variantId ?? null },
+  });
+}
+
 /** POST /v1/orders — checkout. Returns the placed order. */
 export function placeOrder(token: string, input: PlaceOrderInput): Promise<Order> {
   return call("/v1/orders", { method: "POST", token, body: input });
+}
+
+/** One line a reorder added back (Wave 55), at today's price. */
+export interface ReorderAdded {
+  product_id: string;
+  variant_id: string | null;
+  /** The title as bought (the order's snapshot). */
+  title: string;
+  /** Units actually added — clamped by today's stock and cart room. */
+  quantity: number;
+}
+
+/** One line a reorder could not add (Wave 55), with the reason. */
+export interface ReorderSkipped {
+  /** The title as bought (the order's snapshot). */
+  title: string;
+  /** product_unavailable | variant_unavailable | out_of_stock | cart_limit */
+  reason: string;
+  /** The buyer-facing bilingual explanation. */
+  message: string;
+}
+
+/**
+ * POST /v1/orders/{id}/reorder response (Wave 55): honest
+ * partial success — what went back into the cart, what did
+ * not and why, and the cart itself at today's prices.
+ */
+export interface ReorderReport {
+  order_id: string;
+  added: ReorderAdded[];
+  skipped: ReorderSkipped[];
+  cart: Cart;
+}
+
+/**
+ * POST /v1/orders/{id}/reorder — "buy again": re-add a past
+ * order's lines at CURRENT prices/availability. Cancelled
+ * orders answer 409; another buyer's order answers 404.
+ */
+export function reorderOrder(token: string, id: string): Promise<ReorderReport> {
+  return call(`/v1/orders/${encodeURIComponent(id)}/reorder`, {
+    method: "POST",
+    token,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Wave 55 — the buyer address book + the district table.
+// The book is per-buyer (own rows only; another buyer's id
+// is a 404). The zone is NEVER stored or sent: it derives
+// from the district through the API's district table, and
+// GET /v1/districts is public reference data.
+// ---------------------------------------------------------------------------
+
+/** One saved delivery address (GET /v1/addresses). */
+export interface Address {
+  id: string;
+  label: string;
+  recipient_name: string;
+  /** Canonical phone (+8801…). */
+  phone: string;
+  /** Canonical English district name. */
+  district: string;
+  /** The district's Bangla name; null only defensively. */
+  district_bn: string | null;
+  /** Derived from the district: inside_dhaka | dhaka_suburb | outside_dhaka. */
+  zone: string;
+  area: string;
+  address_line: string;
+  /** `address_line, area, district` — what checkout stores on the order. */
+  full_address: string;
+  is_default: boolean;
+  /** When an order last shipped here; null until first use. */
+  last_used_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** The address book: picker order (default, recently used, newest). */
+export interface AddressList {
+  items: Address[];
+  total: number;
+}
+
+/** The create/update payload for one address. */
+export interface AddressInput {
+  label: string;
+  recipient_name: string;
+  phone: string;
+  district: string;
+  area: string;
+  address_line: string;
+}
+
+/** One district of the public table (GET /v1/districts). */
+export interface District {
+  name_en: string;
+  name_bn: string;
+  /** inside_dhaka | dhaka_suburb | outside_dhaka */
+  zone: string;
+}
+
+/** GET /v1/districts — the 64 districts with their zones (public). */
+export function getDistricts(
+  q?: string
+): Promise<{ items: District[]; total: number }> {
+  const query = q && q.trim() ? `?q=${encodeURIComponent(q.trim())}` : "";
+  return call(`/v1/districts${query}`);
+}
+
+/** GET /v1/buyer/default-address — the buyer's default address (404 when none). */
+export function getDefaultAddress(token: string): Promise<Address> {
+  return call("/v1/buyer/default-address", { token });
+}
+
+/** GET /v1/addresses — the signed-in buyer's address book. */
+export function listAddresses(token: string): Promise<AddressList> {
+  return call("/v1/addresses", { token });
+}
+
+/**
+ * POST /v1/addresses — save a new address. The first
+ * address a buyer saves becomes the default automatically;
+ * `isDefault` asks for the default explicitly.
+ */
+export function createAddress(
+  token: string,
+  input: AddressInput,
+  isDefault?: boolean
+): Promise<Address> {
+  return call("/v1/addresses", {
+    method: "POST",
+    token,
+    body: { ...input, is_default: isDefault ?? false },
+  });
+}
+
+/** PATCH /v1/addresses/{id} — edit fields and/or the default flag. */
+export function updateAddress(
+  token: string,
+  id: string,
+  patch: Partial<AddressInput> & { is_default?: boolean }
+): Promise<Address> {
+  return call(`/v1/addresses/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    token,
+    body: patch,
+  });
+}
+
+/**
+ * DELETE /v1/addresses/{id} — remove an address; returns
+ * the remaining book. Deleting the default leaves NO
+ * default (no silent promotion).
+ */
+export function deleteAddress(token: string, id: string): Promise<AddressList> {
+  return call(`/v1/addresses/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    token,
+  });
+}
+
+/** POST /v1/addresses/{id}/default — make one address the default. */
+export function setDefaultAddress(token: string, id: string): Promise<Address> {
+  return call(`/v1/addresses/${encodeURIComponent(id)}/default`, {
+    method: "POST",
+    token,
+  });
+}
+
+/** GET /v1/addresses/{id} — one of the buyer's own addresses (404 for others'). */
+export function getAddress(token: string, id: string): Promise<Address> {
+  return call(`/v1/addresses/${encodeURIComponent(id)}`, { token });
+}
+
+/** POST /v1/cart/saved/move-all — bring the whole save-for-later shelf back into the cart (Wave 55). */
+export function moveAllSavedToCart(token: string): Promise<Cart> {
+  return call("/v1/cart/saved/move-all", { method: "POST", token });
+}
+
+/** DELETE /v1/cart/saved — empty the save-for-later shelf; the active cart is untouched (Wave 55). */
+export function clearSavedItems(token: string): Promise<Cart> {
+  return call("/v1/cart/saved", { method: "DELETE", token });
+}
+
+/** One product on the buy-again rail (Wave 55). */
+export interface BuyAgainItem {
+  product_id: string;
+  /** The product's CURRENT title. */
+  title: string;
+  title_bn: string | null;
+  store_slug: string;
+  image_url: string | null;
+  /** Today's unit price (flash-resolved like the cart). */
+  unit_price_poisha: number;
+  /** The base price when a flash sale governs; equal otherwise. */
+  list_unit_price_poisha: number;
+  /** Variant products: the buyer must pick a variant on the product page. */
+  has_variants: boolean;
+  /** How many of the buyer's orders included it. */
+  times_ordered: number;
+  last_ordered_at: string;
+  /** Already in the active cart. */
+  in_cart: boolean;
+}
+
+/**
+ * GET /v1/buyer/buy-again — products from the buyer's past
+ * orders that can be bought again today (active + in
+ * stock), most recently ordered first, at today's prices.
+ */
+export function getBuyAgain(token: string): Promise<{ items: BuyAgainItem[] }> {
+  return call("/v1/buyer/buy-again", { token });
 }
 
 /** GET /v1/payments/methods — which payment methods are usable now. */
@@ -1902,6 +2221,10 @@ export interface ReceiptSubOrder {
   goods_subtotal_poisha: number;
   delivery_charge_poisha: number;
   items: OrderItem[];
+  /** The sub-order's event timeline (Wave 55). */
+  timeline: TimelineEvent[];
+  /** The tracking stepper (Wave 55), API-computed. */
+  steps: TimelineStep[];
 }
 
 /** GET /v1/orders/{id}/receipt — the buyer receipt view-model. */
@@ -1931,6 +2254,8 @@ export interface Receipt {
     address: string;
     zone: string;
   };
+  /** The buyer's order note (Wave 55); null when none was written. */
+  order_note: string | null;
   sub_orders: ReceiptSubOrder[];
   goods_total_poisha: number;
   /** Coupon applied at checkout (Wave 14); null when none. */
@@ -2006,7 +2331,11 @@ export interface Invoice {
     phone: string;
     address: string;
     zone: string;
+    /** The order's district (Wave 55); null for zone-only orders. */
+    district: string | null;
   };
+  /** The buyer's order note (Wave 55); null when none. */
+  order_note: string | null;
   items: OrderItem[];
   money: InvoiceMoney;
   payment_method: string;
@@ -2239,6 +2568,10 @@ export interface FulfillmentItem {
   delivery_name: string;
   delivery_phone: string;
   delivery_zone: string;
+  /** The order's district (Wave 55); null for zone-only orders. */
+  delivery_district: string | null;
+  /** The buyer's order note (Wave 55); null when none. */
+  order_note: string | null;
   order_payment_status: string;
   shipment: FulfillmentShipment | null;
 }
@@ -2328,6 +2661,10 @@ export interface FulfillmentLabel {
   delivery_phone: string;
   delivery_address: string;
   delivery_zone: string;
+  /** The buyer's order note (Wave 55); null when none. */
+  order_note: string | null;
+  /** The order's district (Wave 55); null for zone-only orders. */
+  delivery_district: string | null;
   courier: string;
   courier_display_name: string;
   consignment_id: string;
@@ -4065,6 +4402,10 @@ export interface TrackedSubOrder {
   status: string;
   items: { title_snapshot: string; quantity: number }[];
   shipment: TrackedShipment | null;
+  /** The sub-order's event timeline (Wave 55). */
+  timeline: TimelineEvent[];
+  /** The tracking stepper (Wave 55), API-computed. */
+  steps: TimelineStep[];
 }
 
 /**
@@ -4080,6 +4421,8 @@ export interface TrackedOrder {
   payment_status: string;
   payment_method: string;
   grand_total_poisha: number;
+  /** The order-level timeline (Wave 55): placement + payment events. */
+  timeline: TimelineEvent[];
   sub_orders: TrackedSubOrder[];
 }
 
@@ -4766,6 +5109,20 @@ export interface AdminMetrics {
     collection_views_total: number;
     banner_clicks_today: number;
     collection_views_today: number;
+  };
+  /**
+   * Orders per delivery district (Wave 55). Only orders
+   * that named a district are counted — zone-only orders
+   * have no district to attribute.
+   */
+  orders_by_district: { district: string; orders: number }[];
+  /** Orders per delivery zone (Wave 55) — every order has one. */
+  orders_by_zone: { zone: string; orders: number }[];
+  /** Address-book adoption (Wave 55). */
+  address_book: {
+    total_addresses: number;
+    buyers_with_addresses: number;
+    defaults_count: number;
   };
 }
 

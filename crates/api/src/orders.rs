@@ -83,6 +83,28 @@
 //! `redeem` row, inside this transaction, under a lock on the
 //! buyer's user row so concurrent checkouts cannot spend the
 //! same points twice.
+//!
+//! Wave 55: checkout gains three additive inputs, none of
+//! which touches the money canon above. `address_id` checks
+//! out against one of the buyer's saved addresses (the
+//! `addresses` module): the order's delivery fields and
+//! zone come from THAT row — the client-sent fields are
+//! ignored on this path — and the address's `last_used_at`
+//! is stamped inside the checkout transaction. Without an
+//! address, the optional `delivery_district` names the
+//! district (validated against the domain district table)
+//! and the zone DERIVES from it; without either, the
+//! pre-Wave-55 body-fields path runs byte-identically.
+//! `order_note` is the buyer's note to the sellers
+//! (domain-capped at 500 chars), stored on the order and
+//! surfaced on every seller view. Saved-for-later cart
+//! lines (the cart module's `saved` flag) are invisible to
+//! checkout: the lock scan and the post-checkout clear
+//! both filter them out. This module also gains REORDER
+//! ("buy again"): a past order's lines re-added at TODAY's
+//! prices through the cart module's one add path, with a
+//! per-line report — the domain's `reorder_decision` names
+//! every skip, and old prices are never resurrected.
 
 use axum::{
     extract::{Path, Query, State},
@@ -92,10 +114,12 @@ use axum::{
 use chrono::{DateTime, Utc};
 use domain::{
     allocate_discount, build_order_totals, can_buyer_cancel, can_transition_sub_order,
-    compute_advance_poisha, compute_coupon_discount, is_valid_sub_order_status,
-    loyalty_discount_poisha, loyalty_max_redeemable_points, normalize_bd_phone,
-    normalize_coupon_code, parse_delivery_zone, split_cart_by_seller, validate_loyalty_request,
-    variant_final_price, CartItem as DomainCartItem, OrderGroupInput,
+    compose_delivery_address, compute_advance_poisha, compute_coupon_discount, district_by_name,
+    is_valid_sub_order_status, loyalty_discount_poisha, loyalty_max_redeemable_points,
+    normalize_bd_phone, normalize_coupon_code, parse_delivery_zone, reorder_decision,
+    split_cart_by_seller, validate_loyalty_request, validate_order_note, variant_final_price,
+    CartItem as DomainCartItem, DeliveryZone, OrderGroupInput, ReorderDecision,
+    ReorderVariantState,
 };
 use payments::{payment_adapter_for, parse_payment_method, PaymentMethod};
 use serde::{Deserialize, Serialize};
@@ -171,6 +195,15 @@ pub struct SubOrder {
     pub seller_payout_poisha: i64,
     pub created_at: DateTime<Utc>,
     pub items: Vec<OrderItem>,
+    /// The sub-order's event timeline (Wave 55), built by
+    /// the `timeline` module from the shipment log, the
+    /// return request and the status — the same events
+    /// the public tracking view shows.
+    pub timeline: Vec<crate::timeline::TimelineEvent>,
+    /// The tracking stepper (Wave 55): the domain's one
+    /// derivation over this sub-order's status + courier
+    /// leg, served so every client renders the same steps.
+    pub steps: Vec<crate::timeline::TimelineStep>,
     /// The courier shipment booked for this sub-order (Wave 6), or
     /// `None` until the seller books one.
     pub shipment: Option<ShipmentSummary>,
@@ -214,6 +247,15 @@ pub struct Order {
     pub delivery_phone: String,
     pub delivery_address: String,
     pub delivery_zone: String,
+    /// The district the order ships to (Wave 55), when
+    /// the platform knows it — from the saved address
+    /// used, or the district picked at checkout. `None`
+    /// for zone-only checkouts: no district is claimed
+    /// for an order that never named one.
+    pub delivery_district: Option<String>,
+    /// The buyer's note to the sellers (Wave 55), or
+    /// `None` when they wrote none.
+    pub order_note: Option<String>,
     pub goods_total_poisha: i64,
     /// The coupon code applied at checkout (Wave 14), or `None`.
     pub coupon_code: Option<String>,
@@ -260,7 +302,20 @@ pub struct SellerSubOrder {
     pub delivery_phone: String,
     pub delivery_address: String,
     pub delivery_zone: String,
+    /// The parent order's buyer note (Wave 55) — the
+    /// seller reads the same note on every sub-order of
+    /// the order, exactly like the delivery fields above.
+    pub order_note: Option<String>,
+    /// The parent order's district (Wave 55); null for
+    /// zone-only orders — sellers route parcels by it.
+    pub delivery_district: Option<String>,
     pub items: Vec<OrderItem>,
+    /// The sub-order's event timeline (Wave 55) — the
+    /// seller watches the same courier story the buyer
+    /// does, from the one shared builder.
+    pub timeline: Vec<crate::timeline::TimelineEvent>,
+    /// The tracking stepper (Wave 55).
+    pub steps: Vec<crate::timeline::TimelineStep>,
     /// The courier shipment booked for this sub-order (Wave 6), or
     /// `None` until the seller books one.
     pub shipment: Option<ShipmentSummary>,
@@ -307,6 +362,8 @@ struct OrderRow {
     delivery_phone: String,
     delivery_address: String,
     delivery_zone: String,
+    delivery_district: Option<String>,
+    order_note: Option<String>,
     goods_total_poisha: i64,
     coupon_code: Option<String>,
     discount_total_poisha: i64,
@@ -335,7 +392,8 @@ struct SubOrderRow {
 
 const ORDER_COLUMNS: &str = "id, buyer_user_id, status, payment_method, payment_status, \
     advance_required_poisha, advance_paid_poisha, \
-    delivery_name, delivery_phone, delivery_address, delivery_zone, goods_total_poisha, \
+    delivery_name, delivery_phone, delivery_address, delivery_zone, delivery_district, \
+    order_note, goods_total_poisha, \
     coupon_code, discount_total_poisha, loyalty_points_used, loyalty_discount_poisha, \
     delivery_total_poisha, grand_total_poisha, created_at";
 
@@ -366,7 +424,18 @@ async fn load_order_items(pool: &PgPool, sub_order_id: Uuid) -> Result<Vec<Order
 
 async fn sub_order_from_row(pool: &PgPool, row: SubOrderRow) -> Result<SubOrder, ApiError> {
     let items = load_order_items(pool, row.id).await?;
+    // Wave 55: the event timeline rides every sub-order
+    // view — one builder (the `timeline` module), the
+    // same events the public tracking page shows.
+    let timeline =
+        crate::timeline::sub_order_timeline(pool, row.id, &row.status, row.created_at).await?;
     let shipment = load_shipment_summary_for_sub_order(pool, row.id).await?;
+    // Wave 55: the stepper, from the domain's one
+    // derivation over the status + the courier leg.
+    let steps = crate::timeline::sub_order_steps(
+        &row.status,
+        shipment.as_ref().map(|summary| summary.status.as_str()),
+    );
     let return_status: Option<String> =
         sqlx::query_scalar("SELECT status FROM return_requests WHERE sub_order_id = $1")
             .bind(row.id)
@@ -387,6 +456,8 @@ async fn sub_order_from_row(pool: &PgPool, row: SubOrderRow) -> Result<SubOrder,
         seller_payout_poisha: row.seller_payout_poisha,
         created_at: row.created_at,
         items,
+        timeline,
+        steps,
         shipment,
         return_status,
     })
@@ -448,6 +519,8 @@ pub async fn load_order(pool: &PgPool, order_id: Uuid) -> Result<Order, ApiError
         delivery_phone: row.delivery_phone,
         delivery_address: row.delivery_address,
         delivery_zone: row.delivery_zone,
+        delivery_district: row.delivery_district,
+        order_note: row.order_note,
         goods_total_poisha: row.goods_total_poisha,
         coupon_code: row.coupon_code,
         discount_total_poisha: row.discount_total_poisha,
@@ -501,6 +574,33 @@ pub struct PlaceOrderInput {
     /// actually used. A negative count is a 400.
     #[serde(default)]
     pub loyalty_points: Option<i64>,
+    /// A saved address to deliver to (Wave 55). When
+    /// present, the address must be one of the BUYER's own
+    /// (another buyer's id is a 404) and the order's
+    /// delivery name/phone/address/zone/district are taken
+    /// from THAT row — the delivery fields above are
+    /// ignored on this path, so a tampered client cannot
+    /// ship an order to fields the address never held.
+    /// The address's `last_used_at` is stamped in the
+    /// checkout transaction.
+    #[serde(default)]
+    pub address_id: Option<Uuid>,
+    /// The delivery district (Wave 55), for the manual
+    /// path: a district name from the domain table
+    /// (`GET /v1/districts`). When present, the zone
+    /// DERIVES from the district and `delivery_zone` is
+    /// not consulted — a district and a zone that
+    /// disagree can never both reach the order. An
+    /// unknown district is a 400. Ignored when
+    /// `address_id` is given (the address carries its
+    /// own district).
+    #[serde(default)]
+    pub delivery_district: Option<String>,
+    /// The buyer's note to the sellers (Wave 55):
+    /// free text, trimmed, capped at 500 characters by
+    /// the domain rule; blank means no note.
+    #[serde(default)]
+    pub order_note: Option<String>,
 }
 
 fn default_payment_method() -> String {
@@ -664,20 +764,97 @@ pub async fn place_order(
             "payment_method must be one of: cod, bkash, nagad, sslcommerz, shurjopay",
         )
     })?;
-    if input.delivery_name.trim().is_empty() {
-        return Err(ApiError::bad_request("delivery_name must not be empty"));
-    }
-    if input.delivery_address.trim().is_empty() {
-        return Err(ApiError::bad_request("delivery_address must not be empty"));
-    }
     if let Some(points) = input.loyalty_points {
         validate_loyalty_request(points).map_err(ApiError::bad_request)?;
     }
-    let delivery_phone = normalize_bd_phone(&input.delivery_phone)
-        .ok_or_else(|| ApiError::bad_request("invalid Bangladeshi phone number"))?;
-    let zone = parse_delivery_zone(&input.delivery_zone).ok_or_else(|| {
-        ApiError::bad_request("delivery_zone must be one of: inside_dhaka, dhaka_suburb, outside_dhaka")
-    })?;
+    // Wave 55: the order note is validated once, here —
+    // what reaches the order row is the trimmed note or
+    // NULL, and an over-long note fails the checkout
+    // before anything is written.
+    let order_note =
+        validate_order_note(input.order_note.as_deref()).map_err(ApiError::bad_request)?;
+
+    // Wave 55: resolve the EFFECTIVE delivery fields —
+    // the five values the order row stores — from exactly
+    // one of three sources, in this precedence:
+    //
+    // 1. `address_id`: the buyer's saved address is the
+    //    source of truth (name, phone, composed address,
+    //    district, and the district's zone); the
+    //    client-sent fields are ignored entirely.
+    // 2. `delivery_district` on the manual path: the
+    //    district is validated against the domain table
+    //    and the zone derives from it.
+    // 3. The pre-Wave-55 path, unchanged: the buyer's
+    //    typed name/address/phone and their chosen zone.
+    let (delivery_name, delivery_phone, delivery_address, zone, delivery_district) =
+        if let Some(address_id) = input.address_id {
+            let address =
+                crate::addresses::load_own_address(pool, user.user_id, address_id)
+                    .await?
+                    .ok_or_else(|| ApiError::not_found("address not found"))?;
+            // The district was validated against the
+            // table when the address was written; the
+            // fallback covers only a district the table
+            // has since dropped, and prices it at the
+            // widest zone rather than inventing a
+            // cheaper one.
+            let address_zone = district_by_name(&address.district)
+                .map(|district| district.zone)
+                .unwrap_or(DeliveryZone::OutsideDhaka);
+            (
+                address.recipient_name.clone(),
+                address.phone.clone(),
+                compose_delivery_address(
+                    &address.address_line,
+                    &address.area,
+                    &address.district,
+                ),
+                address_zone,
+                Some(address.district.clone()),
+            )
+        } else {
+            if input.delivery_name.trim().is_empty() {
+                return Err(ApiError::bad_request("delivery_name must not be empty"));
+            }
+            if input.delivery_address.trim().is_empty() {
+                return Err(ApiError::bad_request("delivery_address must not be empty"));
+            }
+            let phone = normalize_bd_phone(&input.delivery_phone)
+                .ok_or_else(|| ApiError::bad_request("invalid Bangladeshi phone number"))?;
+            let (zone, district) = match input
+                .delivery_district
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                Some(raw_district) => {
+                    let district = district_by_name(raw_district).ok_or_else(|| {
+                        ApiError::bad_request(
+                            "জেলাটি তালিকায় নেই — delivery_district must be a district \
+                             from GET /v1/districts",
+                        )
+                    })?;
+                    (district.zone, Some(district.name_en.to_string()))
+                }
+                None => {
+                    let parsed_zone = parse_delivery_zone(&input.delivery_zone)
+                        .ok_or_else(|| {
+                            ApiError::bad_request(
+                                "delivery_zone must be one of: inside_dhaka, dhaka_suburb, outside_dhaka",
+                            )
+                        })?;
+                    (parsed_zone, None)
+                }
+            };
+            (
+                input.delivery_name.trim().to_string(),
+                phone,
+                input.delivery_address.trim().to_string(),
+                zone,
+                district,
+            )
+        };
 
     let mut tx = pool
         .begin()
@@ -712,7 +889,7 @@ pub async fn place_order(
                  WHERE pv.product_id = p.id AND pv.is_active) AS has_active_variants \
          FROM cart_items ci JOIN products p ON p.id = ci.product_id \
          JOIN stores s ON s.id = p.store_id \
-         WHERE ci.cart_id = $1 FOR UPDATE OF p",
+         WHERE ci.cart_id = $1 AND NOT ci.saved FOR UPDATE OF p",
     )
     .bind(cart_id)
     .fetch_all(&mut *tx)
@@ -1032,15 +1209,16 @@ pub async fn place_order(
          delivery_name, delivery_phone, delivery_address, delivery_zone, \
          goods_total_poisha, delivery_total_poisha, grand_total_poisha, \
          coupon_code, discount_total_poisha, advance_required_poisha, \
-         loyalty_points_used, loyalty_discount_poisha) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING id",
+         loyalty_points_used, loyalty_discount_poisha, order_note, delivery_district) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
+         RETURNING id",
     )
     .bind(user.user_id)
     .bind(method.as_str())
     .bind(order_payment_status)
-    .bind(input.delivery_name.trim())
+    .bind(&delivery_name)
     .bind(&delivery_phone)
-    .bind(input.delivery_address.trim())
+    .bind(&delivery_address)
     .bind(zone.as_str())
     .bind(totals.goods_total_poisha)
     .bind(totals.delivery_total_poisha)
@@ -1050,9 +1228,28 @@ pub async fn place_order(
     .bind(advance_required_poisha)
     .bind(i32::try_from(loyalty_points_used).unwrap_or(i32::MAX))
     .bind(loyalty_discount_total)
+    .bind(&order_note)
+    .bind(&delivery_district)
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| ApiError::internal("insert order", e))?;
+
+    // Wave 55: an order placed against a saved address
+    // stamps the address's `last_used_at` in this same
+    // transaction — the book's "recently used" order is a
+    // record of real checkouts, and a rolled-back
+    // checkout stamps nothing.
+    if let Some(address_id) = input.address_id {
+        sqlx::query(
+            "UPDATE buyer_addresses SET last_used_at = now(), updated_at = now() \
+             WHERE id = $1 AND user_id = $2",
+        )
+        .bind(address_id)
+        .bind(user.user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::internal("stamp address last used", e))?;
+    }
 
     // Online payment: initiate through the payments factory, still
     // inside the checkout transaction. An unconfigured gateway errors
@@ -1308,7 +1505,10 @@ pub async fn place_order(
         .map_err(|e| ApiError::internal("record loyalty redemption", e))?;
     }
 
-    sqlx::query("DELETE FROM cart_items WHERE cart_id = $1")
+    // Wave 55: only the ACTIVE lines are consumed —
+    // saved-for-later lines survive the checkout on the
+    // shelf, exactly as the lock scan above ignored them.
+    sqlx::query("DELETE FROM cart_items WHERE cart_id = $1 AND NOT saved")
         .bind(cart_id)
         .execute(&mut *tx)
         .await
@@ -1396,6 +1596,386 @@ pub async fn get_order_for_buyer(
         return Err(ApiError::not_found("order not found"));
     }
     Ok(order)
+}
+
+// ---------------------------------------------------------------------------
+// Reorder — "buy again" (Wave 55)
+// ---------------------------------------------------------------------------
+
+/// One line reorder DID add to the cart, at today's
+/// price (the cart view in the report carries the price;
+/// this entry carries what was asked of the cart).
+#[derive(Debug, Serialize)]
+pub struct ReorderAdded {
+    pub product_id: Uuid,
+    pub variant_id: Option<Uuid>,
+    /// The title as bought (the order's snapshot) — the
+    /// product's current title rides the cart view.
+    pub title: String,
+    /// Units actually added: the ordered quantity
+    /// clamped by today's stock and the cart line's
+    /// remaining room (the domain decision).
+    pub quantity: i64,
+}
+
+/// One line reorder could NOT add, with the reason.
+#[derive(Debug, Serialize)]
+pub struct ReorderSkipped {
+    /// The title as bought (the order's snapshot).
+    pub title: String,
+    /// The domain reason code (`product_unavailable`,
+    /// `variant_unavailable`, `out_of_stock`,
+    /// `cart_limit`).
+    pub reason: String,
+    /// The buyer-facing bilingual explanation.
+    pub message: String,
+}
+
+/// The reorder report: honest partial success — what
+/// went back into the cart, what did not and why, and
+/// the cart itself (the server's truth, at today's
+/// prices) for the page to render.
+#[derive(Debug, Serialize)]
+pub struct ReorderReport {
+    pub order_id: Uuid,
+    pub added: Vec<ReorderAdded>,
+    pub skipped: Vec<ReorderSkipped>,
+    pub cart: crate::cart::CartView,
+}
+
+/// One past-order line read with TODAY's facts for the
+/// reorder decision: the product's current status and
+/// stock, the bought variant's current state and stock,
+/// and whether the product has active variants now.
+#[derive(FromRow)]
+struct ReorderLine {
+    product_id: Uuid,
+    variant_id: Option<Uuid>,
+    title_snapshot: String,
+    quantity: i32,
+    product_status: Option<String>,
+    product_stock: Option<i32>,
+    variant_active: Option<bool>,
+    variant_stock: Option<i32>,
+    has_active_variants: bool,
+}
+
+/// Re-add a past order's items to the buyer's cart at
+/// CURRENT prices and availability (Wave 55). The order
+/// must be the buyer's own (404 otherwise, the buyer
+/// loader's rule) and not cancelled (a cancelled order's
+/// goods were never the buyer's to re-buy in one click —
+/// 409). Every line is decided by the domain's
+/// `reorder_decision` over today's facts and added
+/// through the cart module's ONE add path, so the cart
+/// the report returns obeys every cart rule (variant
+/// choice, the 99 cap, flash pricing) exactly as a
+/// manual add would. Old prices are never consulted —
+/// the order contributes only (product, variant,
+/// quantity).
+pub async fn reorder_order(
+    pool: &PgPool,
+    user: &AuthUser,
+    order_id: Uuid,
+) -> Result<ReorderReport, ApiError> {
+    let order = get_order_for_buyer(pool, user, order_id).await?;
+    if order.status == "cancelled" {
+        return Err(ApiError::conflict(
+            "বাতিল অর্ডার আবার কেনা যায় না — a cancelled order cannot be reordered",
+        ));
+    }
+
+    let lines: Vec<ReorderLine> = sqlx::query_as(
+        "SELECT oi.product_id, oi.variant_id, oi.title_snapshot, oi.quantity, \
+         p.status AS product_status, p.stock AS product_stock, \
+         v.is_active AS variant_active, v.stock AS variant_stock, \
+         EXISTS (SELECT 1 FROM product_variants pv \
+                 WHERE pv.product_id = p.id AND pv.is_active) AS has_active_variants \
+         FROM order_items oi \
+         JOIN sub_orders so ON so.id = oi.sub_order_id \
+         LEFT JOIN products p ON p.id = oi.product_id \
+         LEFT JOIN product_variants v ON v.id = oi.variant_id \
+         WHERE so.order_id = $1 ORDER BY so.created_at, oi.id",
+    )
+    .bind(order_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::internal("load order lines for reorder", e))?;
+
+    // The buyer's current cart quantities per line, for
+    // the headroom half of the decision (a line already
+    // in the cart — active or saved — accumulates).
+    let cart_id = crate::cart::find_cart_id(pool, user.user_id).await?;
+    let mut cart_quantities: HashMap<(Uuid, Option<Uuid>), i64> = HashMap::new();
+    if let Some(cart_id) = cart_id {
+        let rows: Vec<(Uuid, Option<Uuid>, i32)> = sqlx::query_as(
+            "SELECT product_id, variant_id, quantity FROM cart_items WHERE cart_id = $1",
+        )
+        .bind(cart_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| ApiError::internal("load cart for reorder", e))?;
+        for (product_id, variant_id, quantity) in rows {
+            cart_quantities.insert((product_id, variant_id), i64::from(quantity));
+        }
+    }
+
+    let mut added = Vec::new();
+    let mut skipped = Vec::new();
+    for line in &lines {
+        let variant_state = match line.variant_id {
+            Some(_) => match line.variant_active {
+                None => ReorderVariantState::Missing,
+                Some(true) => ReorderVariantState::Active,
+                Some(false) => ReorderVariantState::Inactive,
+            },
+            None => {
+                if line.has_active_variants {
+                    ReorderVariantState::ProductGainedVariants
+                } else {
+                    ReorderVariantState::NotApplicable
+                }
+            }
+        };
+        let stock = i64::from(match line.variant_id {
+            Some(_) => line.variant_stock.unwrap_or(0),
+            None => line.product_stock.unwrap_or(0),
+        });
+        let in_cart = cart_quantities
+            .get(&(line.product_id, line.variant_id))
+            .copied()
+            .unwrap_or(0);
+        let headroom = i64::from(domain::MAX_CART_QUANTITY) - in_cart;
+        let decision = reorder_decision(
+            line.product_status.as_deref(),
+            variant_state,
+            stock,
+            i64::from(line.quantity),
+            headroom,
+        );
+        match decision {
+            ReorderDecision::Add { quantity } => {
+                match crate::cart::add_cart_item(
+                    pool,
+                    user,
+                    line.product_id,
+                    quantity,
+                    line.variant_id,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        cart_quantities.insert(
+                            (line.product_id, line.variant_id),
+                            in_cart + quantity,
+                        );
+                        added.push(ReorderAdded {
+                            product_id: line.product_id,
+                            variant_id: line.variant_id,
+                            title: line.title_snapshot.clone(),
+                            quantity,
+                        });
+                    }
+                    // The facts were read a moment ago;
+                    // if the add still refuses (a race
+                    // with a seller edit), the line is
+                    // reported skipped with the add's own
+                    // words rather than failing the whole
+                    // reorder.
+                    Err(err) => skipped.push(ReorderSkipped {
+                        title: line.title_snapshot.clone(),
+                        reason: domain::ReorderSkipReason::ProductUnavailable
+                            .as_str()
+                            .to_string(),
+                        message: err.message,
+                    }),
+                }
+            }
+            ReorderDecision::Skip(reason) => skipped.push(ReorderSkipped {
+                title: line.title_snapshot.clone(),
+                reason: reason.as_str().to_string(),
+                message: reason.message().to_string(),
+            }),
+        }
+    }
+
+    let cart = crate::cart::cart_view(pool, user.user_id).await?;
+    Ok(ReorderReport {
+        order_id,
+        added,
+        skipped,
+        cart,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Buy-again rail (Wave 55) — the products a buyer has
+// bought before, offered again at today's facts
+// ---------------------------------------------------------------------------
+
+/// How many products the buy-again rail carries at most.
+pub const BUY_AGAIN_LIMIT: i64 = 12;
+
+/// One product on the buy-again rail: something the buyer
+/// has ordered before that can be bought again TODAY.
+#[derive(Debug, Serialize)]
+pub struct BuyAgainItem {
+    pub product_id: Uuid,
+    /// The product's CURRENT title (not the order's
+    /// snapshot — the rail sells today's product).
+    pub title: String,
+    pub title_bn: Option<String>,
+    pub store_slug: String,
+    pub image_url: Option<String>,
+    /// Today's unit price: the live flash price when a
+    /// sale governs the product, else the base price —
+    /// the same resolution the cart applies.
+    pub unit_price_poisha: i64,
+    /// The base price when a flash sale governs (the
+    /// strike-through figure); equal to
+    /// `unit_price_poisha` when no sale does.
+    pub list_unit_price_poisha: i64,
+    /// The product sells through variants: the rail's
+    /// add must send the buyer to pick one (the product
+    /// page), never guess.
+    pub has_variants: bool,
+    /// How many of the buyer's orders included it.
+    pub times_ordered: i64,
+    pub last_ordered_at: DateTime<Utc>,
+    /// Already in the buyer's ACTIVE cart (saved lines
+    /// do not count — they are not in the cart proper).
+    pub in_cart: bool,
+}
+
+/// The buy-again rail response.
+#[derive(Debug, Serialize)]
+pub struct BuyAgainList {
+    pub items: Vec<BuyAgainItem>,
+}
+
+/// One rail row as stored, before the image URL and the
+/// flash price are resolved.
+#[derive(FromRow)]
+struct BuyAgainRow {
+    product_id: Uuid,
+    title: String,
+    title_bn: Option<String>,
+    store_slug: String,
+    unit_price_poisha: i64,
+    has_variants: bool,
+    times_ordered: i64,
+    last_ordered_at: DateTime<Utc>,
+    in_cart: bool,
+    #[sqlx(default)]
+    product_image_key: Option<String>,
+    #[sqlx(default)]
+    product_image_external_url: Option<String>,
+    #[sqlx(default)]
+    product_image_width: Option<i32>,
+}
+
+/// The buy-again rail (Wave 55): the distinct products
+/// from the buyer's non-cancelled orders, most recently
+/// ordered first, filtered to what can be bought again
+/// today — the product is active AND has stock (its own
+/// stock when it sells plainly; any active variant's
+/// stock when it sells through variants). Archived,
+/// sold-out and cancelled-away products simply do not
+/// appear: the rail never offers what the cart would
+/// refuse. Prices are today's (flash-resolved like the
+/// cart's), never the orders' snapshots.
+pub async fn buy_again_rail(pool: &PgPool, user: &AuthUser) -> Result<BuyAgainList, ApiError> {
+    let rows: Vec<BuyAgainRow> = sqlx::query_as(
+        "SELECT p.id AS product_id, p.title, p.title_bn, s.slug AS store_slug, \
+         p.price_poisha AS unit_price_poisha, \
+         EXISTS (SELECT 1 FROM product_variants pv \
+                 WHERE pv.product_id = p.id AND pv.is_active) AS has_variants, \
+         COUNT(DISTINCT o.id)::bigint AS times_ordered, \
+         MAX(o.created_at) AS last_ordered_at, \
+         EXISTS (SELECT 1 FROM cart_items ci JOIN carts c ON c.id = ci.cart_id \
+                 WHERE c.user_id = $1 AND ci.product_id = p.id AND NOT ci.saved) AS in_cart, \
+         (SELECT pi.storage_key FROM product_images pi \
+           WHERE pi.product_id = p.id \
+           ORDER BY pi.is_primary DESC, pi.position ASC, pi.created_at ASC LIMIT 1) \
+             AS product_image_key, \
+         (SELECT pi.external_url FROM product_images pi \
+           WHERE pi.product_id = p.id \
+           ORDER BY pi.is_primary DESC, pi.position ASC, pi.created_at ASC LIMIT 1) \
+             AS product_image_external_url, \
+         (SELECT pi.width FROM product_images pi \
+           WHERE pi.product_id = p.id \
+           ORDER BY pi.is_primary DESC, pi.position ASC, pi.created_at ASC LIMIT 1) \
+             AS product_image_width \
+         FROM order_items oi \
+         JOIN sub_orders so ON so.id = oi.sub_order_id \
+         JOIN orders o ON o.id = so.order_id \
+         JOIN products p ON p.id = oi.product_id \
+         JOIN stores s ON s.id = p.store_id \
+         WHERE o.buyer_user_id = $1 AND o.status <> 'cancelled' \
+           AND so.status <> 'cancelled' AND p.status = 'active' \
+           AND ((NOT EXISTS (SELECT 1 FROM product_variants pv3 \
+                             WHERE pv3.product_id = p.id AND pv3.is_active) \
+                 AND p.stock > 0) \
+                OR EXISTS (SELECT 1 FROM product_variants pv4 \
+                           WHERE pv4.product_id = p.id AND pv4.is_active \
+                             AND pv4.stock > 0)) \
+         GROUP BY p.id, p.title, p.title_bn, s.slug, p.price_poisha \
+         ORDER BY last_ordered_at DESC \
+         LIMIT $2",
+    )
+    .bind(user.user_id)
+    .bind(BUY_AGAIN_LIMIT)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::internal("load buy-again rail", e))?;
+
+    // Flash resolution, the cart's one rule: a live sale
+    // price replaces the base on the rail exactly as in
+    // the cart, with the base kept for the strike-through.
+    let product_ids: Vec<Uuid> = rows.iter().map(|row| row.product_id).collect();
+    let flash = if product_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        crate::merch::flash_price_map(pool, &product_ids, Utc::now()).await?
+    };
+
+    let items = rows
+        .into_iter()
+        .map(|row| {
+            let image_url = crate::media::product_image_url(
+                row.product_image_key.as_deref(),
+                row.product_image_external_url.as_deref(),
+                row.product_image_width,
+            );
+            let (unit_price_poisha, list_unit_price_poisha) = match flash.get(&row.product_id) {
+                Some(sale) => (sale.sale_price_poisha, row.unit_price_poisha),
+                None => (row.unit_price_poisha, row.unit_price_poisha),
+            };
+            BuyAgainItem {
+                product_id: row.product_id,
+                title: row.title,
+                title_bn: row.title_bn,
+                store_slug: row.store_slug,
+                image_url,
+                unit_price_poisha,
+                list_unit_price_poisha,
+                has_variants: row.has_variants,
+                times_ordered: row.times_ordered,
+                last_ordered_at: row.last_ordered_at,
+                in_cart: row.in_cart,
+            }
+        })
+        .collect();
+    Ok(BuyAgainList { items })
+}
+
+/// GET /v1/buyer/buy-again — the signed-in buyer's rail.
+pub async fn buy_again_handler(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Json<BuyAgainList>, ApiError> {
+    let pool = state.require_pool()?;
+    Ok(Json(buy_again_rail(pool, &user).await?))
 }
 
 // ---------------------------------------------------------------------------
@@ -1637,6 +2217,13 @@ pub struct ReceiptSubOrder {
     pub goods_subtotal_poisha: i64,
     pub delivery_charge_poisha: i64,
     pub items: Vec<OrderItem>,
+    /// The sub-order's event timeline (Wave 55) — the
+    /// receipt page doubles as the buyer's order detail
+    /// page, and the timeline is its tracking section.
+    pub timeline: Vec<crate::timeline::TimelineEvent>,
+    /// The tracking stepper (Wave 55), copied from the
+    /// sub-order's served steps.
+    pub steps: Vec<crate::timeline::TimelineStep>,
 }
 
 /// The buyer receipt view-model: everything needed to render or print
@@ -1666,6 +2253,9 @@ pub struct Receipt {
     /// when the advance payment settled.
     pub advance_paid_poisha: i64,
     pub delivery: ReceiptDelivery,
+    /// The buyer's order note (Wave 55), echoed back so
+    /// the buyer sees what the sellers were told.
+    pub order_note: Option<String>,
     pub sub_orders: Vec<ReceiptSubOrder>,
     pub goods_total_poisha: i64,
     /// The coupon applied at checkout (Wave 14) and its total
@@ -1701,6 +2291,8 @@ pub fn build_receipt(order: &Order, store_names: &HashMap<Uuid, String>) -> Rece
             goods_subtotal_poisha: sub.goods_subtotal_poisha,
             delivery_charge_poisha: sub.delivery_charge_poisha,
             items: sub.items.clone(),
+            timeline: sub.timeline.clone(),
+            steps: sub.steps.clone(),
         })
         .collect();
     Receipt {
@@ -1727,6 +2319,7 @@ pub fn build_receipt(order: &Order, store_names: &HashMap<Uuid, String>) -> Rece
             address: order.delivery_address.clone(),
             zone: order.delivery_zone.clone(),
         },
+        order_note: order.order_note.clone(),
         sub_orders,
         goods_total_poisha: order.goods_total_poisha,
         coupon_code: order.coupon_code.clone(),
@@ -1781,6 +2374,8 @@ struct SellerSubOrderRow {
     delivery_phone: String,
     delivery_address: String,
     delivery_zone: String,
+    order_note: Option<String>,
+    delivery_district: Option<String>,
     buyer_user_id: Uuid,
     order_payment_status: String,
     advance_required_poisha: i64,
@@ -1830,6 +2425,7 @@ pub(crate) async fn list_seller_sub_orders_scoped(
          so.goods_subtotal_poisha, so.discount_poisha, so.delivery_charge_poisha, so.commission_poisha, \
          so.seller_payout_poisha, so.created_at, \
          o.delivery_name, o.delivery_phone, o.delivery_address, o.delivery_zone, \
+         o.order_note, o.delivery_district, \
          o.buyer_user_id, o.payment_status AS order_payment_status, \
          o.advance_required_poisha, o.advance_paid_poisha \
          FROM sub_orders so \
@@ -1849,6 +2445,15 @@ pub(crate) async fn list_seller_sub_orders_scoped(
     for row in rows {
         let order_items = load_order_items(pool, row.id).await?;
         let shipment = load_shipment_summary_for_sub_order(pool, row.id).await?;
+        // Wave 55: the seller list carries the same
+        // timeline + stepper the buyer sees.
+        let timeline =
+            crate::timeline::sub_order_timeline(pool, row.id, &row.status, row.created_at)
+                .await?;
+        let steps = crate::timeline::sub_order_steps(
+            &row.status,
+            shipment.as_ref().map(|summary| summary.status.as_str()),
+        );
         // Wave 17: the buyer's risk level, from the ONE shared
         // aggregate — one call per listed sub-order (pages are
         // small; correctness over micro-optimisation, and the
@@ -1875,7 +2480,11 @@ pub(crate) async fn list_seller_sub_orders_scoped(
             delivery_phone: row.delivery_phone,
             delivery_address: row.delivery_address,
             delivery_zone: row.delivery_zone,
+            order_note: row.order_note,
+            delivery_district: row.delivery_district,
             items: order_items,
+            timeline,
+            steps,
             shipment,
             order_payment_status: row.order_payment_status,
             advance_required_poisha: row.advance_required_poisha,
@@ -2085,6 +2694,20 @@ pub async fn cancel_order(
 ) -> Result<Json<Order>, ApiError> {
     let pool = state.require_pool()?;
     Ok(Json(cancel_order_for_buyer(pool, &user, id).await?))
+}
+
+/// POST /v1/orders/:id/reorder — "buy again" (Wave 55):
+/// re-add the order's lines at today's prices, with the
+/// per-line report. Always 200 for the buyer's own
+/// non-cancelled order — partial success IS the success
+/// shape here; the report says what did not come back.
+pub async fn reorder_order_handler(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ReorderReport>, ApiError> {
+    let pool = state.require_pool()?;
+    Ok(Json(reorder_order(pool, &user, id).await?))
 }
 
 pub async fn get_receipt(

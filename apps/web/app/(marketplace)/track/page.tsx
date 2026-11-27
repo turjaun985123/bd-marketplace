@@ -9,6 +9,9 @@ import {
   trackOrder,
   type TrackedOrder,
 } from "@/lib/api";
+import OrderTimeline, {
+  timelineEventLabel,
+} from "@/components/OrderTimeline";
 
 /** Bangla labels for sub-order statuses (display only). */
 const SUB_ORDER_LABELS: Record<string, string> = {
@@ -27,6 +30,13 @@ const SUB_ORDER_LABELS: Record<string, string> = {
  * answers every failure (unknown id, wrong phone) with the same
  * 404, so this page shows ONE "খুঁজে পাওয়া যায়নি" message and
  * never hints whether the order itself exists.
+ *
+ * Wave 55: the response's timelines render here too — the
+ * order-level money events (placement, advance/payment)
+ * under the summary, and per store the shared OrderTimeline
+ * stepper + events above the shipment's own courier log
+ * (which stays: it is the courier leg in full, raw notes
+ * included).
  */
 export default function TrackPage() {
   const [orderId, setOrderId] = useState("");
@@ -104,6 +114,25 @@ export default function TrackPage() {
               <PriceTag amountPoisha={tracked.grand_total_poisha} />
             </strong>
           </p>
+          {tracked.timeline.length > 0 && (
+            <>
+              <h3>অর্ডার ও পেমেন্টের ধাপ — Order & payment</h3>
+              <ul>
+                {tracked.timeline.map((event, idx) => (
+                  <li key={`${event.kind}-${idx}`}>
+                    {timelineEventLabel(event)}
+                    {event.note && <> — {event.note}</>}
+                    {event.at && (
+                      <>
+                        {" "}
+                        · {new Date(event.at).toLocaleString("bn-BD")}
+                      </>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
           {tracked.sub_orders.map((sub) => (
             <article key={sub.store_slug} className="card">
               <h3>
@@ -115,6 +144,12 @@ export default function TrackPage() {
                   {item.title_snapshot} × {item.quantity}
                 </p>
               ))}
+              <OrderTimeline
+                status={sub.status}
+                shipmentStatus={sub.shipment?.status ?? null}
+                events={sub.timeline}
+                steps={sub.steps}
+              />
               {sub.shipment ? (
                 <>
                   {sub.shipment.manual_courier_name ? (

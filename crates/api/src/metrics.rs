@@ -44,6 +44,20 @@
 //!   Wave 30 poller picks up, i.e. work the poller owes.
 //! - `users_total` / `stores_total` / `products_active`:
 //!   plain catalogue totals (active = `status = 'active'`).
+//! - `orders_by_district` (Wave 55): parent orders grouped
+//!   by their recorded delivery district. Only orders that
+//!   NAMED a district are counted — a zone-only checkout
+//!   (pre-Wave-55 shape, still the manual default) has no
+//!   district to attribute, and inventing one from the
+//!   zone would fabricate geography; the admin page says
+//!   exactly this next to the block.
+//! - `orders_by_zone` (Wave 55): the same grouping by the
+//!   zone every order DOES carry — the complete picture
+//!   next to the district block's partial one.
+//! - `address_book` (Wave 55): the address book's size —
+//!   saved addresses, buyers holding at least one, and
+//!   how many books currently have a default. Adoption
+//!   figures for the checkout shortcut, nothing more.
 
 use std::collections::BTreeMap;
 
@@ -141,6 +155,43 @@ pub struct AdminMetrics {
     /// collection views, all-time and today (see
     /// [`crate::merch::MerchandisingStats`]).
     pub merchandising: crate::merch::MerchandisingStats,
+    /// Wave 55: orders per delivery district (see
+    /// [`DistrictOrderCount`]).
+    pub orders_by_district: Vec<DistrictOrderCount>,
+    /// Wave 55: orders per delivery zone — every order
+    /// carries a zone, so this grouping is complete.
+    pub orders_by_zone: Vec<ZoneOrderCount>,
+    /// Wave 55: the address book's adoption figures.
+    pub address_book: AddressBookStats,
+}
+
+/// One district's order count (Wave 55). Districts are the
+/// canonical English names from the domain district table
+/// — that is what checkout stores — so the admin reads
+/// geography in the same vocabulary the buyer picked.
+#[derive(Debug, Serialize, FromRow)]
+pub struct DistrictOrderCount {
+    pub district: String,
+    pub orders: i64,
+}
+
+/// One zone's order count (Wave 55).
+#[derive(Debug, Serialize, FromRow)]
+pub struct ZoneOrderCount {
+    pub zone: String,
+    pub orders: i64,
+}
+
+/// The address book's size (Wave 55): saved addresses in
+/// total, buyers holding at least one, and rows currently
+/// flagged default (one per book at most — the partial
+/// unique index — so this also counts books WITH a
+/// default).
+#[derive(Debug, Serialize, FromRow)]
+pub struct AddressBookStats {
+    pub total_addresses: i64,
+    pub buyers_with_addresses: i64,
+    pub defaults_count: i64,
 }
 
 /// One (status, count) row, shared by the two GROUP BY
@@ -301,6 +352,30 @@ pub async fn get_admin_metrics(pool: &PgPool) -> Result<AdminMetrics, ApiError> 
             .map_err(|e| ApiError::internal("media top stores", e))?,
         },
         merchandising: crate::merch::merchandising_stats(pool).await?,
+        orders_by_district: sqlx::query_as(
+            "SELECT delivery_district AS district, COUNT(*)::bigint AS orders \
+             FROM orders WHERE delivery_district IS NOT NULL \
+             GROUP BY delivery_district ORDER BY orders DESC, delivery_district ASC",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| ApiError::internal("orders by district", e))?,
+        orders_by_zone: sqlx::query_as(
+            "SELECT delivery_zone AS zone, COUNT(*)::bigint AS orders \
+             FROM orders GROUP BY delivery_zone ORDER BY orders DESC, delivery_zone ASC",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| ApiError::internal("orders by zone", e))?,
+        address_book: sqlx::query_as(
+            "SELECT COUNT(*)::bigint AS total_addresses, \
+             COUNT(DISTINCT user_id)::bigint AS buyers_with_addresses, \
+             COUNT(*) FILTER (WHERE is_default)::bigint AS defaults_count \
+             FROM buyer_addresses",
+        )
+        .fetch_one(pool)
+        .await
+        .map_err(|e| ApiError::internal("address book stats", e))?,
     })
 }
 

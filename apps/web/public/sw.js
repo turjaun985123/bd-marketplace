@@ -69,6 +69,11 @@ var NEVER_CACHE_PREFIXES = [
   "/v1/wishlist",
   "/v1/conversations",
   "/v1/api-keys",
+  // Wave 55: the address book is personal data — never cached.
+  "/v1/addresses",
+  // Wave 55: buyer-scoped reads (export, buy-again rail)
+  // are personal data too.
+  "/v1/buyer/",
 ];
 
 // Rule 4 — public, per-user-data-free API reads.

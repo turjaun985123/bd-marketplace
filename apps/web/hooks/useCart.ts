@@ -4,8 +4,12 @@ import { useCallback, useEffect, useState } from "react";
 import {
   addCartItem,
   clearCart as clearCartApi,
+  clearSavedItems,
   getCart,
+  moveAllSavedToCart,
   removeCartItem,
+  saveCartItem,
+  unsaveCartItem,
   updateCartItem,
   type Cart,
   type CartItem,
@@ -14,6 +18,8 @@ import { useAuth } from "@/hooks/useAuth";
 
 export interface CartState {
   items: CartItem[];
+  /** Lines parked on the save-for-later shelf (Wave 55). */
+  savedItems: CartItem[];
   goodsTotalPoisha: number;
   /** Total unit count across all lines (for badges/labels). */
   count: number;
@@ -35,9 +41,17 @@ export interface CartState {
   ) => Promise<void>;
   remove: (productId: string, variantId?: string | null) => Promise<void>;
   clear: () => Promise<void>;
+  /** Park a line on the save-for-later shelf (Wave 55). */
+  moveToSaved: (productId: string, variantId?: string | null) => Promise<void>;
+  /** Move a saved line back into the active cart (Wave 55). */
+  moveToCart: (productId: string, variantId?: string | null) => Promise<void>;
+  /** Bring the whole shelf back into the cart (Wave 55). */
+  moveAllSaved: () => Promise<void>;
+  /** Empty the shelf; the active cart is untouched (Wave 55). */
+  clearSaved: () => Promise<void>;
 }
 
-const EMPTY_CART: Cart = { items: [], goods_total_poisha: 0 };
+const EMPTY_CART: Cart = { items: [], saved_items: [], goods_total_poisha: 0 };
 
 /**
  * Shared cart hook — the ONLY place the web app calls the cart
@@ -109,9 +123,28 @@ export function useCart(): CartState {
     [mutate]
   );
   const clear = useCallback(() => mutate((t) => clearCartApi(t)), [mutate]);
+  const moveToSaved = useCallback(
+    (productId: string, variantId?: string | null) =>
+      mutate((t) => saveCartItem(t, productId, variantId)),
+    [mutate]
+  );
+  const moveToCart = useCallback(
+    (productId: string, variantId?: string | null) =>
+      mutate((t) => unsaveCartItem(t, productId, variantId)),
+    [mutate]
+  );
+  const moveAllSaved = useCallback(
+    () => mutate((t) => moveAllSavedToCart(t)),
+    [mutate]
+  );
+  const clearSaved = useCallback(
+    () => mutate((t) => clearSavedItems(t)),
+    [mutate]
+  );
 
   return {
     items: cart.items,
+    savedItems: cart.saved_items,
     goodsTotalPoisha: cart.goods_total_poisha,
     count: cart.items.reduce((sum, item) => sum + item.quantity, 0),
     loading,
@@ -121,5 +154,9 @@ export function useCart(): CartState {
     setQuantity,
     remove,
     clear,
+    moveToSaved,
+    moveToCart,
+    moveAllSaved,
+    clearSaved,
   };
 }
