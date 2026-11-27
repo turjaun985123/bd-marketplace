@@ -10,7 +10,7 @@ chrono = { version = "0.4", features = ["serde"] }
 courier = { path = "../courier" }
 domain = { path = "../domain" }
 hex = "0.4"
-hmac = "0.12"
+hmac = "0.13"
 # Wave 39 (security audit CR-02): jsonwebtoken 10.x — 9.3.1 is
 # CVE-2026-25537 (type confusion lets a crafted JWK header bypass
 # verification). v10 splits the crypto backend behind features;
