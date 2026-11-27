@@ -881,8 +881,12 @@ async fn wave53_faceted_browse_end_to_end() {
     // 11. Analytics: searches are logged; the admin read
     //     reports top + zero-result queries, admin-only.
     // ------------------------------------------------------------------
-    let results = browse(&app, "q=Wave53Unobtainium").await;
-    assert_eq!(results["total"], 0, "the unobtainium search: {results}");
+    // The zero-result probe shares no trigrams with any fixture
+    // title — a probe like "Wave53Unobtainium" would legitimately
+    // match every "Wave53 …" product through the search's
+    // documented 0.2 trigram typo tolerance.
+    let results = browse(&app, "q=Zxqwvbn").await;
+    assert_eq!(results["total"], 0, "the zero-result search: {results}");
 
     let (status, body) = call(
         &app,
@@ -922,7 +926,7 @@ async fn wave53_faceted_browse_end_to_end() {
         .as_array()
         .expect("zero-result searches")
         .iter()
-        .find(|row| row["query_text"] == "Wave53Unobtainium")
+        .find(|row| row["query_text"] == "Zxqwvbn")
         .expect("the zero-result search is reported")
         .clone();
     assert!(zero["searches"].as_i64().expect("searches") >= 1);
