@@ -17,6 +17,7 @@ use axum::{
     Router,
 };
 use courier::CouriersConfig;
+use payments::PaymentsConfig;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -223,7 +224,16 @@ async fn test_app() -> Option<Router> {
         dev_mode: true,
         ..CouriersConfig::default()
     };
+    // Payments DEV simulator on (the wave17 pattern): only
+    // then can an over-threshold COD order actually collect
+    // its advance and sit in advance_pending — with no
+    // gateway the W17 degradation records the requirement
+    // and proceeds as plain COD instead.
     let state = AppState::new(Some(pool), "wave55k-test-secret".to_string(), true)
+        .with_payments_config(PaymentsConfig {
+            dev_mode: true,
+            ..PaymentsConfig::default()
+        })
         .with_couriers_config(dev_couriers);
     Some(build_app(state))
 }
@@ -273,7 +283,24 @@ async fn wave55k_timeline_cancelled_advance_and_patch_funnel() {
     // --- Advance-due: the order timeline carries the
     // advance payment event. --------------------------------
     add_to_cart(&app, &buyer, &pricey, 1).await;
-    let order = checkout_cod(&app, &buyer).await;
+    // Over the advance threshold: the checkout names the
+    // advance method (the wave17 rule in dev payments mode).
+    let (status, order) = call(
+        &app,
+        Method::POST,
+        "/v1/orders",
+        Some(json!({
+            "delivery_name": "Test Buyer",
+            "delivery_phone": "01999999999",
+            "delivery_address": "House 1, Road 1, Dhaka",
+            "delivery_zone": "inside_dhaka",
+            "payment_method": "cod",
+            "advance_method": "bkash"
+        })),
+        Some(&buyer),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "advance checkout: {order}");
     assert_eq!(order["payment_status"], "advance_pending", "{order}");
     let order_id = order["id"].as_str().expect("order id").to_string();
     let uri = format!("/v1/track?order_id={order_id}&phone=01999999999");
