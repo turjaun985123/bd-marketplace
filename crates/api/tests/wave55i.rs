@@ -309,12 +309,14 @@ async fn wave55i_address_checkout_keeps_the_money_canon() {
     .await;
     assert_eq!(status, StatusCode::CREATED, "manual checkout: {manual}");
     // goods 200_000, coupon min(10%, cap) = 5_000, delivery
-    // 6_000 (2 × 500 g = 1 kg inside Dhaka), grand 201_000.
+    // 8_000 (2 units × the 1 kg default weight = 2 kg inside
+    // Dhaka: 6_000 base + 2_000 for the second kg), grand
+    // 203_000.
     let manual_money = money_snapshot(&manual, receipt_cod_due(&app, &buyer, &manual).await);
     assert_eq!(manual_money.0, 200_000);
     assert_eq!(manual_money.1, 5_000);
-    assert_eq!(manual_money.2, 6_000);
-    assert_eq!(manual_money.3, 201_000);
+    assert_eq!(manual_money.2, 8_000);
+    assert_eq!(manual_money.3, 203_000);
 
     // --- Order 2: address checkout with coupon B. -----------
     add_to_cart(&app, &buyer, &product, 2).await;
