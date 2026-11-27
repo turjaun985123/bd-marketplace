@@ -11463,7 +11463,7 @@ mod tests {
             cat("x", Some("y"), "x-slug", "X", 10),
             cat("y", Some("x"), "y-slug", "Y", 10),
         ];
-        assert!(would_create_cycle(&cyclic, "x", Some("y")));
+        assert!(would_create_cycle(&cyclic, "x", "y"));
         assert!(category_depth(&cyclic, "x").is_none_or(|d| d > 2));
         assert!(subtree_ids(&cyclic, "x").len() <= 2);
     }
