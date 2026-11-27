@@ -386,7 +386,10 @@ async fn wave52b_variant_coupon_seller_view_and_boundaries() {
         sub_order["discount_poisha"], 15_000,
         "coupon base is the sale price actually paid: {order}"
     );
-    assert_eq!(sub_order["seller_payout_poisha"], 138_000, "order: {order}");
+    // Wave 14 rule: a platform coupon keeps commission on full goods,
+    // but the payout snapshot still nets the discount out:
+    // 150_000 − 15_000 − 12_000 = 123_000.
+    assert_eq!(sub_order["seller_payout_poisha"], 123_000, "order: {order}");
 
     // ------------------------------------------------------------------
     // 3. The seller's flash view: their items, the live cap
