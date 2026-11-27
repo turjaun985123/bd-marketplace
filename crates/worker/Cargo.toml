@@ -7,5 +7,11 @@ license.workspace = true
 [dependencies]
 api = { path = "../api" }
 notify = { path = "../notify" }
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "migrate"] }
+# Wave 42: same sqlx feature diet as the api crate — see
+# crates/api/Cargo.toml for the full rationale. Defaults off
+# (the `any` default dragged the MySQL/SQLite drivers, and
+# libsqlite3-sys's bundled-SQLite CVE, into the graph);
+# `macros` restored explicitly for the migrate! call in
+# main.rs; `json` never exercised (no jsonb via sqlx here).
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "migrate", "macros"] }
 tokio = { version = "1", features = ["full"] }

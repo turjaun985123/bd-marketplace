@@ -2782,7 +2782,9 @@ this wave: separate from the rust/web/docker jobs and
 marked continue-on-error, so it reports without
 blocking. Making it gating is a follow-up once the
 first reports are triaged; no unrelated dependency
-advisories were fixed in this wave.
+advisories were fixed in this wave. (Follow-up: the
+first report was triaged in Wave 42 — see that
+section.)
 
 **Refunds reach the payment record (HI-52, migration
 0037).** `refunded` existed in the schema and the
@@ -2829,6 +2831,101 @@ redesign and CR-15's owner policy decision) stay
 queued in the audit's priority order for future
 waves. PR #1 holds the full register; nothing has
 been silently dropped.
+
+Wave 42 (dependency hygiene — acting on the first
+cargo-audit report):
+
+**The first report.** With the Wave 41 fix resolving
+the lockfile in-job first, the `security-audit` job
+now reports for real: over 291 dependencies it found
+**3 vulnerabilities and 1 informational warning**.
+Each is dispositioned below. Nothing was ignored away
+silently — the two accepted risks live in
+`.cargo/audit.toml` with written justifications and
+removal triggers, in the open, where cargo audit
+still prints them on every run.
+
+**RUSTSEC-2026-0459 (libsqlite3-sys) — REMOVED, not
+ignored.** The bundled SQLite (CVE-2026-119375,
+patched in libsqlite3-sys ≥ 0.39) was in the graph
+because every sqlx declaration in the workspace rode
+the umbrella crate's default features even though
+each crate declares Postgres-only drivers — the
+defaults' `any` member is what kept the MySQL and
+SQLite drivers in the resolved graph for a platform
+that never opens either database. All four sqlx
+declarations (api, worker, notify, and notify's
+migrate-only dev-dependency) now set
+`default-features = false`. What the defaults were
+silently providing is restored explicitly only where
+the code provably uses it: `macros` (the FromRow
+derives throughout, and the `migrate!` calls in api
+and worker) — `migrate` itself was already explicit
+in api/worker. Two defaults are deliberately NOT
+restored: `json`, which this codebase never exercises
+(jsonb is bound and read as text with `::jsonb` /
+`::text` casts — see audit.rs and the notify payload),
+and `any`, dropped outright (no `sqlx::Any` types
+exist in the tree). In sqlx 0.8.6's published feature
+graph the MySQL/SQLite driver crates are reachable
+only through the `mysql` / `sqlite` / `all-databases`
+features (checked in both the umbrella and
+sqlx-macros-core manifests), none of which survives
+the diet — so sqlx-mysql, sqlx-sqlite and
+libsqlite3-sys leave the resolved graph. The
+committed Cargo.lock is still completed by cargo at
+build/CI time, so the audit job's next report —
+against the in-job-resolved lock — is the verifier
+that they are gone; if the advisory ever reappears
+it is a regression to fix, never an ignore to add
+(the audit.toml says so, in writing, next to the
+ignores).
+
+**RUSTSEC-2023-0071 (rsa) + RUSTSEC-2026-0387
+(crypto-bigint) — accepted-risk ignores, HS256-only.**
+Both crates enter solely through jsonwebtoken 10.4's
+`rust_crypto` feature: `rsa` directly (Marvin Attack
+timing sidechannel, patched in rsa ≥ 0.10) and
+`crypto-bigint` 0.5.5 via p256/p384 → elliptic-curve
+(timing variability, patched ≥ 0.7.6) — in other
+words, jsonwebtoken's RSA/ECDSA support. Neither can
+be bumped away from here: jsonwebtoken 10.4.0's
+manifest declares `rsa = "^0.9.6"`, which excludes
+the patched 0.10 line, and elliptic-curve 0.13 pins
+crypto-bigint to the 0.5.x line. The ignores in
+`.cargo/audit.toml` rest on one verifiable fact: this
+platform signs and verifies JWTs with HS256 (HMAC)
+ONLY — the only jsonwebtoken key operations in the
+tree are `EncodingKey::from_secret` /
+`DecodingKey::from_secret` with
+`Validation::new(Algorithm::HS256)` in
+crates/api/src/auth.rs, and a tree-wide grep finds no
+`from_rsa` / `from_ec` constructors and no RS*/ES*
+algorithm identifiers. The vulnerable operations
+(RSA private-key decryption/signing timing, ECDSA
+constant-time arithmetic on secret material)
+therefore never execute. Each ignore names its
+removal trigger: the first jsonwebtoken release
+whose tree resolves rsa ≥ 0.10 / crypto-bigint ≥
+0.7.6 — the audit job keeps printing both advisories
+until then, so a stale ignore cannot hide.
+
+**RUSTSEC-2026-0543 (chrono unmaintained) — noted,
+not acted on.** Informational-warning class only,
+not a vulnerability. chrono is load-bearing across
+the API's timestamps today; replacing it with `time`
+or `jiff` is a deliberate refactor wave of its own,
+queued as such rather than smuggled into a hygiene
+wave.
+
+**The rule going forward.** New advisories get
+triaged per wave: bump or remove where the graph
+allows it; ignore only with a written justification
+and a removal trigger in `.cargo/audit.toml`. The
+audit job stays NON-GATING while the two
+accepted-risk ignores are live; once the tree is
+clean, making it gating is a one-line CI change
+(drop the job's `continue-on-error`).
 
 Wave 8 (reviews, ratings and seller replies):
 
@@ -4253,6 +4350,28 @@ gate) covers the tampered-row rejections (full +
 advance), the uniqueness conflicts, the six-way OTP
 race at the cap boundary, and the partial-then-complete
 refund flip with its COD regression.
+**Real (Wave 42):** dependency hygiene — no new
+endpoints and no behaviour changes; declarations,
+audit config and docs only. Every sqlx dependency
+(api, worker, notify + notify's dev-dependency) now
+sets `default-features = false` with `macros`
+restored explicitly (the defaults' `any` member kept
+the MySQL/SQLite drivers — and libsqlite3-sys's
+bundled-SQLite CVE, RUSTSEC-2026-0459 — in the graph;
+`json` provably unexercised, the jsonb text-cast
+pattern; `any` unused), so the SQLite/MySQL driver
+crates leave the resolved graph, verified by the
+audit job's next report on the in-job-resolved lock.
+`.cargo/audit.toml` records exactly two accepted-risk
+ignores — RUSTSEC-2023-0071 (rsa, via jsonwebtoken's
+rust_crypto; unbumpable, its manifest pins ^0.9.6)
+and RUSTSEC-2026-0387 (crypto-bigint, via p256/p384)
+— each justified by the platform's HS256-only JWT use
+(only `from_secret` keys exist in the tree) and each
+carrying its removal trigger. chrono's unmaintained
+warning (RUSTSEC-2026-0543) is noted, with the
+time/jiff migration queued as its own refactor wave.
+See the Wave 42 section for the full triage.
 
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real

@@ -1,0 +1,85 @@
+# cargo-audit configuration for bd-marketplace.
+#
+# Read by `cargo audit` and by the CI `security-audit` job
+# (rustsec/audit-check, Wave 41) on every run. An entry in
+# the ignore list below is an ACCEPTED-RISK record, not a
+# deletion of the finding: cargo audit still prints ignored
+# advisories in its report, so a stale ignore stays visible
+# and must be removed at its review trigger. Every ignore
+# carries its justification and its expiry condition.
+# Added in Wave 42; see the README "Wave 42" section for the
+# full triage of the first audit report.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — `rsa` 0.9.10: Marvin Attack timing
+    # sidechannel in RSA private-key decryption/signing
+    # operations (patched in rsa >= 0.10).
+    #
+    # Why it is in the tree: `rsa` enters ONLY as a
+    # dependency of jsonwebtoken 10.4's `rust_crypto`
+    # feature (enabled in crates/api/Cargo.toml), which
+    # turns on jsonwebtoken's RSA/ECDSA support alongside
+    # the HMAC support this platform actually uses.
+    # jsonwebtoken 10.4.0 declares `rsa = "^0.9.6"`, so no
+    # lockfile-level bump to rsa 0.10 exists — the ignore
+    # is the only honest route until jsonwebtoken moves.
+    #
+    # Why the vulnerable code never runs: this platform
+    # signs and verifies JWTs with HS256 (HMAC) ONLY —
+    # `EncodingKey::from_secret` / `DecodingKey::from_secret`
+    # and `Validation::new(Algorithm::HS256)` in
+    # crates/api/src/auth.rs are the only jsonwebtoken key
+    # operations in the codebase. A tree-wide grep finds no
+    # `from_rsa` / `from_ec` constructors and no RS*/ES*
+    # algorithm identifiers, so no RSA private-key operation
+    # (the only path the Marvin Attack measures) can ever
+    # execute.
+    #
+    # Review trigger: REMOVE this ignore as soon as a
+    # jsonwebtoken release resolves `rsa >= 0.10`; the
+    # audit job keeps printing the advisory until then.
+    "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2026-0387 — `crypto-bigint` 0.5.5: timing
+    # variability in nominally constant-time operations
+    # (patched in crypto-bigint >= 0.7.6).
+    #
+    # Why it is in the tree: `crypto-bigint` enters ONLY
+    # through the same jsonwebtoken 10.4 `rust_crypto`
+    # subtree — via `p256` / `p384` -> `elliptic-curve`,
+    # i.e. jsonwebtoken's ECDSA support. The 0.5.x line is
+    # pinned by elliptic-curve 0.13, so no lockfile-level
+    # bump to 0.7.6 exists under jsonwebtoken 10.4.
+    #
+    # Why the vulnerable code never runs: same HS256-only
+    # argument as RUSTSEC-2023-0071 above — no ECDSA (or
+    # RSA) key operation exists anywhere in the codebase
+    # (only `from_secret` HMAC keys, `Algorithm::HS256`),
+    # so crypto-bigint's elliptic-curve arithmetic is never
+    # executed with secret material.
+    #
+    # Review trigger: REMOVE this ignore as soon as a
+    # jsonwebtoken release resolves `crypto-bigint >=
+    # 0.7.6`; the audit job keeps printing the advisory
+    # until then.
+    "RUSTSEC-2026-0387",
+]
+
+# Deliberately NOT ignored:
+#
+# - RUSTSEC-2026-0459 (`libsqlite3-sys` 0.30.1, bundled
+#   SQLite CVE-2026-119375): not accepted-risk — REMOVED.
+#   Wave 42 sets `default-features = false` on every sqlx
+#   dependency (the umbrella's default `any` feature was
+#   what pulled the SQLite/MySQL drivers into the graph),
+#   so sqlx-sqlite and libsqlite3-sys leave the resolved
+#   graph outright. If a future audit report shows this
+#   advisory again, that is a regression to fix, not an
+#   ignore to add.
+#
+# - RUSTSEC-2026-0543 (`chrono` unmaintained):
+#   informational-warning class only, not a vulnerability.
+#   chrono stays for now; migrating the codebase's
+#   timestamps to `time` or `jiff` is a deliberate refactor
+#   wave of its own, not a drive-by (see README, Wave 42).

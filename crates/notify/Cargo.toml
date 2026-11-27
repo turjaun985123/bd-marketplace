@@ -8,10 +8,19 @@ license.workspace = true
 async-trait = "0.1"
 domain = { path = "../domain" }
 serde_json = "1"
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid"] }
+# Wave 42: same sqlx feature diet as the api crate — see
+# crates/api/Cargo.toml for the full rationale. Defaults off
+# (the `any` default dragged the MySQL/SQLite drivers, and
+# libsqlite3-sys's bundled-SQLite CVE, into the graph);
+# `macros` restored explicitly for the FromRow derive on
+# ClaimedRow; `json` never exercised (the payload jsonb is
+# bound as serialised text). The dev-dependency below must
+# ALSO opt out of defaults, or feature unification would
+# switch them back on for test builds.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "macros"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 async-trait = "0.1"
-sqlx = { version = "0.8", features = ["migrate"] }
+sqlx = { version = "0.8", default-features = false, features = ["migrate"] }
 tokio = { version = "1", features = ["full"] }

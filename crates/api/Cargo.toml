@@ -25,7 +25,18 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "migrate"] }
+# Wave 42 (dependency hygiene): default features OFF. sqlx's
+# defaults (any, macros, migrate, json) pull the MySQL and
+# SQLite drivers into the graph via the `any` feature —
+# libsqlite3-sys carried a bundled-SQLite CVE
+# (RUSTSEC-2026-0459) for a database this platform never
+# opens. `macros` is restored explicitly (FromRow derives +
+# migrate! are used throughout); `migrate` was already
+# explicit. `json` is deliberately NOT restored: jsonb is
+# bound and read as text with ::jsonb / ::text casts (see
+# audit.rs), so the feature was never exercised. `any` is
+# dropped outright — no sqlx::Any types exist in the tree.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "migrate", "macros"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.5", features = ["cors", "compression-gzip"] }
 uuid = { version = "1", features = ["v4", "serde"] }
