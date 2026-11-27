@@ -3395,7 +3395,7 @@ pub fn validate_store_collection_description(
 /// [`MAX_STORE_COLLECTIONS`] the store must retire a
 /// collection first.
 pub fn validate_store_collection_count(current: i64) -> Result<(), String> {
-    if current < 0 || current >= MAX_STORE_COLLECTIONS {
+    if !(0..MAX_STORE_COLLECTIONS).contains(&current) {
         return Err(format!(
             "একটি স্টোর সর্বোচ্চ {}টি কালেকশন রাখতে পারে — a store may keep at \
              most {} collections",
@@ -3410,7 +3410,7 @@ pub fn validate_store_collection_count(current: i64) -> Result<(), String> {
 /// membership is a set — the API dedupes before calling)
 /// must fit [`MAX_COLLECTION_PRODUCTS`].
 pub fn validate_collection_product_count(count: i64) -> Result<(), String> {
-    if count < 0 || count > MAX_COLLECTION_PRODUCTS {
+    if !(0..=MAX_COLLECTION_PRODUCTS).contains(&count) {
         return Err(format!(
             "একটি কালেকশনে সর্বোচ্চ {}টি পণ্য থাকতে পারে — a collection may hold \
              at most {} products",
