@@ -145,6 +145,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Complete the lockfile for the audit
         run: cargo generate-lockfile
+      # Triage aid: if a flagged crate survives a feature diet, its
+      # reverse-dependency chain is printed here so the next wave
+      # can see exactly which declaration pulls it in.
+      - name: Reverse-dependency chains for flagged crates
+        run: |
+          cargo tree -i libsqlite3-sys || true
+          cargo tree -i sqlx-sqlite || true
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
