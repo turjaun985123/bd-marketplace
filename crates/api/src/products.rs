@@ -173,8 +173,8 @@ pub struct Product {
     /// Units actually sold (Wave 52): the SUM of order-item
     /// quantities over this product's DELIVERED sub-orders —
     /// the platform's one definition of a completed sale,
-    /// computed by the aggregate in `PRODUCT_COLUMNS` (see
-    /// `SOLD_COUNT_SQL`). Placed/confirmed/shipped orders do
+    /// computed by the aggregate at the tail of
+    /// `PRODUCT_COLUMNS`. Placed/confirmed/shipped orders do
     /// not count; a product nobody has received yet shows 0.
     /// Never an estimate, never seeded — the number is the
     /// ledger's.
@@ -211,18 +211,11 @@ pub(crate) const EFFECTIVE_STOCK_SQL: &str = "CASE WHEN EXISTS (\
           WHERE pv2.product_id = p.id AND pv2.is_active) \
     ELSE p.stock END";
 
-/// The sold-count aggregate (Wave 52): units in DELIVERED
-/// sub-orders for the product aliased `p`. THE definition of
-/// "sold" for every surface — the product view's `sold_count`
-/// column (via `PRODUCT_COLUMNS`), the home feed's
-/// best-sellers rail and its per-category best-seller pick all
-/// run this same expression, so the number a card shows can
-/// never disagree with the rail that ranked it.
-pub(crate) const SOLD_COUNT_SQL: &str = "(SELECT COALESCE(SUM(oi.quantity), 0)::bigint \
-    FROM order_items oi \
-    JOIN sub_orders so ON so.id = oi.sub_order_id \
-    WHERE oi.product_id = p.id AND so.status = 'delivered')";
-
+/// The shared product SELECT list. Its tail carries the
+/// sold-count aggregate (Wave 52): units in DELIVERED
+/// sub-orders for the product aliased `p` — THE definition
+/// of "sold" for every surface, so the number a card shows
+/// can never disagree with the rail that ranked it.
 pub(crate) const PRODUCT_COLUMNS: &str = "p.id, p.store_id, s.slug AS store_slug, p.title, p.title_bn, \
     p.description, p.category, p.price_poisha, p.compare_at_poisha, \
     CASE WHEN EXISTS (SELECT 1 FROM product_variants pv \

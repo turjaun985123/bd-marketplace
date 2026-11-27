@@ -47,9 +47,10 @@
 //! deliberate and auditable: it can be recomputed from the
 //! order ledger at any time, and the README states it.
 //!
-//! SOLD COUNTS follow the same philosophy (see
-//! `products::SOLD_COUNT_SQL`): units in DELIVERED sub-orders,
-//! nothing else — a placed order is not a sale.
+//! SOLD COUNTS follow the same philosophy (the aggregate
+//! at the tail of `products::PRODUCT_COLUMNS`): units in
+//! DELIVERED sub-orders, nothing else — a placed order is
+//! not a sale.
 //!
 //! Admin writes sit behind the one `require_admin` guard
 //! (and API keys are refused on the whole `/v1/admin/*`
@@ -269,7 +270,7 @@ pub async fn active_flash_price_tx(
     product_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<Option<ResolvedFlashPrice>, ApiError> {
-    let mut resolved = resolve_flash_on(&mut **tx, &[product_id], now).await?;
+    let mut resolved = resolve_flash_on(tx, &[product_id], now).await?;
     Ok(resolved.remove(&product_id))
 }
 
@@ -1692,7 +1693,8 @@ pub const HOME_FEATURED_STORE_LIMIT: i64 = 8;
 /// table), how many active products carry it, and a cover
 /// image: the primary image of the category's best-selling
 /// product that has one (the sold-count definition again —
-/// see [`crate::products::SOLD_COUNT_SQL`]).
+/// the aggregate at the tail of
+/// [`crate::products::PRODUCT_COLUMNS`]).
 #[derive(Debug, Serialize)]
 pub struct HomeCategory {
     pub category: String,
