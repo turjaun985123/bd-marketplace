@@ -217,6 +217,8 @@ async fn wave55j_address_patch_defaults_ordering_and_district_search() {
     // stranger alike (a stranger's book is empty too).
     let (status, _) = call(&app, Method::GET, "/v1/buyer/default-address", None, Some(&buyer)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = call(&app, Method::GET, "/v1/buyer/default-address", None, Some(&stranger)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     let a1 = create_address(&app, &buyer, "বাসা", "Dhaka").await;
     let a2 = create_address(&app, &buyer, "অফিস", "Gazipur").await;
