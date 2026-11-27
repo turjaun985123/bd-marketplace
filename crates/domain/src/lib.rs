@@ -7138,7 +7138,9 @@ mod tests {
     fn browse_filters_multi_value_normalisation() {
         // Repeated parameters, comma-joined values, stray
         // blanks and duplicates all normalise to one clean
-        // OR list, first occurrence winning.
+        // OR list — deduplicated and SORTED, so the stored
+        // form and the analytics fingerprint are canonical
+        // regardless of the order the values arrived in.
         let filters = validate_browse_filters(BrowseFilterInput {
             categories: vec![
                 " clothing , shoes ".to_string(),
@@ -7150,7 +7152,7 @@ mod tests {
             ..BrowseFilterInput::default()
         })
         .expect("normalisable lists");
-        assert_eq!(filters.categories, vec!["clothing", "shoes", "electronics"]);
+        assert_eq!(filters.categories, vec!["clothing", "electronics", "shoes"]);
         assert_eq!(filters.store_slugs, vec!["alpha", "beta"]);
 
         // The value cap and the per-value length cap bite.
