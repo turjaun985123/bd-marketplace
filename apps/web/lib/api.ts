@@ -1369,6 +1369,200 @@ export function setManualTracking(
   );
 }
 
+/** A fulfillment work bucket (Wave 40): the domain
+ * classification of a sub-order's work state. */
+export type FulfillmentBucket =
+  | "to_confirm"
+  | "to_ship"
+  | "in_transit"
+  | "done"
+  | "attention";
+
+/** Bangla label for a fulfillment bucket (display only). */
+export function fulfillmentBucketLabel(bucket: string): string {
+  switch (bucket) {
+    case "to_confirm":
+      return "কনফার্ম বাকি";
+    case "to_ship":
+      return "বুকিং বাকি";
+    case "in_transit":
+      return "পথে আছে";
+    case "done":
+      return "সম্পন্ন";
+    case "attention":
+      return "মনোযোগ দিন";
+    default:
+      return bucket;
+  }
+}
+
+/** Per-bucket tallies over a store's queue (Wave 40), plus how
+ * many actionable items have breached their SLA. */
+export interface FulfillmentCounts {
+  to_confirm: number;
+  to_ship: number;
+  in_transit: number;
+  done: number;
+  attention: number;
+  breached: number;
+}
+
+/** The shipment on a queued sub-order (Wave 40). */
+export interface FulfillmentShipment {
+  id: string;
+  courier: string;
+  consignment_id: string;
+  status: string;
+  cod_amount_poisha: number;
+  manual_courier_name: string | null;
+  manual_tracking_id: string | null;
+}
+
+/** One row of the fulfillment queue (Wave 40). */
+export interface FulfillmentItem {
+  sub_order_id: string;
+  order_id: string;
+  store_id: string;
+  status: string;
+  bucket: FulfillmentBucket;
+  /** Whole hours since the sub-order was placed. */
+  age_hours: number;
+  sla_breached: boolean;
+  created_at: string;
+  items_count: number;
+  goods_subtotal_poisha: number;
+  discount_poisha: number;
+  loyalty_discount_poisha: number;
+  delivery_charge_poisha: number;
+  /** Cash due on delivery — the booked shipment's stored
+   * amount, or the booking computation's preview while
+   * unbooked; the same number either way. */
+  cod_due_poisha: number;
+  delivery_name: string;
+  delivery_phone: string;
+  delivery_zone: string;
+  order_payment_status: string;
+  shipment: FulfillmentShipment | null;
+}
+
+/** GET /v1/seller/fulfillment — the work queue (Wave 40). */
+export interface FulfillmentQueue {
+  store_id: string;
+  store_name: string;
+  sla: { confirm_hours: number; ship_hours: number };
+  counts: FulfillmentCounts;
+  items: FulfillmentItem[];
+}
+
+/**
+ * GET /v1/seller/fulfillment — one store's work queue:
+ * bucket-classified sub-orders, oldest first, with SLA ages
+ * and exact per-bucket counts. Without a store id the
+ * caller's own earliest store is described.
+ */
+export function listFulfillment(
+  token: string,
+  storeId?: string
+): Promise<FulfillmentQueue> {
+  const query = storeId ? `?store_id=${encodeURIComponent(storeId)}` : "";
+  return call(`/v1/seller/fulfillment${query}`, { token });
+}
+
+/** One id's real outcome in a bulk booking (Wave 40). */
+export interface BulkBookItemResult {
+  sub_order_id: string;
+  ok: boolean;
+  shipment: Shipment | null;
+  error: string | null;
+}
+
+/** POST /v1/seller/fulfillment/bulk-book response (Wave 40). */
+export interface BulkBookResult {
+  store_id: string;
+  results: BulkBookItemResult[];
+  booked: number;
+  failed: number;
+}
+
+/**
+ * POST /v1/seller/fulfillment/bulk-book — book up to 20 of
+ * one store's confirmed sub-orders in one call. Each id runs
+ * the single-booking path on its own; the result reports
+ * every item's real outcome (a failure never rolls back the
+ * others). `courier` mirrors the single endpoint: a name,
+ * "auto" for smart routing, or "manual" with its fields.
+ */
+export function bulkBookShipments(
+  token: string,
+  input: {
+    storeId?: string;
+    subOrderIds: string[];
+    courier?: string;
+    areaId?: number;
+    manualCourier?: string;
+    manualTrackingId?: string;
+  }
+): Promise<BulkBookResult> {
+  const body: Record<string, unknown> = {
+    sub_order_ids: input.subOrderIds,
+  };
+  if (input.storeId) body.store_id = input.storeId;
+  if (input.courier) body.courier = input.courier;
+  if (input.areaId !== undefined) body.area_id = input.areaId;
+  if (input.manualCourier) body.manual_courier = input.manualCourier;
+  if (input.manualTrackingId) body.manual_tracking_id = input.manualTrackingId;
+  return call(`/v1/seller/fulfillment/bulk-book`, {
+    method: "POST",
+    token,
+    body,
+  });
+}
+
+/** Everything one courier label must say (Wave 40). */
+export interface FulfillmentLabel {
+  sub_order_id: string;
+  order_id: string;
+  placed_at: string;
+  store_name: string;
+  store_slug: string;
+  seller_phone: string;
+  delivery_name: string;
+  delivery_phone: string;
+  delivery_address: string;
+  delivery_zone: string;
+  courier: string;
+  courier_display_name: string;
+  consignment_id: string;
+  manual_tracking_id: string | null;
+  cod_amount_poisha: number;
+  items_count: number;
+}
+
+/** GET /v1/seller/fulfillment/labels response (Wave 40):
+ * labels for booked ids, named reasons for the rest. */
+export interface FulfillmentLabels {
+  store_id: string;
+  labels: FulfillmentLabel[];
+  skipped: { sub_order_id: string | null; reason: string }[];
+}
+
+/**
+ * GET /v1/seller/fulfillment/labels — label DATA for the
+ * print view (rendering is the page's job). Only booked
+ * sub-orders get a label; every other id comes back in
+ * `skipped` with its reason.
+ */
+export function getFulfillmentLabels(
+  token: string,
+  ids: string[],
+  storeId?: string
+): Promise<FulfillmentLabels> {
+  const search = new URLSearchParams();
+  search.set("ids", ids.join(","));
+  if (storeId) search.set("store_id", storeId);
+  return call(`/v1/seller/fulfillment/labels?${search.toString()}`, { token });
+}
+
 /** A store's money summary (Wave 9): earnings from DELIVERED
  * sub-orders only, minus what is paid out or waiting in requests. */
 export interface Earnings {
@@ -1408,6 +1602,9 @@ export interface SellerDashboard {
   /** Product questions still awaiting an answer (Wave 25);
    * hidden questions are excluded. */
   unanswered_questions: number;
+  /** Fulfillment queue tallies over the dashboard's scope
+   * (Wave 40) — the summary card linking into the queue. */
+  fulfillment: FulfillmentCounts;
 }
 
 /** Where a store's payout money goes (Wave 9). */

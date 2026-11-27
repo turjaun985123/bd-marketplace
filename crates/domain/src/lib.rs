@@ -626,6 +626,116 @@ pub fn can_transition_shipment(from: &str, to: &str) -> bool {
     )
 }
 
+/// The seller fulfillment center's work buckets (Wave 40): the
+/// five piles a seller's sub-orders sort into on the fulfillment
+/// queue. The queue is a WORK view over the existing sub-order
+/// and shipment statuses — it introduces no new status anywhere;
+/// [`fulfillment_bucket`] is the one classification rule and
+/// [`sla_breached`] the one lateness rule, so the queue, its
+/// counts and the dashboard card can never disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FulfillmentBucket {
+    /// Ordered, waiting for the seller to confirm.
+    ToConfirm,
+    /// Confirmed, waiting for a courier booking.
+    ToShip,
+    /// Booked and moving (or booked and awaiting pickup).
+    InTransit,
+    /// Delivered — the work is finished.
+    Done,
+    /// Something came back or was cancelled: a human must look.
+    Attention,
+}
+
+impl FulfillmentBucket {
+    /// The snake_case string the API returns and the web app
+    /// keys its tabs on.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FulfillmentBucket::ToConfirm => "to_confirm",
+            FulfillmentBucket::ToShip => "to_ship",
+            FulfillmentBucket::InTransit => "in_transit",
+            FulfillmentBucket::Done => "done",
+            FulfillmentBucket::Attention => "attention",
+        }
+    }
+}
+
+/// Which bucket one sub-order belongs to (Wave 40), from its own
+/// status, whether a shipment exists for it, and the shipment's
+/// unified status when it does. The mapping, in precedence
+/// order (first match wins):
+///
+/// 1. Shipment `returned`, `cancelled` or `return_in_transit`
+///    → **Attention**. The parcel is coming back or its booking
+///    died — whatever the sub-order says, a human must look.
+///    (The unified shipment vocabulary has no `failed` status:
+///    `cancelled` is its failure-terminal state, and a courier
+///    failure that maps to `unknown` leaves the sub-order's own
+///    status in charge below.)
+/// 2. Sub-order `returned` or `cancelled` → **Attention**.
+/// 3. Sub-order `delivered` → **Done**.
+/// 4. Sub-order `placed` → **ToConfirm**.
+/// 5. Sub-order `confirmed` → **ToShip** when it has no
+///    shipment yet; **InTransit** when one exists (booking
+///    normally moves the sub-order to `shipped` in the same
+///    transaction, so this is a defensive reading of a raced
+///    row: the parcel is in the pipeline, not awaiting booking).
+/// 6. Sub-order `shipped` → **InTransit** (covers shipment
+///    `created` awaiting pickup and every moving state —
+///    `picked_up`, `in_transit`, `out_for_delivery`,
+///    `partial_delivered` — plus `unknown`).
+/// 7. Any other sub-order status → **Attention**: an
+///    unrecognised state must fail VISIBLE in the queue, never
+///    hide in Done.
+pub fn fulfillment_bucket(
+    sub_order_status: &str,
+    has_shipment: bool,
+    shipment_status: Option<&str>,
+) -> FulfillmentBucket {
+    if matches!(
+        shipment_status,
+        Some("returned") | Some("cancelled") | Some("return_in_transit")
+    ) {
+        return FulfillmentBucket::Attention;
+    }
+    match sub_order_status {
+        "returned" | "cancelled" => FulfillmentBucket::Attention,
+        "delivered" => FulfillmentBucket::Done,
+        "placed" => FulfillmentBucket::ToConfirm,
+        "confirmed" => {
+            if has_shipment {
+                FulfillmentBucket::InTransit
+            } else {
+                FulfillmentBucket::ToShip
+            }
+        }
+        "shipped" => FulfillmentBucket::InTransit,
+        _ => FulfillmentBucket::Attention,
+    }
+}
+
+/// Has a queued sub-order breached its SLA (Wave 40)? Only the
+/// two actionable buckets carry an SLA: a `ToConfirm` item
+/// breaches once its age REACHES `confirm_sla_hours` (the limit
+/// is the deadline, not a grace period — at exactly the limit
+/// the promise is already broken), and a `ToShip` item once its
+/// age reaches `ship_sla_hours`. InTransit, Done and Attention
+/// items never "breach" here: transit time is the courier's,
+/// done is done, and attention items are already flagged.
+pub fn sla_breached(
+    bucket: FulfillmentBucket,
+    age_hours: i64,
+    confirm_sla_hours: i64,
+    ship_sla_hours: i64,
+) -> bool {
+    match bucket {
+        FulfillmentBucket::ToConfirm => age_hours >= confirm_sla_hours,
+        FulfillmentBucket::ToShip => age_hours >= ship_sla_hours,
+        _ => false,
+    }
+}
+
 /// The manual couriers (Wave 19): Sundarban, SA Paribahan,
 /// Karatoa and Carrybee. These couriers have NO public merchant
 /// API — a seller books at the counter of the platform's master
@@ -1620,6 +1730,39 @@ pub fn validate_subscription_price(price_poisha: i64) -> bool {
 /// discipline as [`validate_subscription_price`].
 pub fn validate_plan_free_product_cap(cap: i64) -> bool {
     (0..=1_000_000).contains(&cap)
+}
+
+/// The built-in fulfillment SLA for confirming an order, in
+/// hours (Wave 40): a placed sub-order should be confirmed
+/// within a day. Used when neither a platform setting nor the
+/// startup `FULFILLMENT_CONFIRM_SLA_HOURS` provides one; the
+/// effective resolution (setting, then startup, then this
+/// constant) lives in the API's `fulfillment` module.
+pub const DEFAULT_FULFILLMENT_CONFIRM_SLA_HOURS: i64 = 24;
+
+/// The built-in fulfillment SLA for booking a courier once an
+/// order is confirmed, in hours (Wave 40): two days. See
+/// [`DEFAULT_FULFILLMENT_CONFIRM_SLA_HOURS`].
+pub const DEFAULT_FULFILLMENT_SHIP_SLA_HOURS: i64 = 48;
+
+/// The `platform_settings` key for the confirm-SLA override
+/// (Wave 40). When a row with this key holds a valid value, it
+/// beats the startup `FULFILLMENT_CONFIRM_SLA_HOURS`.
+pub const FULFILLMENT_CONFIRM_SLA_HOURS_KEY: &str = "fulfillment_confirm_sla_hours";
+
+/// The `platform_settings` key for the ship-SLA override
+/// (Wave 40). See [`FULFILLMENT_CONFIRM_SLA_HOURS_KEY`].
+pub const FULFILLMENT_SHIP_SLA_HOURS_KEY: &str = "fulfillment_ship_sla_hours";
+
+/// Is `hours` a legal fulfillment SLA length? At least one
+/// hour (a zero or negative SLA would flag every item the
+/// moment it is placed) and at most thirty days (720 hours —
+/// beyond that the "SLA" is not a promise anyone works to).
+/// The same rule gates the startup values and the read-back
+/// of a stored setting, so an out-of-range row is ignored
+/// rather than applied.
+pub fn validate_fulfillment_sla_hours(hours: i64) -> bool {
+    (1..=720).contains(&hours)
 }
 
 /// The `platform_settings` key for the commission rate override
@@ -4404,6 +4547,127 @@ mod tests {
         ] {
             assert!(!can_transition_shipment(from, to), "{from} -> {to}");
         }
+    }
+
+    #[test]
+    fn fulfillment_bucket_mapping() {
+        use FulfillmentBucket::*;
+        // The forward flow: placed waits for confirmation, a
+        // confirmed sub-order without a shipment waits for a
+        // booking, shipped is in the pipeline, delivered is done.
+        assert_eq!(fulfillment_bucket("placed", false, None), ToConfirm);
+        assert_eq!(fulfillment_bucket("confirmed", false, None), ToShip);
+        assert_eq!(
+            fulfillment_bucket("confirmed", true, Some("created")),
+            InTransit
+        );
+        assert_eq!(
+            fulfillment_bucket("shipped", true, Some("created")),
+            InTransit
+        );
+        assert_eq!(
+            fulfillment_bucket("shipped", true, Some("picked_up")),
+            InTransit
+        );
+        assert_eq!(
+            fulfillment_bucket("shipped", true, Some("in_transit")),
+            InTransit
+        );
+        assert_eq!(
+            fulfillment_bucket("shipped", true, Some("out_for_delivery")),
+            InTransit
+        );
+        assert_eq!(
+            fulfillment_bucket("shipped", true, Some("partial_delivered")),
+            InTransit
+        );
+        // An `unknown` courier report does not change the pile:
+        // the sub-order's own status stays in charge.
+        assert_eq!(
+            fulfillment_bucket("shipped", true, Some("unknown")),
+            InTransit
+        );
+        assert_eq!(
+            fulfillment_bucket("delivered", true, Some("delivered")),
+            Done
+        );
+        assert_eq!(fulfillment_bucket("delivered", false, None), Done);
+        // Everything that came back or was cancelled needs a
+        // human — by sub-order status OR by shipment status,
+        // and the shipment verdict wins over a `delivered`
+        // sub-order (the parcel came back after delivery).
+        assert_eq!(fulfillment_bucket("returned", false, None), Attention);
+        assert_eq!(fulfillment_bucket("cancelled", false, None), Attention);
+        assert_eq!(
+            fulfillment_bucket("shipped", true, Some("returned")),
+            Attention
+        );
+        assert_eq!(
+            fulfillment_bucket("shipped", true, Some("cancelled")),
+            Attention
+        );
+        assert_eq!(
+            fulfillment_bucket("shipped", true, Some("return_in_transit")),
+            Attention
+        );
+        assert_eq!(
+            fulfillment_bucket("delivered", true, Some("return_in_transit")),
+            Attention
+        );
+        assert_eq!(
+            fulfillment_bucket("delivered", true, Some("returned")),
+            Attention
+        );
+        // A placed/confirmed sub-order keeps its actionable
+        // bucket even if a stale shipment row claims a moving
+        // state — only the three failure states override.
+        assert_eq!(
+            fulfillment_bucket("placed", true, Some("in_transit")),
+            ToConfirm
+        );
+        // An unrecognised sub-order status fails visible.
+        assert_eq!(fulfillment_bucket("bogus", false, None), Attention);
+        assert_eq!(fulfillment_bucket("", false, None), Attention);
+        // The wire strings.
+        assert_eq!(ToConfirm.as_str(), "to_confirm");
+        assert_eq!(ToShip.as_str(), "to_ship");
+        assert_eq!(InTransit.as_str(), "in_transit");
+        assert_eq!(Done.as_str(), "done");
+        assert_eq!(Attention.as_str(), "attention");
+    }
+
+    #[test]
+    fn fulfillment_sla_breach_boundaries() {
+        use FulfillmentBucket::*;
+        // Confirm SLA 24h: below is fine, AT the limit the
+        // promise is already broken, above is breached.
+        assert!(!sla_breached(ToConfirm, 0, 24, 48));
+        assert!(!sla_breached(ToConfirm, 23, 24, 48));
+        assert!(sla_breached(ToConfirm, 24, 24, 48));
+        assert!(sla_breached(ToConfirm, 100, 24, 48));
+        // Ship SLA 48h, independent of the confirm limit.
+        assert!(!sla_breached(ToShip, 24, 24, 48));
+        assert!(!sla_breached(ToShip, 47, 24, 48));
+        assert!(sla_breached(ToShip, 48, 24, 48));
+        // The other buckets never breach, at any age.
+        for bucket in [InTransit, Done, Attention] {
+            assert!(!sla_breached(bucket, 10_000, 24, 48), "{bucket:?}");
+        }
+        // A negative age (clock skew) breaches nothing.
+        assert!(!sla_breached(ToConfirm, -5, 24, 48));
+        assert!(!sla_breached(ToShip, -5, 24, 48));
+    }
+
+    #[test]
+    fn fulfillment_sla_hours_validation() {
+        assert_eq!(DEFAULT_FULFILLMENT_CONFIRM_SLA_HOURS, 24);
+        assert_eq!(DEFAULT_FULFILLMENT_SHIP_SLA_HOURS, 48);
+        assert!(validate_fulfillment_sla_hours(1));
+        assert!(validate_fulfillment_sla_hours(24));
+        assert!(validate_fulfillment_sla_hours(720));
+        assert!(!validate_fulfillment_sla_hours(0));
+        assert!(!validate_fulfillment_sla_hours(-1));
+        assert!(!validate_fulfillment_sla_hours(721));
     }
 
     #[test]

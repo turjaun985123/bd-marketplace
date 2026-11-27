@@ -136,6 +136,13 @@ pub struct SellerDashboard {
     /// excluded — hiding is how a seller deals with spam, so
     /// a hidden question must not keep counting as work.
     pub unanswered_questions: i64,
+    /// The fulfillment center's tallies over the dashboard's
+    /// scope (Wave 40): how much work is waiting in each
+    /// bucket and how much of it has breached its SLA — the
+    /// dashboard card that links into the queue. Computed by
+    /// the ONE counts function the fulfillment list itself
+    /// uses, so the card and the queue always agree.
+    pub fulfillment: crate::fulfillment::FulfillmentCounts,
 }
 
 /// Where a store's payout money goes; also a `payout_accounts` row.
@@ -272,10 +279,14 @@ pub async fn available_balance_poisha(pool: &PgPool, user_id: Uuid) -> Result<i6
 /// The default scope is the caller's whole selling activity —
 /// every store they own — with earnings read for the payout
 /// store, exactly as before Wave 34.
-pub async fn get_dashboard(pool: &PgPool, user: &AuthUser) -> Result<SellerDashboard, ApiError> {
+pub async fn get_dashboard(
+    pool: &PgPool,
+    user: &AuthUser,
+    sla: &crate::fulfillment::FulfillmentSla,
+) -> Result<SellerDashboard, ApiError> {
     let store = seller_store(pool, user).await?;
     let owned = crate::access::owned_store_ids(pool, user.user_id).await?;
-    build_dashboard(pool, store, &owned).await
+    build_dashboard(pool, store, &owned, sla).await
 }
 
 /// The Wave 34 store-scoped dashboard: everything (counts,
@@ -285,17 +296,22 @@ pub async fn get_dashboard(pool: &PgPool, user: &AuthUser) -> Result<SellerDashb
 pub async fn get_dashboard_for_store(
     pool: &PgPool,
     store: Store,
+    sla: &crate::fulfillment::FulfillmentSla,
 ) -> Result<SellerDashboard, ApiError> {
     let scope = [store.id];
-    build_dashboard(pool, store, &scope).await
+    build_dashboard(pool, store, &scope, sla).await
 }
 
 /// The dashboard assembly shared by both scopes: counts and
-/// alerts over `scope`, earnings over `store` itself.
+/// alerts over `scope`, earnings over `store` itself. The
+/// Wave 40 fulfillment tallies are computed over the same
+/// `scope` by the fulfillment module's one counts function,
+/// judged against the SLA pair the handler resolved.
 async fn build_dashboard(
     pool: &PgPool,
     store: Store,
     scope: &[Uuid],
+    sla: &crate::fulfillment::FulfillmentSla,
 ) -> Result<SellerDashboard, ApiError> {
     let products: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM products p WHERE p.store_id = ANY($1)",
@@ -338,6 +354,7 @@ async fn build_dashboard(
         crate::orders::list_seller_sub_orders_scoped(pool, scope, Some(1), Some(5)).await?;
     let low_stock_items = crate::inventory::low_stock_items_for_seller(pool, scope).await?;
     let unanswered_questions = crate::qna::count_unanswered_questions(pool, scope).await?;
+    let fulfillment = crate::fulfillment::fulfillment_counts(pool, scope, sla).await?;
 
     Ok(SellerDashboard {
         store,
@@ -349,6 +366,7 @@ async fn build_dashboard(
         recent_sub_orders: recent.items,
         low_stock_items,
         unanswered_questions,
+        fulfillment,
     })
 }
 
@@ -593,6 +611,9 @@ pub async fn dashboard_handler(
     Query(scope): Query<StoreScopeQuery>,
 ) -> Result<Json<SellerDashboard>, ApiError> {
     let pool = state.require_pool()?;
+    // Wave 40: the fulfillment tallies on the dashboard are
+    // judged against the SLA pair in force right now.
+    let sla = crate::fulfillment::effective_fulfillment_sla(&state).await;
     // Wave 34: `?store_id=` views ONE store's dashboard —
     // any role the caller holds in it suffices (a dashboard
     // is a view); without it, the caller's own whole-activity
@@ -601,9 +622,9 @@ pub async fn dashboard_handler(
         Some(store_id) => {
             crate::access::seller_access(pool, user.user_id, store_id).await?;
             let store = crate::stores::get_store_by_id(pool, store_id).await?;
-            Ok(Json(get_dashboard_for_store(pool, store).await?))
+            Ok(Json(get_dashboard_for_store(pool, store, &sla).await?))
         }
-        None => Ok(Json(get_dashboard(pool, &user).await?)),
+        None => Ok(Json(get_dashboard(pool, &user, &sla).await?)),
     }
 }
 

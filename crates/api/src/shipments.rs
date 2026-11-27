@@ -24,6 +24,15 @@
 //! reference: it is what the buyer sees on the public tracking
 //! view and what support can check against the paper receipt.
 //!
+//! Wave 40 factors the booking dispatch (manual vs API
+//! courier) out of the HTTP handler into
+//! [`book_shipment_for_seller`], so the fulfillment center's
+//! bulk booking runs the very same path as a single booking;
+//! the field loader behind the booking guards is likewise
+//! shared with the fulfillment queue's COD preview
+//! ([`preview_cod_amount_for_sub_order`]), which reads the one
+//! collection computation without booking anything.
+//!
 //! Wave 30 adds automatic courier status polling: the worker
 //! process periodically calls [`refresh_stale_shipments`],
 //! which finds API-courier shipments whose stored status has
@@ -508,20 +517,16 @@ struct SubOrderBookingRow {
     delivery_zone: String,
 }
 
-/// Load the sub-order row a booking needs and apply EVERY
-/// pre-booking guard, in the established order: the sub-order
-/// exists (404), the caller owns its store (403), it is
-/// `confirmed` (409), its order's advance is not still pending
-/// (409, Wave 17) and it has no shipment yet (409). THE one
-/// guard path — API-courier booking and manual booking (Wave
-/// 19) both start here, so a manual parcel can never slip past
-/// a check an API parcel would face.
-async fn load_booking_row(
+/// Load just the FIELDS a booking computation needs for one
+/// sub-order — no guards, no access check. The guarded loader
+/// below builds on it, and the Wave 40 fulfillment queue's COD
+/// preview reads through it, so the fields behind the one
+/// collection computation are selected in exactly one place.
+async fn load_booking_fields(
     pool: &PgPool,
-    user: &AuthUser,
     sub_order_id: Uuid,
-) -> Result<SubOrderBookingRow, ApiError> {
-    let row: Option<SubOrderBookingRow> = sqlx::query_as(
+) -> Result<Option<SubOrderBookingRow>, ApiError> {
+    sqlx::query_as(
         "SELECT so.status, so.store_id, s.owner_user_id, o.id AS order_id, \
          so.goods_subtotal_poisha, so.discount_poisha, so.delivery_charge_poisha, so.loyalty_discount_poisha, \
          o.payment_status, o.advance_required_poisha, o.advance_paid_poisha, \
@@ -535,8 +540,25 @@ async fn load_booking_row(
     .bind(sub_order_id)
     .fetch_optional(pool)
     .await
-    .map_err(|e| ApiError::internal("load sub-order for booking", e))?;
-    let row = row.ok_or_else(|| ApiError::not_found("sub-order not found"))?;
+    .map_err(|e| ApiError::internal("load sub-order for booking", e))
+}
+
+/// Load the sub-order row a booking needs and apply EVERY
+/// pre-booking guard, in the established order: the sub-order
+/// exists (404), the caller owns its store (403), it is
+/// `confirmed` (409), its order's advance is not still pending
+/// (409, Wave 17) and it has no shipment yet (409). THE one
+/// guard path — API-courier booking and manual booking (Wave
+/// 19) both start here, so a manual parcel can never slip past
+/// a check an API parcel would face.
+async fn load_booking_row(
+    pool: &PgPool,
+    user: &AuthUser,
+    sub_order_id: Uuid,
+) -> Result<SubOrderBookingRow, ApiError> {
+    let row = load_booking_fields(pool, sub_order_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("sub-order not found"))?;
     // Wave 34: the owner, or a member whose role carries
     // `manage_orders` (every member role does). A caller with
     // no relationship keeps this module's historical 403.
@@ -629,6 +651,24 @@ async fn compute_booking_cod_amount(
     } else {
         Ok(0)
     }
+}
+
+/// Preview the cash a booking WOULD collect for one sub-order
+/// (Wave 40): the shared [`compute_booking_cod_amount`] over
+/// the shared field loader, with NO booking guards and no
+/// writes — the fulfillment queue shows an unbooked sub-order
+/// the exact amount its eventual booking will store. A booked
+/// sub-order's authoritative figure is the one stored on its
+/// shipment row; this preview exists for the not-yet-booked.
+/// 404 when the sub-order does not exist.
+pub async fn preview_cod_amount_for_sub_order(
+    pool: &PgPool,
+    sub_order_id: Uuid,
+) -> Result<i64, ApiError> {
+    let row = load_booking_fields(pool, sub_order_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("sub-order not found"))?;
+    compute_booking_cod_amount(pool, &row).await
 }
 
 /// Book a courier shipment for one of the seller's CONFIRMED
@@ -1231,21 +1271,27 @@ pub struct CreateShipmentInput {
     pub manual_tracking_id: Option<String>,
 }
 
-pub async fn create_shipment(
-    State(state): State<AppState>,
-    user: AuthUser,
-    Path(id): Path<Uuid>,
-    body: Option<Json<CreateShipmentInput>>,
-) -> Result<(StatusCode, Json<Shipment>), ApiError> {
-    let input = body.map(|Json(input)| input);
-    let courier = input.as_ref().and_then(|input| input.courier.as_deref());
-    if courier == Some("manual") {
+/// Book a shipment from a full booking input (Wave 40 factors
+/// this dispatch out of the HTTP handler): `courier = "manual"`
+/// validates the manual fields with the domain functions and
+/// writes the manual shipment directly; anything else goes
+/// through the API-courier booking. THE one dispatch — the
+/// single-booking endpoint and the fulfillment center's bulk
+/// booking both call it, so a bulk-booked parcel faces exactly
+/// the guards, validation and collection computation a
+/// single-booked one does.
+pub async fn book_shipment_for_seller(
+    state: &AppState,
+    user: &AuthUser,
+    sub_order_id: Uuid,
+    input: &CreateShipmentInput,
+) -> Result<Shipment, ApiError> {
+    if input.courier.as_deref() == Some("manual") {
         // Wave 19: a manual booking names its courier by key
         // and may carry the receipt number; both are validated
         // by the pure domain functions before anything is read
         // or written, so an invalid manual booking is a 400
         // that changes nothing.
-        let input = input.expect("body present when courier is set");
         let raw_courier = input.manual_courier.as_deref().ok_or_else(|| {
             ApiError::bad_request(
                 "manual_courier is required when courier is 'manual' \
@@ -1259,19 +1305,38 @@ pub async fn create_shipment(
             validate_manual_tracking_id(input.manual_tracking_id.as_deref()).map_err(
                 |message| ApiError::bad_request(format!("manual_tracking_id: {message}")),
             )?;
-        let shipment = create_manual_shipment_for_seller(
-            &state,
-            &user,
-            id,
+        return create_manual_shipment_for_seller(
+            state,
+            user,
+            sub_order_id,
             manual_courier_key,
             manual_tracking_id,
         )
-        .await?;
-        return Ok((StatusCode::CREATED, Json(shipment)));
+        .await;
     }
-    let area_id = input.as_ref().and_then(|input| input.area_id);
-    let shipment =
-        create_shipment_for_seller(&state, &user, id, courier, area_id).await?;
+    create_shipment_for_seller(
+        state,
+        user,
+        sub_order_id,
+        input.courier.as_deref(),
+        input.area_id,
+    )
+    .await
+}
+
+pub async fn create_shipment(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+    body: Option<Json<CreateShipmentInput>>,
+) -> Result<(StatusCode, Json<Shipment>), ApiError> {
+    let input = body.map(|Json(input)| input).unwrap_or(CreateShipmentInput {
+        courier: None,
+        area_id: None,
+        manual_courier: None,
+        manual_tracking_id: None,
+    });
+    let shipment = book_shipment_for_seller(&state, &user, id, &input).await?;
     Ok((StatusCode::CREATED, Json(shipment)))
 }
 

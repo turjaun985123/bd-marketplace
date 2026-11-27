@@ -306,6 +306,7 @@ pub mod cart;
 pub mod coupons;
 pub mod exports;
 pub mod facebook;
+pub mod fulfillment;
 pub mod inventory;
 pub mod invoices;
 pub mod loyalty;
@@ -453,6 +454,17 @@ pub struct AppState {
     /// `api_keys` module for the honest limits of an
     /// in-memory limiter.
     pub api_key_rate_limiter: std::sync::Arc<api_keys::ApiKeyRateLimiter>,
+    /// Fulfillment SLA for confirming an order, in hours
+    /// (Wave 40), read once at startup from
+    /// `FULFILLMENT_CONFIRM_SLA_HOURS`. The FALLBACK value:
+    /// `fulfillment::effective_fulfillment_sla` wins over it
+    /// with a stored platform setting.
+    pub fulfillment_confirm_sla_hours: i64,
+    /// Fulfillment SLA for booking a courier after
+    /// confirmation, in hours (Wave 40), read once at startup
+    /// from `FULFILLMENT_SHIP_SLA_HOURS`. The FALLBACK value:
+    /// see [`AppState::fulfillment_confirm_sla_hours`].
+    pub fulfillment_ship_sla_hours: i64,
 }
 
 /// SIDRA bridge configuration (Wave 13). See [`AppState::sidra_config`].
@@ -519,6 +531,15 @@ pub const DEFAULT_SUBSCRIPTION_PRICE_BUSINESS_POISHA: i64 =
 /// Default free-plan product cap: 50 products (Wave 36) — the
 /// domain constant, re-exported like the defaults above.
 pub const DEFAULT_PLAN_FREE_PRODUCT_CAP: i64 = domain::DEFAULT_FREE_PLAN_PRODUCT_CAP;
+
+/// Default fulfillment confirm SLA: 24 hours (Wave 40) — the
+/// domain constant, re-exported like the defaults above.
+pub const DEFAULT_FULFILLMENT_CONFIRM_SLA_HOURS: i64 =
+    domain::DEFAULT_FULFILLMENT_CONFIRM_SLA_HOURS;
+
+/// Default fulfillment ship SLA: 48 hours (Wave 40). See
+/// [`DEFAULT_FULFILLMENT_CONFIRM_SLA_HOURS`].
+pub const DEFAULT_FULFILLMENT_SHIP_SLA_HOURS: i64 = domain::DEFAULT_FULFILLMENT_SHIP_SLA_HOURS;
 
 /// The one origin allowed by CORS when `CORS_ORIGINS` is not set
 /// (Wave 20): the local Next.js dev server. A real deployment
@@ -593,6 +614,8 @@ impl AppState {
             cors_origins: vec![DEFAULT_CORS_ORIGIN.to_string()],
             api_key_rate_limit_per_min: api_keys::DEFAULT_API_KEY_RATE_LIMIT_PER_MIN,
             api_key_rate_limiter: std::sync::Arc::new(api_keys::ApiKeyRateLimiter::new()),
+            fulfillment_confirm_sla_hours: DEFAULT_FULFILLMENT_CONFIRM_SLA_HOURS,
+            fulfillment_ship_sla_hours: DEFAULT_FULFILLMENT_SHIP_SLA_HOURS,
         }
     }
 
@@ -773,6 +796,35 @@ impl AppState {
                     "WARNING: API_KEY_RATE_LIMIT_PER_MIN='{raw}' is invalid — \
                      using the default {} requests/minute",
                     api_keys::DEFAULT_API_KEY_RATE_LIMIT_PER_MIN
+                ),
+            }
+        }
+        // FULFILLMENT_CONFIRM_SLA_HOURS / FULFILLMENT_SHIP_SLA_HOURS
+        // are read once, here at startup, under the same
+        // discipline (Wave 40): a value inside the domain's
+        // legal range wins; anything else keeps the default
+        // rather than flagging every queued order breached (or
+        // none). Admin platform settings override both at read
+        // time.
+        if let Ok(raw) = std::env::var("FULFILLMENT_CONFIRM_SLA_HOURS") {
+            match raw.parse::<i64>() {
+                Ok(hours) if domain::validate_fulfillment_sla_hours(hours) => {
+                    state.fulfillment_confirm_sla_hours = hours
+                }
+                _ => eprintln!(
+                    "WARNING: FULFILLMENT_CONFIRM_SLA_HOURS='{raw}' is invalid — \
+                     using the default {DEFAULT_FULFILLMENT_CONFIRM_SLA_HOURS} hours"
+                ),
+            }
+        }
+        if let Ok(raw) = std::env::var("FULFILLMENT_SHIP_SLA_HOURS") {
+            match raw.parse::<i64>() {
+                Ok(hours) if domain::validate_fulfillment_sla_hours(hours) => {
+                    state.fulfillment_ship_sla_hours = hours
+                }
+                _ => eprintln!(
+                    "WARNING: FULFILLMENT_SHIP_SLA_HOURS='{raw}' is invalid — \
+                     using the default {DEFAULT_FULFILLMENT_SHIP_SLA_HOURS} hours"
                 ),
             }
         }
@@ -1367,6 +1419,22 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/v1/seller/sub-orders/:id/shipment",
             post(shipments::create_shipment),
+        )
+        // Wave 40 — seller fulfillment center: the work queue
+        // (buckets + SLA ages over the caller's store), bulk
+        // shipment booking through the single-booking path,
+        // and courier label data for the web print view.
+        .route(
+            "/v1/seller/fulfillment",
+            get(fulfillment::list_fulfillment_handler),
+        )
+        .route(
+            "/v1/seller/fulfillment/bulk-book",
+            post(fulfillment::bulk_book_handler),
+        )
+        .route(
+            "/v1/seller/fulfillment/labels",
+            get(fulfillment::labels_handler),
         )
         .route("/v1/shipments/:id/refresh", post(shipments::refresh))
         // Wave 19 — manual couriers: seller-entered statuses and

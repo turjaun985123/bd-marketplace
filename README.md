@@ -2621,6 +2621,93 @@ their reasons:
   which the audit did not cover): future waves, in the
   audit's priority order.
 
+Wave 40 (seller fulfillment center + SLA dashboard):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| GET | `/v1/seller/fulfillment?store_id=` | Bearer, `manage_orders` in the store (owner or any member role). The store's work queue: sub-orders classified into buckets (below), oldest first, at most 200, with per-bucket counts, breached count, and the SLA pair the ages were judged against |
+| POST | `/v1/seller/fulfillment/bulk-book` | Bearer, same scope. Book up to 20 of the store's confirmed sub-orders in one call, with the single-booking endpoint's courier fields (`courier` name / `auto` / `manual` + its fields, `area_id`). Per-item results; see the bulk rules |
+| GET | `/v1/seller/fulfillment/labels?store_id=&ids=` | Bearer, same scope. Label DATA for booked sub-orders (sender, recipient, courier, consignment, COD due); every id without a label is named in `skipped` with its reason. The web print view renders the cards — there is no server-side PDF |
+
+**Queue model:** the queue is a VIEW, not a new workflow —
+no status was added anywhere. The pure domain function
+`fulfillment_bucket` classifies each sub-order from its own
+status, whether a shipment exists, and the shipment's
+unified status, in this precedence: a shipment that is
+`returned`, `cancelled` or `return_in_transit` → `attention`
+(the unified shipment vocabulary has no `failed` status —
+`cancelled` is its failure-terminal state); a sub-order
+`returned` or `cancelled` → `attention`; `delivered` →
+`done`; `placed` → `to_confirm`; `confirmed` without a
+shipment → `to_ship` (with one → `in_transit`, a defensive
+reading of a raced row); `shipped` → `in_transit`; anything
+unrecognised → `attention`, failing visible rather than
+hiding in done. Done items leave the queue after 7 days
+(the list filter and the counts share one SQL fragment that
+mirrors the Done case, so they cannot drift). The seller
+dashboard carries the same counts (its `fulfillment`
+block, computed by the same function over the dashboard's
+scope) as a summary card linking here.
+
+**SLA rules:** two platform SLAs, in hours — confirm
+(default 24) and ship (default 48) — resolved
+DB `platform_settings` (`fulfillment_confirm_sla_hours` /
+`fulfillment_ship_sla_hours`) > startup env
+(`FULFILLMENT_CONFIRM_SLA_HOURS` /
+`FULFILLMENT_SHIP_SLA_HOURS`) > domain constants, through
+one helper pair (`effective_fulfillment_sla`), with stored
+or startup values outside 1..=720 ignored on read. Only
+the two actionable buckets can breach (`sla_breached`):
+a `to_confirm` item breaches when its age REACHES the
+confirm SLA, a `to_ship` item at the ship SLA. **Age is
+measured from placement for every bucket:** `sub_orders`
+carries `created_at` and no `updated_at`, so there is no
+honest confirm timestamp to start the ship clock from —
+the ship SLA is therefore the stricter reading (confirm
+late and less of the 48 hours remains). That is a
+documented consequence of the schema, not an oversight.
+
+**Money figures:** an item's `cod_due_poisha` is the
+booked shipment's stored collection amount, or — while
+unbooked — the preview from the booking path itself
+(`preview_cod_amount_for_sub_order` runs the shared field
+loader and the one `compute_booking_cod_amount`, with no
+guards and no writes). There is no second COD formula in
+the fulfillment module.
+
+**Bulk booking semantics:** scope errors (no relationship
+with the named store), an empty or >20 id list, and
+invalid manual fields fail the WHOLE request before
+anything books — they are request-shape errors, exactly
+like the single endpoint's 400s. Every id after that is
+independent: it must belong to the scoped store (a foreign
+or unknown id is a per-item error), then it runs
+`book_shipment_for_seller` — the dispatch the Wave 40
+refactor factored out of the single-booking handler — with
+that path's own guards (confirmed-only, advance-pending,
+one-shipment) and its own transaction per item. The
+response is per-item truth: the created shipment, or the
+booking path's own error message. One failure never rolls
+back the others, and nothing is reported booked that was
+not.
+
+**Labels:** data only. A label carries the store's name,
+slug and the owner's phone as the sender block (the schema
+has no store street address, so none is invented), the
+delivery name/phone/address/zone as stored at checkout,
+the courier's display name, the consignment id, and the
+shipment's stored COD amount. Only booked sub-orders get
+labels — a label without a consignment id would be a lie.
+
+**Limits:** the queue list is FIFO-capped at 200 rows
+(counts stay exact over the full actionable set); Done
+retention in the queue is 7 days; bulk batches cap at 20,
+label runs at 100; there are no courier-native label PDFs
+(per-courier label APIs are merchant-onboarding items,
+like the RedX/eCourier/Paperfly field confirmations), no
+pick-list or packing workflow, and no per-item SLA clocks
+beyond the one placement clock described above.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -2996,6 +3083,7 @@ broken or unsafe without it.
 | `COURIER_DEV_MODE` | DEV courier simulator (local/CI only) | **Must be off** — simulated shipments are not real bookings |
 | `FACEBOOK_APP_ID` / `FACEBOOK_APP_SECRET` | Meta app credentials (presence only is read) | For the Graph API status to report configured |
 | `SIDRA_API_URL` / `SIDRA_WEBHOOK_SECRET` | SIDRA bridge endpoint + shared HMAC secret (both or neither) | For the AI salesperson bridge |
+| `FULFILLMENT_CONFIRM_SLA_HOURS` / `FULFILLMENT_SHIP_SLA_HOURS` | Fulfillment SLA fallbacks in hours (Wave 40; defaults 24 / 48, legal range 1–720). Admin settings `fulfillment_confirm_sla_hours` / `fulfillment_ship_sla_hours` override at read time | No — defaults are sane |
 
 ### Production checklist
 
@@ -4001,6 +4089,21 @@ coupon booking == receipt equality. The audit items
 NOT addressed are listed as deferred, with reasons,
 in the Wave 39 section above — the backlog stays
 visible, never silently dropped.
+**Real (Wave 40):** the seller fulfillment center — the
+work queue (`GET /v1/seller/fulfillment`, domain bucket
+classification + SLA ages + exact counts, FIFO 200,
+7-day Done retention), bulk booking
+(`POST /v1/seller/fulfillment/bulk-book`, per-item
+outcomes through the factored single-booking dispatch),
+label data (`GET /v1/seller/fulfillment/labels`) with the
+printable `/seller/fulfillment/labels` view, the
+`/seller/fulfillment` queue page (bucket tabs, breach
+badges, bulk-book panel), and the dashboard fulfillment
+card fed by the same counts function. No migration: the
+queue is a view over existing statuses, and the SLA pair
+rides the existing settings precedence. See the Wave 40
+section for the queue model, the one-clock age rule and
+the limits.
 
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
@@ -4068,7 +4171,9 @@ the external service at the other end of it, configured by
   Wave 38 adds /offline and the PWA shell — the manifest
   route, the generated icons, and the service worker —
   plus the install button on the home page and the
-  buyer orders page).
+  buyer orders page; Wave 40 adds /seller/fulfillment
+  and /seller/fulfillment/labels, the dashboard
+  fulfillment card and the seller nav link).
 - **Rust unit tests: verified on this machine** — cargo 1.100.0 is
   installed here after all; `cargo test --workspace` passes locally
   (domain 118, courier 31, payments 8 unit tests, plus the API

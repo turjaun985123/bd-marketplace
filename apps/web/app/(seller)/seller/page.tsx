@@ -59,6 +59,11 @@ const STATUS_LABELS: Record<string, string> = {
  * store's current subscription plan (GET /v1/seller/subscription)
  * and links to the subscription page; the badge is best-effort
  * and never blocks the dashboard.
+ *
+ * Wave 40: a fulfillment summary card (confirm / booking /
+ * attention counts + the SLA breach tally from the dashboard's
+ * `fulfillment` block) links into the fulfillment center; it
+ * renders only when there is work waiting.
  */
 export default function SellerDashboardPage() {
   const { ready, token } = useAuth();
@@ -312,6 +317,8 @@ export default function SellerDashboardPage() {
         {" · "}
         <Link href="/seller/orders">আমার বিক্রির অর্ডার — Seller orders</Link>
         {" · "}
+        <Link href="/seller/fulfillment">ফুলফিলমেন্ট — Fulfillment</Link>
+        {" · "}
         <Link href="/seller/import">Facebook থেকে ইমপোর্ট — Import</Link>
         {" · "}
         <Link href="/seller/inbox">ইনবক্স — Inbox</Link>
@@ -358,6 +365,35 @@ export default function SellerDashboardPage() {
           </div>
         </section>
       )}
+      {dashboard !== null &&
+        (dashboard.fulfillment.to_confirm > 0 ||
+          dashboard.fulfillment.to_ship > 0 ||
+          dashboard.fulfillment.attention > 0) && (
+          <section>
+            <div className="card">
+              <h2>ফুলফিলমেন্ট — Fulfillment</h2>
+              <p>
+                কনফার্ম বাকি: {dashboard.fulfillment.to_confirm} · বুকিং
+                বাকি: {dashboard.fulfillment.to_ship} · মনোযোগ দিন:{" "}
+                {dashboard.fulfillment.attention}
+                {dashboard.fulfillment.breached > 0 && (
+                  <>
+                    {" "}
+                    ·{" "}
+                    <span className="sla-badge">
+                      SLA ছাড়িয়েছে {dashboard.fulfillment.breached}টি
+                    </span>
+                  </>
+                )}
+              </p>
+              <p>
+                <Link href="/seller/fulfillment">
+                  ফুলফিলমেন্ট সেন্টারে গিয়ে কাজ করুন — Work the queue
+                </Link>
+              </p>
+            </div>
+          </section>
+        )}
       {dashboard !== null && dashboard.low_stock_items.length > 0 && (
         <section>
           <div className="card">
