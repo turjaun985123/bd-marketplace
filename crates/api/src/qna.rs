@@ -76,11 +76,15 @@ pub struct SellerQuestion {
 }
 
 /// One page of public questions plus the total count — the same
-/// shape as the review list.
+/// shape as the review list. Wave 54 extension adds
+/// `unanswered_count`: how many of the product's visible
+/// questions still await the seller (over ALL pages — the
+/// number the page's "awaiting answers" line quotes).
 #[derive(Debug, Serialize)]
 pub struct QuestionList {
     pub items: Vec<ProductQuestion>,
     pub total: i64,
+    pub unanswered_count: i64,
     pub page: i64,
     pub limit: i64,
 }
@@ -251,12 +255,27 @@ pub async fn ask_question(
 /// paginated like every other list in the API. Hidden questions
 /// are excluded; a product that is not publicly visible is a
 /// 404, not an empty list.
+/// The ORDER BY fragment for one validated question sort
+/// (Wave 54 extension). `AnsweredFirst` leads with the
+/// questions carrying a seller answer (newest of those
+/// first), unanswered after — a sort, never a filter.
+fn question_order_by(sort: domain::QuestionSort) -> &'static str {
+    match sort {
+        domain::QuestionSort::Newest => "ORDER BY q.created_at DESC",
+        domain::QuestionSort::AnsweredFirst => {
+            "ORDER BY (q.answer_body IS NOT NULL) DESC, q.created_at DESC"
+        }
+    }
+}
+
 pub async fn list_product_questions(
     pool: &PgPool,
     product_id: Uuid,
     page: Option<i64>,
     limit: Option<i64>,
+    sort: Option<&str>,
 ) -> Result<QuestionList, ApiError> {
+    let sort = domain::validate_question_sort(sort).map_err(ApiError::bad_request)?;
     get_public_product(pool, product_id).await?;
     let (page, limit) = clamp_pagination(page, limit);
     let offset = (page - 1) * limit;
@@ -270,10 +289,20 @@ pub async fn list_product_questions(
     .await
     .map_err(|e| ApiError::internal("count questions", e))?;
 
+    let unanswered_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM product_questions \
+         WHERE product_id = $1 AND NOT is_hidden AND answer_body IS NULL",
+    )
+    .bind(product_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::internal("count unanswered questions", e))?;
+
     let rows: Vec<QuestionRow> = sqlx::query_as(&format!(
         "SELECT {QUESTION_COLUMNS} {QUESTION_FROM} \
          WHERE q.product_id = $1 AND NOT q.is_hidden \
-         ORDER BY q.created_at DESC LIMIT $2 OFFSET $3"
+         {} LIMIT $2 OFFSET $3",
+        question_order_by(sort)
     ))
     .bind(product_id)
     .bind(limit)
@@ -285,6 +314,7 @@ pub async fn list_product_questions(
     Ok(QuestionList {
         items: rows.into_iter().map(QuestionRow::into_view).collect(),
         total,
+        unanswered_count,
         page,
         limit,
     })
@@ -518,6 +548,8 @@ pub struct AnswerQuestionInput {
 pub struct ListQuestionsQuery {
     pub page: Option<i64>,
     pub limit: Option<i64>,
+    /// Wave 54 extension: `newest` (default) or `answered`.
+    pub sort: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -549,7 +581,14 @@ pub async fn list_questions_handler(
 ) -> Result<Json<QuestionList>, ApiError> {
     let pool = state.require_pool()?;
     Ok(Json(
-        list_product_questions(pool, product_id, query.page, query.limit).await?,
+        list_product_questions(
+            pool,
+            product_id,
+            query.page,
+            query.limit,
+            query.sort.as_deref(),
+        )
+        .await?,
     ))
 }
 

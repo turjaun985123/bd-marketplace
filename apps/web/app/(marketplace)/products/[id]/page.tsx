@@ -3,12 +3,20 @@
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import DeliveryEstimate from "@/components/DeliveryEstimate";
+import FollowButton from "@/components/FollowButton";
+import HelpfulButton from "@/components/HelpfulButton";
+import StoreCollections from "@/components/StoreCollections";
 import PriceTag from "@/components/PriceTag";
 import ProductGallery from "@/components/ProductGallery";
 import ProductImage from "@/components/ProductImage";
 import ProductRail from "@/components/ProductRail";
+import RatingSummary from "@/components/RatingSummary";
 import RecentlyViewedRail from "@/components/RecentlyViewedRail";
+import ShareRow from "@/components/ShareRow";
 import Stars from "@/components/Stars";
+import StoreStats from "@/components/StoreStats";
+import StickyBuyBar from "@/components/StickyBuyBar";
 import VerificationBadge from "@/components/VerificationBadge";
 import WishlistButton from "@/components/WishlistButton";
 import { Badge, Countdown } from "@/components/ui";
@@ -34,8 +42,10 @@ import {
   type ProductDetail,
   type ProductQuestion,
   type ProductVariant,
+  type PublicStore,
+  type QuestionSort,
   type Review,
-  type Store,
+  type ReviewSort,
 } from "@/lib/api";
 import { useAuth } from "@/hooks/useAuth";
 import { useCart } from "@/hooks/useCart";
@@ -83,9 +93,14 @@ export default function ProductDetailPage({
     null
   );
   const [reviews, setReviews] = useState<Review[] | null>(null);
+  // Wave 54: the review list's sort (the API validates
+  // the same keys); changing it refetches ONLY the list.
+  const [reviewSort, setReviewSort] = useState<ReviewSort>("newest");
   const [related, setRelated] = useState<Product[]>([]);
   const [alsoBought, setAlsoBought] = useState<AlsoBoughtItem[]>([]);
-  const [store, setStore] = useState<Store | null>(null);
+  // Wave 54: rails from the product's own store.
+  const [sameStore, setSameStore] = useState<Product[]>([]);
+  const [store, setStore] = useState<PublicStore | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [added, setAdded] = useState(false);
 
@@ -95,14 +110,28 @@ export default function ProductDetailPage({
   const [submitting, setSubmitting] = useState(false);
 
   const [questions, setQuestions] = useState<ProductQuestion[] | null>(null);
+  // Wave 54 extension: the Q&A sort + the unanswered
+  // count the API reports alongside the list.
+  const [questionSort, setQuestionSort] = useState<QuestionSort>("newest");
+  const [unansweredCount, setUnansweredCount] = useState(0);
   const [questionBody, setQuestionBody] = useState("");
   const [questionError, setQuestionError] = useState<string | null>(null);
   const [questionSubmitting, setQuestionSubmitting] = useState(false);
 
+  // Wave 54: the review list alone, under the current
+  // sort — the sort control refetches this, not the page.
+  const loadReviews = useCallback(
+    async (sort: ReviewSort) => {
+      const list = await getProductReviews(params.id, { sort });
+      setReviews(list.items);
+    },
+    [params.id]
+  );
+
   const reload = useCallback(async () => {
     const [p, list] = await Promise.all([
       getProduct(params.id, token),
-      getProductReviews(params.id),
+      getProductReviews(params.id, { sort: reviewSort }),
     ]);
     setProduct(p);
     // Wave 33: preselect the first variant (picker order),
@@ -116,12 +145,20 @@ export default function ProductDetailPage({
     // Wave 25: the public Q&A list — best-effort like the
     // discovery rails, a failed read hides the section's list
     // instead of breaking the page.
-    const qs = await getProductQuestions(params.id).catch(() => null);
-    if (qs) setQuestions(qs.items);
+    const qs = await getProductQuestions(params.id, {
+      sort: questionSort,
+    }).catch(() => null);
+    if (qs) {
+      setQuestions(qs.items);
+      setUnansweredCount(qs.unanswered_count);
+    }
     // The store is public data: it carries the owner check AND
     // the Wave 21 verification tier for the trust badge, which
     // every visitor should see — not only signed-in users.
-    const s = await getStore(p.store_slug).catch(() => null);
+    // Wave 54: the read is the public store view (follower
+    // count + the viewer's follow state ride along; the
+    // token makes `is_following` the viewer's own).
+    const s = await getStore(p.store_slug, token).catch(() => null);
     setStore(s);
     // Discovery rails: public endpoints, best-effort — a
     // failed rail hides itself, it never breaks the page.
@@ -129,7 +166,7 @@ export default function ProductDetailPage({
     // discovery path — the faceted browse, this category,
     // best sellers first, self excluded — instead of the
     // old related endpoint.
-    const [rel, also] = await Promise.all([
+    const [rel, also, same] = await Promise.all([
       p.category
         ? searchProducts({
             categories: [p.category],
@@ -138,12 +175,36 @@ export default function ProductDetailPage({
           }).catch(() => null)
         : Promise.resolve(null),
       getAlsoBought(params.id).catch(() => null),
+      // Wave 54: the same store's best sellers, this
+      // product excluded — the "more from this seller"
+      // rail under the detail.
+      searchProducts({
+        stores: [p.store_slug],
+        sort: "sold",
+        limit: 12,
+      }).catch(() => null),
     ]);
     if (rel) {
       setRelated(rel.items.filter((item) => item.id !== p.id));
     }
     if (also) setAlsoBought(also.items);
-  }, [params.id, token, user]);
+    if (same) {
+      setSameStore(same.items.filter((item) => item.id !== p.id));
+    }
+  }, [params.id, token, user, reviewSort, questionSort]);
+
+  // Wave 54 extension: a Q&A sort change refetches only
+  // the question list.
+  async function onQuestionSortChange(next: QuestionSort) {
+    setQuestionSort(next);
+    const qs = await getProductQuestions(params.id, { sort: next }).catch(
+      () => null
+    );
+    if (qs) {
+      setQuestions(qs.items);
+      setUnansweredCount(qs.unanswered_count);
+    }
+  }
 
   // Wave 24: record the view in the DEVICE-LOCAL history
   // (localStorage only — see useRecentlyViewed). Wave 53:
@@ -182,6 +243,23 @@ export default function ProductDetailPage({
     setAdded(false);
     await add(params.id, 1, selectedVariantId);
     setAdded(true);
+  }
+
+  // Wave 54: buy now = add this item, then straight to
+  // the cart to review and check out. The cart is the
+  // platform's one purchase path — buy-now never opens a
+  // parallel checkout, and anything already in the cart
+  // stays visible there rather than being silently swept
+  // into an order.
+  async function onBuyNow() {
+    await add(params.id, 1, selectedVariantId);
+    router.push("/cart");
+  }
+
+  // Wave 54: a sort change refetches only the review list.
+  function onReviewSortChange(next: ReviewSort) {
+    setReviewSort(next);
+    void loadReviews(next).catch(() => setReviews([]));
   }
 
   // Ask the seller about THIS product (Wave 13): find-or-create
@@ -295,17 +373,30 @@ export default function ProductDetailPage({
 
   return (
     <main>
-      <p>
-        <Link href="/">← মার্কেটপ্লেস</Link>
-        {" · "}
-        <Link href={`/${product.store_slug}`}>স্টোর: {product.store_slug}</Link>
+      {/* Wave 54: real breadcrumbs — home, the product's
+          category landing, its store, and the product
+          itself (the current page, unlinked). */}
+      <nav aria-label="breadcrumb" className="breadcrumbs">
+        <Link href="/">মার্কেটপ্লেস — Home</Link>
+        {product.category && (
+          <>
+            {" › "}
+            <Link href={`/categories/${encodeURIComponent(product.category)}`}>
+              {product.category}
+            </Link>
+          </>
+        )}
+        {" › "}
+        <Link href={`/${product.store_slug}`}>{store?.name ?? product.store_slug}</Link>
+        {" › "}
+        <span aria-current="page">{product.title_bn ?? product.title}</span>
         {store && (
           <>
             {" "}
             <VerificationBadge tier={store.verified_tier} />
           </>
         )}
-      </p>
+      </nav>
       <h1>{product.title_bn ?? product.title}</h1>
       {product.title_bn && <p>{product.title}</p>}
       {/* Wave 51 extension: schema.org Product structured
@@ -344,6 +435,39 @@ export default function ProductDetailPage({
           }),
         }}
       />
+      {/* Wave 54: the breadcrumb trail as structured data,
+          mirroring the visible nav above it. */}
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{
+          __html: JSON.stringify({
+            "@context": "https://schema.org",
+            "@type": "BreadcrumbList",
+            itemListElement: [
+              { "@type": "ListItem", position: 1, name: "Marketplace" },
+              ...(product.category
+                ? [
+                    {
+                      "@type": "ListItem",
+                      position: 2,
+                      name: product.category,
+                    },
+                  ]
+                : []),
+              {
+                "@type": "ListItem",
+                position: product.category ? 3 : 2,
+                name: store?.name ?? product.store_slug,
+              },
+              {
+                "@type": "ListItem",
+                position: product.category ? 4 : 3,
+                name: product.title,
+              },
+            ],
+          }),
+        }}
+      />
       {/* Wave 51: the full image gallery (stage, thumbs,
           keyboard nav, lightbox) — or the placeholder tile
           while the product has no photos. Picking a variant
@@ -357,17 +481,36 @@ export default function ProductDetailPage({
       {product.variants.length > 0 && (
         <div>
           <p>আকার/রং বেছে নিন — Choose a variant:</p>
-          <p>
+          <p className="variant-picker">
             {product.variants.map((variant) => (
               <button
                 key={variant.id}
                 type="button"
+                className="variant-button"
                 aria-pressed={variant.id === selectedVariantId}
                 onClick={() => setSelectedVariantId(variant.id)}
               >
+                {/* Wave 54: the variant's own photo (Wave
+                    51) rides its button when one is
+                    assigned, so colour/size picks are
+                    visual, not just names. */}
+                {variant.image_url && (
+                  <ProductImage
+                    src={variant.image_url}
+                    alt=""
+                    className="variant-button-thumb"
+                  />
+                )}
                 {variant.id === selectedVariantId ? "✓ " : ""}
                 {variant.name} —{" "}
                 <PriceTag amountPoisha={variantPrice(variant)} />
+                {variant.price_delta_poisha !== 0 && (
+                  <span className="variant-delta">
+                    {" "}
+                    ({variant.price_delta_poisha > 0 ? "+" : "−"}
+                    {formatBdt(Math.abs(variant.price_delta_poisha))})
+                  </span>
+                )}
                 {variant.stock <= 0 ? " (স্টক শেষ)" : ""}
               </button>
             ))}
@@ -426,9 +569,18 @@ export default function ProductDetailPage({
           </span>
         )}
       </p>
+      {/* Wave 54: the urgency line follows the API's own
+          stock health — for the base product that is
+          `stock_status` (the seller's low-stock threshold
+          included, Wave 23); a picked variant has no
+          threshold, so its line uses the small-number rule
+          on the variant's own stock. The number shown is
+          always the real stock. */}
       <p>
         {displayStock > 0
-          ? displayStock <= 5
+          ? (selectedVariant
+              ? displayStock <= 5
+              : product.stock_status === "low")
             ? `মাত্র ${displayStock}টি বাকি আছে — Only ${displayStock} left in stock`
             : `স্টকে আছে (${displayStock}টি)`
           : "স্টকে নেই"}
@@ -437,9 +589,18 @@ export default function ProductDetailPage({
       </p>
       {product.description && <p>{product.description}</p>}
 
+      {/* Wave 54: the delivery block — the buyer's zone,
+          the real charge for one unit, the published day
+          range (see the component). */}
+      <DeliveryEstimate weightGrams={product.weight_grams} />
+
       <p>
         <WishlistButton productId={product.id} />
       </p>
+      <ShareRow
+        title={product.title_bn ?? product.title}
+        path={`/products/${product.id}`}
+      />
 
       {token ? (
         <p>
@@ -449,6 +610,13 @@ export default function ProductDetailPage({
             onClick={() => void onAdd()}
           >
             কার্টে যোগ করুন — Add to cart
+          </button>{" "}
+          <button
+            type="button"
+            disabled={product.variants.length > 0 && displayStock <= 0}
+            onClick={() => void onBuyNow()}
+          >
+            এখনই কিনুন — Buy now
           </button>{" "}
           {added && !cartError && (
             <span>
@@ -493,10 +661,19 @@ export default function ProductDetailPage({
               <VerificationBadge tier={store.verified_tier} />
             </p>
             {store.description ? <p>{store.description}</p> : null}
+            {/* Wave 54: the store's live trust line +
+                the follow button ride the seller card. */}
+            <StoreStats store={store} />
             <p>
               <Link href={`/${store.slug}`}>
                 স্টোরফ্রন্ট দেখুন — Visit the storefront
-              </Link>
+              </Link>{" "}
+              <FollowButton
+                slug={store.slug}
+                storeOwnerId={store.owner_user_id}
+                initialFollowing={store.is_following}
+                initialCount={store.follower_count}
+              />
             </p>
           </div>
         </section>
@@ -512,12 +689,65 @@ export default function ProductDetailPage({
         title="অন্যরা এটাও কিনেছেন — Others also bought"
         products={alsoBought}
       />
+      {/* Wave 54: the rest of this seller's catalogue,
+          best sellers first. */}
+      <ProductRail
+        title="এই স্টোরের আরও পণ্য — More from this store"
+        products={sameStore}
+        linkHref={store ? `/${store.slug}/shop?sort=sold` : undefined}
+        linkLabel="স্টোরের সব পণ্য — All store products"
+      />
+      {/* Wave 54 extension: the seller's curated shelves
+          for this store, as tiles to their public pages —
+          renders nothing when the store has none. */}
+      {store && <StoreCollections slug={store.slug} />}
       {/* Wave 53: the visitor's own device-local history,
           this product excluded — renders nothing when the
           history holds nothing else. */}
       <RecentlyViewedRail excludeId={params.id} />
 
       <h2>রিভিউ — Reviews</h2>
+
+      {/* Wave 54: the distribution summary above the list
+          (average, per-star bars, photo count). */}
+      <RatingSummary productId={params.id} />
+
+      {/* Wave 54: photographed reviews first-class — a
+          strip of every review photo, each jumping to its
+          review below. */}
+      {reviews !== null && reviews.some((r) => r.image_url) && (
+        <div className="review-photo-strip">
+          {reviews
+            .filter((r) => r.image_url)
+            .map((r) => (
+              <a key={r.id} href={`#review-${r.id}`}>
+                <ProductImage
+                  src={r.image_url ?? ""}
+                  alt="রিভিউয়ের ছবি — Review photo"
+                  className="review-photo-thumb"
+                />
+              </a>
+            ))}
+        </div>
+      )}
+
+      {reviews !== null && reviews.length > 0 && (
+        <p>
+          <label>
+            সাজান — Sort{" "}
+            <select
+              value={reviewSort}
+              onChange={(e) => onReviewSortChange(e.target.value as ReviewSort)}
+            >
+              <option value="newest">নতুন আগে — Newest</option>
+              <option value="highest">বেশি রেটিং আগে — Highest</option>
+              <option value="lowest">কম রেটিং আগে — Lowest</option>
+              <option value="photos">ছবিসহ আগে — With photos</option>
+              <option value="helpful">সবচেয়ে কাজের আগে — Most helpful</option>
+            </select>
+          </label>
+        </p>
+      )}
 
       {token ? (
         <form onSubmit={(e) => void onSubmitReview(e)}>
@@ -575,6 +805,25 @@ export default function ProductDetailPage({
       )}
 
       <h2>প্রশ্নোত্তর — Questions &amp; answers</h2>
+
+      {questions !== null && questions.length > 0 && (
+        <p>
+          <label>
+            সাজান — Sort{" "}
+            <select
+              value={questionSort}
+              onChange={(e) =>
+                void onQuestionSortChange(e.target.value as QuestionSort)
+              }
+            >
+              <option value="newest">নতুন আগে — Newest</option>
+              <option value="answered">উত্তর দেওয়া আগে — Answered first</option>
+            </select>
+          </label>
+          {unansweredCount > 0 &&
+            ` · ${unansweredCount}টি প্রশ্ন উত্তরের অপেক্ষায় — awaiting the seller`}
+        </p>
+      )}
 
       {isStoreOwner ? (
         <p>
@@ -639,6 +888,28 @@ export default function ProductDetailPage({
           </article>
         ))
       )}
+
+      {/* Wave 54: the sticky buy bar — the same price and
+          the same actions, pinned once the buyer scrolls
+          past the buy block. */}
+      <StickyBuyBar
+        title={product.title_bn ?? product.title}
+        imageUrl={product.image_url}
+        pricePoisha={displayPrice}
+        wasPoisha={
+          flashPrice !== null
+            ? product.price_poisha
+            : product.compare_at_poisha !== null &&
+                product.compare_at_poisha > displayPrice
+              ? product.compare_at_poisha
+              : null
+        }
+        canBuy={displayStock > 0}
+        signedIn={!!token}
+        added={added && !cartError}
+        onAdd={() => void onAdd()}
+        onBuyNow={() => void onBuyNow()}
+      />
     </main>
   );
 }
@@ -713,12 +984,20 @@ function ReviewItem({
     isStoreOwner && review.reply !== null && review.reply.store_id === ownStoreId;
 
   return (
-    <article className="card">
+    <article className="card" id={`review-${review.id}`}>
       <p>
         <Stars value={review.rating} /> <strong>{review.buyer_display}</strong>{" "}
         <small>{new Date(review.created_at).toLocaleDateString("en-GB")}</small>
       </p>
       {review.body && <p>{review.body}</p>}
+      {/* Wave 54 extension: the helpful vote. */}
+      <p>
+        <HelpfulButton
+          reviewId={review.id}
+          authorId={review.buyer_id}
+          initialCount={review.helpful_count}
+        />
+      </p>
       {/* Wave 51: the reviewer's photo, when they attached one. */}
       {review.image_url && (
         <button

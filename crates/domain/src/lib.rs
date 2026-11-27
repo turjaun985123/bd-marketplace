@@ -3048,6 +3048,378 @@ pub fn validate_analytics_window_days(days: Option<i64>) -> Result<i64, String> 
     }
 }
 
+// ---------------------------------------------------------------------------
+// Store follows (Wave 54)
+// ---------------------------------------------------------------------------
+
+/// How many stores one user may follow at once (Wave 54).
+/// A follow is a subscription to a store's new products —
+/// the cap keeps the /following page (and the notice
+/// fan-out) a human-scale list rather than a scrape of
+/// the whole marketplace, and it is high enough that no
+/// genuine shopper reaches it by accident.
+pub const MAX_FOLLOWED_STORES: i64 = 200;
+
+/// May this user follow this store (Wave 54)? The one
+/// refusal: a store's owner following their own store —
+/// the owner already sees their catalogue in the seller
+/// dashboard, and a self-follow would inflate the public
+/// follower count the storefront advertises. Everyone
+/// else (buyers, other sellers, the store's own staff)
+/// may follow.
+pub fn can_follow_store(follower_is_owner: bool) -> bool {
+    !follower_is_owner
+}
+
+/// The bilingual refusal for a self-follow (Wave 54),
+/// shared by the follow endpoint so its wording lives
+/// with the rule.
+pub const SELF_FOLLOW_ERROR: &str =
+    "you cannot follow your own store — নিজের স্টোর ফলো করা যায় না";
+
+/// Validate a follow attempt against the caller's current
+/// follow count (Wave 54): at [`MAX_FOLLOWED_STORES`] the
+/// next follow is refused. Re-following a store already
+/// followed is NOT routed through here — the write is
+/// idempotent and never counts twice (the API checks for
+/// the existing row first).
+pub fn validate_follow_count(current_follows: i64) -> Result<(), String> {
+    if current_follows < 0 {
+        return Err("follow count cannot be negative".to_string());
+    }
+    if current_follows >= MAX_FOLLOWED_STORES {
+        return Err(format!(
+            "you already follow {MAX_FOLLOWED_STORES} stores, the most allowed — \
+             unfollow one first — আপনি ইতিমধ্যে সর্বোচ্চ {MAX_FOLLOWED_STORES}টি \
+             স্টোর ফলো করেছেন, নতুন স্টোর ফলো করতে আগে একটি আনফলো করুন"
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Store profile texts (Wave 54)
+// ---------------------------------------------------------------------------
+
+/// Longest store "about" text, in characters (Wave 54).
+pub const MAX_STORE_ABOUT_CHARS: usize = 2_000;
+
+/// Longest store return-policy text, in characters
+/// (Wave 54).
+pub const MAX_STORE_RETURN_POLICY_CHARS: usize = 2_000;
+
+/// Validate a store's "about" text (Wave 54): the
+/// [`validate_store_description`] shape with the larger
+/// [`MAX_STORE_ABOUT_CHARS`] limit — `None` and blank
+/// become `None` (the storefront hides the section), a
+/// present value is trimmed and returned owned.
+pub fn validate_store_about(text: Option<&str>) -> Result<Option<String>, &'static str> {
+    validate_optional_text(text, MAX_STORE_ABOUT_CHARS, "about")
+}
+
+/// Validate a store's return-policy text (Wave 54): the
+/// same optional-text shape as [`validate_store_about`],
+/// with its own label so the error names the right field.
+pub fn validate_store_return_policy(
+    text: Option<&str>,
+) -> Result<Option<String>, &'static str> {
+    validate_optional_text(text, MAX_STORE_RETURN_POLICY_CHARS, "return_policy")
+}
+
+// ---------------------------------------------------------------------------
+// Delivery-time estimates (Wave 54)
+// ---------------------------------------------------------------------------
+
+/// The platform-settings keys holding each zone's
+/// delivery-time estimate (Wave 54): the stored value is
+/// the `"<min>-<max>"` day range written by
+/// [`format_delivery_day_range`] and read back by
+/// [`parse_delivery_day_range`]. An absent or garbled row
+/// falls back to the zone's built-in default — a bad
+/// settings row must never take the product page down.
+pub const DELIVERY_DAYS_INSIDE_DHAKA_KEY: &str = "delivery_days_inside_dhaka";
+pub const DELIVERY_DAYS_DHAKA_SUBURB_KEY: &str = "delivery_days_dhaka_suburb";
+pub const DELIVERY_DAYS_OUTSIDE_DHAKA_KEY: &str = "delivery_days_outside_dhaka";
+
+/// The settings key for one zone's estimate (Wave 54) —
+/// the one place the zone → key mapping lives.
+pub fn delivery_days_setting_key(zone: DeliveryZone) -> &'static str {
+    match zone {
+        DeliveryZone::InsideDhaka => DELIVERY_DAYS_INSIDE_DHAKA_KEY,
+        DeliveryZone::DhakaSuburb => DELIVERY_DAYS_DHAKA_SUBURB_KEY,
+        DeliveryZone::OutsideDhaka => DELIVERY_DAYS_OUTSIDE_DHAKA_KEY,
+    }
+}
+
+/// The built-in delivery-time estimate per zone, in days
+/// (Wave 54): (earliest, latest) a buyer should expect
+/// once the seller hands the parcel to a courier. These
+/// are the platform's published promises, deliberately
+/// conservative for the outside-Dhaka districts; an admin
+/// may narrow or widen them per zone in the settings.
+pub fn default_delivery_day_range(zone: DeliveryZone) -> (i64, i64) {
+    match zone {
+        DeliveryZone::InsideDhaka => (1, 2),
+        DeliveryZone::DhakaSuburb => (2, 3),
+        DeliveryZone::OutsideDhaka => (3, 5),
+    }
+}
+
+/// The widest single bound a delivery estimate may carry,
+/// in days (Wave 54): a month covers every honest promise
+/// a Bangladeshi courier makes; beyond it the number is a
+/// data-entry error, not an estimate.
+pub const MAX_DELIVERY_ESTIMATE_DAYS: i64 = 30;
+
+/// Validate one delivery day range (Wave 54): both bounds
+/// within 0..=[`MAX_DELIVERY_ESTIMATE_DAYS`] and the
+/// earliest no later than the latest. Zero is allowed —
+/// same-day delivery inside Dhaka is a real promise a
+/// platform may choose to make.
+pub fn validate_delivery_day_range(min_days: i64, max_days: i64) -> Result<(i64, i64), String> {
+    if !(0..=MAX_DELIVERY_ESTIMATE_DAYS).contains(&min_days)
+        || !(0..=MAX_DELIVERY_ESTIMATE_DAYS).contains(&max_days)
+    {
+        return Err(format!(
+            "delivery estimate days must be between 0 and {MAX_DELIVERY_ESTIMATE_DAYS} — \
+             ডেলিভারির সময় ০ থেকে {MAX_DELIVERY_ESTIMATE_DAYS} দিনের মধ্যে হতে হবে"
+        ));
+    }
+    if min_days > max_days {
+        return Err(
+            "the earliest delivery day cannot be after the latest — \
+             সবচেয়ে কম দিন সবচেয়ে বেশি দিনের চেয়ে বড় হতে পারে না"
+                .to_string(),
+        );
+    }
+    Ok((min_days, max_days))
+}
+
+/// The stored form of a day range (Wave 54): `"<min>-<max>"`,
+/// the exact string the platform-settings row carries.
+pub fn format_delivery_day_range(min_days: i64, max_days: i64) -> String {
+    format!("{min_days}-{max_days}")
+}
+
+/// Parse a stored day range (Wave 54): the inverse of
+/// [`format_delivery_day_range`], validated by
+/// [`validate_delivery_day_range`]. Anything else — a
+/// missing dash, a non-number, an inverted or absurd
+/// range — is `None`, and the caller falls back to the
+/// zone default.
+pub fn parse_delivery_day_range(raw: &str) -> Option<(i64, i64)> {
+    let (min_raw, max_raw) = raw.trim().split_once('-')?;
+    let min_days: i64 = min_raw.trim().parse().ok()?;
+    let max_days: i64 = max_raw.trim().parse().ok()?;
+    validate_delivery_day_range(min_days, max_days).ok()
+}
+
+/// Resolve one zone's effective day range (Wave 54) from
+/// its raw stored setting: a parseable, valid stored
+/// range wins; anything else is the zone default. THE
+/// resolution rule — the estimate endpoint and the admin
+/// settings view both read through here, so the number a
+/// buyer is promised is the number the admin sees.
+pub fn resolve_delivery_day_range(zone: DeliveryZone, stored: Option<&str>) -> (i64, i64) {
+    stored
+        .and_then(parse_delivery_day_range)
+        .unwrap_or_else(|| default_delivery_day_range(zone))
+}
+
+// ---------------------------------------------------------------------------
+// Review sorting + rating distribution (Wave 54)
+// ---------------------------------------------------------------------------
+
+/// The review-list sort orders (Wave 54). `Newest` is the
+/// pre-Wave-54 behaviour and the default; `Photos` puts
+/// reviews carrying a photo first (the Wave 51 photos are
+/// the most informative reviews a product page has), then
+/// newest — it is a sort, never a filter: photo-less
+/// reviews still appear, after the photographed ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewSort {
+    Newest,
+    Highest,
+    Lowest,
+    Photos,
+    /// Most helpful first (Wave 54 extension): by the
+    /// live helpful-vote count, then newest — the sort a
+    /// buyer wants when a product has hundreds of reviews.
+    Helpful,
+}
+
+/// Validate a review-list `sort` parameter (Wave 54):
+/// absent means [`ReviewSort::Newest`]; an unknown value
+/// is an error naming the allowed set, in the style of
+/// [`validate_product_list_sort`].
+pub fn validate_review_sort(sort: Option<&str>) -> Result<ReviewSort, &'static str> {
+    match sort {
+        None | Some("newest") => Ok(ReviewSort::Newest),
+        Some("highest") => Ok(ReviewSort::Highest),
+        Some("lowest") => Ok(ReviewSort::Lowest),
+        Some("photos") => Ok(ReviewSort::Photos),
+        Some("helpful") => Ok(ReviewSort::Helpful),
+        Some(_) => Err("sort must be one of: newest, highest, lowest, photos, helpful"),
+    }
+}
+
+/// May this user cast a helpful vote on a review (Wave 54
+/// extension)? Everyone except the review's AUTHOR: a
+/// vote is other buyers certifying the review helped
+/// them, and self-certification would make the count a
+/// vanity metric. (Sellers may vote on reviews of other
+/// stores' products — they are buyers there too.)
+pub fn can_vote_review_helpful(voter_is_author: bool) -> bool {
+    !voter_is_author
+}
+
+/// The bilingual refusal for voting on your own review
+/// (Wave 54 extension), returned by the vote endpoint.
+pub const OWN_REVIEW_VOTE_ERROR: &str =
+    "নিজের রিভিউতে ভোট দেওয়া যায় না — you cannot vote on your own review";
+
+/// How a product's question list is ordered (Wave 54
+/// extension): newest first (the Wave 25 default), or
+/// answered first — a buyer scanning for information
+/// wants the questions the seller actually answered at
+/// the top, unanswered ones after.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuestionSort {
+    Newest,
+    AnsweredFirst,
+}
+
+/// Validate a question-list `sort` parameter (Wave 54
+/// extension): absent means [`QuestionSort::Newest`]; an
+/// unknown value is an error naming the allowed set.
+pub fn validate_question_sort(sort: Option<&str>) -> Result<QuestionSort, &'static str> {
+    match sort {
+        None | Some("newest") => Ok(QuestionSort::Newest),
+        Some("answered") => Ok(QuestionSort::AnsweredFirst),
+        Some(_) => Err("sort must be one of: newest, answered"),
+    }
+}
+
+/// One star level's share of a rating distribution, as a
+/// whole percent (Wave 54): the floor of count / total,
+/// and 0 when there are no reviews at all — the summary's
+/// bars never divide by zero and never round a level UP
+/// into a share it does not have.
+pub fn rating_share_percent(count: i64, total: i64) -> i64 {
+    if count <= 0 || total <= 0 {
+        return 0;
+    }
+    (count.min(total) * 100) / total
+}
+
+// ---------------------------------------------------------------------------
+// Store collections (Wave 54 extension)
+// ---------------------------------------------------------------------------
+
+/// How many collections one store may curate at once
+/// (Wave 54 extension). A storefront is a shop window,
+/// not an archive: the cap keeps the seller's collection
+/// list a merchandising tool and bounds the storefront's
+/// section rendering.
+pub const MAX_STORE_COLLECTIONS: i64 = 20;
+
+/// How many products one store collection may hold at
+/// once (Wave 54 extension). A collection is a curated
+/// shelf; past this size it is the catalogue itself,
+/// which the shop page already renders with filters.
+pub const MAX_COLLECTION_PRODUCTS: i64 = 100;
+
+/// Longest store-collection title, in characters.
+pub const MAX_STORE_COLLECTION_TITLE_CHARS: usize = 120;
+
+/// Longest store-collection description, in characters.
+pub const MAX_STORE_COLLECTION_DESCRIPTION_CHARS: usize = 1_000;
+
+/// Validate a store collection's title (Wave 54
+/// extension): required, trimmed, at most
+/// [`MAX_STORE_COLLECTION_TITLE_CHARS`] characters.
+/// Returns the trimmed title.
+pub fn validate_store_collection_title(title: &str) -> Result<String, String> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "কালেকশনের নাম আবশ্যক — a collection title is required".to_string(),
+        );
+    }
+    if trimmed.chars().count() > MAX_STORE_COLLECTION_TITLE_CHARS {
+        return Err(format!(
+            "কালেকশনের নাম সর্বোচ্চ {} অক্ষরের হতে হবে — collection title must be \
+             at most {} characters",
+            MAX_STORE_COLLECTION_TITLE_CHARS, MAX_STORE_COLLECTION_TITLE_CHARS
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Validate a store collection's slug (Wave 54 extension):
+/// the platform's one slug grammar
+/// ([`validate_collection_slug`]), with the refusal
+/// worded bilingually like the other storefront rules.
+/// The slug is unique within the store (the DB constraint
+/// is the backstop; this is the shape rule).
+pub fn validate_store_collection_slug(slug: &str) -> Result<String, String> {
+    match validate_collection_slug(slug) {
+        Ok(valid) => Ok(valid.to_string()),
+        Err(_) => Err(
+            "স্লাগটি ৩-৪০ অক্ষরের হতে হবে (ছোট হাতের অক্ষর, সংখ্যা ও হাইফেন) — \
+             the slug must be 3-40 characters of lowercase letters, digits and \
+             hyphens"
+                .to_string(),
+        ),
+    }
+}
+
+/// Validate a store collection's description (Wave 54
+/// extension): optional text under the same convention as
+/// the store profile texts — blank clears (returns
+/// `None`), a value is trimmed and capped at
+/// [`MAX_STORE_COLLECTION_DESCRIPTION_CHARS`] characters.
+pub fn validate_store_collection_description(
+    text: Option<&str>,
+) -> Result<Option<String>, String> {
+    validate_optional_text(
+        text,
+        MAX_STORE_COLLECTION_DESCRIPTION_CHARS,
+        "description",
+    )
+    .map_err(|message| message.to_string())
+}
+
+/// Validate a store's collection count before creating
+/// one more (Wave 54 extension): at
+/// [`MAX_STORE_COLLECTIONS`] the store must retire a
+/// collection first.
+pub fn validate_store_collection_count(current: i64) -> Result<(), String> {
+    if current < 0 || current >= MAX_STORE_COLLECTIONS {
+        return Err(format!(
+            "একটি স্টোর সর্বোচ্চ {}টি কালেকশন রাখতে পারে — a store may keep at \
+             most {} collections",
+            MAX_STORE_COLLECTIONS, MAX_STORE_COLLECTIONS
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a collection's membership size (Wave 54
+/// extension): the count AFTER duplicates collapse (the
+/// membership is a set — the API dedupes before calling)
+/// must fit [`MAX_COLLECTION_PRODUCTS`].
+pub fn validate_collection_product_count(count: i64) -> Result<(), String> {
+    if count < 0 || count > MAX_COLLECTION_PRODUCTS {
+        return Err(format!(
+            "একটি কালেকশনে সর্বোচ্চ {}টি পণ্য থাকতে পারে — a collection may hold \
+             at most {} products",
+            MAX_COLLECTION_PRODUCTS, MAX_COLLECTION_PRODUCTS
+        ));
+    }
+    Ok(())
+}
+
 /// Maximum length of a buyer's return reason, in characters.
 pub const MAX_RETURN_REASON_CHARS: usize = 500;
 
@@ -3252,6 +3624,8 @@ fn validate_optional_text(
     if trimmed.chars().count() > max_chars {
         return Err(match label {
             "announcement" => "announcement must be at most 120 characters",
+            "about" => "about must be at most 2000 characters",
+            "return_policy" => "return policy must be at most 2000 characters",
             _ => "description must be at most 1000 characters",
         });
     }
@@ -3705,6 +4079,18 @@ pub const NOTIFICATION_SUB_ORDER_CANCELLED: &str = "sub_order_cancelled";
 pub const NOTIFICATION_SUB_ORDER_RETURNED: &str = "sub_order_returned";
 pub const NOTIFICATION_PAYOUT_PAID: &str = "payout_paid";
 pub const NOTIFICATION_RETURN_UPDATE: &str = "return_update";
+/// Wave 54: a store a user follows published a new product;
+/// the notice goes to each follower (see the API's
+/// `notices` fan-out), one row per follower per product.
+pub const NOTIFICATION_STORE_NEW_PRODUCT: &str = "store_new_product";
+
+/// A product of a followed store joined a LIVE flash sale
+/// (Wave 54 extension). Enqueued by the one funnel in the
+/// API's notices module when the admin item-set of a
+/// currently-running sale gains the product; muted
+/// follows are excluded there, exactly like the
+/// new-product kind.
+pub const NOTIFICATION_STORE_FLASH_SALE: &str = "store_flash_sale";
 
 /// The values a notification template renders (Wave 29).
 /// Every field is optional in effect: a kind uses the fields
@@ -3721,6 +4107,14 @@ pub struct NotificationVars {
     /// (`return_update` reads `approved` / `rejected` /
     /// `received`).
     pub status: String,
+    /// The new product's title (Wave 54) — read only by
+    /// the `store_new_product` template; empty for every
+    /// other kind.
+    pub product_title: String,
+    /// The flash sale's title (Wave 54 extension) — read
+    /// only by the `store_flash_sale` template; empty for
+    /// every other kind.
+    pub sale_title: String,
 }
 
 /// The short display form of an order id: its first 8
@@ -3795,6 +4189,26 @@ pub fn render_body(kind: &str, vars: &NotificationVars) -> String {
                 vars.status
             ),
         },
+        NOTIFICATION_STORE_NEW_PRODUCT => {
+            if vars.product_title.is_empty() {
+                format!("BD Marketplace: {store} নতুন পণ্য যোগ করেছে। স্টোরটি ঘুরে দেখুন!")
+            } else {
+                format!(
+                    "BD Marketplace: {store} নতুন পণ্য যোগ করেছে: {}।",
+                    vars.product_title
+                )
+            }
+        }
+        NOTIFICATION_STORE_FLASH_SALE => {
+            if vars.sale_title.is_empty() {
+                format!("BD Marketplace: {store} স্টোরের পণ্যে ফ্ল্যাশ সেল চলছে!")
+            } else {
+                format!(
+                    "BD Marketplace: {store} স্টোরের পণ্যে ফ্ল্যাশ সেল চলছে: {}!",
+                    vars.sale_title
+                )
+            }
+        }
         _ => format!("BD Marketplace: অর্ডার #{short} সম্পর্কে একটি আপডেট আছে।"),
     }
 }
@@ -8037,6 +8451,8 @@ mod tests {
             store_name: "ঢাকা গ্যাজেট".to_string(),
             amount_poisha: Some(206_000),
             status: String::new(),
+            product_title: String::new(),
+            sale_title: String::new(),
         };
         // The short order id (first 8 chars) is what prints.
         let placed = render_body(NOTIFICATION_ORDER_PLACED, &vars);
@@ -8076,6 +8492,26 @@ mod tests {
         // Unknown kinds still render a body.
         let other = render_body("some_future_kind", &vars);
         assert!(other.contains("#12345678"), "{other}");
+
+        // Wave 54: the follower notice names the store and,
+        // when the payload carries it, the product itself.
+        let mut follow_vars = vars.clone();
+        follow_vars.product_title = "নতুন স্মার্টওয়াচ".to_string();
+        let with_title = render_body(NOTIFICATION_STORE_NEW_PRODUCT, &follow_vars);
+        assert!(with_title.contains("ঢাকা গ্যাজেট"), "{with_title}");
+        assert!(with_title.contains("নতুন স্মার্টওয়াচ"), "{with_title}");
+        let without_title = render_body(NOTIFICATION_STORE_NEW_PRODUCT, &vars);
+        assert!(without_title.contains("নতুন পণ্য যোগ করেছে"), "{without_title}");
+
+        // The flash-sale body names the store and, when
+        // known, the sale title.
+        let mut sale_vars = vars.clone();
+        sale_vars.sale_title = "মেগা সেল".to_string();
+        let with_sale = render_body(NOTIFICATION_STORE_FLASH_SALE, &sale_vars);
+        assert!(with_sale.contains("ঢাকা গ্যাজেট"), "{with_sale}");
+        assert!(with_sale.contains("মেগা সেল"), "{with_sale}");
+        let without_sale = render_body(NOTIFICATION_STORE_FLASH_SALE, &vars);
+        assert!(without_sale.contains("ফ্ল্যাশ সেল চলছে"), "{without_sale}");
     }
 
     // -- Wave 37: API keys ---------------------------------------------
@@ -8815,5 +9251,217 @@ mod tests {
         assert_eq!(price_drop_percent(100_000, 120_000), 0);
         assert_eq!(price_drop_percent(0, 0), 0);
         assert_eq!(price_drop_percent(-5, -10), 0);
+    }
+
+    // -- Wave 54: store follows -----------------------------------------
+
+    #[test]
+    fn follow_rules_refuse_only_the_owner() {
+        assert!(!can_follow_store(true));
+        assert!(can_follow_store(false));
+        // The refusal wording is bilingual, like every
+        // buyer-facing refusal in the API.
+        assert!(SELF_FOLLOW_ERROR.contains("নিজের স্টোর"));
+    }
+
+    #[test]
+    fn follow_count_cap_bites_at_the_limit() {
+        assert!(validate_follow_count(0).is_ok());
+        assert!(validate_follow_count(MAX_FOLLOWED_STORES - 1).is_ok());
+        assert!(validate_follow_count(MAX_FOLLOWED_STORES).is_err());
+        assert!(validate_follow_count(MAX_FOLLOWED_STORES + 1).is_err());
+        assert!(validate_follow_count(-1).is_err());
+    }
+
+    // -- Wave 54: store profile texts -----------------------------------
+
+    #[test]
+    fn store_profile_texts_trim_cap_and_clear() {
+        // Absent and blank both clear to None.
+        assert_eq!(validate_store_about(None).unwrap(), None);
+        assert_eq!(validate_store_about(Some("   ")).unwrap(), None);
+        assert_eq!(validate_store_return_policy(None).unwrap(), None);
+        // A present value is trimmed and kept.
+        assert_eq!(
+            validate_store_about(Some("  আমরা ঢাকার কারিগর।  ")).unwrap(),
+            Some("আমরা ঢাকার কারিগর।".to_string())
+        );
+        assert_eq!(
+            validate_store_return_policy(Some("৭ দিনে ফেরত")).unwrap(),
+            Some("৭ দিনে ফেরত".to_string())
+        );
+        // The caps count characters, not bytes: 2,000 Bangla
+        // characters pass, 2,001 fail, and the error names
+        // the field that overflowed.
+        let at_cap = "ক".repeat(MAX_STORE_ABOUT_CHARS);
+        assert!(validate_store_about(Some(&at_cap)).is_ok());
+        let over_cap = "ক".repeat(MAX_STORE_ABOUT_CHARS + 1);
+        assert_eq!(
+            validate_store_about(Some(&over_cap)).unwrap_err(),
+            "about must be at most 2000 characters"
+        );
+        let over_policy = "ক".repeat(MAX_STORE_RETURN_POLICY_CHARS + 1);
+        assert_eq!(
+            validate_store_return_policy(Some(&over_policy)).unwrap_err(),
+            "return policy must be at most 2000 characters"
+        );
+    }
+
+    // -- Wave 54: delivery-time estimates -------------------------------
+
+    #[test]
+    fn delivery_day_defaults_match_the_published_zones() {
+        assert_eq!(default_delivery_day_range(DeliveryZone::InsideDhaka), (1, 2));
+        assert_eq!(default_delivery_day_range(DeliveryZone::DhakaSuburb), (2, 3));
+        assert_eq!(default_delivery_day_range(DeliveryZone::OutsideDhaka), (3, 5));
+        // Every zone has its own settings key.
+        assert_eq!(
+            delivery_days_setting_key(DeliveryZone::InsideDhaka),
+            DELIVERY_DAYS_INSIDE_DHAKA_KEY
+        );
+        assert_eq!(
+            delivery_days_setting_key(DeliveryZone::DhakaSuburb),
+            DELIVERY_DAYS_DHAKA_SUBURB_KEY
+        );
+        assert_eq!(
+            delivery_days_setting_key(DeliveryZone::OutsideDhaka),
+            DELIVERY_DAYS_OUTSIDE_DHAKA_KEY
+        );
+    }
+
+    #[test]
+    fn delivery_day_range_validation() {
+        assert_eq!(validate_delivery_day_range(1, 2).unwrap(), (1, 2));
+        // Same-day (0) is a legitimate promise.
+        assert_eq!(validate_delivery_day_range(0, 0).unwrap(), (0, 0));
+        assert_eq!(
+            validate_delivery_day_range(0, MAX_DELIVERY_ESTIMATE_DAYS).unwrap(),
+            (0, MAX_DELIVERY_ESTIMATE_DAYS)
+        );
+        // Inverted, negative and absurd ranges all refuse.
+        assert!(validate_delivery_day_range(3, 2).is_err());
+        assert!(validate_delivery_day_range(-1, 2).is_err());
+        assert!(validate_delivery_day_range(1, MAX_DELIVERY_ESTIMATE_DAYS + 1).is_err());
+    }
+
+    #[test]
+    fn delivery_day_range_storage_round_trips() {
+        assert_eq!(format_delivery_day_range(1, 2), "1-2");
+        assert_eq!(format_delivery_day_range(0, 30), "0-30");
+        assert_eq!(parse_delivery_day_range("1-2"), Some((1, 2)));
+        assert_eq!(parse_delivery_day_range(" 3 - 5 "), Some((3, 5)));
+        // Garbage, inverted and out-of-range stored values
+        // all read as "no override".
+        assert_eq!(parse_delivery_day_range(""), None);
+        assert_eq!(parse_delivery_day_range("soon"), None);
+        assert_eq!(parse_delivery_day_range("5-3"), None);
+        assert_eq!(parse_delivery_day_range("1-99"), None);
+        assert_eq!(parse_delivery_day_range("1-2-3"), None);
+        assert_eq!(parse_delivery_day_range("-1-2"), None);
+    }
+
+    #[test]
+    fn delivery_day_resolution_prefers_a_valid_stored_range() {
+        let zone = DeliveryZone::OutsideDhaka;
+        assert_eq!(resolve_delivery_day_range(zone, Some("2-4")), (2, 4));
+        assert_eq!(resolve_delivery_day_range(zone, None), (3, 5));
+        assert_eq!(resolve_delivery_day_range(zone, Some("garbage")), (3, 5));
+        assert_eq!(resolve_delivery_day_range(zone, Some("9-1")), (3, 5));
+    }
+
+    // -- Wave 54: review sorts + rating shares --------------------------
+
+    #[test]
+    fn review_sort_validation() {
+        assert_eq!(validate_review_sort(None), Ok(ReviewSort::Newest));
+        assert_eq!(validate_review_sort(Some("newest")), Ok(ReviewSort::Newest));
+        assert_eq!(validate_review_sort(Some("highest")), Ok(ReviewSort::Highest));
+        assert_eq!(validate_review_sort(Some("lowest")), Ok(ReviewSort::Lowest));
+        assert_eq!(validate_review_sort(Some("photos")), Ok(ReviewSort::Photos));
+        assert!(validate_review_sort(Some("banana")).is_err());
+        assert!(validate_review_sort(Some("")).is_err());
+    }
+
+    #[test]
+    fn rating_share_percent_floors_and_never_divides_by_zero() {
+        assert_eq!(rating_share_percent(0, 0), 0);
+        assert_eq!(rating_share_percent(5, 0), 0);
+        assert_eq!(rating_share_percent(0, 10), 0);
+        assert_eq!(rating_share_percent(10, 10), 100);
+        assert_eq!(rating_share_percent(1, 3), 33);
+        assert_eq!(rating_share_percent(2, 3), 66);
+        // A corrupt count above the total clamps to the total.
+        assert_eq!(rating_share_percent(15, 10), 100);
+        assert_eq!(rating_share_percent(-1, 10), 0);
+    }
+
+    #[test]
+    fn helpful_sort_and_own_review_vote_rules() {
+        assert_eq!(
+            validate_review_sort(Some("helpful")),
+            Ok(ReviewSort::Helpful)
+        );
+        assert!(can_vote_review_helpful(false));
+        assert!(!can_vote_review_helpful(true));
+    }
+
+    #[test]
+    fn question_sort_accepts_only_its_two_orders() {
+        assert_eq!(validate_question_sort(None), Ok(QuestionSort::Newest));
+        assert_eq!(
+            validate_question_sort(Some("answered")),
+            Ok(QuestionSort::AnsweredFirst)
+        );
+        assert!(validate_question_sort(Some("oldest")).is_err());
+    }
+
+    #[test]
+    fn store_collection_title_trims_caps_and_is_required() {
+        assert_eq!(
+            validate_store_collection_title("  ঈদ কালেকশন  "),
+            Ok("ঈদ কালেকশন".to_string())
+        );
+        assert!(validate_store_collection_title("").is_err());
+        assert!(validate_store_collection_title("   ").is_err());
+        let at_cap = "a".repeat(MAX_STORE_COLLECTION_TITLE_CHARS);
+        assert!(validate_store_collection_title(&at_cap).is_ok());
+        let over_cap = "a".repeat(MAX_STORE_COLLECTION_TITLE_CHARS + 1);
+        assert!(validate_store_collection_title(&over_cap).is_err());
+    }
+
+    #[test]
+    fn store_collection_slug_uses_the_platform_grammar() {
+        assert_eq!(
+            validate_store_collection_slug("eid-2026"),
+            Ok("eid-2026".to_string())
+        );
+        assert!(validate_store_collection_slug("Eid").is_err());
+        assert!(validate_store_collection_slug("ab").is_err());
+        assert!(validate_store_collection_slug("-eid").is_err());
+        assert!(validate_store_collection_slug("eid_2026").is_err());
+    }
+
+    #[test]
+    fn store_collection_description_blank_clears_and_caps() {
+        assert_eq!(validate_store_collection_description(None), Ok(None));
+        assert_eq!(validate_store_collection_description(Some("  ")), Ok(None));
+        assert_eq!(
+            validate_store_collection_description(Some("  হাতে বোনা  ")),
+            Ok(Some("হাতে বোনা".to_string()))
+        );
+        let over_cap = "a".repeat(MAX_STORE_COLLECTION_DESCRIPTION_CHARS + 1);
+        assert!(validate_store_collection_description(Some(&over_cap)).is_err());
+    }
+
+    #[test]
+    fn store_collection_caps_are_bounds_not_targets() {
+        assert!(validate_store_collection_count(0).is_ok());
+        assert!(validate_store_collection_count(MAX_STORE_COLLECTIONS - 1).is_ok());
+        assert!(validate_store_collection_count(MAX_STORE_COLLECTIONS).is_err());
+        assert!(validate_store_collection_count(-1).is_err());
+        assert!(validate_collection_product_count(0).is_ok());
+        assert!(validate_collection_product_count(MAX_COLLECTION_PRODUCTS).is_ok());
+        assert!(validate_collection_product_count(MAX_COLLECTION_PRODUCTS + 1).is_err());
+        assert!(validate_collection_product_count(-1).is_err());
     }
 }

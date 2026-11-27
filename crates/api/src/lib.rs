@@ -339,8 +339,10 @@ pub mod audit;
 pub mod auth;
 pub mod cart;
 pub mod coupons;
+pub mod delivery_estimates;
 pub mod exports;
 pub mod facebook;
+pub mod follows;
 pub mod fulfillment;
 pub mod inventory;
 pub mod invoices;
@@ -366,6 +368,7 @@ pub mod risk;
 pub mod saved_searches;
 pub mod search;
 pub mod shipments;
+pub mod store_collections;
 pub mod stores;
 pub mod subscriptions;
 pub mod tracking;
@@ -1406,6 +1409,98 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/stores/:slug/products",
             get(products::list_store_products),
         )
+        // Wave 54 — store follows (the relationship in the
+        // `follows` module; the new-product notice fan-out
+        // is in `notices`), the store-wide review reads, and
+        // the signed-in buyer's followed-stores list.
+        .route(
+            "/v1/stores/:slug/follow",
+            post(follows::follow_store_handler)
+                .delete(follows::unfollow_store_handler)
+                .patch(follows::set_follow_notify_handler),
+        )
+        // Wave 54 extension — helpful votes on reviews:
+        // cast/retract (POST/DELETE) and the viewer's own
+        // state read (GET) on the same path.
+        .route(
+            "/v1/reviews/:id/helpful",
+            get(reviews::review_helpful_state_handler)
+                .post(reviews::vote_helpful_handler)
+                .delete(reviews::unvote_helpful_handler),
+        )
+        .route(
+            "/v1/stores/:slug/reviews",
+            get(reviews::list_store_reviews_handler),
+        )
+        .route(
+            "/v1/stores/:slug/rating-summary",
+            get(reviews::store_rating_summary_handler),
+        )
+        .route("/v1/follows", get(follows::list_follows_handler))
+        .route(
+            "/v1/seller/followers",
+            get(follows::list_seller_followers_handler),
+        )
+        // Wave 54 — the delivery estimate: the Wave 1 charge
+        // rule plus the per-zone delivery-time range, for
+        // the product page's delivery block.
+        .route(
+            "/v1/delivery-estimate",
+            get(delivery_estimates::delivery_estimate_handler),
+        )
+        // Wave 54 extension — store collections: the
+        // seller's own curated shelves (seller CRUD +
+        // membership under /v1/seller/store/collections,
+        // public reads under the storefront's slug).
+        .route(
+            "/v1/seller/store/collections",
+            get(store_collections::list_seller_collections_handler)
+                .post(store_collections::create_collection_handler),
+        )
+        .route(
+            "/v1/seller/store/collections/:id",
+            get(store_collections::seller_collection_detail_handler)
+                .put(store_collections::update_collection_handler)
+                .delete(store_collections::delete_collection_handler),
+        )
+        .route(
+            "/v1/seller/store/collections/:id/products",
+            put(store_collections::set_collection_products_handler),
+        )
+        .route(
+            "/v1/stores/:slug/collections",
+            get(store_collections::list_public_collections_handler),
+        )
+        .route(
+            "/v1/stores/:slug/collections/:collection_slug",
+            get(store_collections::public_collection_handler),
+        )
+        // Wave 54 extension — the follows feed (newest
+        // products from followed stores), store suggestions,
+        // the seller's follower statistics, and the user's
+        // own notification inbox (the read side of the
+        // outbox for its owner; `notifications` module).
+        .route("/v1/follows/feed", get(follows::follows_feed_handler))
+        // (Suggestions live under /v1/follows, not
+        // /v1/stores/suggested: a static segment cannot
+        // sit beside /v1/stores/:slug in the router.)
+        .route(
+            "/v1/follows/suggested",
+            get(follows::suggested_stores_handler),
+        )
+        .route(
+            "/v1/seller/followers/stats",
+            get(follows::seller_follower_stats_handler),
+        )
+        .route(
+            "/v1/notifications",
+            get(notifications::list_user_notifications_handler)
+                .put(notifications::mark_all_notifications_read_handler),
+        )
+        .route(
+            "/v1/notifications/:id/read",
+            post(notifications::mark_notification_read_handler),
+        )
         // Wave 34 — multi-store access + staff roles: every
         // store the caller owns or is a member of (with their
         // role in it), and the member management endpoints —
@@ -1541,6 +1636,12 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/v1/products/:id/reviews",
             post(reviews::create_review_handler).get(reviews::list_reviews_handler),
+        )
+        // Wave 54 — the rating distribution behind the
+        // product page's summary bars.
+        .route(
+            "/v1/products/:id/rating-summary",
+            get(reviews::product_rating_summary_handler),
         )
         .route(
             "/v1/reviews/:id",
@@ -1693,6 +1794,10 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/v1/admin/stores/:id/status",
             patch(admin::set_store_status_handler),
+        )
+        .route(
+            "/v1/admin/stores/:id/followers",
+            get(follows::list_admin_store_followers_handler),
         )
         .route("/v1/admin/orders", get(admin::list_orders_handler))
         .route("/v1/admin/payouts", get(admin::list_payouts_handler))

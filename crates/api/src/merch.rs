@@ -1544,7 +1544,7 @@ pub async fn set_flash_sale_items(
     sale_id: Uuid,
     items: Vec<FlashSaleItemInput>,
 ) -> Result<FlashSaleDetail, ApiError> {
-    let _sale = get_flash_sale(pool, sale_id).await?;
+    let sale = get_flash_sale(pool, sale_id).await?;
     let mut seen = std::collections::HashSet::new();
     for item in &items {
         if !seen.insert(item.product_id) {
@@ -1595,6 +1595,16 @@ pub async fn set_flash_sale_items(
         };
         validated.push((item.product_id, sale_price, cap));
     }
+    // Wave 54 extension: remember the outgoing item set —
+    // the follower alert below fires only for products
+    // that are NEW to the sale, so re-saving the same set
+    // (or repricing an existing item) never re-alerts.
+    let previous_ids: Vec<Uuid> =
+        sqlx::query_scalar("SELECT product_id FROM flash_sale_items WHERE flash_sale_id = $1")
+            .bind(sale_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| ApiError::internal("load outgoing flash sale items", e))?;
     sqlx::query("DELETE FROM flash_sale_items WHERE flash_sale_id = $1")
         .bind(sale_id)
         .execute(&mut *tx)
@@ -1612,6 +1622,29 @@ pub async fn set_flash_sale_items(
         .execute(&mut *tx)
         .await
         .map_err(|e| ApiError::internal("insert flash sale item", e))?;
+    }
+    // Wave 54 extension: when the sale is LIVE right now,
+    // followers of the newly-added products' stores get
+    // the `store_flash_sale` notice inside this same
+    // transaction. A sale scheduled for later alerts
+    // nobody at item-set time — the honest limit,
+    // documented in the README.
+    let now = chrono::Utc::now();
+    if sale.is_active && sale.starts_at <= now && now < sale.ends_at {
+        let new_ids: Vec<Uuid> = validated
+            .iter()
+            .map(|(product_id, _, _)| *product_id)
+            .filter(|product_id| !previous_ids.contains(product_id))
+            .collect();
+        if !new_ids.is_empty() {
+            crate::notices::enqueue_store_flash_sale_notices(
+                &mut tx,
+                sale_id,
+                &sale.title,
+                &new_ids,
+            )
+            .await?;
+        }
     }
     tx.commit()
         .await

@@ -2,8 +2,11 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import FollowButton from "./FollowButton";
+import StoreStats from "./StoreStats";
 import VerificationBadge from "./VerificationBadge";
-import { getStore, type Store } from "@/lib/api";
+import { useAuth } from "@/hooks/useAuth";
+import { getStore, type PublicStore } from "@/lib/api";
 
 /**
  * The shop page's store header (Wave 53): the store's
@@ -17,12 +20,13 @@ import { getStore, type Store } from "@/lib/api";
  * just the way back — the catalogue below still works.
  */
 export default function StoreShopHeader({ slug }: { slug: string }) {
-  const [store, setStore] = useState<Store | null>(null);
+  const { token } = useAuth();
+  const [store, setStore] = useState<PublicStore | null>(null);
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
-    getStore(slug)
+    getStore(slug, token)
       .then((data) => {
         if (!cancelled) setStore(data);
       })
@@ -32,7 +36,7 @@ export default function StoreShopHeader({ slug }: { slug: string }) {
     return () => {
       cancelled = true;
     };
-  }, [slug]);
+  }, [slug, token]);
 
   return (
     <header className="store-shop-header">
@@ -59,6 +63,17 @@ export default function StoreShopHeader({ slug }: { slug: string }) {
           {store.announcement && (
             <p className="announcement-bar">{store.announcement}</p>
           )}
+          {/* Wave 54: the trust line + follow action, the
+              same as the storefront's. */}
+          <StoreStats store={store} />
+          <p>
+            <FollowButton
+              slug={store.slug}
+              storeOwnerId={store.owner_user_id}
+              initialFollowing={store.is_following}
+              initialCount={store.follower_count}
+            />
+          </p>
         </>
       )}
     </header>

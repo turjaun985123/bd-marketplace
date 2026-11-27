@@ -32,6 +32,22 @@
 //! - `return_update` — `returns::decide_return_request`
 //!   (approved / rejected) and `returns::mark_return_received`
 //!   (received), to the buyer.
+//! - `store_new_product` (Wave 54) — the three product
+//!   publish funnels: `products::create_product_for_owner`
+//!   (created already `active`), `products::
+//!   update_product_for_owner` (a PATCH that moves a product
+//!   INTO `active` from any other status) and the Facebook
+//!   import (`facebook::import_posts`, whose rows are born
+//!   `active`). One row per follower of the store, enqueued
+//!   by [`enqueue_store_new_product_notices`] inside the
+//!   same transaction as the publish itself. A product that
+//!   was already active and stays active never re-fires:
+//!   the update funnel compares the stored status before
+//!   the write, so an edit to a live product is silent.
+//!   The flash-sale sibling kind
+//!   ([`enqueue_store_flash_sale_notices`]) fires from the
+//!   admin item-set write when a product NEWLY joins a
+//!   sale that is live at that moment.
 
 use serde_json::json;
 use sqlx::{FromRow, PgConnection};
@@ -132,6 +148,146 @@ pub async fn enqueue_return_notice(
     .await
     .map_err(|e| ApiError::internal("enqueue return notification", e))?;
     Ok(())
+}
+
+/// Queue the `store_new_product` notice (Wave 54) for
+/// EVERY follower of the product's store: one outbox row
+/// per follower, each at the follower's account phone,
+/// inside the caller's transaction — so the notices exist
+/// exactly when the publish commits, and vanish with it
+/// when it rolls back. A store with no followers enqueues
+/// nothing (the common case costs one indexed read).
+/// Returns how many notices were queued, for the caller's
+/// logs/tests.
+pub async fn enqueue_store_new_product_notices(
+    conn: &mut PgConnection,
+    product_id: Uuid,
+) -> Result<i64, ApiError> {
+    #[derive(FromRow)]
+    struct ProductNoticeRow {
+        store_id: Uuid,
+        store_name: String,
+        product_title: String,
+    }
+    let product: ProductNoticeRow = sqlx::query_as(
+        "SELECT p.store_id, s.name AS store_name, p.title AS product_title \
+         FROM products p JOIN stores s ON s.id = p.store_id \
+         WHERE p.id = $1",
+    )
+    .bind(product_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| ApiError::internal("load new-product notice subject", e))?;
+
+    #[derive(FromRow)]
+    struct FollowerRow {
+        user_id: Uuid,
+        phone: String,
+    }
+    // Wave 54 extension: a follow whose owner muted
+    // new-product notices (notify_new_products = false)
+    // is skipped — the follow itself (shelf, feed) is
+    // unaffected; only this fan-out honours the flag.
+    let followers: Vec<FollowerRow> = sqlx::query_as(
+        "SELECT f.user_id, u.phone FROM store_follows f \
+         JOIN users u ON u.id = f.user_id \
+         WHERE f.store_id = $1 AND f.notify_new_products \
+         ORDER BY f.created_at ASC",
+    )
+    .bind(product.store_id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| ApiError::internal("load store followers for notice", e))?;
+
+    let payload = json!({
+        "store_id": product.store_id.to_string(),
+        "store_name": product.store_name,
+        "product_id": product_id.to_string(),
+        "product_title": product.product_title,
+    });
+    let mut queued: i64 = 0;
+    for follower in &followers {
+        notify::enqueue(
+            &mut *conn,
+            follower.user_id,
+            &follower.phone,
+            domain::NOTIFICATION_STORE_NEW_PRODUCT,
+            &payload,
+        )
+        .await
+        .map_err(|e| ApiError::internal("enqueue new-product notification", e))?;
+        queued += 1;
+    }
+    Ok(queued)
+}
+
+/// Queue the `store_flash_sale` notice for the followers
+/// of the stores behind a batch of products that have
+/// JUST joined a live flash sale (Wave 54 extension). One
+/// row per (follower, product): a follower of two stores
+/// in the same sale hears about each store's product,
+/// which is the same per-store honesty as the
+/// new-product fan-out. Muted follows are skipped by the
+/// same flag. The caller (the merch item-set write)
+/// decides which products are new and whether the sale is
+/// live; this funnel only fans out. Returns how many
+/// notices were queued.
+pub async fn enqueue_store_flash_sale_notices(
+    conn: &mut PgConnection,
+    sale_id: Uuid,
+    sale_title: &str,
+    product_ids: &[Uuid],
+) -> Result<i64, ApiError> {
+    if product_ids.is_empty() {
+        return Ok(0);
+    }
+    #[derive(FromRow)]
+    struct SaleNoticeRow {
+        user_id: Uuid,
+        phone: String,
+        store_id: Uuid,
+        store_name: String,
+        product_id: Uuid,
+        product_title: String,
+    }
+    let rows: Vec<SaleNoticeRow> = sqlx::query_as(
+        "SELECT f.user_id, u.phone, s.id AS store_id, \
+                s.name AS store_name, p.id AS product_id, \
+                p.title AS product_title \
+         FROM products p \
+         JOIN stores s ON s.id = p.store_id \
+         JOIN store_follows f ON f.store_id = s.id \
+         JOIN users u ON u.id = f.user_id \
+         WHERE p.id = ANY($1) AND f.notify_new_products \
+         ORDER BY f.created_at ASC",
+    )
+    .bind(product_ids)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| ApiError::internal("load flash-sale notice recipients", e))?;
+
+    let mut queued: i64 = 0;
+    for row in &rows {
+        let payload = json!({
+            "store_id": row.store_id.to_string(),
+            "store_name": row.store_name,
+            "product_id": row.product_id.to_string(),
+            "product_title": row.product_title,
+            "sale_title": sale_title,
+            "flash_sale_id": sale_id.to_string(),
+        });
+        notify::enqueue(
+            &mut *conn,
+            row.user_id,
+            &row.phone,
+            domain::NOTIFICATION_STORE_FLASH_SALE,
+            &payload,
+        )
+        .await
+        .map_err(|e| ApiError::internal("enqueue flash-sale notification", e))?;
+        queued += 1;
+    }
+    Ok(queued)
 }
 
 /// Queue the `payout_paid` notice for a store's owner: the

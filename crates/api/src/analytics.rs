@@ -217,6 +217,22 @@ pub struct AdminAnalyticsTotals {
     pub payouts: AdminPayoutTotals,
     pub charges_poisha: i64,
     pub coupons: AdminCouponTotals,
+    /// Wave 54's community surfaces, counted in the same
+    /// window style as the rest of the block.
+    pub community: AdminCommunityTotals,
+}
+
+/// The Wave 54 community totals (admin analytics):
+/// follows are counted all-time AND in the window (the
+/// graph's size vs its growth), muted follows are the
+/// all-time count of follows with notices off, and
+/// store collections are the all-time shelf count.
+#[derive(Debug, Serialize)]
+pub struct AdminCommunityTotals {
+    pub total_follows: i64,
+    pub new_follows: i64,
+    pub muted_follows: i64,
+    pub store_collections: i64,
 }
 
 /// One top store of the window, by GMV.
@@ -491,6 +507,10 @@ pub async fn admin_analytics(pool: &PgPool, days: i64) -> Result<AdminAnalytics,
         charges_poisha: i64,
         coupon_redemptions: i64,
         coupon_discount_poisha: i64,
+        total_follows: i64,
+        new_follows: i64,
+        muted_follows: i64,
+        store_collections: i64,
     }
 
     let totals: TotalsRow = sqlx::query_as(&format!(
@@ -530,7 +550,17 @@ pub async fn admin_analytics(pool: &PgPool, days: i64) -> Result<AdminAnalytics,
              AS coupon_redemptions, \
            (SELECT COALESCE(SUM(discount_poisha), 0)::bigint \
               FROM coupon_redemptions WHERE created_at >= {WINDOW_START}) \
-             AS coupon_discount_poisha"
+             AS coupon_discount_poisha, \
+           (SELECT COUNT(*) FROM store_follows) \
+             AS total_follows, \
+           (SELECT COUNT(*) FROM store_follows \
+             WHERE created_at >= {WINDOW_START}) \
+             AS new_follows, \
+           (SELECT COUNT(*) FROM store_follows \
+             WHERE NOT notify_new_products) \
+             AS muted_follows, \
+           (SELECT COUNT(*) FROM store_collections) \
+             AS store_collections"
     ))
     .bind(days)
     .fetch_one(pool)
@@ -601,6 +631,12 @@ pub async fn admin_analytics(pool: &PgPool, days: i64) -> Result<AdminAnalytics,
             coupons: AdminCouponTotals {
                 redemptions: totals.coupon_redemptions,
                 discount_poisha: totals.coupon_discount_poisha,
+            },
+            community: AdminCommunityTotals {
+                total_follows: totals.total_follows,
+                new_follows: totals.new_follows,
+                muted_follows: totals.muted_follows,
+                store_collections: totals.store_collections,
             },
         },
         top_stores,

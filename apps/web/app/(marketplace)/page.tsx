@@ -2,6 +2,7 @@ import Link from "next/link";
 import AdminLink from "@/components/AdminLink";
 import InstallAppButton from "@/components/InstallAppButton";
 import DeliveryChargeWidget from "@/components/DeliveryChargeWidget";
+import FollowsFeedRail from "@/components/FollowsFeedRail";
 import HomeDiscovery from "@/components/HomeDiscovery";
 import HomeFeed from "@/components/HomeFeed";
 import ProductGrid from "@/components/ProductGrid";
@@ -38,6 +39,10 @@ export default function MarketplaceHomePage() {
         {" · "}
         <Link href="/saved-searches">সংরক্ষিত খোঁজ — Saved searches</Link>
         {" · "}
+        <Link href="/following">ফলো করা স্টোর — Following</Link>
+        {" · "}
+        <Link href="/notifications">নোটিফিকেশন — Notifications</Link>
+        {" · "}
         <Link href="/orders">আমার অর্ডার — My orders</Link>
         {" · "}
         <Link href="/track">অর্ডার ট্র্যাক — Track order</Link>
@@ -54,6 +59,10 @@ export default function MarketplaceHomePage() {
       <SearchBar />
 
       <HomeFeed />
+
+      {/* Wave 54 extension: the visitor's own follow rail
+          (renders nothing signed-out or following nothing). */}
+      <FollowsFeedRail />
 
       <HomeDiscovery />
 

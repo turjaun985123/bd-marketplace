@@ -102,6 +102,12 @@ function Analytics() {
           {" · "}পরিশোধিত: <PriceTag amountPoisha={totals.payouts.paid_poisha} />
         </p>
         <p>
+          ফলো (Wave 54): মোট <strong>{totals.community.total_follows}</strong>
+          {" · "}এই সময়ে নতুন <strong>{totals.community.new_follows}</strong>
+          {" · "}নোটিফিকেশন বন্ধ <strong>{totals.community.muted_follows}</strong>
+          {" · "}স্টোর কালেকশন <strong>{totals.community.store_collections}</strong>
+        </p>
+        <p>
           <small>
             সংজ্ঞা: অর্ডার = এই সময়ে তৈরি মূল অর্ডার; সাব-অর্ডার = বাতিলসহ
             সব বিক্রেতা-ভাগ; পে-আউট ও চার্জ = এই সময়ে তৈরি রেকর্ড।

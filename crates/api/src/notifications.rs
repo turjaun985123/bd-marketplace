@@ -139,3 +139,167 @@ pub async fn list_notifications_handler(
         list_notifications(pool, query.status.as_deref(), query.limit).await?,
     ))
 }
+
+// ---------------------------------------------------------------------------
+// The user's own inbox (Wave 54 extension)
+// ---------------------------------------------------------------------------
+//
+// The admin view above watches the QUEUE; this is the
+// other side of the same table — the signed-in user's
+// own notifications as an in-app inbox (the follow
+// feature's new-product notices land here, alongside
+// order and payout notices). A row is the user's copy:
+// they see its rendered body in full (it was written for
+// them) and mark it read; `read_at` (migration 0054) is
+// their state and never touches delivery.
+
+/// One notification in the owner's inbox: the rendered
+/// body, its delivery status, and the owner's read state.
+#[derive(Debug, Serialize, FromRow)]
+pub struct UserNotification {
+    pub id: Uuid,
+    pub kind: String,
+    pub body: String,
+    /// pending | sending | sent | failed (delivery, not read state)
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub sent_at: Option<DateTime<Utc>>,
+    pub read_at: Option<DateTime<Utc>>,
+}
+
+/// One page of the owner's inbox plus their unread total
+/// (over ALL their rows, not just this page — the badge
+/// number).
+#[derive(Debug, Serialize)]
+pub struct UserNotificationList {
+    pub items: Vec<UserNotification>,
+    pub total: i64,
+    pub unread_count: i64,
+    pub page: i64,
+    pub limit: i64,
+}
+
+/// The owner's inbox, newest first. Ownership is the
+/// WHERE clause: a user can only ever read their own
+/// rows, so there is no per-row check to forget.
+pub async fn list_user_notifications(
+    pool: &PgPool,
+    user: &AuthUser,
+    page: Option<i64>,
+    limit: Option<i64>,
+) -> Result<UserNotificationList, ApiError> {
+    let (page, limit) = crate::products::clamp_pagination(page, limit);
+    let offset = (page - 1) * limit;
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notifications WHERE user_id = $1")
+        .bind(user.user_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| ApiError::internal("count user notifications", e))?;
+    let unread_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notifications WHERE user_id = $1 AND read_at IS NULL",
+    )
+    .bind(user.user_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::internal("count unread notifications", e))?;
+    let items: Vec<UserNotification> = sqlx::query_as(
+        "SELECT id, kind, body, status, created_at, sent_at, read_at \
+         FROM notifications WHERE user_id = $1 \
+         ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3",
+    )
+    .bind(user.user_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::internal("list user notifications", e))?;
+    Ok(UserNotificationList {
+        items,
+        total,
+        unread_count,
+        page,
+        limit,
+    })
+}
+
+/// Mark ONE of the owner's notifications read. Idempotent:
+/// the first read time stands (COALESCE), and marking a
+/// row that is not the owner's (or does not exist) is a
+/// 404 — the row is simply not in their inbox.
+pub async fn mark_notification_read(
+    pool: &PgPool,
+    user: &AuthUser,
+    notification_id: Uuid,
+) -> Result<UserNotification, ApiError> {
+    sqlx::query_as::<_, UserNotification>(
+        "UPDATE notifications SET read_at = COALESCE(read_at, now()) \
+         WHERE id = $1 AND user_id = $2 \
+         RETURNING id, kind, body, status, created_at, sent_at, read_at",
+    )
+    .bind(notification_id)
+    .bind(user.user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ApiError::internal("mark notification read", e))?
+    .ok_or_else(|| ApiError::not_found("notification not found"))
+}
+
+/// Mark every unread notification of the owner's read;
+/// returns how many rows changed.
+pub async fn mark_all_notifications_read(
+    pool: &PgPool,
+    user: &AuthUser,
+) -> Result<i64, ApiError> {
+    let result = sqlx::query(
+        "UPDATE notifications SET read_at = now() \
+         WHERE user_id = $1 AND read_at IS NULL",
+    )
+    .bind(user.user_id)
+    .execute(pool)
+    .await
+    .map_err(|e| ApiError::internal("mark all notifications read", e))?;
+    Ok(result.rows_affected() as i64)
+}
+
+#[derive(Deserialize)]
+pub struct UserNotificationsQuery {
+    pub page: Option<i64>,
+    pub limit: Option<i64>,
+}
+
+pub async fn list_user_notifications_handler(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(query): Query<UserNotificationsQuery>,
+) -> Result<Json<UserNotificationList>, ApiError> {
+    let pool = state.require_pool()?;
+    Ok(Json(
+        list_user_notifications(pool, &user, query.page, query.limit).await?,
+    ))
+}
+
+pub async fn mark_notification_read_handler(
+    State(state): State<AppState>,
+    user: AuthUser,
+    axum::extract::Path(notification_id): axum::extract::Path<Uuid>,
+) -> Result<Json<UserNotification>, ApiError> {
+    let pool = state.require_pool()?;
+    Ok(Json(
+        mark_notification_read(pool, &user, notification_id).await?,
+    ))
+}
+
+/// The mark-all response: how many rows were newly read.
+#[derive(Debug, Serialize)]
+pub struct MarkAllReadResult {
+    pub marked_read: i64,
+}
+
+pub async fn mark_all_notifications_read_handler(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Json<MarkAllReadResult>, ApiError> {
+    let pool = state.require_pool()?;
+    let marked_read = mark_all_notifications_read(pool, &user).await?;
+    Ok(Json(MarkAllReadResult { marked_read }))
+}

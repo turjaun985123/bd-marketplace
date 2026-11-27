@@ -378,6 +378,10 @@ pub struct AdminStore {
     /// The store's logo URL (Wave 51 extension) — the
     /// admin list shows the mark it moderates.
     pub logo_url: Option<String>,
+    /// The store's follower count (Wave 54) — the admin
+    /// list shows the audience a moderation decision
+    /// affects.
+    pub follower_count: i64,
     pub created_at: DateTime<Utc>,
 }
 
@@ -417,7 +421,9 @@ pub async fn list_stores(
         "SELECT s.id, s.owner_user_id, u.phone AS owner_phone, s.slug, s.name, \
          s.description, s.status, \
          (SELECT COUNT(*) FROM products p WHERE p.store_id = s.id) AS product_count, \
-         s.logo_url, s.created_at \
+         s.logo_url, \
+         (SELECT COUNT(*) FROM store_follows f WHERE f.store_id = s.id) AS follower_count, \
+         s.created_at \
          FROM stores s JOIN users u ON u.id = s.owner_user_id \
          WHERE ($1::text IS NULL OR s.name ILIKE $1 OR s.slug ILIKE $1) \
          ORDER BY s.created_at DESC LIMIT $2 OFFSET $3",
@@ -461,7 +467,8 @@ pub async fn set_store_status(
         "UPDATE stores SET status = $2 WHERE id = $1 \
          RETURNING id, owner_user_id, slug, name, description, status, \
          facebook_page_id, facebook_page_name, sidra_auto_reply, \
-         theme_key, brand_color, logo_url, banner_url, announcement, verified_tier, created_at",
+         theme_key, brand_color, logo_url, banner_url, announcement, verified_tier, \
+         about, return_policy, created_at",
     )
     .bind(store_id)
     .bind(status)
@@ -868,6 +875,17 @@ pub struct AdminSettings {
     /// extension) — see
     /// `product_images::effective_media_limits`.
     pub media_store_quota_mb: i64,
+    /// Delivery-time estimate for Inside Dhaka, in days
+    /// (Wave 54): [earliest, latest] — see the
+    /// `delivery_estimates` module. Serialized as a
+    /// two-element array.
+    pub delivery_days_inside_dhaka: (i64, i64),
+    /// Delivery-time estimate for the Dhaka suburbs
+    /// (Wave 54), [earliest, latest] days.
+    pub delivery_days_dhaka_suburb: (i64, i64),
+    /// Delivery-time estimate for outside Dhaka
+    /// (Wave 54), [earliest, latest] days.
+    pub delivery_days_outside_dhaka: (i64, i64),
     pub platform_name: &'static str,
 }
 
@@ -883,6 +901,12 @@ pub async fn get_settings(state: &AppState) -> AdminSettings {
             store_quota_bytes: domain::MAX_STORE_MEDIA_BYTES,
         },
     };
+    // Wave 54 extension: the delivery-time estimates live
+    // in the delivery_estimates module (their resolution
+    // home); the settings view surfaces them like every
+    // other rule.
+    let delivery_ranges =
+        crate::delivery_estimates::effective_delivery_day_ranges(state.pool.as_ref()).await;
     AdminSettings {
         commission_bps: i64::from(effective_commission_bps(state).await),
         min_payout_poisha: effective_min_payout(state).await,
@@ -896,6 +920,9 @@ pub async fn get_settings(state: &AppState) -> AdminSettings {
         plan_free_product_cap: effective_plan_free_product_cap(state).await,
         media_max_images_per_product: media_limits.max_images_per_product,
         media_store_quota_mb: media_limits.store_quota_bytes / (1024 * 1024),
+        delivery_days_inside_dhaka: delivery_ranges[0].1,
+        delivery_days_dhaka_suburb: delivery_ranges[1].1,
+        delivery_days_outside_dhaka: delivery_ranges[2].1,
         platform_name: PLATFORM_NAME,
     }
 }
@@ -1060,6 +1087,38 @@ pub async fn update_settings(
         save_setting(&mut *tx, PLAN_FREE_PRODUCT_CAP_KEY, free_cap).await?;
         changed_keys.push(PLAN_FREE_PRODUCT_CAP_KEY);
     }
+    // Wave 54: the three delivery-time estimate ranges.
+    // Each is validated by the domain rule and stored in
+    // its `"<min>-<max>"` text form under its zone key —
+    // the estimate endpoint resolves them back through
+    // the same domain parser.
+    for (range, key) in [
+        (
+            input.delivery_days_inside_dhaka,
+            domain::DELIVERY_DAYS_INSIDE_DHAKA_KEY,
+        ),
+        (
+            input.delivery_days_dhaka_suburb,
+            domain::DELIVERY_DAYS_DHAKA_SUBURB_KEY,
+        ),
+        (
+            input.delivery_days_outside_dhaka,
+            domain::DELIVERY_DAYS_OUTSIDE_DHAKA_KEY,
+        ),
+    ] {
+        if let Some((min_days, max_days)) = range {
+            let (min_days, max_days) =
+                domain::validate_delivery_day_range(min_days, max_days)
+                    .map_err(ApiError::bad_request)?;
+            save_setting_text(
+                &mut *tx,
+                key,
+                &domain::format_delivery_day_range(min_days, max_days),
+            )
+            .await?;
+            changed_keys.push(key);
+        }
+    }
     if !changed_keys.is_empty() {
         record_admin_action(
             &mut *tx,
@@ -1153,6 +1212,17 @@ pub struct UpdateSettingsInput {
     /// Wave 51 extension: per-store media quota override
     /// in megabytes, validated by the domain rule.
     pub media_store_quota_mb: Option<i64>,
+    /// Wave 54: Inside Dhaka delivery-time estimate
+    /// override, [earliest, latest] days, validated by
+    /// `domain::validate_delivery_day_range` and stored in
+    /// the `"<min>-<max>"` text form.
+    pub delivery_days_inside_dhaka: Option<(i64, i64)>,
+    /// Wave 54: Dhaka suburb delivery-time estimate
+    /// override, [earliest, latest] days.
+    pub delivery_days_dhaka_suburb: Option<(i64, i64)>,
+    /// Wave 54: outside-Dhaka delivery-time estimate
+    /// override, [earliest, latest] days.
+    pub delivery_days_outside_dhaka: Option<(i64, i64)>,
 }
 
 // ---------------------------------------------------------------------------

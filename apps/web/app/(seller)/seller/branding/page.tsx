@@ -60,6 +60,9 @@ export default function SellerBrandingPage() {
   const [bannerUrl, setBannerUrl] = useState("");
   const [announcement, setAnnouncement] = useState("");
   const [description, setDescription] = useState("");
+  // Wave 54: the store's long-form texts.
+  const [about, setAbout] = useState("");
+  const [returnPolicy, setReturnPolicy] = useState("");
 
   const fillForm = useCallback((s: Store) => {
     setStore(s);
@@ -69,6 +72,8 @@ export default function SellerBrandingPage() {
     setBannerUrl(s.banner_url ?? "");
     setAnnouncement(s.announcement ?? "");
     setDescription(s.description ?? "");
+    setAbout(s.about ?? "");
+    setReturnPolicy(s.return_policy ?? "");
   }, []);
 
   useEffect(() => {
@@ -126,6 +131,8 @@ export default function SellerBrandingPage() {
         banner_url: bannerUrl.trim(),
         announcement: announcement.trim(),
         description: description.trim(),
+        about: about.trim(),
+        return_policy: returnPolicy.trim(),
       });
       fillForm(saved);
       setMessage("স্টোরের সাজসজ্জা সেভ হয়েছে। (Branding saved.)");
@@ -306,6 +313,38 @@ export default function SellerBrandingPage() {
               value={description}
               onChange={(e) => setDescription(e.target.value)}
               rows={4}
+              cols={60}
+            />
+          </label>
+
+          <h2>স্টোর সম্পর্কে বিস্তারিত — About the store (Wave 54)</h2>
+          <p>
+            স্টোরফ্রন্টের নিচে দেখানো দীর্ঘ লেখা — স্টোরের গল্প, মানের
+            প্রতিশ্রুতি, যা খুশি। খালি রাখলে অংশটি দেখানো হবে না।
+          </p>
+          <label>
+            স্টোর সম্পর্কে (সর্বোচ্চ ২০০০ অক্ষর) — {charCount(about)}/2000
+            <textarea
+              value={about}
+              onChange={(e) => setAbout(e.target.value)}
+              rows={8}
+              cols={60}
+            />
+          </label>
+
+          <h2>রিটার্ন নীতি — Return policy (Wave 54)</h2>
+          <p>
+            এই স্টোরের নিজের রিটার্নের শর্ত — প্ল্যাটফর্মের রিটার্ন
+            প্রক্রিয়া (Wave 27) যেমন আছে তেমনই থাকে; এই লেখাটি ক্রেতাকে
+            স্টোরের শর্ত আগেই জানায়। খালি রাখলে অংশটি দেখানো হবে না।
+          </p>
+          <label>
+            রিটার্ন নীতি (সর্বোচ্চ ২০০০ অক্ষর) —{" "}
+            {charCount(returnPolicy)}/2000
+            <textarea
+              value={returnPolicy}
+              onChange={(e) => setReturnPolicy(e.target.value)}
+              rows={6}
               cols={60}
             />
           </label>

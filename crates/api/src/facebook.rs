@@ -398,6 +398,15 @@ pub async fn import_products_for_owner(
     for (product, _image_url) in &ready {
         created_ids.push(insert_product(&mut *tx, product).await?);
     }
+    // Wave 54: imported products are born `active`
+    // (IMPORTED_PRODUCT_STATUS), so each one is a publish:
+    // the store's followers get the `store_new_product`
+    // notice in the same commit, exactly as for a manual
+    // create. (Skipped drafts were filtered out above —
+    // only `ready` rows reach this loop.)
+    for id in &created_ids {
+        crate::notices::enqueue_store_new_product_notices(&mut tx, *id).await?;
+    }
     tx.commit()
         .await
         .map_err(|e| ApiError::internal("commit import", e))?;

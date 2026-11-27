@@ -4269,6 +4269,172 @@ Worked example (unit-tested in `crates/domain`): goods ৳4,450 + delivery
 ৳240 = ৳4,690 payable; 8% commission on the goods subtotal only = ৳356;
 sellers receive ৳4,094.
 
+Wave 54 (product page v2 + storefront v2 — the
+Shopify-parity program continues):
+
+**Buyers can follow stores, and the two pages a buyer
+actually shops from — the product page and the
+storefront — grow their missing halves.** Following is
+one table (migration 0051, `store_follows`, PK
+`(user_id, store_id)` — the primary key IS the
+idempotency guard) behind `POST`/`DELETE
+/v1/stores/{slug}/follow`: following your own store is a
+bilingual 400 (the domain rule `can_follow_store`), a
+signed-in buyer may follow at most 200 stores (a cap on
+notification fan-out cost, enforced by the domain), and
+both verbs return the store's fresh `FollowState`
+(`following` + `follower_count`) so clients render the
+server's answer, never an optimistic guess. The public
+store view (`GET /v1/stores/{slug}`) gains
+`follower_count` + `is_following` for the viewer, plus
+the trust aggregates the storefront header prints:
+`rating_avg`/`rating_count` over ALL the store's
+products' reviews, `total_sold` (delivered units),
+`product_count`. `GET /v1/follows` is the buyer's shelf:
+their followed stores (suspended stores hidden — the
+follow survives a suspension and returns on
+reinstatement), each with its four newest active
+products attached by one window-function query.
+`GET /v1/seller/followers` lists the seller's own
+followers with masked displays (a follow is a
+subscription, not a contact list); the admin store list
+gains `follower_count`; the buyer export gains a
+`followed_stores` section.
+
+**A publish notifies the followers.** When a product
+BECOMES active — created active, a draft published, or a
+Facebook import (imports are born active) — one funnel
+(`enqueue_store_new_product_notices` in `notices.rs`,
+called inside the publishing transaction) enqueues one
+Wave 29 outbox row per follower under the new kind
+`store_new_product`; the rendered body names the store
+and the product. Editing an already-live product never
+re-notifies. The worker needs no change: bodies render
+at enqueue time and the outbox drains kinds generically.
+
+**Storefront v2.** The store home and shop header gain
+the trust line (rating, sold, followers, products,
+joined) and the follow button; the store's own category
+tiles are read from the faceted browse's category facet
+scoped to the store, so a tile can never advertise an
+empty shelf, and each deep-links into the shop page with
+the category applied. Sellers write two long-form texts
+— `about` and `return_policy` (migration 0052, nullable
+columns on `stores`, 2,000-character caps validated in
+the domain, edited in the branding page under the
+established convention: absent keeps, blank clears) —
+and the storefront prints them as sections when set.
+`GET /v1/stores/{slug}/reviews` is the store's
+all-reviews page data (every review of every product,
+product titles attached, seller replies inline; reviews
+of since-retired products stay listed — they were real
+purchases), and `GET /v1/stores/{slug}/rating-summary`
+the store-wide distribution.
+
+**Product page v2.** Breadcrumbs (Home / Category /
+Store / Title) with matching BreadcrumbList JSON-LD
+alongside the extended Product JSON-LD. The delivery
+block: the buyer picks a zone (persisted on the device
+in localStorage — a browsing preference, not account
+data) and `GET /v1/delivery-estimate?zone=&weight_grams=`
+answers with the Wave 1 charge rule for one parcel of
+that weight plus the zone's delivery-time range. The
+ranges are platform settings (`delivery_days_inside_dhaka`
+etc., stored as `min-max` text) read DB > built-in
+default (Dhaka 1–2, suburb 2–3, outside 3–5) — the
+Wave 21 KYC-gate precedent: there is deliberately no env
+layer — and the admin settings page edits all three,
+validated by the domain rule (whole days, 0–30, earliest
+not after latest). The ranges are display promises only;
+they never move a charge. The stock urgency line follows
+the API's own `stock_status` (the seller's low-stock
+threshold included) for the base product and the
+small-number rule for a picked variant; the number shown
+is always the real stock. Rating summaries come from
+`GET /v1/products/{id}/rating-summary` (and the store
+twin): counts per star with FLOORED percents — bars never
+overstate — plus the photographed-review count. The
+review list takes `?sort=newest|highest|lowest|photos`
+(validated in the domain; anything else is a 400); the
+page adds a photo strip of the listed reviews' photos,
+the variant picker shows each variant's own photo and
+its price delta, the share row uses the device share
+sheet or copies the link (nothing is posted or counted
+by the platform), buy-now adds the item and goes to the
+cart (the platform's one purchase path — no parallel
+checkout), and a sticky buy bar pins the same
+flash-aware price and the same actions once the buyer
+scrolls past the buy block. "More from this store"
+(best sellers, this product excluded) joins the related
+and also-bought rails.
+
+**The extension scope.** Sellers curate their own
+collections (migration 0053 — distinct from the Wave 52
+platform collections): slug/title/description under the
+domain's validators, a 20-per-store cap, and an ordered
+membership the seller replaces wholesale (duplicates
+collapse, every product must be the store's own, the
+swap is one transaction; public reads show active
+members in the seller's order, drafts stay members but
+invisible). The storefront renders the shelves as tiles
+and each shelf gets a public page under the store. The
+follow graph gains its reading surfaces: `GET
+/v1/follows/feed` (the newest products across followed
+stores — the home page's personal rail), `GET
+/v1/follows/suggested` (active stores ranked by real
+follower counts and ratings, excluding the viewer's own
+and already-followed — no paid placement), and `GET
+/v1/seller/followers/stats` (the total, 7/30-day gains
+and a zero-filled 30-day daily series in Asia/Dhaka
+dates, graphed on the seller followers page). And the
+outbox gains its owner-side read: the buyer's
+notification inbox (`GET /v1/notifications`, migration
+0054's `read_at` — the user's state on their copy,
+never a delivery input) with mark-one-read and
+mark-all-read, at `/notifications`, with an unread bell
+in the marketplace frame.
+
+**The second extension round.** Reviews gain helpful
+votes (migration 0055): one vote per signed-in user per
+review, the author cannot vote on their own review,
+cast/retract are idempotent and return the fresh state,
+the count rides every review view, and `helpful` joins
+the review sorts on the product page and the store
+reviews page. Follows gain a per-follow mute (migration
+0056's `notify_new_products`, PATCH on the follow
+endpoint): muting keeps the follow — the shelf and the
+feed — and stops only the notices; the toggle lives on
+the /following cards, and sellers and admins see who
+muted in their follower lists. The same flag gates the
+new `store_flash_sale` notice: when the admin item-set
+of a sale that is LIVE at that moment gains a product,
+the unmuted followers of its store are alerted once —
+re-saving the same set is silent, and items staged into
+a future sale alert nobody at staging time — they alert
+only if the item set is saved again while the sale is
+live; the honest limit is stated plainly rather than
+hidden.
+Questions gain an answered-first sort and the list
+envelope reports how many visible questions still await
+the seller. Admin gains the per-store follower list
+(`/v1/admin/stores/:id/followers`, linked from the
+stores table) and the analytics totals gain a community
+block (total/new/muted follows, store collections). The
+cart page reuses the delivery estimate block over the
+cart's total parcel weight.
+
+Honest limits: the follow cap (200) is enforced on the
+follow write only; the delivery day ranges are the
+platform's published promises, not per-courier tracking
+estimates (courier ETAs remain the couriers' own data);
+review photos in the strip come from the currently
+listed page of reviews, not a separate all-photos index;
+the sticky bar appears after a fixed scroll threshold,
+not by observing the buy block; store suggestions rank
+by followers then ratings only — there is no
+personalisation model behind them, and the label says
+exactly what they are.
+
 ## How to run
 
 With a database (Wave 2 features):
@@ -5751,6 +5917,35 @@ overview card), the /browse page with the shared
 FilterPanel/BrowseResults, the suggest-v2 SearchBar
 dropdown, and the snapshot-based recently-viewed rails.
 See the Wave 53 section.
+
+**Real (Wave 54):** store follows (migration 0051,
+follow/unfollow + public counts + `/v1/follows` +
+seller followers + admin follower counts + buyer-export
+section), the `store_new_product` outbox notification on
+every publish funnel (create-active, draft-to-active,
+Facebook import), store profile texts (migration 0052
+`about`/`return_policy` + branding UI + storefront
+sections), the public store aggregates (rating / sold /
+products), rating summaries with floored distributions
+(product + store), review sorts, the store all-reviews
+list, the delivery estimate endpoint (Wave 1 charges +
+settings-driven day ranges, admin-editable), and the
+product page v2 (breadcrumbs + JSON-LD, delivery block,
+variant thumbnails + deltas, photo strip, share row,
+buy-now, sticky buy bar, same-store rail) with the
+/following page — plus the extension scope: seller
+store collections (migration 0053 + seller editor +
+storefront shelves + public shelf pages), the follows
+feed + store suggestions + seller follower statistics,
+and the buyer's notification inbox (migration 0054
+read state) — plus the second extension round: review
+helpful votes (migration 0055 + `helpful` sort), the
+per-follow notice mute (migration 0056), `store_flash_sale`
+follower alerts on live-sale item changes, the Q&A
+answered-first sort + unanswered count, the admin
+per-store follower list, the analytics community totals,
+the header notification bell, and the cart-page delivery
+estimate. See the Wave 54 section.
 
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real

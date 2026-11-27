@@ -623,8 +623,19 @@ pub async fn create_product_for_owner(
         )));
     }
 
+    // Wave 54: the insert runs in a transaction so a
+    // product born `active` announces itself to the
+    // store's followers in the SAME commit (the
+    // `store_new_product` outbox funnel) — a follower can
+    // never be notified of a product that rolled back,
+    // and a published product's notice can never be lost
+    // to a crash between the two writes.
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| ApiError::internal("begin create product", e))?;
     let id = insert_product(
-        pool,
+        &mut *tx,
         &NewProduct {
             store_id: input.store_id,
             title: input.title.clone(),
@@ -641,6 +652,12 @@ pub async fn create_product_for_owner(
         },
     )
     .await?;
+    if input.status == "active" {
+        crate::notices::enqueue_store_new_product_notices(&mut tx, id).await?;
+    }
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::internal("commit create product", e))?;
 
     get_product_by_id(pool, id).await
 }
@@ -718,6 +735,18 @@ pub async fn update_product_for_owner(
     // would corrupt the stored fallback. Stock moves only
     // through the audited paths, so the column is simply not
     // this statement's business.
+    //
+    // Wave 54: the UPDATE runs in a transaction so a PATCH
+    // that moves the product INTO `active` (from draft or
+    // archived) announces it to the store's followers in
+    // the same commit. The comparison is against the
+    // status loaded BEFORE the write: a product that was
+    // already active and stays active is an edit, not a
+    // publish, and never re-notifies.
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| ApiError::internal("begin update product", e))?;
     sqlx::query(
         "UPDATE products SET title = $2, title_bn = $3, description = $4, \
          price_poisha = $5, compare_at_poisha = $6, status = $7, \
@@ -732,9 +761,15 @@ pub async fn update_product_for_owner(
     .bind(&merged.status)
     .bind(merged_weight_grams)
     .bind(&merged_category)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| ApiError::internal("update product", e))?;
+    if existing.status != "active" && merged.status == "active" {
+        crate::notices::enqueue_store_new_product_notices(&mut tx, id).await?;
+    }
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::internal("commit update product", e))?;
 
     get_product_by_id(pool, id).await
 }

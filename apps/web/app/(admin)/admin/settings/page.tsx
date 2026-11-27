@@ -46,6 +46,14 @@ function Settings() {
   const [promotionPriceTaka, setPromotionPriceTaka] = useState("");
   const [mediaMaxImages, setMediaMaxImages] = useState("");
   const [mediaQuotaMb, setMediaQuotaMb] = useState("");
+  // Wave 54: the per-zone delivery-time ranges, as six
+  // day fields (earliest/latest per zone).
+  const [daysInsideMin, setDaysInsideMin] = useState("");
+  const [daysInsideMax, setDaysInsideMax] = useState("");
+  const [daysSuburbMin, setDaysSuburbMin] = useState("");
+  const [daysSuburbMax, setDaysSuburbMax] = useState("");
+  const [daysOutsideMin, setDaysOutsideMin] = useState("");
+  const [daysOutsideMax, setDaysOutsideMax] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -64,6 +72,12 @@ function Settings() {
       );
       setMediaMaxImages(String(current.media_max_images_per_product));
       setMediaQuotaMb(String(current.media_store_quota_mb));
+      setDaysInsideMin(String(current.delivery_days_inside_dhaka[0]));
+      setDaysInsideMax(String(current.delivery_days_inside_dhaka[1]));
+      setDaysSuburbMin(String(current.delivery_days_dhaka_suburb[0]));
+      setDaysSuburbMax(String(current.delivery_days_dhaka_suburb[1]));
+      setDaysOutsideMin(String(current.delivery_days_outside_dhaka[0]));
+      setDaysOutsideMax(String(current.delivery_days_outside_dhaka[1]));
     } catch (err) {
       setMessage(err instanceof Error ? err.message : "সেটিংস লোড করা যায়নি।");
     }
@@ -111,6 +125,32 @@ function Settings() {
       setMessage("স্টোরের মিডিয়া কোটা ১০ থেকে ১০২৪০০ MB এর মধ্যে হতে হবে।");
       return;
     }
+    // Wave 54: each zone's range must be whole days,
+    // 0–30, earliest not after latest (the API enforces
+    // the same rule; this is the form's early answer).
+    const dayRanges: [string, string, string][] = [
+      [daysInsideMin, daysInsideMax, "ঢাকার ভিতরে"],
+      [daysSuburbMin, daysSuburbMax, "ঢাকার উপশহর"],
+      [daysOutsideMin, daysOutsideMax, "ঢাকার বাইরে"],
+    ];
+    const parsedRanges: [number, number][] = [];
+    for (const [minRaw, maxRaw, label] of dayRanges) {
+      const min = Number(minRaw);
+      const max = Number(maxRaw);
+      if (
+        !Number.isInteger(min) ||
+        !Number.isInteger(max) ||
+        min < 0 ||
+        max > 30 ||
+        min > max
+      ) {
+        setMessage(
+          `${label}: ডেলিভারির সময় ০–৩০ দিনের মধ্যে হতে হবে এবং শুরুর দিন শেষের দিনের পরে হতে পারবে না।`
+        );
+        return;
+      }
+      parsedRanges.push([min, max]);
+    }
     setBusy(true);
     setMessage(null);
     try {
@@ -123,6 +163,9 @@ function Settings() {
         promotion_price_per_day_poisha: promotionPoisha,
         media_max_images_per_product: maxImages,
         media_store_quota_mb: quotaMb,
+        delivery_days_inside_dhaka: parsedRanges[0],
+        delivery_days_dhaka_suburb: parsedRanges[1],
+        delivery_days_outside_dhaka: parsedRanges[2],
       });
       setSettings(updated);
       setMessage("সেটিংস সংরক্ষিত হয়েছে।");
@@ -215,6 +258,63 @@ function Settings() {
             inputMode="numeric"
           />
         </label>
+        <fieldset>
+          <legend>
+            ডেলিভারির আনুমানিক সময় (দিন) — Delivery time estimates (Wave 54)
+          </legend>
+          <p>
+            পণ্যের পেজে ক্রেতাকে দেখানো সময়সীমা — সবচেয়ে আগে ও সবচেয়ে
+            দেরিতে পৌঁছানোর দিন। চার্জের নিয়ম এতে বদলায় না।
+          </p>
+          <label>
+            ঢাকার ভিতরে — Inside Dhaka: থেকে (earliest)
+            <input
+              value={daysInsideMin}
+              onChange={(e) => setDaysInsideMin(e.target.value)}
+              inputMode="numeric"
+            />
+          </label>
+          <label>
+            পর্যন্ত (latest)
+            <input
+              value={daysInsideMax}
+              onChange={(e) => setDaysInsideMax(e.target.value)}
+              inputMode="numeric"
+            />
+          </label>
+          <label>
+            ঢাকার উপশহর — Dhaka suburb: থেকে (earliest)
+            <input
+              value={daysSuburbMin}
+              onChange={(e) => setDaysSuburbMin(e.target.value)}
+              inputMode="numeric"
+            />
+          </label>
+          <label>
+            পর্যন্ত (latest)
+            <input
+              value={daysSuburbMax}
+              onChange={(e) => setDaysSuburbMax(e.target.value)}
+              inputMode="numeric"
+            />
+          </label>
+          <label>
+            ঢাকার বাইরে — Outside Dhaka: থেকে (earliest)
+            <input
+              value={daysOutsideMin}
+              onChange={(e) => setDaysOutsideMin(e.target.value)}
+              inputMode="numeric"
+            />
+          </label>
+          <label>
+            পর্যন্ত (latest)
+            <input
+              value={daysOutsideMax}
+              onChange={(e) => setDaysOutsideMax(e.target.value)}
+              inputMode="numeric"
+            />
+          </label>
+        </fieldset>
         <button type="submit" disabled={busy}>
           সংরক্ষণ করুন
         </button>

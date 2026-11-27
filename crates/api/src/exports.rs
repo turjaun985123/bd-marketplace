@@ -360,6 +360,17 @@ struct ExportWishlistItem {
     created_at: DateTime<Utc>,
 }
 
+/// One followed store (Wave 54): the store's slug and
+/// name plus when the follow began — the buyer's own
+/// subscription record, exported like the wishlist.
+#[derive(Debug, FromRow, Serialize)]
+struct ExportFollowedStore {
+    store_id: Uuid,
+    slug: String,
+    name: String,
+    created_at: DateTime<Utc>,
+}
+
 /// One question the buyer asked, as stored (hidden ones
 /// included — it is the asker's own record).
 #[derive(Debug, FromRow, Serialize)]
@@ -456,6 +467,19 @@ pub async fn buyer_export(pool: &PgPool, user: &AuthUser) -> Result<ExportDownlo
     .await
     .map_err(|e| ApiError::internal("export questions", e))?;
 
+    // Wave 54: the buyer's followed stores ride the same
+    // document — a follow is the buyer's data exactly like
+    // a wishlist entry.
+    let followed_stores: Vec<ExportFollowedStore> = sqlx::query_as(
+        "SELECT f.store_id, s.slug, s.name, f.created_at \
+         FROM store_follows f JOIN stores s ON s.id = f.store_id \
+         WHERE f.user_id = $1 ORDER BY f.created_at DESC",
+    )
+    .bind(user.user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::internal("export followed stores", e))?;
+
     let now = Utc::now();
     let filename = export_filename("buyer", &profile.phone, &now.format("%Y%m%d").to_string());
     let document = json!({
@@ -466,6 +490,7 @@ pub async fn buyer_export(pool: &PgPool, user: &AuthUser) -> Result<ExportDownlo
         "reviews": reviews,
         "wishlist": wishlist,
         "questions": questions,
+        "followed_stores": followed_stores,
     });
     Ok(ExportDownload { filename, document })
 }

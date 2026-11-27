@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import PriceTag from "@/components/PriceTag";
 import SellerFlashCard from "@/components/SellerFlashCard";
+import SellerFollowersCard from "@/components/SellerFollowersCard";
 import StoreSwitcher from "@/components/StoreSwitcher";
 import {
   downloadSellerExport,
@@ -358,6 +359,10 @@ export default function SellerDashboardPage() {
         {" · "}
         <Link href="/seller/branding">স্টোরের সাজসজ্জা — Branding</Link>
         {" · "}
+        <Link href="/seller/followers">ফলোয়ার — Followers</Link>
+        {" · "}
+        <Link href="/seller/collections">কালেকশন — Collections</Link>
+        {" · "}
         <Link href="/seller/verification">স্টোর যাচাইকরণ — Verification</Link>
         {myRole !== "staff" && (
           <>
@@ -370,6 +375,9 @@ export default function SellerDashboardPage() {
       {/* Wave 52: the live flash sale, when it carries this
           seller's products (renders nothing otherwise). */}
       {token && <SellerFlashCard token={token} />}
+      {/* Wave 54 extension: the follower card (renders
+          nothing until the first follow). */}
+      {token && <SellerFollowersCard token={token} />}
       {dashboard !== null && dashboard.unanswered_questions > 0 && (
         <section>
           <div className="card">

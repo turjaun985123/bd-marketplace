@@ -2,12 +2,17 @@
 
 import { useEffect, useState, type CSSProperties } from "react";
 import Link from "next/link";
+import FollowButton from "./FollowButton";
 import MessageStoreButton from "./MessageStoreButton";
 import ProductGrid from "./ProductGrid";
+import StoreCategories from "./StoreCategories";
+import StoreCollections from "./StoreCollections";
+import StoreStats from "./StoreStats";
 import StorefrontSections from "./StorefrontSections";
 import SearchBar from "./SearchBar";
 import VerificationBadge from "./VerificationBadge";
-import { getStore, type Store } from "@/lib/api";
+import { useAuth } from "@/hooks/useAuth";
+import { getStore, type PublicStore } from "@/lib/api";
 
 /**
  * The ONE storefront view (Wave 18). The store's `theme_key`
@@ -28,12 +33,17 @@ import { getStore, type Store } from "@/lib/api";
  * image URLs, short texts) — never markup or CSS.
  */
 export default function StorefrontView({ slug }: { slug: string }) {
-  const [store, setStore] = useState<Store | null>(null);
+  // Wave 54: the public store view — follower count, the
+  // viewer's follow state and the trust aggregates ride
+  // the same read; the token makes the follow state the
+  // viewer's own.
+  const { token } = useAuth();
+  const [store, setStore] = useState<PublicStore | null>(null);
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
-    getStore(slug)
+    getStore(slug, token)
       .then((data) => {
         if (!cancelled) setStore(data);
       })
@@ -43,7 +53,7 @@ export default function StorefrontView({ slug }: { slug: string }) {
     return () => {
       cancelled = true;
     };
-  }, [slug]);
+  }, [slug, token]);
 
   if (failed) {
     return (
@@ -115,6 +125,18 @@ export default function StorefrontView({ slug }: { slug: string }) {
         কেন্দ্রীয় মার্কেটপ্লেসেও পাওয়া যায়।
       </p>
 
+      {/* Wave 54: the trust line (rating, sold, followers,
+          joined) and the follow action. */}
+      <StoreStats store={store} />
+      <p>
+        <FollowButton
+          slug={store.slug}
+          storeOwnerId={store.owner_user_id}
+          initialFollowing={store.is_following}
+          initialCount={store.follower_count}
+        />
+      </p>
+
       <MessageStoreButton slug={slug} />
       <SearchBar storeSlug={slug} />
       <p>
@@ -125,6 +147,10 @@ export default function StorefrontView({ slug }: { slug: string }) {
       {/* Wave 52: the store's merchandising sections (on
           sale / best sellers / new), above the full grid. */}
       <StorefrontSections slug={slug} />
+      {/* Wave 54 extension: the seller's own collections. */}
+      <StoreCollections slug={slug} />
+      {/* Wave 54: the store's own category tiles. */}
+      <StoreCategories slug={slug} />
       <h2>সব পণ্য — All products</h2>
       <ProductGrid
         storeSlug={slug}
@@ -132,6 +158,20 @@ export default function StorefrontView({ slug }: { slug: string }) {
           theme === "minimal" ? "list" : theme === "bold" ? "large" : "grid"
         }
       />
+      {/* Wave 54: the seller's own long-form texts, when
+          they have written them (seller settings). */}
+      {store.about && (
+        <section className="store-text-block">
+          <h2>স্টোর সম্পর্কে — About this store</h2>
+          <p className="store-long-text">{store.about}</p>
+        </section>
+      )}
+      {store.return_policy && (
+        <section className="store-text-block">
+          <h2>রিটার্ন নীতি — Return policy</h2>
+          <p className="store-long-text">{store.return_policy}</p>
+        </section>
+      )}
     </div>
   );
 }

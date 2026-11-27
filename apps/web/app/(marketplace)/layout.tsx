@@ -1,4 +1,5 @@
 import FlashStrip from "@/components/FlashStrip";
+import NotificationBell from "@/components/NotificationBell";
 
 /**
  * The marketplace route group's frame (Wave 52): the
@@ -16,6 +17,9 @@ export default function MarketplaceLayout({
   return (
     <>
       <FlashStrip />
+      {/* Wave 54 extension: the signed-in visitor's inbox
+          bell (unread badge) rides the marketplace frame. */}
+      <NotificationBell />
       {children}
     </>
   );

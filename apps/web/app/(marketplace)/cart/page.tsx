@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import DeliveryEstimate from "@/components/DeliveryEstimate";
 import PriceTag from "@/components/PriceTag";
 import ProductImage from "@/components/ProductImage";
 import { Badge } from "@/components/ui";
@@ -149,6 +150,16 @@ export default function CartPage() {
             ডেলিভারি চার্জ চেকআউটে বিক্রেতা অনুযায়ী হিসাব হবে। (Delivery is
             charged per seller at checkout.)
           </p>
+          {/* Wave 54 extension: the same estimate block as
+              the product page, over the cart's TOTAL parcel
+              weight — an orientation figure; checkout still
+              splits the charge per seller. */}
+          <DeliveryEstimate
+            weightGrams={items.reduce(
+              (sum, item) => sum + item.weight_grams * item.quantity,
+              0
+            )}
+          />
           <p>
             <Link href="/checkout">চেকআউটে যান — Checkout</Link>
             {" · "}

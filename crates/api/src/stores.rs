@@ -5,13 +5,14 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use chrono::{DateTime, Utc};
 use domain::{
     is_valid_slug, mask_phone, normalize_bd_phone, validate_announcement, validate_branding_url,
-    validate_hex_color, validate_store_description, validate_store_role, validate_theme_key,
+    validate_hex_color, validate_store_about, validate_store_description,
+    validate_store_return_policy, validate_store_role, validate_theme_key,
     STORE_ACTION_MANAGE_MARKETING, STORE_ACTION_MANAGE_MEMBERS,
 };
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,12 @@ use crate::{ApiError, AppState};
 /// `basic` or `verified` — earned through document review (see
 /// the `verification` module); it is display metadata here, and
 /// the payout gate reads it at payout creation time.
+/// `about` / `return_policy` (Wave 54) are the seller's two
+/// long profile texts — the store's story and its own returns
+/// wording — written through the same branding write as the
+/// look (domain `validate_store_about` /
+/// `validate_store_return_policy`); null when unwritten, and
+/// the storefront hides an unwritten text's section entirely.
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct Store {
     pub id: Uuid,
@@ -58,6 +65,8 @@ pub struct Store {
     pub banner_url: Option<String>,
     pub announcement: Option<String>,
     pub verified_tier: String,
+    pub about: Option<String>,
+    pub return_policy: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -65,20 +74,24 @@ const INSERT_STORE_SQL: &str = "INSERT INTO stores (owner_user_id, slug, name, d
     VALUES ($1, $2, $3, $4) \
     RETURNING id, owner_user_id, slug, name, description, status, \
     facebook_page_id, facebook_page_name, sidra_auto_reply, \
-    theme_key, brand_color, logo_url, banner_url, announcement, verified_tier, created_at";
+    theme_key, brand_color, logo_url, banner_url, announcement, verified_tier, \
+    about, return_policy, created_at";
 const SELECT_STORE_BY_SLUG_SQL: &str =
     "SELECT id, owner_user_id, slug, name, description, status, \
      facebook_page_id, facebook_page_name, sidra_auto_reply, \
-     theme_key, brand_color, logo_url, banner_url, announcement, verified_tier, created_at \
+     theme_key, brand_color, logo_url, banner_url, announcement, verified_tier, \
+     about, return_policy, created_at \
      FROM stores WHERE slug = $1";
 const SELECT_STORE_BY_ID_SQL: &str =
     "SELECT id, owner_user_id, slug, name, description, status, \
      facebook_page_id, facebook_page_name, sidra_auto_reply, \
-     theme_key, brand_color, logo_url, banner_url, announcement, verified_tier, created_at \
+     theme_key, brand_color, logo_url, banner_url, announcement, verified_tier, \
+     about, return_policy, created_at \
      FROM stores WHERE id = $1";
 const SELECT_STORE_BY_OWNER_SQL: &str = "SELECT id, owner_user_id, slug, name, description, \
     status, facebook_page_id, facebook_page_name, sidra_auto_reply, \
-    theme_key, brand_color, logo_url, banner_url, announcement, verified_tier, created_at \
+    theme_key, brand_color, logo_url, banner_url, announcement, verified_tier, \
+    about, return_policy, created_at \
     FROM stores WHERE owner_user_id = $1 ORDER BY created_at ASC LIMIT 1";
 
 /// Create a store for the authenticated user. Validates the slug with
@@ -185,12 +198,22 @@ pub struct UpdateBrandingRequest {
     pub banner_url: Option<String>,
     pub announcement: Option<String>,
     pub description: Option<String>,
+    /// Wave 54: the store's long "about" text; same
+    /// convention as `description` (absent keeps, blank
+    /// clears, a value is validated and stored).
+    pub about: Option<String>,
+    /// Wave 54: the store's own return-policy text; same
+    /// convention as `about`.
+    pub return_policy: Option<String>,
 }
 
 /// Update a store's branding. Every provided value passes
 /// its domain validator first, so an invalid write is a 400
 /// and changes nothing; the merged row is then written in
-/// one UPDATE and returned as the shared store view. The
+/// one UPDATE and returned as the shared store view. Wave
+/// 54 adds the two long profile texts (`about`,
+/// `return_policy`) to the same write and the same
+/// convention. The
 /// store arrives already resolved by the handler: before
 /// Wave 34 that was always the caller's own earliest store
 /// (via [`get_store_by_owner`]); Wave 34 also lets a manager
@@ -234,10 +257,23 @@ pub async fn update_store_branding_for_store(
         Some(raw) => validate_store_description(Some(raw)).map_err(ApiError::bad_request)?,
         None => existing.description.clone(),
     };
+    // Wave 54: the two long profile texts ride the same
+    // write — one settings save covers the whole storefront
+    // identity, and each text follows the same convention
+    // (absent keeps, blank clears, value validates).
+    let about = match patch.about.as_deref() {
+        Some(raw) => validate_store_about(Some(raw)).map_err(ApiError::bad_request)?,
+        None => existing.about.clone(),
+    };
+    let return_policy = match patch.return_policy.as_deref() {
+        Some(raw) => validate_store_return_policy(Some(raw)).map_err(ApiError::bad_request)?,
+        None => existing.return_policy.clone(),
+    };
 
     sqlx::query(
         "UPDATE stores SET theme_key = $2, brand_color = $3, logo_url = $4, \
-         banner_url = $5, announcement = $6, description = $7 WHERE id = $1",
+         banner_url = $5, announcement = $6, description = $7, \
+         about = $8, return_policy = $9 WHERE id = $1",
     )
     .bind(existing.id)
     .bind(&theme_key)
@@ -246,6 +282,8 @@ pub async fn update_store_branding_for_store(
     .bind(&banner_url)
     .bind(&announcement)
     .bind(&description)
+    .bind(&about)
+    .bind(&return_policy)
     .execute(pool)
     .await
     .map_err(|e| ApiError::internal("update store branding", e))?;
@@ -281,12 +319,103 @@ pub async fn create_store(
     Ok((StatusCode::CREATED, Json(store)))
 }
 
+/// The PUBLIC store view (Wave 54): the store row plus
+/// the facts a storefront header is built from — the live
+/// follower count, whether the VIEWER follows the store,
+/// and the store's trust aggregates (its products' rating
+/// summary, its delivered units, its active catalogue
+/// size). Every number is a live aggregate over the same
+/// tables the surfaces themselves read — there is no
+/// cached counter anywhere in this view.
+#[derive(Debug, Serialize)]
+pub struct PublicStore {
+    #[serde(flatten)]
+    pub store: Store,
+    pub follower_count: i64,
+    pub is_following: bool,
+    pub rating_avg: Option<f64>,
+    pub rating_count: i64,
+    pub total_sold: i64,
+    pub product_count: i64,
+}
+
+/// The aggregate half of [`PublicStore`], as one row.
+#[derive(Debug, FromRow)]
+struct StorePublicStats {
+    rating_avg: Option<f64>,
+    rating_count: i64,
+    total_sold: i64,
+    product_count: i64,
+}
+
+/// One store's public aggregates (Wave 54): rating over
+/// the reviews of ALL its products (the same ROUND-to-one-
+/// decimal rule as the product rating join), delivered
+/// units over its products (the platform's one "sold"
+/// definition), and its active product count. Four scalar
+/// subqueries in one round-trip.
+async fn store_public_stats(pool: &PgPool, store_id: Uuid) -> Result<StorePublicStats, ApiError> {
+    sqlx::query_as(
+        "SELECT \
+         (SELECT CAST(ROUND(AVG(r.rating)::numeric, 1) AS float8) \
+          FROM reviews r JOIN products p ON p.id = r.product_id \
+          WHERE p.store_id = $1) AS rating_avg, \
+         (SELECT COUNT(*) FROM reviews r \
+          JOIN products p ON p.id = r.product_id \
+          WHERE p.store_id = $1) AS rating_count, \
+         (SELECT COALESCE(SUM(oi.quantity), 0)::bigint \
+          FROM order_items oi \
+          JOIN sub_orders so ON so.id = oi.sub_order_id \
+          JOIN products p ON p.id = oi.product_id \
+          WHERE p.store_id = $1 AND so.status = 'delivered') AS total_sold, \
+         (SELECT COUNT(*) FROM products p \
+          WHERE p.store_id = $1 AND p.status = 'active') AS product_count",
+    )
+    .bind(store_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::internal("load store public stats", e))
+}
+
+/// Build the public view of one store for one viewer
+/// (Wave 54): the store by slug (404 when missing), its
+/// follower count, the viewer's own follow state (false
+/// for anonymous viewers), and its aggregates.
+pub async fn get_public_store(
+    pool: &PgPool,
+    slug: &str,
+    viewer_user_id: Option<Uuid>,
+) -> Result<PublicStore, ApiError> {
+    let store = get_store_by_slug(pool, slug).await?;
+    let follower_count = crate::follows::follower_count(pool, store.id).await?;
+    let is_following = match viewer_user_id {
+        Some(user_id) => crate::follows::is_following(pool, store.id, user_id).await?,
+        None => false,
+    };
+    let stats = store_public_stats(pool, store.id).await?;
+    Ok(PublicStore {
+        store,
+        follower_count,
+        is_following,
+        rating_avg: stats.rating_avg,
+        rating_count: stats.rating_count,
+        total_sold: stats.total_sold,
+        product_count: stats.product_count,
+    })
+}
+
 pub async fn get_store(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(slug): Path<String>,
-) -> Result<Json<Store>, ApiError> {
+) -> Result<Json<PublicStore>, ApiError> {
     let pool = state.require_pool()?;
-    Ok(Json(get_store_by_slug(pool, &slug).await?))
+    // Wave 54: the public view is viewer-aware (the
+    // follow state) — an optional read, exactly like the
+    // product detail's: a bad or absent token simply means
+    // an anonymous viewer, never an error.
+    let viewer = crate::auth::authenticate_optional(&state, &headers).map(|u| u.user_id);
+    Ok(Json(get_public_store(pool, &slug, viewer).await?))
 }
 
 pub async fn update_store_branding(

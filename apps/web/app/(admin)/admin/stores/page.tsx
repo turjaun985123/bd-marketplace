@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
 import AdminShell from "@/components/AdminShell";
 import {
   listAdminStores,
@@ -81,6 +82,7 @@ function Stores() {
             <th>স্টোর</th>
             <th>মালিক</th>
             <th>পণ্য</th>
+            <th>ফলোয়ার — Followers</th>
             <th>স্ট্যাটাস</th>
             <th></th>
           </tr>
@@ -110,6 +112,11 @@ function Stores() {
               </td>
               <td>{store.owner_phone}</td>
               <td>{store.product_count}</td>
+              <td>
+                <Link href={`/admin/stores/${store.id}/followers`}>
+                  {store.follower_count}
+                </Link>
+              </td>
               <td>{store.status === "suspended" ? "সাসপেন্ডেড" : "সক্রিয়"}</td>
               <td>
                 <button

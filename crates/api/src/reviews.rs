@@ -72,6 +72,11 @@ pub struct Review {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub reply: Option<ReviewReply>,
+    /// How many signed-in users marked this review
+    /// helpful (Wave 54 extension) — the live count of
+    /// `review_helpful_votes`, materialised by the shared
+    /// review SELECT so every surface agrees.
+    pub helpful_count: i64,
 }
 
 /// One page of reviews plus the total count — the same shape as the
@@ -109,6 +114,8 @@ struct ReviewRow {
     reply_body: Option<String>,
     reply_created_at: Option<DateTime<Utc>>,
     reply_updated_at: Option<DateTime<Utc>>,
+    /// Wave 54 extension: the helpful-vote count subquery.
+    helpful_count: i64,
 }
 
 impl ReviewRow {
@@ -149,6 +156,7 @@ impl ReviewRow {
             created_at: self.created_at,
             updated_at: self.updated_at,
             reply,
+            helpful_count: self.helpful_count,
         }
     }
 }
@@ -160,7 +168,9 @@ const REVIEW_COLUMNS: &str = "r.id, r.product_id, r.buyer_id, \
     r.order_id, r.rating, r.body, r.image_storage_key, r.image_width, \
     r.image_height, r.created_at, r.updated_at, \
     rp.id AS reply_id, rp.store_id AS reply_store_id, rp.body AS reply_body, \
-    rp.created_at AS reply_created_at, rp.updated_at AS reply_updated_at";
+    rp.created_at AS reply_created_at, rp.updated_at AS reply_updated_at, \
+    (SELECT COUNT(*) FROM review_helpful_votes hv WHERE hv.review_id = r.id) \
+        AS helpful_count";
 
 const REVIEW_FROM: &str = "FROM reviews r \
     JOIN users u ON u.id = r.buyer_id \
@@ -285,14 +295,41 @@ pub async fn create_review(
     get_review_by_id(pool, id).await
 }
 
-/// List a product's reviews, newest first, paginated like every other
-/// list in the API. A missing product is a 404, not an empty list.
+/// The ORDER BY fragment for one validated review sort
+/// (Wave 54). `Photos` leads with the photographed reviews
+/// (the Wave 51 photo is the most informative thing on the
+/// page) and falls back to newest inside each group — a
+/// sort, never a filter.
+fn review_order_by(sort: domain::ReviewSort) -> &'static str {
+    match sort {
+        domain::ReviewSort::Newest => "ORDER BY r.created_at DESC",
+        domain::ReviewSort::Highest => "ORDER BY r.rating DESC, r.created_at DESC",
+        domain::ReviewSort::Lowest => "ORDER BY r.rating ASC, r.created_at DESC",
+        domain::ReviewSort::Photos => {
+            "ORDER BY (r.image_storage_key IS NOT NULL) DESC, r.created_at DESC"
+        }
+        domain::ReviewSort::Helpful => {
+            "ORDER BY (SELECT COUNT(*) FROM review_helpful_votes hv \
+             WHERE hv.review_id = r.id) DESC, r.created_at DESC"
+        }
+    }
+}
+
+/// List a product's reviews, paginated like every other
+/// list in the API. The default order is newest first
+/// (the pre-Wave-54 behaviour); Wave 54 adds the `sort`
+/// parameter (`newest` / `highest` / `lowest` / `photos`,
+/// validated by the domain rule — an unknown value is a
+/// 400, never a silent default). A missing product is a
+/// 404, not an empty list.
 pub async fn list_product_reviews(
     pool: &PgPool,
     product_id: Uuid,
     page: Option<i64>,
     limit: Option<i64>,
+    sort: Option<&str>,
 ) -> Result<ReviewList, ApiError> {
+    let sort = domain::validate_review_sort(sort).map_err(ApiError::bad_request)?;
     get_product_by_id(pool, product_id).await?;
     let (page, limit) = clamp_pagination(page, limit);
     let offset = (page - 1) * limit;
@@ -305,7 +342,8 @@ pub async fn list_product_reviews(
 
     let rows: Vec<ReviewRow> = sqlx::query_as(&format!(
         "SELECT {REVIEW_COLUMNS} {REVIEW_FROM} \
-         WHERE r.product_id = $1 ORDER BY r.created_at DESC LIMIT $2 OFFSET $3"
+         WHERE r.product_id = $1 {} LIMIT $2 OFFSET $3",
+        review_order_by(sort)
     ))
     .bind(product_id)
     .bind(limit)
@@ -316,6 +354,246 @@ pub async fn list_product_reviews(
 
     Ok(ReviewList {
         items: rows.into_iter().map(ReviewRow::into_view).collect(),
+        total,
+        page,
+        limit,
+    })
+}
+
+/// One star level of a rating distribution (Wave 54): how
+/// many reviews gave it, and its floored whole-percent
+/// share of the total (the domain's `rating_share_percent`
+/// — the bars can sum to under 100, never over).
+#[derive(Debug, Serialize)]
+pub struct RatingLevel {
+    pub stars: i16,
+    pub count: i64,
+    pub percent: i64,
+}
+
+/// A rating summary with its distribution (Wave 54): the
+/// average (the platform's one ROUND-to-one-decimal rule),
+/// the total, how many reviews carry a photo, and the
+/// five distribution levels, 5 stars first. Every number
+/// is a live aggregate over real reviews — an unreviewed
+/// subject reports count 0, a null average and five zero
+/// levels, never an invented rating.
+#[derive(Debug, Serialize)]
+pub struct RatingSummary {
+    pub rating_avg: Option<f64>,
+    pub rating_count: i64,
+    pub with_photos_count: i64,
+    pub distribution: Vec<RatingLevel>,
+}
+
+/// The aggregate row behind [`RatingSummary`]: one query
+/// with FILTER counts per star level.
+#[derive(Debug, FromRow)]
+struct RatingSummaryRow {
+    rating_avg: Option<f64>,
+    rating_count: i64,
+    with_photos_count: i64,
+    five: i64,
+    four: i64,
+    three: i64,
+    two: i64,
+    one: i64,
+}
+
+impl RatingSummaryRow {
+    fn into_summary(self) -> RatingSummary {
+        let total = self.rating_count;
+        let level = |stars: i16, count: i64| RatingLevel {
+            stars,
+            count,
+            percent: domain::rating_share_percent(count, total),
+        };
+        RatingSummary {
+            rating_avg: self.rating_avg,
+            rating_count: total,
+            with_photos_count: self.with_photos_count,
+            distribution: vec![
+                level(5, self.five),
+                level(4, self.four),
+                level(3, self.three),
+                level(2, self.two),
+                level(1, self.one),
+            ],
+        }
+    }
+}
+
+/// The shared summary SELECT list (Wave 54): average,
+/// total, photo count and the per-star FILTER counts —
+/// used verbatim by the product and the store summaries
+/// so the two can never compute a distribution differently.
+const RATING_SUMMARY_COLUMNS: &str = "CAST(ROUND(AVG(r.rating)::numeric, 1) AS float8) AS rating_avg, \
+    COUNT(*)::bigint AS rating_count, \
+    COUNT(*) FILTER (WHERE r.image_storage_key IS NOT NULL)::bigint AS with_photos_count, \
+    COUNT(*) FILTER (WHERE r.rating = 5)::bigint AS five, \
+    COUNT(*) FILTER (WHERE r.rating = 4)::bigint AS four, \
+    COUNT(*) FILTER (WHERE r.rating = 3)::bigint AS three, \
+    COUNT(*) FILTER (WHERE r.rating = 2)::bigint AS two, \
+    COUNT(*) FILTER (WHERE r.rating = 1)::bigint AS one";
+
+/// One product's rating summary (Wave 54). A missing
+/// product is a 404, matching the review list.
+pub async fn get_product_rating_summary(
+    pool: &PgPool,
+    product_id: Uuid,
+) -> Result<RatingSummary, ApiError> {
+    get_product_by_id(pool, product_id).await?;
+    let row: RatingSummaryRow = sqlx::query_as(&format!(
+        "SELECT {RATING_SUMMARY_COLUMNS} FROM reviews r WHERE r.product_id = $1"
+    ))
+    .bind(product_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::internal("load product rating summary", e))?;
+    Ok(row.into_summary())
+}
+
+/// One store's rating summary (Wave 54): the same
+/// distribution over the reviews of ALL the store's
+/// products — the storefront's trust block and the store
+/// reviews page read it. A missing store is a 404.
+pub async fn get_store_rating_summary(
+    pool: &PgPool,
+    slug: &str,
+) -> Result<RatingSummary, ApiError> {
+    let store = crate::stores::get_store_by_slug(pool, slug).await?;
+    let row: RatingSummaryRow = sqlx::query_as(&format!(
+        "SELECT {RATING_SUMMARY_COLUMNS} FROM reviews r \
+         JOIN products p ON p.id = r.product_id WHERE p.store_id = $1"
+    ))
+    .bind(store.id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::internal("load store rating summary", e))?;
+    Ok(row.into_summary())
+}
+
+/// One review on a store's all-reviews page (Wave 54):
+/// the shared review view plus the title of the product
+/// it reviews (the page spans the whole catalogue, so
+/// each review names its product).
+#[derive(Debug, Serialize)]
+pub struct StoreReview {
+    #[serde(flatten)]
+    pub review: Review,
+    pub product_title: String,
+}
+
+/// Flat row for the store review SELECT: the review
+/// columns plus the product's title.
+#[derive(Debug, FromRow)]
+struct StoreReviewRow {
+    id: Uuid,
+    product_id: Uuid,
+    buyer_id: Uuid,
+    buyer_name: Option<String>,
+    buyer_phone: String,
+    order_id: Uuid,
+    rating: i16,
+    body: Option<String>,
+    image_storage_key: Option<String>,
+    image_width: Option<i32>,
+    image_height: Option<i32>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    reply_id: Option<Uuid>,
+    reply_store_id: Option<Uuid>,
+    reply_body: Option<String>,
+    reply_created_at: Option<DateTime<Utc>>,
+    reply_updated_at: Option<DateTime<Utc>>,
+    helpful_count: i64,
+    product_title: String,
+}
+
+impl StoreReviewRow {
+    fn into_view(self) -> StoreReview {
+        let product_title = self.product_title.clone();
+        let review = ReviewRow {
+            id: self.id,
+            product_id: self.product_id,
+            buyer_id: self.buyer_id,
+            buyer_name: self.buyer_name,
+            buyer_phone: self.buyer_phone,
+            order_id: self.order_id,
+            rating: self.rating,
+            body: self.body,
+            image_storage_key: self.image_storage_key,
+            image_width: self.image_width,
+            image_height: self.image_height,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            reply_id: self.reply_id,
+            reply_store_id: self.reply_store_id,
+            reply_body: self.reply_body,
+            reply_created_at: self.reply_created_at,
+            reply_updated_at: self.reply_updated_at,
+            helpful_count: self.helpful_count,
+        }
+        .into_view();
+        StoreReview {
+            review,
+            product_title,
+        }
+    }
+}
+
+/// A page of a store's reviews plus the total — the same
+/// envelope as the product review list.
+#[derive(Debug, Serialize)]
+pub struct StoreReviewList {
+    pub items: Vec<StoreReview>,
+    pub total: i64,
+    pub page: i64,
+    pub limit: i64,
+}
+
+/// Every review of every product of one store (Wave 54),
+/// with the same sorts as the product list. A missing
+/// store is a 404. Reviews of DRAFT/archived products are
+/// included — they are real reviews buyers wrote; hiding
+/// them would rewrite the store's history when a product
+/// is retired.
+pub async fn list_store_reviews(
+    pool: &PgPool,
+    slug: &str,
+    page: Option<i64>,
+    limit: Option<i64>,
+    sort: Option<&str>,
+) -> Result<StoreReviewList, ApiError> {
+    let sort = domain::validate_review_sort(sort).map_err(ApiError::bad_request)?;
+    let store = crate::stores::get_store_by_slug(pool, slug).await?;
+    let (page, limit) = clamp_pagination(page, limit);
+    let offset = (page - 1) * limit;
+
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM reviews r \
+         JOIN products p ON p.id = r.product_id WHERE p.store_id = $1",
+    )
+    .bind(store.id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::internal("count store reviews", e))?;
+
+    let rows: Vec<StoreReviewRow> = sqlx::query_as(&format!(
+        "SELECT {REVIEW_COLUMNS}, p.title AS product_title {REVIEW_FROM} \
+         JOIN products p ON p.id = r.product_id \
+         WHERE p.store_id = $1 {} LIMIT $2 OFFSET $3",
+        review_order_by(sort)
+    ))
+    .bind(store.id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::internal("list store reviews", e))?;
+
+    Ok(StoreReviewList {
+        items: rows.into_iter().map(StoreReviewRow::into_view).collect(),
         total,
         page,
         limit,
@@ -581,6 +859,9 @@ pub struct ReplyInput {
 pub struct ListReviewsQuery {
     pub page: Option<i64>,
     pub limit: Option<i64>,
+    /// Wave 54: `newest` (default) / `highest` / `lowest`
+    /// / `photos` — validated by the domain rule.
+    pub sort: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -605,7 +886,43 @@ pub async fn list_reviews_handler(
 ) -> Result<Json<ReviewList>, ApiError> {
     let pool = state.require_pool()?;
     Ok(Json(
-        list_product_reviews(pool, product_id, query.page, query.limit).await?,
+        list_product_reviews(pool, product_id, query.page, query.limit, query.sort.as_deref())
+            .await?,
+    ))
+}
+
+/// GET /v1/products/:id/rating-summary (Wave 54) — the
+/// distribution behind the product page's rating bars.
+pub async fn product_rating_summary_handler(
+    State(state): State<AppState>,
+    Path(product_id): Path<Uuid>,
+) -> Result<Json<RatingSummary>, ApiError> {
+    let pool = state.require_pool()?;
+    Ok(Json(get_product_rating_summary(pool, product_id).await?))
+}
+
+/// GET /v1/stores/:slug/rating-summary (Wave 54) — the
+/// store-wide distribution behind the storefront's trust
+/// block and its reviews page.
+pub async fn store_rating_summary_handler(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+) -> Result<Json<RatingSummary>, ApiError> {
+    let pool = state.require_pool()?;
+    Ok(Json(get_store_rating_summary(pool, &slug).await?))
+}
+
+/// GET /v1/stores/:slug/reviews (Wave 54) — every review
+/// of the store's products, paginated and sortable like
+/// the product list.
+pub async fn list_store_reviews_handler(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    Query(query): Query<ListReviewsQuery>,
+) -> Result<Json<StoreReviewList>, ApiError> {
+    let pool = state.require_pool()?;
+    Ok(Json(
+        list_store_reviews(pool, &slug, query.page, query.limit, query.sort.as_deref()).await?,
     ))
 }
 
@@ -673,4 +990,132 @@ pub async fn update_reply_handler(
 ) -> Result<Json<ReviewReply>, ApiError> {
     let pool = state.require_pool()?;
     Ok(Json(update_reply(pool, &user, review_id, &input.body).await?))
+}
+
+// ---------------------------------------------------------------------------
+// Helpful votes (Wave 54 extension)
+// ---------------------------------------------------------------------------
+
+/// One review's helpful state for one viewer: whether
+/// THEY voted, and the total count. Returned by the vote
+/// writes and the state read, so the client renders the
+/// server's truth after every toggle.
+#[derive(Debug, Serialize)]
+pub struct HelpfulState {
+    pub review_id: Uuid,
+    pub helpful: bool,
+    pub helpful_count: i64,
+}
+
+/// The helpful state of one review for one viewer (404
+/// when the review does not exist).
+pub async fn review_helpful_state(
+    pool: &PgPool,
+    user: &AuthUser,
+    review_id: Uuid,
+) -> Result<HelpfulState, ApiError> {
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM reviews WHERE id = $1)")
+            .bind(review_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| ApiError::internal("check review exists", e))?;
+    if !exists {
+        return Err(ApiError::not_found("review not found"));
+    }
+    let helpful: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM review_helpful_votes \
+         WHERE review_id = $1 AND user_id = $2)",
+    )
+    .bind(review_id)
+    .bind(user.user_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::internal("check helpful vote", e))?;
+    let helpful_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM review_helpful_votes WHERE review_id = $1",
+    )
+    .bind(review_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::internal("count helpful votes", e))?;
+    Ok(HelpfulState {
+        review_id,
+        helpful,
+        helpful_count,
+    })
+}
+
+/// Cast or retract the caller's helpful vote on a review.
+/// The author rule is the domain's
+/// (`can_vote_review_helpful`): voting on your own review
+/// is a bilingual 400. Both directions are idempotent —
+/// the (review, user) primary key plus ON CONFLICT DO
+/// NOTHING make a repeated vote a no-op, and retracting a
+/// vote that does not exist already holds the requested
+/// end state.
+pub async fn set_review_helpful(
+    pool: &PgPool,
+    user: &AuthUser,
+    review_id: Uuid,
+    helpful: bool,
+) -> Result<HelpfulState, ApiError> {
+    let author: Option<Uuid> =
+        sqlx::query_scalar("SELECT buyer_id FROM reviews WHERE id = $1")
+            .bind(review_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| ApiError::internal("load review author", e))?;
+    let author = author.ok_or_else(|| ApiError::not_found("review not found"))?;
+    if !domain::can_vote_review_helpful(author == user.user_id) {
+        return Err(ApiError::bad_request(domain::OWN_REVIEW_VOTE_ERROR));
+    }
+    if helpful {
+        sqlx::query(
+            "INSERT INTO review_helpful_votes (review_id, user_id) VALUES ($1, $2) \
+             ON CONFLICT (review_id, user_id) DO NOTHING",
+        )
+        .bind(review_id)
+        .bind(user.user_id)
+        .execute(pool)
+        .await
+        .map_err(|e| ApiError::internal("cast helpful vote", e))?;
+    } else {
+        sqlx::query(
+            "DELETE FROM review_helpful_votes WHERE review_id = $1 AND user_id = $2",
+        )
+        .bind(review_id)
+        .bind(user.user_id)
+        .execute(pool)
+        .await
+        .map_err(|e| ApiError::internal("retract helpful vote", e))?;
+    }
+    review_helpful_state(pool, user, review_id).await
+}
+
+pub async fn review_helpful_state_handler(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(review_id): Path<Uuid>,
+) -> Result<Json<HelpfulState>, ApiError> {
+    let pool = state.require_pool()?;
+    Ok(Json(review_helpful_state(pool, &user, review_id).await?))
+}
+
+pub async fn vote_helpful_handler(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(review_id): Path<Uuid>,
+) -> Result<Json<HelpfulState>, ApiError> {
+    let pool = state.require_pool()?;
+    Ok(Json(set_review_helpful(pool, &user, review_id, true).await?))
+}
+
+pub async fn unvote_helpful_handler(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(review_id): Path<Uuid>,
+) -> Result<Json<HelpfulState>, ApiError> {
+    let pool = state.require_pool()?;
+    Ok(Json(set_review_helpful(pool, &user, review_id, false).await?))
 }

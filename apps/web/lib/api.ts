@@ -51,7 +51,32 @@ export interface Store {
    * seller-chosen. Drives the storefront trust badge.
    */
   verified_tier: VerificationTier;
+  /**
+   * The store's long "about" text (Wave 54); null when the
+   * seller has written none — the storefront hides the
+   * section rather than showing a placeholder.
+   */
+  about: string | null;
+  /** The store's own return-policy text (Wave 54); null when unwritten. */
+  return_policy: string | null;
   created_at: string;
+}
+
+/**
+ * The PUBLIC store view (Wave 54): the store row plus the
+ * live facts the storefront header is built from — the
+ * follower count, whether the VIEWER follows the store,
+ * and the store's trust aggregates (rating over all its
+ * products' reviews, delivered units, active catalogue
+ * size). Every number is a live aggregate on the API.
+ */
+export interface PublicStore extends Store {
+  follower_count: number;
+  is_following: boolean;
+  rating_avg: number | null;
+  rating_count: number;
+  total_sold: number;
+  product_count: number;
 }
 
 /** The three storefront layout variants (Wave 18). */
@@ -1052,9 +1077,125 @@ export function getMe(token: string): Promise<User> {
   return call("/v1/auth/me", { token });
 }
 
-/** GET /v1/stores/{slug} — public store profile (also resolves the id). */
-export function getStore(slug: string): Promise<Store> {
-  return call(`/v1/stores/${encodeURIComponent(slug)}`);
+/**
+ * GET /v1/stores/{slug} — the public store view (Wave 54:
+ * the store row plus follower count, the viewer's follow
+ * state and the trust aggregates). Pass the token when
+ * signed in so `is_following` speaks for the viewer;
+ * anonymous reads report it false.
+ */
+export function getStore(
+  slug: string,
+  token?: string | null
+): Promise<PublicStore> {
+  return call(`/v1/stores/${encodeURIComponent(slug)}`, { token });
+}
+
+// ---------------------------------------------------------------------------
+// Wave 54 — store follows
+// ---------------------------------------------------------------------------
+
+/** The follow state of one store for the caller, after a write. */
+export interface FollowState {
+  following: boolean;
+  follower_count: number;
+  /** Whether this follow's new-product notices are on (Wave 54 extension). */
+  notify_new_products: boolean;
+}
+
+/** POST /v1/stores/{slug}/follow — follow a store (idempotent). */
+export function followStore(
+  token: string,
+  slug: string
+): Promise<FollowState> {
+  return call(`/v1/stores/${encodeURIComponent(slug)}/follow`, {
+    method: "POST",
+    token,
+  });
+}
+
+/** DELETE /v1/stores/{slug}/follow — unfollow (idempotent). */
+export function unfollowStore(
+  token: string,
+  slug: string
+): Promise<FollowState> {
+  return call(`/v1/stores/${encodeURIComponent(slug)}/follow`, {
+    method: "DELETE",
+    token,
+  });
+}
+
+/**
+ * One store on the buyer's /following page: the store row
+ * plus when they followed it, its counts, and its newest
+ * active products (the shared product view).
+ */
+export interface FollowedStore extends Store {
+  followed_at: string;
+  follower_count: number;
+  product_count: number;
+  /** Whether this follow's new-product notices are on (Wave 54 extension). */
+  notify_new_products: boolean;
+  newest_products: Product[];
+}
+
+/** The follows list envelope: items + total (unpaginated — the follow cap bounds it). */
+export interface FollowList {
+  items: FollowedStore[];
+  total: number;
+}
+
+/** GET /v1/follows — the caller's followed stores, newest follow first. */
+export function listFollows(token: string): Promise<FollowList> {
+  return call("/v1/follows", { token });
+}
+
+/** One follower of the seller's own store (display = name or masked phone). */
+export interface StoreFollower {
+  user_id: string;
+  display: string;
+  followed_at: string;
+  /** Whether this follower still receives store notices (Wave 54). */
+  notify_new_products: boolean;
+}
+
+export interface StoreFollowerList {
+  items: StoreFollower[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+/** GET /v1/seller/followers — the caller's own store's followers. */
+export function listSellerFollowers(
+  token: string,
+  params?: { page?: number; limit?: number }
+): Promise<StoreFollowerList> {
+  const search = new URLSearchParams();
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/seller/followers${qs ? `?${qs}` : ""}`, { token });
+}
+
+/**
+ * GET /v1/admin/stores/{id}/followers — the moderation
+ * view of any store's followers (Wave 54 extension): the
+ * same masked list the seller sees.
+ */
+export function listAdminStoreFollowers(
+  token: string,
+  storeId: string,
+  params?: { page?: number; limit?: number }
+): Promise<StoreFollowerList> {
+  const search = new URLSearchParams();
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(
+    `/v1/admin/stores/${encodeURIComponent(storeId)}/followers${qs ? `?${qs}` : ""}`,
+    { token }
+  );
 }
 
 /**
@@ -1072,6 +1213,10 @@ export interface UpdateBrandingInput {
   banner_url?: string;
   announcement?: string;
   description?: string;
+  /** The store's long "about" text (Wave 54); blank clears it. */
+  about?: string;
+  /** The store's own return-policy text (Wave 54); blank clears it. */
+  return_policy?: string;
 }
 
 /** PUT /v1/seller/store/branding — update the caller's own store branding. */
@@ -1316,6 +1461,8 @@ export interface Review {
   created_at: string;
   updated_at: string;
   reply: ReviewReply | null;
+  /** Helpful-vote count (Wave 54 extension). */
+  helpful_count: number;
 }
 
 export interface ReviewList {
@@ -1325,16 +1472,118 @@ export interface ReviewList {
   limit: number;
 }
 
-/** GET /v1/products/{id}/reviews — public review list, newest first. */
+/** Review list sort orders (Wave 54); `newest` is the default. */
+export type ReviewSort =
+  | "newest"
+  | "highest"
+  | "lowest"
+  | "photos"
+  | "helpful";
+
+/**
+ * GET /v1/products/{id}/reviews — public review list.
+ * Wave 54 adds `sort` (see ReviewSort); the default stays
+ * newest first.
+ */
 export function getProductReviews(
   productId: string,
-  params?: { page?: number; limit?: number }
+  params?: { page?: number; limit?: number; sort?: ReviewSort }
 ): Promise<ReviewList> {
   const search = new URLSearchParams();
   if (params?.page) search.set("page", String(params.page));
   if (params?.limit) search.set("limit", String(params.limit));
+  if (params?.sort) search.set("sort", params.sort);
   const qs = search.toString();
   return call(`/v1/products/${encodeURIComponent(productId)}/reviews${qs ? `?${qs}` : ""}`);
+}
+
+/** One star level of a rating distribution (Wave 54). */
+export interface RatingLevel {
+  stars: number;
+  count: number;
+  /** Floored whole-percent share of the total (bars never overstate). */
+  percent: number;
+}
+
+/**
+ * A rating summary with its distribution (Wave 54): the
+ * average (null when unreviewed), the total, how many
+ * reviews carry a photo, and the five levels, 5 first.
+ */
+export interface RatingSummary {
+  rating_avg: number | null;
+  rating_count: number;
+  with_photos_count: number;
+  distribution: RatingLevel[];
+}
+
+/** GET /v1/products/{id}/rating-summary — the product's distribution. */
+export function getProductRatingSummary(
+  productId: string
+): Promise<RatingSummary> {
+  return call(`/v1/products/${encodeURIComponent(productId)}/rating-summary`);
+}
+
+/** GET /v1/stores/{slug}/rating-summary — the store-wide distribution. */
+export function getStoreRatingSummary(slug: string): Promise<RatingSummary> {
+  return call(`/v1/stores/${encodeURIComponent(slug)}/rating-summary`);
+}
+
+/** One review on a store's all-reviews page: the review plus its product's title. */
+export interface StoreReview extends Review {
+  product_title: string;
+}
+
+export interface StoreReviewList {
+  items: StoreReview[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+/** GET /v1/stores/{slug}/reviews — every review of the store's products. */
+export function listStoreReviews(
+  slug: string,
+  params?: { page?: number; limit?: number; sort?: ReviewSort }
+): Promise<StoreReviewList> {
+  const search = new URLSearchParams();
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  if (params?.sort) search.set("sort", params.sort);
+  const qs = search.toString();
+  return call(`/v1/stores/${encodeURIComponent(slug)}/reviews${qs ? `?${qs}` : ""}`);
+}
+
+// ---------------------------------------------------------------------------
+// Wave 54 — delivery estimates
+// ---------------------------------------------------------------------------
+
+/** The three delivery zones, in the API's stored string form. */
+export type DeliveryZoneKey = "inside_dhaka" | "dhaka_suburb" | "outside_dhaka";
+
+/** One delivery estimate: the charge for the parcel + the day range. */
+export interface DeliveryEstimate {
+  zone: DeliveryZoneKey;
+  weight_grams: number;
+  delivery_charge_poisha: number;
+  min_days: number;
+  max_days: number;
+}
+
+/**
+ * GET /v1/delivery-estimate — the Wave 1 charge rule plus
+ * the zone's delivery-time range (admin-tunable), for one
+ * parcel of the given weight.
+ */
+export function getDeliveryEstimate(
+  zone: DeliveryZoneKey,
+  weightGrams: number
+): Promise<DeliveryEstimate> {
+  const search = new URLSearchParams({
+    zone,
+    weight_grams: String(weightGrams),
+  });
+  return call(`/v1/delivery-estimate?${search.toString()}`);
 }
 
 /**
@@ -1422,6 +1671,8 @@ export interface ProductQuestion {
 export interface QuestionList {
   items: ProductQuestion[];
   total: number;
+  /** Visible questions still awaiting the seller (Wave 54 extension). */
+  unanswered_count: number;
   page: number;
   limit: number;
 }
@@ -1444,11 +1695,12 @@ export interface SellerQuestionList {
  * first, hidden questions excluded. */
 export function getProductQuestions(
   productId: string,
-  params?: { page?: number; limit?: number }
+  params?: { page?: number; limit?: number; sort?: QuestionSort }
 ): Promise<QuestionList> {
   const search = new URLSearchParams();
   if (params?.page) search.set("page", String(params.page));
   if (params?.limit) search.set("limit", String(params.limit));
+  if (params?.sort) search.set("sort", params.sort);
   const qs = search.toString();
   return call(`/v1/products/${encodeURIComponent(productId)}/questions${qs ? `?${qs}` : ""}`);
 }
@@ -2937,6 +3189,8 @@ export interface AdminStore {
   product_count: number;
   /** The store's logo URL (Wave 51 ext); null when unset. */
   logo_url: string | null;
+  /** The store's follower count (Wave 54). */
+  follower_count: number;
   created_at: string;
 }
 
@@ -3014,6 +3268,12 @@ export interface AdminSettings {
   media_max_images_per_product: number;
   /** Per-store media quota in megabytes (Wave 51 extension). */
   media_store_quota_mb: number;
+  /** Inside Dhaka delivery-time estimate (Wave 54): [earliest, latest] days. */
+  delivery_days_inside_dhaka: [number, number];
+  /** Dhaka suburb delivery-time estimate (Wave 54): [earliest, latest] days. */
+  delivery_days_dhaka_suburb: [number, number];
+  /** Outside Dhaka delivery-time estimate (Wave 54): [earliest, latest] days. */
+  delivery_days_outside_dhaka: [number, number];
   platform_name: string;
 }
 
@@ -3278,6 +3538,9 @@ export function updateAdminSettings(
     promotion_price_per_day_poisha?: number;
     media_max_images_per_product?: number;
     media_store_quota_mb?: number;
+    delivery_days_inside_dhaka?: [number, number];
+    delivery_days_dhaka_suburb?: [number, number];
+    delivery_days_outside_dhaka?: [number, number];
   }
 ): Promise<AdminSettings> {
   return call("/v1/admin/settings", { method: "PUT", token, body: patch });
@@ -4327,6 +4590,13 @@ export interface AdminAnalyticsTotals {
     redemptions: number;
     discount_poisha: number;
   };
+  /** Wave 54 community totals: the follow graph + store collections. */
+  community: {
+    total_follows: number;
+    new_follows: number;
+    muted_follows: number;
+    store_collections: number;
+  };
 }
 
 /** One top store of the window, by GMV (Wave 27). */
@@ -5101,3 +5371,307 @@ export function listAdminMerchEvents(
   const qs = limit ? `?limit=${limit}` : "";
   return call(`/v1/admin/merch-events${qs}`, { token });
 }
+
+// ---------------------------------------------------------------------------
+// Wave 54 extension — store collections
+// ---------------------------------------------------------------------------
+
+/**
+ * One store collection: the seller's own curated shelf.
+ * `product_count` counts ACTIVE members on public reads
+ * and ALL members on the seller's own reads (documented
+ * at the endpoints); the cover is the first member's
+ * primary image.
+ */
+export interface StoreCollection {
+  id: string;
+  store_id: string;
+  slug: string;
+  title: string;
+  description: string | null;
+  product_count: number;
+  cover_image_url: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StoreCollectionList {
+  items: StoreCollection[];
+  total: number;
+}
+
+/** GET /v1/stores/{slug}/collections — the store's public shelves. */
+export function listStoreCollections(
+  slug: string
+): Promise<StoreCollectionList> {
+  return call(`/v1/stores/${encodeURIComponent(slug)}/collections`);
+}
+
+/** One public collection page: the collection plus its active products. */
+export interface PublicStoreCollection extends StoreCollection {
+  products: Product[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+/** GET /v1/stores/{slug}/collections/{cslug} — one shelf, products in seller order. */
+export function getStoreCollection(
+  slug: string,
+  collectionSlug: string,
+  params?: { page?: number; limit?: number }
+): Promise<PublicStoreCollection> {
+  const search = new URLSearchParams();
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(
+    `/v1/stores/${encodeURIComponent(slug)}/collections/${encodeURIComponent(collectionSlug)}${qs ? `?${qs}` : ""}`
+  );
+}
+
+/** GET /v1/seller/store/collections — the seller's own shelves (all members counted). */
+export function listSellerCollections(
+  token: string
+): Promise<StoreCollectionList> {
+  return call("/v1/seller/store/collections", { token });
+}
+
+/** The seller detail of one collection: the shelf plus member ids in order. */
+export interface SellerCollectionDetail extends StoreCollection {
+  product_ids: string[];
+}
+
+/** GET /v1/seller/store/collections/{id} — one shelf with its membership. */
+export function getSellerCollection(
+  token: string,
+  collectionId: string
+): Promise<SellerCollectionDetail> {
+  return call(
+    `/v1/seller/store/collections/${encodeURIComponent(collectionId)}`,
+    { token }
+  );
+}
+
+export interface StoreCollectionInput {
+  slug?: string;
+  title?: string;
+  description?: string;
+}
+
+/** POST /v1/seller/store/collections — create one shelf. */
+export function createStoreCollection(
+  token: string,
+  input: StoreCollectionInput
+): Promise<StoreCollection> {
+  return call("/v1/seller/store/collections", {
+    method: "POST",
+    token,
+    body: input,
+  });
+}
+
+/** PUT /v1/seller/store/collections/{id} — merge-update one shelf. */
+export function updateStoreCollection(
+  token: string,
+  collectionId: string,
+  input: StoreCollectionInput
+): Promise<StoreCollection> {
+  return call(
+    `/v1/seller/store/collections/${encodeURIComponent(collectionId)}`,
+    { method: "PUT", token, body: input }
+  );
+}
+
+/** DELETE /v1/seller/store/collections/{id} — remove a shelf (products untouched). */
+export function deleteStoreCollection(
+  token: string,
+  collectionId: string
+): Promise<{ deleted: boolean }> {
+  return call(
+    `/v1/seller/store/collections/${encodeURIComponent(collectionId)}`,
+    { method: "DELETE", token }
+  );
+}
+
+/** PUT /v1/seller/store/collections/{id}/products — replace the membership (ordered). */
+export function setStoreCollectionProducts(
+  token: string,
+  collectionId: string,
+  productIds: string[]
+): Promise<StoreCollection> {
+  return call(
+    `/v1/seller/store/collections/${encodeURIComponent(collectionId)}/products`,
+    { method: "PUT", token, body: { product_ids: productIds } }
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Wave 54 extension — follows feed, suggestions, follower stats
+// ---------------------------------------------------------------------------
+
+/** The follows feed envelope: the rail's products + their count. */
+export interface FollowFeed {
+  items: Product[];
+  total: number;
+}
+
+/** GET /v1/follows/feed — newest products across the stores the caller follows. */
+export function getFollowsFeed(token: string): Promise<FollowFeed> {
+  return call("/v1/follows/feed", { token });
+}
+
+/** One suggested store: the store plus its ranking signals. */
+export interface SuggestedStore extends Store {
+  follower_count: number;
+  rating_avg: number | null;
+  rating_count: number;
+  product_count: number;
+}
+
+export interface SuggestedStoreList {
+  items: SuggestedStore[];
+  total: number;
+}
+
+/** GET /v1/follows/suggested — popular, well-rated stores the caller does not follow yet. */
+export function getSuggestedStores(
+  token: string
+): Promise<SuggestedStoreList> {
+  return call("/v1/follows/suggested", { token });
+}
+
+/** One day of the seller's follower-growth series. */
+export interface FollowerDay {
+  date: string;
+  new_followers: number;
+}
+
+/** The seller's follower statistics (total, recent gains, 30-day series). */
+export interface FollowerStats {
+  total: number;
+  last_7_days: number;
+  last_30_days: number;
+  daily: FollowerDay[];
+}
+
+/** GET /v1/seller/followers/stats — the caller's own store's follower growth. */
+export function getSellerFollowerStats(token: string): Promise<FollowerStats> {
+  return call("/v1/seller/followers/stats", { token });
+}
+
+// ---------------------------------------------------------------------------
+// Wave 54 extension — the user's notification inbox
+// ---------------------------------------------------------------------------
+
+/** One notification in the owner's inbox. */
+export interface UserNotification {
+  id: string;
+  kind: string;
+  body: string;
+  /** Delivery status: pending | sending | sent | failed. */
+  status: string;
+  created_at: string;
+  sent_at: string | null;
+  read_at: string | null;
+}
+
+export interface UserNotificationList {
+  items: UserNotification[];
+  total: number;
+  unread_count: number;
+  page: number;
+  limit: number;
+}
+
+/** GET /v1/notifications — the signed-in user's own inbox, newest first. */
+export function listMyNotifications(
+  token: string,
+  params?: { page?: number; limit?: number }
+): Promise<UserNotificationList> {
+  const search = new URLSearchParams();
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/notifications${qs ? `?${qs}` : ""}`, { token });
+}
+
+/** POST /v1/notifications/{id}/read — mark one of mine read. */
+export function markNotificationRead(
+  token: string,
+  notificationId: string
+): Promise<UserNotification> {
+  return call(
+    `/v1/notifications/${encodeURIComponent(notificationId)}/read`,
+    { method: "POST", token }
+  );
+}
+
+/** PUT /v1/notifications — mark all of mine read; returns how many changed. */
+export function markAllNotificationsRead(
+  token: string
+): Promise<{ marked_read: number }> {
+  return call("/v1/notifications", { method: "PUT", token });
+}
+
+// ---------------------------------------------------------------------------
+// Wave 54 extension — helpful votes + follow mute + question sort
+// ---------------------------------------------------------------------------
+
+/** One review's helpful state for the signed-in viewer. */
+export interface HelpfulState {
+  review_id: string;
+  helpful: boolean;
+  helpful_count: number;
+}
+
+/** GET /v1/reviews/{id}/helpful — my vote state + the total. */
+export function getReviewHelpfulState(
+  token: string,
+  reviewId: string
+): Promise<HelpfulState> {
+  return call(`/v1/reviews/${encodeURIComponent(reviewId)}/helpful`, {
+    token,
+  });
+}
+
+/** POST /v1/reviews/{id}/helpful — cast my helpful vote. */
+export function voteReviewHelpful(
+  token: string,
+  reviewId: string
+): Promise<HelpfulState> {
+  return call(`/v1/reviews/${encodeURIComponent(reviewId)}/helpful`, {
+    method: "POST",
+    token,
+  });
+}
+
+/** DELETE /v1/reviews/{id}/helpful — retract my helpful vote. */
+export function unvoteReviewHelpful(
+  token: string,
+  reviewId: string
+): Promise<HelpfulState> {
+  return call(`/v1/reviews/${encodeURIComponent(reviewId)}/helpful`, {
+    method: "DELETE",
+    token,
+  });
+}
+
+/**
+ * PATCH /v1/stores/{slug}/follow — set the follow's
+ * new-product-notice flag (the follow itself is kept).
+ */
+export function setFollowNotify(
+  token: string,
+  slug: string,
+  notify: boolean
+): Promise<FollowState> {
+  return call(`/v1/stores/${encodeURIComponent(slug)}/follow`, {
+    method: "PATCH",
+    token,
+    body: { notify_new_products: notify },
+  });
+}
+
+/** Question list sort orders (Wave 54 extension). */
+export type QuestionSort = "newest" | "answered";
