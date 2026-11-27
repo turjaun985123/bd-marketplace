@@ -1339,7 +1339,7 @@ async fn fetch_image_bytes(url: &str) -> Result<(Vec<u8>, Option<String>), ApiEr
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(|value| value.split(';').next().unwrap_or(value).trim().to_string());
-    let cap = domain::MAX_IMAGE_BYTES as usize;
+    let cap = domain::MAX_IMAGE_BYTES;
     if let Some(length) = response.content_length() {
         if length > cap as u64 {
             return Err(ApiError::bad_request(
@@ -1531,7 +1531,7 @@ pub async fn list_admin_media(
         store_id: Uuid,
         store_slug: String,
     }
-    let rows: Vec<AdminMediaRow> = sqlx::query_as(&format!(
+    let rows: Vec<AdminMediaRow> = sqlx::query_as(
         "SELECT pi.id, pi.product_id, pi.variant_id, pi.storage_key, pi.external_url, \
          pi.width, pi.height, pi.size_bytes, pi.position, pi.is_primary, pi.alt_text, \
          pi.content_hash, pi.original_filename, pi.created_at, p.title AS product_title, p.store_id, \
@@ -1540,8 +1540,8 @@ pub async fn list_admin_media(
          JOIN products p ON p.id = pi.product_id \
          JOIN stores s ON s.id = p.store_id \
          WHERE ($1::text IS NULL OR s.slug = $1) \
-         ORDER BY pi.created_at DESC LIMIT 200"
-    ))
+         ORDER BY pi.created_at DESC LIMIT 200",
+    )
     .bind(store_slug)
     .fetch_all(pool)
     .await

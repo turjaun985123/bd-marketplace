@@ -1102,10 +1102,10 @@ pub fn process_upload(
     bytes: &[u8],
     declared_content_type: Option<&str>,
 ) -> Result<ProcessedImage, ApiError> {
-    validate_media_key(base_key).map_err(|m| ApiError::bad_request(m))?;
-    validate_image_size(bytes.len()).map_err(|m| ApiError::bad_request(m))?;
+    validate_media_key(base_key).map_err(ApiError::bad_request)?;
+    validate_image_size(bytes.len()).map_err(ApiError::bad_request)?;
     let kind =
-        resolve_image_kind(declared_content_type, bytes).map_err(|m| ApiError::bad_request(m))?;
+        resolve_image_kind(declared_content_type, bytes).map_err(ApiError::bad_request)?;
     let decoded = image::load_from_memory(bytes).map_err(|_| {
         ApiError::bad_request(
             "the image could not be decoded — the file may be truncated or corrupt — \
@@ -1128,7 +1128,7 @@ pub fn process_upload(
         use image::GenericImageView;
         image.dimensions()
     };
-    validate_image_dimensions(width, height).map_err(|m| ApiError::bad_request(m))?;
+    validate_image_dimensions(width, height).map_err(ApiError::bad_request)?;
 
     let format = match kind {
         ImageKind::Jpeg => ImageFormat::Jpeg,
