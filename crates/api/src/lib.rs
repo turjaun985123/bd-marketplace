@@ -950,6 +950,16 @@ impl ApiError {
             format!("database error ({context})"),
         )
     }
+
+    /// Map any other internal failure (IO, HTTP client setup, …) to a
+    /// 500 without leaking internals to clients (Wave 51).
+    pub fn internal_any(context: &str, err: impl std::fmt::Display) -> Self {
+        eprintln!("internal error in {context}: {err}");
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("internal error ({context})"),
+        )
+    }
 }
 
 impl IntoResponse for ApiError {

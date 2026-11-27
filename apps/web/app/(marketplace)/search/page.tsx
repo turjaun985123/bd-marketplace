@@ -234,8 +234,6 @@ function SearchResultsView() {
                 isPromoted={p.is_promoted}
                 imageUrl={p.image_url}
                 hoverImageUrl={p.hover_image_url}
-            imageUrl={p.image_url}
-                hoverImageUrl={p.hover_image_url}
               />
               {token ? (
                 <p>

@@ -48,7 +48,7 @@ use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
-use crate::media::{self, MediaStore, ProcessedImage};
+use crate::media::{self, ProcessedImage};
 use crate::products::{get_product_by_id, Product};
 use crate::stores::{get_store_by_id, Store};
 use crate::{ApiError, AppState};
@@ -1321,7 +1321,7 @@ async fn fetch_image_bytes(url: &str) -> Result<(Vec<u8>, Option<String>), ApiEr
         .redirect(reqwest::redirect::Policy::limited(3))
         .user_agent("BDMarketplace-ImageFetch/1.0")
         .build()
-        .map_err(|e| ApiError::internal("build fetch client", e))?;
+        .map_err(|e| ApiError::internal_any("build fetch client", e))?;
     let mut response = client.get(&url).send().await.map_err(|e| {
         ApiError::bad_request(format!(
             "the image could not be fetched: {e} — ছবিটি আনা যায়নি"
@@ -1542,6 +1542,7 @@ pub async fn list_admin_media(
          ORDER BY pi.created_at DESC LIMIT 200"
     ))
     .bind(store_slug)
+    .fetch_all(pool)
     .await
     .map_err(|e| ApiError::internal("list admin media", e))?;
     Ok(rows
