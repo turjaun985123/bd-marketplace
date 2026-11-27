@@ -346,6 +346,7 @@ pub mod inventory;
 pub mod invoices;
 pub mod loyalty;
 pub mod media;
+pub mod merch;
 pub mod messaging;
 pub mod metrics;
 pub mod notices;
@@ -1981,6 +1982,77 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/seller/subscription/cancel",
             post(subscriptions::cancel_subscription_handler),
         )
+        // Wave 52 — merchandising: the public home feed and
+        // collection landing data, the event beacon, and the
+        // admin CRUD for banners / collections / flash sales
+        // (all behind require_admin; the banner image upload
+        // takes the same raised body limit as product images).
+        // Flash price resolution itself lives in the merch
+        // module and is honoured by the cart and checkout.
+        .route("/v1/home", get(merch::home_feed_handler))
+        .route(
+            "/v1/collections/:slug",
+            get(merch::get_collection_public_handler),
+        )
+        .route("/v1/merch/events", post(merch::record_merch_event_handler))
+        .route(
+            "/v1/admin/home-preview",
+            get(merch::admin_home_preview_handler),
+        )
+        .route(
+            "/v1/admin/merch-events",
+            get(merch::list_merch_events_handler),
+        )
+        .route(
+            "/v1/admin/banners",
+            get(merch::list_banners_handler).post(merch::create_banner_handler),
+        )
+        .route(
+            "/v1/admin/banners/:id",
+            patch(merch::update_banner_handler).delete(merch::delete_banner_handler),
+        )
+        .route(
+            "/v1/admin/banners/:id/image",
+            post(merch::upload_banner_image_handler).layer(DefaultBodyLimit::max(
+                product_images::IMAGE_UPLOAD_ROUTE_LIMIT_BYTES,
+            )),
+        )
+        .route(
+            "/v1/admin/banners/:id/image",
+            delete(merch::delete_banner_image_handler),
+        )
+        .route(
+            "/v1/admin/collections",
+            get(merch::list_collections_handler).post(merch::create_collection_handler),
+        )
+        .route(
+            "/v1/admin/collections/:id",
+            get(merch::get_collection_admin_handler)
+                .patch(merch::update_collection_handler)
+                .delete(merch::delete_collection_handler),
+        )
+        .route(
+            "/v1/admin/collections/:id/products",
+            put(merch::set_collection_products_handler),
+        )
+        .route(
+            "/v1/admin/flash-sales",
+            get(merch::list_flash_sales_handler).post(merch::create_flash_sale_handler),
+        )
+        .route(
+            "/v1/admin/flash-sales/:id",
+            get(merch::get_flash_sale_handler)
+                .patch(merch::update_flash_sale_handler)
+                .delete(merch::delete_flash_sale_handler),
+        )
+        .route(
+            "/v1/admin/flash-sales/:id/items",
+            put(merch::set_flash_sale_items_handler),
+        )
+        // Wave 52 — the seller's seat on the same event: their
+        // own products inside the live flash sale, with the
+        // cap accounting the resolution itself uses.
+        .route("/v1/seller/flash-sale", get(merch::seller_flash_sale_handler))
         // Wave 24 — wishlist: the caller's server-side
         // saved-for-later list. Add/remove are idempotent
         // and answer with the resulting state; the ids read

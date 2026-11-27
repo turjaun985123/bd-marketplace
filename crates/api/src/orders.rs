@@ -684,6 +684,17 @@ pub async fn place_order(
         .await
         .map_err(|e| ApiError::internal("begin checkout transaction", e))?;
 
+    // Wave 52: the transaction's own clock reading, taken
+    // once. The flash price resolution below runs against
+    // this instant — the database clock, the same clock the
+    // stored windows are compared against everywhere else —
+    // so "the price at order placement" is one well-defined
+    // value for the whole checkout.
+    let tx_now: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| ApiError::internal("read checkout clock", e))?;
+
     let cart_id: Uuid = sqlx::query_scalar("SELECT id FROM carts WHERE user_id = $1")
         .bind(user.user_id)
         .fetch_optional(&mut *tx)
@@ -732,11 +743,45 @@ pub async fn place_order(
     let variant_by_id: HashMap<Uuid, &LockedVariant> =
         locked_variants.iter().map(|v| (v.id, v)).collect();
 
+    // Wave 52: resolve the live flash price for each distinct
+    // product in the cart, INSIDE this transaction and AFTER
+    // the product rows are locked — so the cap the resolution
+    // reads cannot be consumed by a concurrent checkout of
+    // the same product between the read and this order's
+    // write (that checkout waits on the product-row lock, then
+    // reads a cap that includes this order). A resolved flash
+    // price replaces the product's BASE price for this order:
+    // variant deltas still apply on top of it, and every
+    // downstream figure (goods subtotal, commission, payout
+    // snapshot, coupon base, COD collection) derives from the
+    // snapshot as it always has — the snapshot now carries
+    // the price the buyer actually pays.
+    let mut flash_by_product: HashMap<Uuid, i64> = HashMap::new();
+    {
+        let mut seen = std::collections::HashSet::new();
+        for item in &locked {
+            if seen.insert(item.product_id) {
+                if let Some(flash) =
+                    crate::merch::active_flash_price_tx(&mut tx, item.product_id, tx_now).await?
+                {
+                    flash_by_product.insert(item.product_id, flash.sale_price_poisha);
+                }
+            }
+        }
+    }
+
     // The FINAL price of every line, computed once here (base
     // + delta through the domain rule for variant lines) and
     // reused by the totals and the snapshots below.
     let mut final_price_by_line: HashMap<(Uuid, Option<Uuid>), i64> = HashMap::new();
     for item in &locked {
+        // The base this line prices from: the flash price
+        // when one resolved for its product, else the locked
+        // product price (Wave 52).
+        let base_price = flash_by_product
+            .get(&item.product_id)
+            .copied()
+            .unwrap_or(item.unit_price_poisha);
         if item.store_status == "suspended" {
             return Err(ApiError::conflict(format!(
                 "the store selling '{}' is suspended and cannot take orders right now",
@@ -766,7 +811,7 @@ pub async fn place_order(
                         variant.name, item.title
                     )));
                 }
-                let price = variant_final_price(item.unit_price_poisha, variant.price_delta_poisha)
+                let price = variant_final_price(base_price, variant.price_delta_poisha)
                     .ok_or_else(|| {
                         ApiError::bad_request(format!(
                             "variant '{}' of product '{}' no longer has a valid price",
@@ -795,7 +840,7 @@ pub async fn place_order(
                         item.title, item.quantity, item.stock
                     )));
                 }
-                item.unit_price_poisha
+                base_price
             }
         };
         final_price_by_line.insert((item.product_id, item.variant_id), final_price);

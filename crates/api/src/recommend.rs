@@ -139,7 +139,7 @@ pub async fn related_products(
 ) -> Result<RelatedList, ApiError> {
     let base = get_public_product(pool, base_id).await?;
     let limit = recommendation_limit(limit);
-    let items: Vec<Product> = sqlx::query_as(&format!(
+    let mut items: Vec<Product> = sqlx::query_as(&format!(
         "SELECT {PRODUCT_COLUMNS} FROM products p \
          JOIN stores s ON s.id = p.store_id \
          {PRODUCT_RATING_JOIN} \
@@ -163,6 +163,9 @@ pub async fn related_products(
     .into_iter()
     .map(with_stock_status)
     .collect();
+    // Wave 52: rails carry live flash prices like every
+    // other product surface.
+    crate::merch::attach_flash_prices(pool, &mut items, chrono::Utc::now()).await?;
     Ok(RelatedList { items })
 }
 
@@ -203,13 +206,17 @@ pub async fn also_bought_products(
     .fetch_all(pool)
     .await
     .map_err(|e| ApiError::internal("also bought products", e))?;
-    let items = rows
+    let mut items: Vec<AlsoBoughtItem> = rows
         .into_iter()
         .map(|row| AlsoBoughtItem {
             product: with_stock_status(row.product),
             co_count: row.co_count,
         })
         .collect();
+    // Wave 52: rails carry live flash prices like every
+    // other product surface.
+    let mut refs: Vec<&mut Product> = items.iter_mut().map(|item| &mut item.product).collect();
+    crate::merch::attach_flash_prices_refs(pool, &mut refs, chrono::Utc::now()).await?;
     Ok(AlsoBoughtList { items })
 }
 
@@ -253,7 +260,7 @@ pub async fn recommendations_for_user(
         // visible products, with the caller's bought and
         // wishlisted products still excluded (a caller can
         // have purchases without having category signals).
-        let items: Vec<Product> = sqlx::query_as(&format!(
+        let mut items: Vec<Product> = sqlx::query_as(&format!(
             "SELECT {PRODUCT_COLUMNS} FROM products p \
              JOIN stores s ON s.id = p.store_id \
              {PRODUCT_RATING_JOIN} \
@@ -271,6 +278,7 @@ pub async fn recommendations_for_user(
         .into_iter()
         .map(with_stock_status)
         .collect();
+        crate::merch::attach_flash_prices(pool, &mut items, chrono::Utc::now()).await?;
         return Ok(Recommendations {
             personalized: false,
             items,
@@ -281,7 +289,7 @@ pub async fn recommendations_for_user(
     // recent signal (a delivered purchase line, or a
     // wishlist add). Candidates join on the category and
     // inherit its recency for ordering.
-    let items: Vec<Product> = sqlx::query_as(&format!(
+    let mut items: Vec<Product> = sqlx::query_as(&format!(
         "WITH signals AS (\
             SELECT lower(sig.category) AS category, MAX(sig.at) AS last_at \
             FROM (\
@@ -318,6 +326,7 @@ pub async fn recommendations_for_user(
     .into_iter()
     .map(with_stock_status)
     .collect();
+    crate::merch::attach_flash_prices(pool, &mut items, chrono::Utc::now()).await?;
     Ok(Recommendations {
         personalized: true,
         items,

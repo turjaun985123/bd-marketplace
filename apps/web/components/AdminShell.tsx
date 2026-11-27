@@ -95,6 +95,14 @@ export default function AdminShell({
         {" · "}
         <Link href="/admin/coupons">কুপন</Link>
         {" · "}
+        <Link href="/admin/banners">ব্যানার</Link>
+        {" · "}
+        <Link href="/admin/collections">কালেকশন</Link>
+        {" · "}
+        <Link href="/admin/flash-sales">ফ্ল্যাশ সেল</Link>
+        {" · "}
+        <Link href="/admin/home-preview">হোম প্রিভিউ</Link>
+        {" · "}
         <Link href="/admin/returns">রিটার্ন ও রিফান্ড</Link>
         {" · "}
         <Link href="/admin/verifications">যাচাইকরণ</Link>

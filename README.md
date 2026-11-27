@@ -3711,6 +3711,195 @@ primary image (documented on the field — a replaced
 photo updates old receipts' pictures, never their
 prices).
 
+Wave 52 (design foundation + merchandising home — the
+Shopify-parity program continues):
+
+**The storefront stops looking like a form demo, and the
+home page becomes a merchandised storefront.**
+`apps/web/app/globals.css` gains a real design-token
+layer — CSS custom properties for the brand palette
+(built on the brand green `#1b5e20`), an amber accent,
+surface / text / border tones, a type scale, radius and
+shadow tokens, and `prefers-color-scheme: dark`
+overrides — and `apps/web/components/ui.tsx` the shared
+primitives: `Button` (primary / ghost / danger, sizes,
+loading), `Badge`, `SectionHeader`, `Skeleton` +
+product/rail skeletons, `EmptyState`, the horizontal
+scroll-snap `Rail`, and a live-ticking `Countdown`.
+`ProductCard` v2 uses the Wave 51 hover image swap, a
+2-line title clamp, rating + sold-count meta, promotion
+and flash badges, and a price block that shows the sale
+price with the base struck through and a −% badge.
+
+**Merchandising data (migrations 0044–0047):**
+`home_banners` — title, subtitle, link, ONE image source
+(an upload through the Wave 51 pipeline under a
+`site/banners/` storage prefix, or a hotlink; exactly
+one, like product images), position, an optional
+visibility window, an active flag. `collections` +
+`collection_products` — curated sets whose membership
+rows carry the display position (cascade on both
+sides). `flash_sales` + `flash_sale_items` — a sale
+window plus per-product sale price and optional stock
+cap. `merch_events` — an append-only engagement counter
+log (banner clicks, collection views; no user or
+session is stored). Admin API (all behind
+`require_admin`; API keys stay refused on the whole
+`/v1/admin/*` prefix): full CRUD for banners including
+`POST /v1/admin/banners/:id/image` (multipart, through
+the media pipeline) and its `DELETE`; collections CRUD
+plus `PUT /v1/admin/collections/:id/products` replacing
+the ordered membership; flash sales CRUD plus
+`PUT /v1/admin/flash-sales/:id/items` replacing items
+with per-item price + cap; `GET /v1/admin/home-preview?at=`
+rendering the home feed as of any instant (the feed
+builder takes `now` as a parameter from the start, so
+previewing a scheduled campaign is the same code path);
+and merchandising totals inside `GET /v1/admin/metrics`.
+Domain rules, pure and unit-tested: banner visibility =
+`is_active AND (starts_at IS NULL OR starts_at <= now)
+AND (ends_at IS NULL OR now < ends_at)`; banner links
+must be a site-relative path or an http(s) URL;
+collection slugs reuse the store-slug rule; a flash
+window must end after it starts; **a sale price must be
+> 0 and below the product's current base price**,
+validated against the product row at write time; and
+**at most one ACTIVE flash sale may cover any instant**
+— overlapping active windows are refused bilingually
+(409) inside the create/update transaction, since no
+plain CHECK can express it; back-to-back sales that
+merely touch at a boundary are allowed.
+
+**Flash price resolution — the money rule.** ONE
+service function (`active_flash_price` in
+`crates/api/src/merch.rs`, plus a batch variant for
+lists) resolves the price, and every surface honours
+it: product views gain `flash_price_poisha` +
+`flash_ends_at` while a sale resolves; the cart view
+prices lines at the sale price (a variant's price delta
+still composes on top of the sale base, via the same
+`variant_final_price` rule); and checkout resolves the
+price **inside its own transaction, under the
+product-row locks, on the transaction's own
+`SELECT now()` clock** — so the order-item snapshot
+carries the sale price, and goods subtotal, commission,
+the seller payout snapshot, coupon allocation bases and
+COD collection all derive from the price actually paid,
+exactly as they already derived from the snapshot. A
+sale that ends mid-checkout therefore resolves at the
+price the placement transaction sees, never a torn mix.
+**Cap accounting (the deliberate, auditable
+definition):** units sold at the sale price =
+`SUM(quantity)` over order items that sit in
+non-cancelled sub-orders, whose order was placed inside
+the sale window, and whose snapshot unit price equals
+the item's sale price plus the variant's price delta
+(0 for variant-less lines). The admin item editor shows
+exactly this aggregate as sold / remaining; when it
+reaches the cap, the price reverts to base everywhere,
+immediately — the resolution and the accounting are the
+same query family, so they cannot drift apart. The cap
+is measured on units already sold at the moment an order
+is placed, so a single multi-unit order placed just
+under the cap prices all of its units at the sale price
+(the count can land above the cap; the remaining count
+clamps at 0) and only the next buyer sees base price —
+the Wave 52 tests pin this behaviour exactly.
+
+**Sold counts (real numbers only).** Every product view
+gains `sold_count` = `SUM(quantity)` over order items
+whose sub-order status is `delivered` — the platform's
+one definition of a completed sale — computed as a
+single aggregate inside the shared product SELECT, so
+list, detail, search, storefront, related, also-bought,
+wishlist, recommendations, seller export and the home
+rails all agree. A product with no delivered sales
+shows 0, and the card hides the sold line at 0 rather
+than printing a hollow "0 sold" (a design call, stated
+here).
+
+**`GET /v1/home`** returns the whole merchandised home
+in one response: the visible banners; category tiles
+(product counts, the tile image being the primary image
+of the category's best-selling product — newest with an
+image when nothing has sold); the live flash sale with
+per-item sale prices and cap progress; up to 4
+collection sections with their first products; the new
+arrivals, top rated, best sellers (only products with
+at least one delivered sale — the rail hides rather
+than padding with unsold products) and promoted rails;
+and featured stores (stores on a verified KYC tier,
+with branding and product counts). Section sizes are
+named constants in `merch.rs`. The home page renders
+the feed as a hero carousel (auto-advance, dots,
+arrows, touch swipe; a click beacons a `banner_click`
+event, fire-and-forget), category tiles, the flash
+section with a live countdown and cap progress bars,
+collection sections, rails and the featured-stores
+strip — skeleton placeholders while loading, empty
+sections hidden, and the plain catalogue grid remains
+below as content and as the fallback if the feed fails.
+Public collection landing pages live at
+`/collections/<slug>` — products in membership order, a
+`collection_view` beacon per visit, and an honest 404
+for unpublished collections. Admin web pages:
+`/admin/banners` (form + image upload per row),
+`/admin/collections` (CRUD + the ordered product
+picker), `/admin/flash-sales` (CRUD + the item editor
+with taka price entry and the live sold/remaining
+accounting), `/admin/home-preview` (the feed as of any
+chosen instant, summarised section by section for
+verification), nav links in the admin shell, and the
+merchandising totals on the admin overview. The wave's
+surfaces extend past the home page: the product detail
+page prices through the flash rule too (sale banner with
+the countdown, struck base, −% badge, sold line, and
+variant prices composed over the SALE base — the API's
+per-variant finals are base-derived, so the page composes
+them itself through the same add-the-delta rule the cart
+uses, and the JSON-LD offer price is the price actually
+charged); a site-wide flash strip rides above every
+marketplace page while a sale is live (the marketplace
+route group's layout — never the back offices);
+storefronts gain on-sale / best-sellers / new-arrivals
+sections scoped to the store above their full grid; the
+search page renders results as design-system cards in a
+grid with skeleton and empty states, its cards carrying
+the same sold/flash fields; and sellers get their own
+seat on the event — `GET /v1/seller/flash-sale` and
+`/seller/flash-sale` show a seller exactly which of their
+products the live sale carries, at what price, and how
+much of each cap is already sold (read-only: flash sales
+are a platform event, and the seller's levers stay their
+base price and their stock).
+
+**Honest limits.** The feed is identical for every
+visitor — no per-user personalisation (the per-visitor
+discovery strips from Wave 24 still render below it).
+Category tiles derive from the free-text product
+category strings: there is still no categories table,
+so a category rename is a data edit, not a migration.
+Banner PATCH is merge-style, like the platform's other
+PATCH endpoints: provided fields override, absent fields
+keep their stored values, and the merged row is
+re-validated whole (a patch moving only `ends_at` still
+cannot invert the window). Text fields clear by sending
+an empty string (validation normalises blank to NULL);
+a stored window bound cannot be cleared back to NULL
+through the patch. The image source has its own rule:
+uploading replaces a hotlink and setting a hotlink
+deletes the stored upload, so the one-image-source rule
+holds from every direction. The engagement beacon is
+best-effort by design: a lost count is acceptable, a
+blocked click is not, so counts inform and never gate
+anything. Cap accounting keys on the snapshot price by
+design — if a seller edits a product's base price
+mid-sale so it collides with the sale price, units sold
+at that price inside the window count toward the cap;
+the sale price itself is never re-validated against a
+later base-price edit (the write-time rule is the
+guarantee).
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |

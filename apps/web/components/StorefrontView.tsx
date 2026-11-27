@@ -3,6 +3,7 @@
 import { useEffect, useState, type CSSProperties } from "react";
 import MessageStoreButton from "./MessageStoreButton";
 import ProductGrid from "./ProductGrid";
+import StorefrontSections from "./StorefrontSections";
 import SearchBar from "./SearchBar";
 import VerificationBadge from "./VerificationBadge";
 import { getStore, type Store } from "@/lib/api";
@@ -115,7 +116,10 @@ export default function StorefrontView({ slug }: { slug: string }) {
 
       <MessageStoreButton slug={slug} />
       <SearchBar storeSlug={slug} />
-      <h2>পণ্য — Products</h2>
+      {/* Wave 52: the store's merchandising sections (on
+          sale / best sellers / new), above the full grid. */}
+      <StorefrontSections slug={slug} />
+      <h2>সব পণ্য — All products</h2>
       <ProductGrid
         storeSlug={slug}
         layout={

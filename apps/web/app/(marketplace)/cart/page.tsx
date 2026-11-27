@@ -3,6 +3,8 @@
 import Link from "next/link";
 import PriceTag from "@/components/PriceTag";
 import ProductImage from "@/components/ProductImage";
+import { Badge } from "@/components/ui";
+import { formatBdt } from "@/lib/format";
 import { useAuth } from "@/hooks/useAuth";
 import { useCart } from "@/hooks/useCart";
 
@@ -11,11 +13,26 @@ import { useCart } from "@/hooks/useCart";
  * steppers and remove buttons, goods total, and a link to checkout.
  * All cart state comes from the shared useCart hook — delivery charges
  * are quoted per seller at checkout, not here.
+ *
+ * Wave 52: a line priced by a live flash sale says so — the
+ * sale badge, the struck pre-sale price beside the unit price,
+ * and a savings total under the goods total. The saving is
+ * computed from the API's two unit prices per line
+ * (`list_unit_price_poisha` − `unit_price_poisha`) × quantity:
+ * the same numbers checkout will snapshot, never a sticker
+ * invented for the cart.
  */
 export default function CartPage() {
   const { ready, token } = useAuth();
   const { items, goodsTotalPoisha, count, loading, error, setQuantity, remove, clear } =
     useCart();
+  const savingsPoisha = items.reduce(
+    (sum, item) =>
+      sum +
+      Math.max(0, item.list_unit_price_poisha - item.unit_price_poisha) *
+        item.quantity,
+    0
+  );
 
   if (!ready) {
     return (
@@ -67,7 +84,15 @@ export default function CartPage() {
               </h3>
               <p>
                 {item.store_slug} · একক দাম{" "}
-                <PriceTag amountPoisha={item.unit_price_poisha} />
+                <PriceTag amountPoisha={item.unit_price_poisha} />{" "}
+                {item.list_unit_price_poisha > item.unit_price_poisha && (
+                  <>
+                    <s>
+                      <PriceTag amountPoisha={item.list_unit_price_poisha} />
+                    </s>{" "}
+                    <Badge tone="flash">ফ্ল্যাশ সেল — Flash sale</Badge>
+                  </>
+                )}
               </p>
               <p>
                 পরিমাণ:{" "}
@@ -114,6 +139,12 @@ export default function CartPage() {
             মোট পণ্য: {count}টি · পণ্যের মোট দাম:{" "}
             <PriceTag amountPoisha={goodsTotalPoisha} />
           </p>
+          {savingsPoisha > 0 && (
+            <p>
+              ফ্ল্যাশ সেলে আপনার সাশ্রয় — You save{" "}
+              <strong>{formatBdt(savingsPoisha)}</strong> on this cart
+            </p>
+          )}
           <p>
             ডেলিভারি চার্জ চেকআউটে বিক্রেতা অনুযায়ী হিসাব হবে। (Delivery is
             charged per seller at checkout.)

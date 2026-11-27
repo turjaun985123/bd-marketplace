@@ -170,6 +170,29 @@ pub struct Product {
     /// hover. Null when the product has fewer than 2 images.
     #[sqlx(default)]
     pub hover_image_url: Option<String>,
+    /// Units actually sold (Wave 52): the SUM of order-item
+    /// quantities over this product's DELIVERED sub-orders —
+    /// the platform's one definition of a completed sale,
+    /// computed by the aggregate in `PRODUCT_COLUMNS` (see
+    /// `SOLD_COUNT_SQL`). Placed/confirmed/shipped orders do
+    /// not count; a product nobody has received yet shows 0.
+    /// Never an estimate, never seeded — the number is the
+    /// ledger's.
+    pub sold_count: i64,
+    /// The live flash sale price for this product (Wave 52),
+    /// when a flash sale is running, this product is in it,
+    /// and its stock cap is not exhausted — the price the
+    /// cart and checkout will actually charge. Filled after
+    /// load by `merch::attach_flash_prices` (the resolution
+    /// needs the cap aggregate, so it cannot be a column);
+    /// null whenever the product sells at its base price.
+    #[sqlx(default)]
+    pub flash_price_poisha: Option<i64>,
+    /// When the live flash sale ends (Wave 52); set exactly
+    /// when `flash_price_poisha` is set. Drives the card's
+    /// countdown chip.
+    #[sqlx(default)]
+    pub flash_ends_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -187,6 +210,18 @@ pub(crate) const EFFECTIVE_STOCK_SQL: &str = "CASE WHEN EXISTS (\
     THEN (SELECT COALESCE(SUM(pv2.stock), 0)::int FROM product_variants pv2 \
           WHERE pv2.product_id = p.id AND pv2.is_active) \
     ELSE p.stock END";
+
+/// The sold-count aggregate (Wave 52): units in DELIVERED
+/// sub-orders for the product aliased `p`. THE definition of
+/// "sold" for every surface — the product view's `sold_count`
+/// column (via `PRODUCT_COLUMNS`), the home feed's
+/// best-sellers rail and its per-category best-seller pick all
+/// run this same expression, so the number a card shows can
+/// never disagree with the rail that ranked it.
+pub(crate) const SOLD_COUNT_SQL: &str = "(SELECT COALESCE(SUM(oi.quantity), 0)::bigint \
+    FROM order_items oi \
+    JOIN sub_orders so ON so.id = oi.sub_order_id \
+    WHERE oi.product_id = p.id AND so.status = 'delivered')";
 
 pub(crate) const PRODUCT_COLUMNS: &str = "p.id, p.store_id, s.slug AS store_slug, p.title, p.title_bn, \
     p.description, p.category, p.price_poisha, p.compare_at_poisha, \
@@ -226,7 +261,11 @@ pub(crate) const PRODUCT_COLUMNS: &str = "p.id, p.store_id, s.slug AS store_slug
     (SELECT pi.width FROM product_images pi \
       WHERE pi.product_id = p.id \
       ORDER BY pi.is_primary DESC, pi.position ASC, pi.created_at ASC LIMIT 1 OFFSET 1) \
-        AS hover_image_width";
+        AS hover_image_width, \
+    (SELECT COALESCE(SUM(oi.quantity), 0)::bigint \
+      FROM order_items oi \
+      JOIN sub_orders so ON so.id = oi.sub_order_id \
+      WHERE oi.product_id = p.id AND so.status = 'delivered') AS sold_count";
 
 /// The product DETAIL shape (Wave 33): the shared product
 /// view flattened, plus the ACTIVE variants a buyer can pick
@@ -350,7 +389,7 @@ pub async fn list_products(
     // output column of PRODUCT_COLUMNS, so ORDER BY can name
     // it directly. Sponsored placement is always labelled in
     // the UI (the স্পন্সরড badge), never disguised as organic.
-    let items: Vec<Product> = sqlx::query_as(&format!(
+    let mut items: Vec<Product> = sqlx::query_as(&format!(
         "SELECT {PRODUCT_COLUMNS} FROM products p JOIN stores s ON s.id = p.store_id \
          {PRODUCT_RATING_JOIN} \
          WHERE {PRODUCT_WHERE} ORDER BY is_promoted DESC, p.created_at DESC LIMIT $4 OFFSET $5"
@@ -366,6 +405,9 @@ pub async fn list_products(
     .into_iter()
     .map(with_stock_status)
     .collect();
+    // Wave 52: live flash prices ride the shared view (see
+    // the field doc on `Product`).
+    crate::merch::attach_flash_prices(pool, &mut items, Utc::now()).await?;
 
     Ok(ProductList {
         items,
@@ -387,7 +429,11 @@ pub async fn get_product_by_id(pool: &PgPool, id: Uuid) -> Result<Product, ApiEr
     .await
     .map_err(|e| ApiError::internal("load product", e))?
     .ok_or_else(|| ApiError::not_found("product not found"))?;
-    Ok(with_stock_status(product))
+    // Wave 52: the detail view carries the live flash price
+    // like every other product surface.
+    let mut single = vec![with_stock_status(product)];
+    crate::merch::attach_flash_prices(pool, &mut single, Utc::now()).await?;
+    Ok(single.pop().expect("one product in, one product out"))
 }
 
 /// Fetch one product under the PUBLIC visibility rule — the

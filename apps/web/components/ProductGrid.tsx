@@ -103,6 +103,10 @@ export default function ProductGrid({
             isPromoted={p.is_promoted}
             imageUrl={p.image_url}
             hoverImageUrl={p.hover_image_url}
+            compareAtPoisha={p.compare_at_poisha}
+            soldCount={p.sold_count}
+            flashPricePoisha={p.flash_price_poisha}
+            flashEndsAt={p.flash_ends_at}
             variant={
               layout === "list" ? "row" : layout === "large" ? "large" : "card"
             }

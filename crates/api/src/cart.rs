@@ -77,6 +77,29 @@ pub struct CartItemView {
     /// product has no image.
     #[sqlx(default)]
     pub image_url: Option<String>,
+    /// The product's base price (Wave 52) — an intermediate
+    /// for the flash price override in `load_cart_items`;
+    /// never serialized.
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub base_price_poisha: i64,
+    /// The variant's price delta (Wave 52) — an intermediate
+    /// for the flash price override: the flash price replaces
+    /// the BASE price, and the delta applies on top of it,
+    /// exactly as it applies over the base. Never serialized.
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub variant_delta_poisha: Option<i64>,
+    /// What one unit would cost WITHOUT a live flash sale
+    /// (Wave 52): the SQL's own unit price (base + variant
+    /// delta), captured in `load_cart_items` before the flash
+    /// override replaces `unit_price_poisha`. Equal to the
+    /// unit price whenever no sale governs the line; the
+    /// difference between the two is the buyer's per-unit
+    /// saving, which the cart page totals from these fields
+    /// alone — no second price source, nothing invented.
+    #[sqlx(default)]
+    pub list_unit_price_poisha: i64,
 }
 
 impl CartItemView {
@@ -107,6 +130,8 @@ const CART_ITEMS_SQL: &str = "SELECT ci.product_id, ci.variant_id, \
     p.title, p.title_bn, \
     CASE WHEN ci.variant_id IS NULL THEN p.price_poisha \
          ELSE p.price_poisha + v.price_delta_poisha END AS unit_price_poisha, \
+    p.price_poisha AS base_price_poisha, \
+    v.price_delta_poisha AS variant_delta_poisha, \
     ci.quantity, \
     CASE WHEN ci.variant_id IS NULL THEN p.stock ELSE v.stock END AS stock, \
     p.weight_grams, \
@@ -155,24 +180,46 @@ pub async fn load_cart_items(pool: &PgPool, user_id: Uuid) -> Result<Vec<CartIte
     let Some(cart_id) = find_cart_id(pool, user_id).await? else {
         return Ok(Vec::new());
     };
-    let rows: Vec<CartItemView> = sqlx::query_as(CART_ITEMS_SQL)
+    let mut rows: Vec<CartItemView> = sqlx::query_as(CART_ITEMS_SQL)
         .bind(cart_id)
         .fetch_all(pool)
         .await
         .map_err(|e| ApiError::internal("load cart items", e))?;
     // Wave 51: fill each line's image_url from its product's
     // primary image facts (the media module's one URL rule).
-    Ok(rows
-        .into_iter()
-        .map(|mut item| {
-            item.image_url = crate::media::product_image_url(
-                item.product_image_key.as_deref(),
-                item.product_image_external_url.as_deref(),
-                item.product_image_width,
-            );
-            item
-        })
-        .collect())
+    for item in rows.iter_mut() {
+        item.image_url = crate::media::product_image_url(
+            item.product_image_key.as_deref(),
+            item.product_image_external_url.as_deref(),
+            item.product_image_width,
+        );
+        // Capture the pre-sale unit price before the flash
+        // override below replaces it (Wave 52 savings display).
+        item.list_unit_price_poisha = item.unit_price_poisha;
+    }
+    // Wave 52: a live flash price replaces the line's BASE
+    // price (the one resolution in the merch module — the
+    // same answer the catalogue showed and checkout will
+    // snapshot). A variant line's delta applies on top of
+    // the sale price through the same domain rule that
+    // applies it over the base; if that composition ever
+    // failed to produce a positive price, the line keeps its
+    // base-derived price rather than inventing one.
+    if !rows.is_empty() {
+        let product_ids: Vec<Uuid> = rows.iter().map(|item| item.product_id).collect();
+        let resolved =
+            crate::merch::flash_price_map(pool, &product_ids, chrono::Utc::now()).await?;
+        for item in rows.iter_mut() {
+            if let Some(flash) = resolved.get(&item.product_id) {
+                item.unit_price_poisha = match item.variant_delta_poisha {
+                    Some(delta) => domain::variant_final_price(flash.sale_price_poisha, delta)
+                        .unwrap_or(item.unit_price_poisha),
+                    None => flash.sale_price_poisha,
+                };
+            }
+        }
+    }
+    Ok(rows)
 }
 
 /// THE cart view builder: the GET endpoint and every cart mutation

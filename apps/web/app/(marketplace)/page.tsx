@@ -3,9 +3,20 @@ import AdminLink from "@/components/AdminLink";
 import InstallAppButton from "@/components/InstallAppButton";
 import DeliveryChargeWidget from "@/components/DeliveryChargeWidget";
 import HomeDiscovery from "@/components/HomeDiscovery";
+import HomeFeed from "@/components/HomeFeed";
 import ProductGrid from "@/components/ProductGrid";
 import SearchBar from "@/components/SearchBar";
 
+/**
+ * The marketplace home page. Wave 52 rebuilt its body: the
+ * merchandised feed (HomeFeed — hero campaigns, category
+ * tiles, the flash sale, collections, rails, featured
+ * stores, all from GET /v1/home) now leads, the per-visitor
+ * discovery strips follow, and the full catalogue grid —
+ * the page's original content and its fallback when the
+ * feed is unavailable — closes it. The header, account nav,
+ * install affordance and search bar are unchanged.
+ */
 export default function MarketplaceHomePage() {
   return (
     <main>
@@ -38,9 +49,11 @@ export default function MarketplaceHomePage() {
 
       <SearchBar />
 
+      <HomeFeed />
+
       <HomeDiscovery />
 
-      <h2>পণ্য — Products</h2>
+      <h2>সব পণ্য — All products</h2>
       <ProductGrid />
 
       <DeliveryChargeWidget />

@@ -137,6 +137,10 @@ pub struct AdminMetrics {
     /// Wave 51: the media library's footprint (see
     /// [`MediaUsage`]).
     pub media: MediaUsage,
+    /// Wave 52: merchandising engagement — banner clicks and
+    /// collection views, all-time and today (see
+    /// [`crate::merch::MerchandisingStats`]).
+    pub merchandising: crate::merch::MerchandisingStats,
 }
 
 /// One (status, count) row, shared by the two GROUP BY
@@ -296,6 +300,7 @@ pub async fn get_admin_metrics(pool: &PgPool) -> Result<AdminMetrics, ApiError> 
             .await
             .map_err(|e| ApiError::internal("media top stores", e))?,
         },
+        merchandising: crate::merch::merchandising_stats(pool).await?,
     })
 }
 

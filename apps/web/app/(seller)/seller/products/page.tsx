@@ -159,7 +159,20 @@ export default function SellerProductsPage() {
                   pricePoisha={p.price_poisha}
                   isPromoted={p.is_promoted}
                   imageUrl={p.image_url}
+                  hoverImageUrl={p.hover_image_url}
+                  compareAtPoisha={p.compare_at_poisha}
+                  soldCount={p.sold_count}
+                  flashPricePoisha={p.flash_price_poisha}
+                  flashEndsAt={p.flash_ends_at}
                 />
+                {p.flash_price_poisha !== null && (
+                  <p>
+                    ⚡ এই পণ্যটি এখন ফ্ল্যাশ সেলে আছে —{" "}
+                    <Link href="/seller/flash-sale">
+                      সেলের বিবরণ দেখুন — See the flash sale
+                    </Link>
+                  </p>
+                )}
                 <p>
                   <button
                     type="button"

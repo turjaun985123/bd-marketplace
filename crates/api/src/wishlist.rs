@@ -109,7 +109,7 @@ pub async fn remove_from_wishlist(
 /// rating aggregate, joined through the wishlist table — the
 /// same materialisation every other product surface uses.
 pub async fn list_wishlist(pool: &PgPool, user_id: Uuid) -> Result<WishlistList, ApiError> {
-    let items: Vec<Product> = sqlx::query_as(&format!(
+    let mut items: Vec<Product> = sqlx::query_as(&format!(
         "SELECT {PRODUCT_COLUMNS} FROM wishlist_items w \
          JOIN products p ON p.id = w.product_id \
          JOIN stores s ON s.id = p.store_id \
@@ -123,6 +123,9 @@ pub async fn list_wishlist(pool: &PgPool, user_id: Uuid) -> Result<WishlistList,
     .into_iter()
     .map(with_stock_status)
     .collect();
+    // Wave 52: wishlist rows carry live flash prices like
+    // every other product surface.
+    crate::merch::attach_flash_prices(pool, &mut items, chrono::Utc::now()).await?;
     Ok(WishlistList { items })
 }
 

@@ -10,6 +10,8 @@ import ProductRail from "@/components/ProductRail";
 import Stars from "@/components/Stars";
 import VerificationBadge from "@/components/VerificationBadge";
 import WishlistButton from "@/components/WishlistButton";
+import { Badge, Countdown } from "@/components/ui";
+import { formatBdt } from "@/lib/format";
 import {
   askQuestion,
   attachReviewImage,
@@ -30,6 +32,7 @@ import {
   type Product,
   type ProductDetail,
   type ProductQuestion,
+  type ProductVariant,
   type Review,
   type Store,
 } from "@/lib/api";
@@ -236,10 +239,35 @@ export default function ProductDetailPage({
   // variant — its final price and its own stock.
   const selectedVariant =
     product.variants.find((v) => v.id === selectedVariantId) ?? null;
+  // Wave 52: a live flash price replaces the product's BASE
+  // price on this page exactly as it does in the cart and at
+  // checkout — the variant's delta composes on top of the
+  // sale base (the API's per-variant final prices are
+  // base-derived, so during a sale the page composes them
+  // itself, through the same rule: delta added, a
+  // non-positive result falls back to the stored final).
+  const flashPrice = product.flash_price_poisha;
+  const effectiveBase = flashPrice ?? product.price_poisha;
+  const variantPrice = (variant: ProductVariant) =>
+    flashPrice !== null && flashPrice + variant.price_delta_poisha > 0
+      ? flashPrice + variant.price_delta_poisha
+      : variant.final_price_poisha;
   const displayPrice = selectedVariant
-    ? selectedVariant.final_price_poisha
-    : product.price_poisha;
+    ? variantPrice(selectedVariant)
+    : effectiveBase;
   const displayStock = selectedVariant ? selectedVariant.stock : product.stock;
+  const dropPercent =
+    flashPrice !== null && product.price_poisha > flashPrice
+      ? Math.floor(
+          ((product.price_poisha - flashPrice) * 100) / product.price_poisha
+        )
+      : product.compare_at_poisha !== null &&
+          product.compare_at_poisha > displayPrice
+        ? Math.floor(
+            ((product.compare_at_poisha - displayPrice) * 100) /
+              product.compare_at_poisha
+          )
+        : 0;
 
   return (
     <main>
@@ -272,7 +300,9 @@ export default function ProductDetailPage({
             offers: {
               "@type": "Offer",
               priceCurrency: "BDT",
-              price: (product.price_poisha / 100).toFixed(2),
+              // The price a buyer actually pays right now:
+              // the flash price while a sale resolves.
+              price: (effectiveBase / 100).toFixed(2),
               availability:
                 product.stock_status === "in_stock"
                   ? "https://schema.org/InStock"
@@ -313,27 +343,49 @@ export default function ProductDetailPage({
               >
                 {variant.id === selectedVariantId ? "✓ " : ""}
                 {variant.name} —{" "}
-                <PriceTag amountPoisha={variant.final_price_poisha} />
+                <PriceTag amountPoisha={variantPrice(variant)} />
                 {variant.stock <= 0 ? " (স্টক শেষ)" : ""}
               </button>
             ))}
           </p>
         </div>
       )}
-      <p>
-        <PriceTag amountPoisha={displayPrice} />{" "}
-        {selectedVariant && selectedVariant.price_delta_poisha !== 0 && (
+      {/* Wave 52 price block: while a flash sale resolves,
+          the sale is the page's headline — badge, countdown
+          and the struck base — and the price shown is the
+          price the cart and checkout will charge. */}
+      {flashPrice !== null && product.flash_ends_at && (
+        <div className="flash-banner">
+          <Badge tone="flash">ফ্ল্যাশ সেল — Flash sale</Badge>{" "}
+          <span>শেষ হতে বাকি — Ends in</span>{" "}
+          <Countdown endsAt={product.flash_ends_at} />
+        </div>
+      )}
+      <p className="product-price-block">
+        <span
+          className={
+            flashPrice !== null
+              ? "product-price-now product-price-now--flash"
+              : "product-price-now"
+          }
+        >
+          {formatBdt(displayPrice)}
+        </span>{" "}
+        {flashPrice !== null ? (
+          <s className="product-price-was">{formatBdt(product.price_poisha)}</s>
+        ) : selectedVariant && selectedVariant.price_delta_poisha !== 0 ? (
           <span>
             (মূল দাম <PriceTag amountPoisha={product.price_poisha} />)
           </span>
-        )}{" "}
-        {product.compare_at_poisha !== null && (
+        ) : null}{" "}
+        {flashPrice === null && product.compare_at_poisha !== null && (
           <s>
             <PriceTag amountPoisha={product.compare_at_poisha} />
           </s>
-        )}
+        )}{" "}
+        {dropPercent > 0 && <Badge tone="flash">-{dropPercent}%</Badge>}
       </p>
-      <p>
+      <p className="product-meta-line">
         <Stars value={product.rating_avg} />{" "}
         {product.rating_count > 0 ? (
           <span>
@@ -342,10 +394,19 @@ export default function ProductDetailPage({
         ) : (
           <span>এখনো কোনো রিভিউ নেই</span>
         )}
+        {product.sold_count > 0 && (
+          <span>
+            {" · "}
+            {product.sold_count.toLocaleString("en-IN")}টি বিক্রি হয়েছে —{" "}
+            {product.sold_count.toLocaleString("en-IN")} sold
+          </span>
+        )}
       </p>
       <p>
         {displayStock > 0
-          ? `স্টকে আছে (${displayStock}টি)`
+          ? displayStock <= 5
+            ? `মাত্র ${displayStock}টি বাকি আছে — Only ${displayStock} left in stock`
+            : `স্টকে আছে (${displayStock}টি)`
           : "স্টকে নেই"}
         {" · "}
         ওজন: {product.weight_grams} গ্রাম
@@ -385,6 +446,36 @@ export default function ProductDetailPage({
           </button>
           {messageError && <span role="alert"> {messageError}</span>}
         </p>
+      )}
+
+      {/* Wave 52: the seller card — who stands behind this
+          product, with the store's own branding and the way
+          to its storefront. Built from the same store read
+          the verification badge uses. */}
+      {store && (
+        <section className="card store-card">
+          {store.logo_url ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={store.logo_url}
+              alt=""
+              className="featured-store-logo"
+              loading="lazy"
+            />
+          ) : null}
+          <div>
+            <p className="store-card-name">
+              <Link href={`/${store.slug}`}>{store.name}</Link>{" "}
+              <VerificationBadge tier={store.verified_tier} />
+            </p>
+            {store.description ? <p>{store.description}</p> : null}
+            <p>
+              <Link href={`/${store.slug}`}>
+                স্টোরফ্রন্ট দেখুন — Visit the storefront
+              </Link>
+            </p>
+          </div>
+        </section>
       )}
 
       <ProductRail

@@ -2,6 +2,8 @@ import Link from "next/link";
 import PriceTag from "./PriceTag";
 import ProductImage from "./ProductImage";
 import WishlistButton from "./WishlistButton";
+import { Badge } from "./ui";
+import { formatBdt } from "@/lib/format";
 
 export interface ProductCardProps {
   name: string;
@@ -45,6 +47,28 @@ export interface ProductCardProps {
    * shoe" gesture, with zero layout cost when absent.
    */
   hoverImageUrl?: string | null;
+  /**
+   * The seller's strikethrough comparison price (Wave 52):
+   * when it exceeds the price, the card shows it struck
+   * through with a -% badge. The flash price, when present,
+   * takes precedence as the discount source.
+   */
+  compareAtPoisha?: number | null;
+  /**
+   * Units sold (Wave 52): the API's delivered-sub-orders
+   * count. Rendered as the "X বিক্রি — sold" line only when
+   * positive — a product with no completed sales shows no
+   * sold line at all rather than a hollow "0 sold".
+   */
+  soldCount?: number;
+  /**
+   * The live flash sale price (Wave 52), when the API
+   * resolved one for this product. The card prices at it,
+   * strikes the base price, and badges the drop.
+   */
+  flashPricePoisha?: number | null;
+  /** When the live flash sale ends (Wave 52); display only. */
+  flashEndsAt?: string | null;
 }
 
 /**
@@ -64,7 +88,22 @@ export default function ProductCard({
   variant = "card",
   imageUrl,
   hoverImageUrl,
+  compareAtPoisha,
+  soldCount,
+  flashPricePoisha,
 }: ProductCardProps) {
+  // Wave 52 price block: the flash price, when the API
+  // resolved one, IS the price — the base strikes through.
+  // Otherwise a compare-at above the price is the discount
+  // source. The percent is the same floor rule the API's
+  // domain crate states (price_drop_percent).
+  const salePrice = flashPricePoisha ?? null;
+  const effectivePrice = salePrice ?? pricePoisha;
+  const discountBase = salePrice !== null ? pricePoisha : (compareAtPoisha ?? null);
+  const dropPercent =
+    discountBase !== null && discountBase > effectivePrice
+      ? Math.floor(((discountBase - effectivePrice) * 100) / discountBase)
+      : 0;
   const image = (
     <span className="product-card-image-stack">
       <ProductImage
@@ -84,7 +123,14 @@ export default function ProductCard({
     </span>
   );
   return (
-    <article className={variant === "card" ? "card" : `card card--${variant}`}>
+    <article
+      className={`product-card ${variant === "card" ? "card" : `card card--${variant}`}`}
+    >
+      {dropPercent > 0 && variant === "card" && (
+        <span className="badge badge--flash product-card-discount">
+          -{dropPercent}%
+        </span>
+      )}
       {href ? (
         <Link href={href} className="product-card-image-link" aria-label={name}>
           {image}
@@ -92,17 +138,49 @@ export default function ProductCard({
       ) : (
         image
       )}
-      {isPromoted && (
-        <p>
-          <span className="sponsored-badge">স্পন্সরড — Sponsored</span>
+      {(isPromoted || salePrice !== null) && (
+        <p className="product-card-badges">
+          {isPromoted && (
+            <span className="sponsored-badge">স্পন্সরড — Sponsored</span>
+          )}
+          {salePrice !== null && <Badge tone="flash">ফ্ল্যাশ সেল — Flash sale</Badge>}
         </p>
       )}
-      <h3>{href ? <Link href={href}>{name}</Link> : name}</h3>
-      <p>{storeName}</p>
-      <PriceTag amountPoisha={pricePoisha} />
-      {ratingCount !== undefined && ratingCount > 0 && (
-        <p>
-          ★ {(ratingAvg ?? 0).toFixed(1)} ({ratingCount})
+      <h3 className="product-card-title">
+        {href ? <Link href={href}>{name}</Link> : name}
+      </h3>
+      <p className="product-card-store">{storeName}</p>
+      {salePrice !== null || dropPercent > 0 ? (
+        <p className="product-card-price">
+          <span
+            className={
+              salePrice !== null
+                ? "product-card-price-now product-card-price-now--flash"
+                : "product-card-price-now"
+            }
+          >
+            {formatBdt(effectivePrice)}
+          </span>
+          <span className="product-card-price-was">
+            {formatBdt(discountBase ?? pricePoisha)}
+          </span>
+        </p>
+      ) : (
+        <PriceTag amountPoisha={pricePoisha} />
+      )}
+      {((ratingCount !== undefined && ratingCount > 0) ||
+        (soldCount !== undefined && soldCount > 0)) && (
+        <p className="product-card-meta">
+          {ratingCount !== undefined && ratingCount > 0 && (
+            <span>
+              ★ {(ratingAvg ?? 0).toFixed(1)} ({ratingCount})
+            </span>
+          )}
+          {soldCount !== undefined && soldCount > 0 && (
+            <span>
+              {soldCount.toLocaleString("en-IN")} বিক্রি — sold
+            </span>
+          )}
         </p>
       )}
       {productId && (

@@ -136,7 +136,7 @@ pub async fn search_products(
         }
     };
 
-    let items: Vec<Product> = sqlx::query_as(&format!(
+    let mut items: Vec<Product> = sqlx::query_as(&format!(
         "SELECT {PRODUCT_COLUMNS} FROM products p JOIN stores s ON s.id = p.store_id \
          {PRODUCT_RATING_JOIN} \
          WHERE {SEARCH_WHERE} {order_by} LIMIT $8 OFFSET $9"
@@ -156,6 +156,9 @@ pub async fn search_products(
     .into_iter()
     .map(with_stock_status)
     .collect();
+    // Wave 52: search results carry live flash prices like
+    // every other product surface.
+    crate::merch::attach_flash_prices(pool, &mut items, chrono::Utc::now()).await?;
 
     Ok(SearchResults {
         items,

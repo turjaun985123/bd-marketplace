@@ -109,6 +109,21 @@ export interface Product {
   image_url: string | null;
   /** Second image's gallery URL (Wave 51 ext): cards swap to it on hover. */
   hover_image_url: string | null;
+  /**
+   * Units sold (Wave 52): order-item quantities over
+   * DELIVERED sub-orders only — the API's one definition of
+   * a completed sale. 0 for a product nobody has received.
+   */
+  sold_count: number;
+  /**
+   * The live flash sale price (Wave 52) when one resolves
+   * for this product right now (sale live, product in it,
+   * cap not exhausted) — the price the cart and checkout
+   * will charge. Null when the product sells at base price.
+   */
+  flash_price_poisha: number | null;
+  /** When the live flash sale ends (Wave 52); set with the price. */
+  flash_ends_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -298,6 +313,12 @@ export interface CartItem {
   image_url: string | null;
   /** The variant's FINAL price for variant lines (Wave 33). */
   unit_price_poisha: number;
+  /**
+   * The unit price WITHOUT a live flash sale (Wave 52):
+   * base + variant delta. Equals `unit_price_poisha` when
+   * no sale governs the line; the difference is the saving.
+   */
+  list_unit_price_poisha: number;
   quantity: number;
   stock: number;
   /** Weight of one unit in grams (Wave 4). */
@@ -4370,9 +4391,475 @@ export interface AdminMetrics {
       stored_bytes: number;
     }[];
   };
+  /** Merchandising engagement (Wave 52): banner clicks + collection views. */
+  merchandising: {
+    banner_clicks_total: number;
+    collection_views_total: number;
+    banner_clicks_today: number;
+    collection_views_today: number;
+  };
 }
 
 /** GET /v1/admin/metrics — admin only (the API answers 403 otherwise). */
 export function getAdminMetrics(token: string): Promise<AdminMetrics> {
   return call("/v1/admin/metrics", { token });
+}
+
+// ---------------------------------------------------------------------------
+// Merchandising (Wave 52): home banners, collections, flash
+// sales, the home feed, and the event beacon. The admin
+// writes are JWT-admin only on the API side (API keys are
+// refused on the whole /v1/admin/* prefix); the feed and the
+// collection landing read are public.
+// ---------------------------------------------------------------------------
+
+/** One home banner as the API serves it (admin + feed share the shape). */
+export interface HomeBanner {
+  id: string;
+  title: string;
+  subtitle: string | null;
+  link_url: string | null;
+  /** Display URL: the sized upload or the hotlink; null = text-only. */
+  image_url: string | null;
+  position: number;
+  starts_at: string | null;
+  ends_at: string | null;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface BannerList {
+  items: HomeBanner[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+/** The banner write payload (create: title required; update: all optional). */
+export interface BannerInput {
+  title?: string;
+  subtitle?: string | null;
+  link_url?: string | null;
+  external_image_url?: string | null;
+  position?: number;
+  starts_at?: string | null;
+  ends_at?: string | null;
+  is_active?: boolean;
+}
+
+/** GET /v1/admin/banners — every banner, carousel order. */
+export function listAdminBanners(
+  token: string,
+  params?: { page?: number; limit?: number }
+): Promise<BannerList> {
+  const search = new URLSearchParams();
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/admin/banners${qs ? `?${qs}` : ""}`, { token });
+}
+
+/** POST /v1/admin/banners. */
+export function createAdminBanner(
+  token: string,
+  input: BannerInput & { title: string }
+): Promise<HomeBanner> {
+  return call("/v1/admin/banners", { method: "POST", token, body: input });
+}
+
+/** PATCH /v1/admin/banners/:id — set-only optional fields. */
+export function updateAdminBanner(
+  token: string,
+  id: string,
+  input: BannerInput
+): Promise<HomeBanner> {
+  return call(`/v1/admin/banners/${id}`, { method: "PATCH", token, body: input });
+}
+
+/** DELETE /v1/admin/banners/:id (uploaded objects are removed too). */
+export function deleteAdminBanner(
+  token: string,
+  id: string
+): Promise<{ deleted: boolean; id: string }> {
+  return call(`/v1/admin/banners/${id}`, { method: "DELETE", token });
+}
+
+/**
+ * POST /v1/admin/banners/:id/image — upload the banner's
+ * image through the media pipeline (multipart, the `file`
+ * field). Becomes the banner's one image source.
+ */
+export function uploadAdminBannerImage(
+  token: string,
+  id: string,
+  file: File
+): Promise<HomeBanner> {
+  const form = new FormData();
+  form.append("file", file);
+  return callForm(`/v1/admin/banners/${id}/image`, form, { token });
+}
+
+/** DELETE /v1/admin/banners/:id/image — remove the uploaded image. */
+export function deleteAdminBannerImage(
+  token: string,
+  id: string
+): Promise<HomeBanner> {
+  return call(`/v1/admin/banners/${id}/image`, { method: "DELETE", token });
+}
+
+/** One curated collection (membership lives in the detail shape). */
+export interface MerchCollection {
+  id: string;
+  slug: string;
+  title: string;
+  subtitle: string | null;
+  is_active: boolean;
+  position: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** A collection plus its products in membership order. */
+export interface MerchCollectionDetail extends MerchCollection {
+  products: Product[];
+}
+
+export interface MerchCollectionList {
+  items: MerchCollection[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+export interface CollectionInput {
+  slug?: string;
+  title?: string;
+  subtitle?: string | null;
+  is_active?: boolean;
+  position?: number;
+}
+
+/** GET /v1/admin/collections — every collection, home order. */
+export function listAdminCollections(
+  token: string,
+  params?: { page?: number; limit?: number }
+): Promise<MerchCollectionList> {
+  const search = new URLSearchParams();
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/admin/collections${qs ? `?${qs}` : ""}`, { token });
+}
+
+/** POST /v1/admin/collections. */
+export function createAdminCollection(
+  token: string,
+  input: CollectionInput & { slug: string; title: string }
+): Promise<MerchCollection> {
+  return call("/v1/admin/collections", { method: "POST", token, body: input });
+}
+
+/** GET /v1/admin/collections/:id — the collection + its products. */
+export function getAdminCollection(
+  token: string,
+  id: string
+): Promise<MerchCollectionDetail> {
+  return call(`/v1/admin/collections/${id}`, { token });
+}
+
+/** PATCH /v1/admin/collections/:id. */
+export function updateAdminCollection(
+  token: string,
+  id: string,
+  input: CollectionInput
+): Promise<MerchCollection> {
+  return call(`/v1/admin/collections/${id}`, {
+    method: "PATCH",
+    token,
+    body: input,
+  });
+}
+
+/** DELETE /v1/admin/collections/:id (membership cascades). */
+export function deleteAdminCollection(
+  token: string,
+  id: string
+): Promise<{ deleted: boolean; id: string }> {
+  return call(`/v1/admin/collections/${id}`, { method: "DELETE", token });
+}
+
+/**
+ * PUT /v1/admin/collections/:id/products — replace the
+ * membership with this ordered list (the list IS the order).
+ */
+export function setAdminCollectionProducts(
+  token: string,
+  id: string,
+  productIds: string[]
+): Promise<MerchCollectionDetail> {
+  return call(`/v1/admin/collections/${id}/products`, {
+    method: "PUT",
+    token,
+    body: { product_ids: productIds },
+  });
+}
+
+/** GET /v1/collections/:slug — the public landing data (404 when unpublished). */
+export function getCollection(slug: string): Promise<MerchCollectionDetail> {
+  return call(`/v1/collections/${encodeURIComponent(slug)}`);
+}
+
+/** One flash sale as the admin lists serve it. */
+export interface FlashSale {
+  id: string;
+  title: string;
+  starts_at: string;
+  ends_at: string;
+  is_active: boolean;
+  item_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FlashSaleList {
+  items: FlashSale[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+/** One flash sale item in the admin editor: terms + live cap accounting. */
+export interface FlashSaleItemView {
+  product_id: string;
+  product_title: string;
+  base_price_poisha: number;
+  sale_price_poisha: number;
+  stock_cap: number | null;
+  sold_at_sale: number;
+  cap_remaining: number | null;
+}
+
+/** A flash sale plus its item views. */
+export interface FlashSaleDetail extends FlashSale {
+  items: FlashSaleItemView[];
+}
+
+export interface FlashSaleInput {
+  title?: string;
+  starts_at?: string;
+  ends_at?: string;
+  is_active?: boolean;
+}
+
+/** One item of the replace-items payload (prices in poisha). */
+export interface FlashSaleItemInput {
+  product_id: string;
+  sale_price_poisha: number;
+  stock_cap?: number | null;
+}
+
+/** GET /v1/admin/flash-sales — newest window first. */
+export function listAdminFlashSales(
+  token: string,
+  params?: { page?: number; limit?: number }
+): Promise<FlashSaleList> {
+  const search = new URLSearchParams();
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/admin/flash-sales${qs ? `?${qs}` : ""}`, { token });
+}
+
+/** POST /v1/admin/flash-sales. */
+export function createAdminFlashSale(
+  token: string,
+  input: FlashSaleInput & { title: string; starts_at: string; ends_at: string }
+): Promise<FlashSale> {
+  return call("/v1/admin/flash-sales", { method: "POST", token, body: input });
+}
+
+/** GET /v1/admin/flash-sales/:id — the sale + item views. */
+export function getAdminFlashSale(
+  token: string,
+  id: string
+): Promise<FlashSaleDetail> {
+  return call(`/v1/admin/flash-sales/${id}`, { token });
+}
+
+/** PATCH /v1/admin/flash-sales/:id. */
+export function updateAdminFlashSale(
+  token: string,
+  id: string,
+  input: FlashSaleInput
+): Promise<FlashSale> {
+  return call(`/v1/admin/flash-sales/${id}`, {
+    method: "PATCH",
+    token,
+    body: input,
+  });
+}
+
+/** DELETE /v1/admin/flash-sales/:id (items cascade). */
+export function deleteAdminFlashSale(
+  token: string,
+  id: string
+): Promise<{ deleted: boolean; id: string }> {
+  return call(`/v1/admin/flash-sales/${id}`, { method: "DELETE", token });
+}
+
+/**
+ * PUT /v1/admin/flash-sales/:id/items — replace the item
+ * list. Every price is validated against the product's
+ * current base price on the API (a genuine reduction only).
+ */
+export function setAdminFlashSaleItems(
+  token: string,
+  id: string,
+  items: FlashSaleItemInput[]
+): Promise<FlashSaleDetail> {
+  return call(`/v1/admin/flash-sales/${id}/items`, {
+    method: "PUT",
+    token,
+    body: { items },
+  });
+}
+
+/** One category tile of the home feed. */
+export interface HomeCategory {
+  category: string;
+  product_count: number;
+  image_url: string | null;
+}
+
+/** One flash card of the home feed: the product view + the sale terms. */
+export interface HomeFlashItem extends Product {
+  sale_price_poisha: number;
+  stock_cap: number | null;
+  sold_at_sale: number;
+}
+
+/** The feed's flash sale block (null in the feed when no sale is live). */
+export interface HomeFlashSale {
+  id: string;
+  title: string;
+  starts_at: string;
+  ends_at: string;
+  items: HomeFlashItem[];
+}
+
+/** One collection section of the home feed. */
+export interface HomeCollectionSection extends MerchCollection {
+  products: Product[];
+}
+
+/** One featured (verified) store tile of the home feed. */
+export interface FeaturedStore {
+  id: string;
+  slug: string;
+  name: string;
+  logo_url: string | null;
+  banner_url: string | null;
+  brand_color: string | null;
+  verified_tier: string;
+  product_count: number;
+}
+
+/** GET /v1/home — everything the home page renders, in one response. */
+export interface HomeFeed {
+  banners: HomeBanner[];
+  categories: HomeCategory[];
+  flash_sale: HomeFlashSale | null;
+  collections: HomeCollectionSection[];
+  new_arrivals: Product[];
+  top_rated: Product[];
+  best_sellers: Product[];
+  promoted: Product[];
+  featured_stores: FeaturedStore[];
+}
+
+/** GET /v1/home — the public home feed. */
+export function getHomeFeed(): Promise<HomeFeed> {
+  return call("/v1/home");
+}
+
+/**
+ * GET /v1/admin/home-preview?at= — the feed as of a
+ * scheduled instant (admin only), for verifying a campaign
+ * before it goes live. Omit `at` for "now".
+ */
+export function getAdminHomePreview(
+  token: string,
+  at?: string
+): Promise<HomeFeed> {
+  const qs = at ? `?at=${encodeURIComponent(at)}` : "";
+  return call(`/v1/admin/home-preview${qs}`, { token });
+}
+
+export type MerchEventKind = "banner_click" | "collection_view";
+
+/**
+ * POST /v1/merch/events — the fire-and-forget engagement
+ * beacon. Callers must never await it on a navigation path
+ * and never surface its failure: a lost count is acceptable,
+ * a blocked click is not.
+ */
+export function recordMerchEvent(kind: MerchEventKind, targetId: string): void {
+  void call("/v1/merch/events", {
+    method: "POST",
+    body: { kind, target_id: targetId },
+  }).catch(() => {
+    // The beacon is best-effort by design (see the API's
+    // migration 0047 note): counts inform, they never gate.
+  });
+}
+
+/** One of the seller's products inside the live flash sale (Wave 52). */
+export interface SellerFlashItem {
+  product_id: string;
+  product_title: string;
+  store_slug: string;
+  base_price_poisha: number;
+  sale_price_poisha: number;
+  stock_cap: number | null;
+  sold_at_sale: number;
+  cap_remaining: number | null;
+}
+
+/** The live flash sale from the seller's seat (Wave 52). */
+export interface SellerFlashSale {
+  sale_id: string;
+  title: string;
+  starts_at: string;
+  ends_at: string;
+  items: SellerFlashItem[];
+}
+
+/**
+ * GET /v1/seller/flash-sale — the caller's products inside
+ * the flash sale live right now, with the cap accounting.
+ * Null when no sale is live.
+ */
+export function getSellerFlashSale(
+  token: string
+): Promise<SellerFlashSale | null> {
+  return call("/v1/seller/flash-sale", { token });
+}
+
+/** One recent merchandising event (Wave 52), target title resolved. */
+export interface MerchEventView {
+  id: number;
+  kind: MerchEventKind;
+  target_id: string;
+  target_title: string | null;
+  created_at: string;
+}
+
+/** GET /v1/admin/merch-events — the most recent engagement events. */
+export function listAdminMerchEvents(
+  token: string,
+  limit?: number
+): Promise<MerchEventView[]> {
+  const qs = limit ? `?limit=${limit}` : "";
+  return call(`/v1/admin/merch-events${qs}`, { token });
 }

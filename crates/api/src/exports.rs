@@ -208,7 +208,7 @@ async fn build_seller_export(
     charges_store: Option<Uuid>,
 ) -> Result<ExportDownload, ApiError> {
 
-    let products: Vec<Product> = sqlx::query_as(&format!(
+    let mut products: Vec<Product> = sqlx::query_as(&format!(
         "SELECT {PRODUCT_COLUMNS} FROM products p JOIN stores s ON s.id = p.store_id \
          {PRODUCT_RATING_JOIN} \
          WHERE p.store_id = ANY($1) ORDER BY p.created_at ASC"
@@ -220,6 +220,9 @@ async fn build_seller_export(
     .into_iter()
     .map(with_stock_status)
     .collect();
+    // Wave 52: the export's product views are the shared
+    // view, flash fields included, like every other surface.
+    crate::merch::attach_flash_prices(pool, &mut products, chrono::Utc::now()).await?;
 
     let sub_order_rows: Vec<ExportSubOrderRow> = sqlx::query_as(&format!(
         "SELECT {EXPORT_SUB_ORDER_COLUMNS} FROM sub_orders \

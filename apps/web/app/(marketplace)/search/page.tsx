@@ -4,6 +4,7 @@ import { Suspense, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import ProductCard from "@/components/ProductCard";
+import { Button, EmptyState, ProductCardSkeleton } from "@/components/ui";
 import {
   searchProducts,
   type SearchResult,
@@ -149,7 +150,7 @@ function SearchResultsView() {
         </p>
       )}
 
-      <form onSubmit={onFilter}>
+      <form onSubmit={onFilter} className="merch-form search-filters">
         <label>
           খুঁজুন — Keywords{" "}
           <input
@@ -198,8 +199,14 @@ function SearchResultsView() {
             ))}
           </select>
         </label>{" "}
-        <button type="submit">ফিল্টার করুন — Filter</button>
-        {formError && <p role="alert">{formError}</p>}
+        <Button type="submit" variant="primary">
+          ফিল্টার করুন — Filter
+        </Button>
+        {formError && (
+          <p role="alert" className="merch-error">
+            {formError}
+          </p>
+        )}
       </form>
 
       {offline ? (
@@ -208,12 +215,15 @@ function SearchResultsView() {
           not reach the API, so search cannot run.)
         </p>
       ) : results === null ? (
-        <p>খোঁজা হচ্ছে… (Searching…)</p>
+        <div className="search-grid" aria-hidden="true">
+          {Array.from({ length: 8 }, (_, i) => (
+            <ProductCardSkeleton key={i} />
+          ))}
+        </div>
       ) : results.total === 0 ? (
-        <p>
-          কোনো পণ্য মেলেনি — অন্য শব্দ বা ফিল্টার চেষ্টা করুন। (No products
-          matched.)
-        </p>
+        <EmptyState title="কোনো পণ্য মেলেনি — No products matched">
+          <p>অন্য শব্দ বা ফিল্টার চেষ্টা করুন। (Try other words or filters.)</p>
+        </EmptyState>
       ) : (
         <div>
           <p>
@@ -221,8 +231,9 @@ function SearchResultsView() {
             of {totalPages}
           </p>
           {cartError && <p role="alert">{cartError}</p>}
+          <div className="search-grid">
           {results.items.map((p) => (
-            <div key={p.id}>
+            <div key={p.id} className="search-result">
               <ProductCard
                 name={p.title_bn ?? p.title}
                 storeName={p.store_slug}
@@ -234,6 +245,10 @@ function SearchResultsView() {
                 isPromoted={p.is_promoted}
                 imageUrl={p.image_url}
                 hoverImageUrl={p.hover_image_url}
+                compareAtPoisha={p.compare_at_poisha}
+                soldCount={p.sold_count}
+                flashPricePoisha={p.flash_price_poisha}
+                flashEndsAt={p.flash_ends_at}
               />
               {token ? (
                 <p>
@@ -253,6 +268,7 @@ function SearchResultsView() {
               )}
             </div>
           ))}
+          </div>
           <p>
             {page > 1 && (
               <button

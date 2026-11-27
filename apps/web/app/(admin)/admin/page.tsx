@@ -7,9 +7,12 @@ import PriceTag from "@/components/PriceTag";
 import {
   getAdminMetrics,
   getAdminOverview,
+  listAdminMerchEvents,
   type AdminMetrics,
   type AdminOverview,
+  type MerchEventView,
 } from "@/lib/api";
+import { formatDateTime } from "@/lib/format";
 import { useAuth } from "@/hooks/useAuth";
 
 /**
@@ -25,7 +28,54 @@ export default function AdminOverviewPage() {
     <AdminShell>
       <Overview />
       <SystemStatus />
+      <RecentMerchEvents />
     </AdminShell>
+  );
+}
+
+/**
+ * The most recent merchandising events (Wave 52): the
+ * beacon's raw feed — which banners are being clicked and
+ * which collections viewed, newest first, with each
+ * target's current title (a deleted target shows its id —
+ * the append-only log outlives its targets by design).
+ */
+function RecentMerchEvents() {
+  const { token } = useAuth();
+  const [events, setEvents] = useState<MerchEventView[] | null>(null);
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    listAdminMerchEvents(token, 10)
+      .then((data) => {
+        if (!cancelled) setEvents(data);
+      })
+      .catch(() => {
+        if (!cancelled) setEvents([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token]);
+
+  if (events === null || events.length === 0) return null;
+  return (
+    <>
+      <h2>সাম্প্রতিক মার্চেন্ডাইজিং ইভেন্ট — Recent merchandising events</h2>
+      <ul>
+        {events.map((event) => (
+          <li key={event.id}>
+            {event.kind === "banner_click"
+              ? "ব্যানার ক্লিক — Banner click"
+              : "কালেকশন ভিউ — Collection view"}
+            {": "}
+            {event.target_title ?? event.target_id} ·{" "}
+            {formatDateTime(event.created_at)}
+          </li>
+        ))}
+      </ul>
+    </>
   );
 }
 
@@ -157,6 +207,14 @@ function SystemStatus() {
               {" · "}বাইরের URL <strong>{metrics.media.external_images}</strong>
               {" · "}সংরক্ষিত আকার{" "}
               <strong>{(metrics.media.stored_bytes / 1024).toFixed(1)} KB</strong>
+            </p>
+            <p>
+              মার্চেন্ডাইজিং (Wave 52): ব্যানার ক্লিক{" "}
+              <strong>{metrics.merchandising.banner_clicks_total}</strong> (আজ{" "}
+              <strong>{metrics.merchandising.banner_clicks_today}</strong>)
+              {" · "}কালেকশন ভিউ{" "}
+              <strong>{metrics.merchandising.collection_views_total}</strong>{" "}
+              (আজ <strong>{metrics.merchandising.collection_views_today}</strong>)
             </p>
             {metrics.media.top_stores.length > 0 && (
               <>

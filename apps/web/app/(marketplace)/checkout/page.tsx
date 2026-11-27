@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import PriceTag from "@/components/PriceTag";
+import { formatBdt } from "@/lib/format";
 import {
   devSimulateSuccess,
   getAdvancePolicy,
@@ -115,6 +116,16 @@ export default function CheckoutPage() {
   const { ready, token } = useAuth();
   const { items, goodsTotalPoisha, loading, refresh } = useCart();
   const { quoteAmount } = useDeliveryCharge();
+  // Wave 52: what the live flash sale is saving on this cart
+  // — the API's per-line list vs charged unit prices, the
+  // same pair the cart page totals.
+  const flashSavingsPoisha = items.reduce(
+    (sum, item) =>
+      sum +
+      Math.max(0, item.list_unit_price_poisha - item.unit_price_poisha) *
+        item.quantity,
+    0
+  );
 
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
@@ -575,6 +586,14 @@ export default function CheckoutPage() {
               </>
             )}
           </p>
+          {flashSavingsPoisha > 0 && (
+            <p>
+              ফ্ল্যাশ সেলে সাশ্রয় — Flash sale savings:{" "}
+              <strong>{formatBdt(flashSavingsPoisha)}</strong> (ইতিমধ্যে
+              পণ্যের মোটে ধরা আছে — already included in the goods total
+              above)
+            </p>
+          )}
           <p>
             আনুমানিক হিসাব শুধু দেখার জন্য — অর্ডারের সময় সার্ভারের হিসাবই
             চূড়ান্ত। (Preview only; the server's totals at order time are

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import ProductCard from "@/components/ProductCard";
+import { EmptyState, ProductCardSkeleton } from "@/components/ui";
 import { getWishlist, type Product } from "@/lib/api";
 import { useAuth } from "@/hooks/useAuth";
 import { useWishlist } from "@/hooks/useWishlist";
@@ -78,14 +79,20 @@ export default function WishlistPage() {
       <h1>আমার উইশলিস্ট — My wishlist</h1>
       {error && <p role="alert">{error}</p>}
       {items === null && !error ? (
-        <p>লোড হচ্ছে… (Loading…)</p>
+        <div className="search-grid" aria-hidden="true">
+          {Array.from({ length: 4 }, (_, i) => (
+            <ProductCardSkeleton key={i} />
+          ))}
+        </div>
       ) : items !== null && items.length === 0 ? (
-        <p>
-          আপনার উইশলিস্ট খালি — পছন্দের পণ্যে ♡ চাপ দিলেই এখানে জমা
-          হবে। (Your wishlist is empty.)
-        </p>
+        <EmptyState title="আপনার উইশলিস্ট খালি — Your wishlist is empty">
+          <p>
+            পছন্দের পণ্যে ♡ চাপ দিলেই এখানে জমা হবে। (Tap ♡ on a product
+            and it will be saved here.)
+          </p>
+        </EmptyState>
       ) : (
-        <div>
+        <div className="search-grid">
           {items?.map((p) => (
             <ProductCard
               key={p.id}
@@ -97,8 +104,12 @@ export default function WishlistPage() {
               ratingAvg={p.rating_avg}
               ratingCount={p.rating_count}
               isPromoted={p.is_promoted}
-            imageUrl={p.image_url}
-            hoverImageUrl={p.hover_image_url}
+              imageUrl={p.image_url}
+              hoverImageUrl={p.hover_image_url}
+              compareAtPoisha={p.compare_at_poisha}
+              soldCount={p.sold_count}
+              flashPricePoisha={p.flash_price_poisha}
+              flashEndsAt={p.flash_ends_at}
             />
           ))}
         </div>

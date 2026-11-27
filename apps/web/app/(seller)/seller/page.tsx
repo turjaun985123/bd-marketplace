@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import PriceTag from "@/components/PriceTag";
+import SellerFlashCard from "@/components/SellerFlashCard";
 import StoreSwitcher from "@/components/StoreSwitcher";
 import {
   downloadSellerExport,
@@ -343,6 +344,8 @@ export default function SellerDashboardPage() {
         {" · "}
         <Link href="/seller/promotions">প্রমোশন — Promotions</Link>
         {" · "}
+        <Link href="/seller/flash-sale">ফ্ল্যাশ সেল — Flash sale</Link>
+        {" · "}
         <Link href="/seller/subscription">সাবস্ক্রিপশন — Subscription</Link>
         {" · "}
         <Link href="/seller/api-keys">API কী — API keys</Link>
@@ -364,6 +367,9 @@ export default function SellerDashboardPage() {
         )}
       </p>
       {message && <p role="status">{message}</p>}
+      {/* Wave 52: the live flash sale, when it carries this
+          seller's products (renders nothing otherwise). */}
+      {token && <SellerFlashCard token={token} />}
       {dashboard !== null && dashboard.unanswered_questions > 0 && (
         <section>
           <div className="card">

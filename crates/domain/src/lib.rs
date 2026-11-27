@@ -4299,6 +4299,270 @@ pub fn is_blocked_fetch_ip(raw: &str) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Wave 52 — merchandising: home banners, collections, flash sales
+// ---------------------------------------------------------------------------
+//
+// The storefront-parity program's data rules. Banners and
+// collections are admin-curated home-page furniture; flash
+// sales are time-boxed price events whose prices the cart and
+// checkout honour. Every rule here is pure and unit-tested;
+// the API layer adds only the database facts (a product's
+// current base price, the units already sold at a sale price)
+// and never re-implements a rule.
+
+/// Longest merchandising title (banner, collection, flash
+/// sale): a headline, not a paragraph.
+pub const MAX_MERCH_TITLE_CHARS: usize = 120;
+
+/// Longest banner subtitle: one supporting line under the
+/// headline.
+pub const MAX_BANNER_SUBTITLE_CHARS: usize = 200;
+
+/// Longest banner link: room for a deep link with a query
+/// string, not for a pasted document.
+pub const MAX_BANNER_LINK_CHARS: usize = 500;
+
+/// Longest collection subtitle.
+pub const MAX_COLLECTION_SUBTITLE_CHARS: usize = 200;
+
+/// Validate a merchandising title (home banner, collection or
+/// flash sale): trimmed, 1..=[`MAX_MERCH_TITLE_CHARS`]
+/// characters. Returns the trimmed title on success. Error
+/// strings are user-facing (the admin forms show them).
+pub fn validate_merch_title(title: &str) -> Result<String, &'static str> {
+    let trimmed = title.trim();
+    let len = trimmed.chars().count();
+    if len == 0 {
+        return Err("the title must not be empty");
+    }
+    if len > MAX_MERCH_TITLE_CHARS {
+        return Err("the title is too long (120 characters at most)");
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Validate an optional merchandising subtitle: absent and
+/// blank both store as "no subtitle"; a present one is
+/// trimmed and capped at `max_chars`. Returns the value to
+/// store.
+pub fn validate_merch_subtitle(
+    subtitle: Option<&str>,
+    max_chars: usize,
+) -> Result<Option<String>, &'static str> {
+    match subtitle {
+        None => Ok(None),
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            if trimmed.chars().count() > max_chars {
+                return Err("the subtitle is too long");
+            }
+            Ok(Some(trimmed.to_string()))
+        }
+    }
+}
+
+/// Validate a home banner's link. A banner links either to a
+/// page of this site — a site-relative path beginning with a
+/// single `/` (`//` would be a protocol-relative URL pointing
+/// off-site, and is refused) — or to an absolute `http://` /
+/// `https://` URL (a partner campaign). Anything else
+/// (`javascript:`, a bare host, an empty string) is refused:
+/// the carousel renders the value straight into an anchor, so
+/// the scheme whitelist is the whole defence. Returns the
+/// trimmed link on success.
+pub fn validate_banner_link(link: &str) -> Result<String, &'static str> {
+    let trimmed = link.trim();
+    if trimmed.is_empty() {
+        return Err("the link must not be empty");
+    }
+    if trimmed.chars().count() > MAX_BANNER_LINK_CHARS {
+        return Err("the link is too long (500 characters at most)");
+    }
+    if trimmed.chars().any(char::is_control) || trimmed.contains(char::is_whitespace) {
+        return Err("the link must not contain spaces or control characters");
+    }
+    if let Some(rest) = trimmed.strip_prefix('/') {
+        if rest.starts_with('/') {
+            return Err("the link must be a site path or an http(s) URL");
+        }
+        return Ok(trimmed.to_string());
+    }
+    if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+        return Ok(trimmed.to_string());
+    }
+    Err("the link must be a site path (starting with /) or an http(s) URL")
+}
+
+/// Is a home banner visible at `now` (unix seconds)? The one
+/// visibility rule: the banner must be switched on, and its
+/// optional window must contain `now` — half-open
+/// [starts_at, ends_at), the same convention as promotions
+/// and flash sales: a banner appears exactly at its start
+/// second and disappears exactly at its end second. A null
+/// bound is unbounded on that side. The home feed's SQL
+/// implements this same rule over the stored timestamps.
+pub fn banner_is_visible(
+    is_active: bool,
+    starts_at_unix: Option<i64>,
+    ends_at_unix: Option<i64>,
+    now_unix: i64,
+) -> bool {
+    if !is_active {
+        return false;
+    }
+    if let Some(starts) = starts_at_unix {
+        if now_unix < starts {
+            return false;
+        }
+    }
+    if let Some(ends) = ends_at_unix {
+        if now_unix >= ends {
+            return false;
+        }
+    }
+    true
+}
+
+/// Validate an optional merchandising window (a banner's):
+/// when both bounds are present the window must be non-empty
+/// — it ends strictly after it starts. A single bound (or
+/// none) is always a valid window.
+pub fn validate_optional_window(
+    starts_at_unix: Option<i64>,
+    ends_at_unix: Option<i64>,
+) -> Result<(), &'static str> {
+    if let (Some(starts), Some(ends)) = (starts_at_unix, ends_at_unix) {
+        if ends <= starts {
+            return Err("the window must end after it starts");
+        }
+    }
+    Ok(())
+}
+
+/// Validate a collection slug: the landing-page segment of
+/// `/collections/<slug>`. The rule is the store-slug rule
+/// ([`is_valid_slug`]) — one slug grammar for the whole site,
+/// so a collection can never squat on a shape a store could
+/// not use and the two namespaces stay indistinguishable in
+/// form. Returns the slug unchanged on success.
+pub fn validate_collection_slug(slug: &str) -> Result<&str, &'static str> {
+    if is_valid_slug(slug) {
+        Ok(slug)
+    } else {
+        Err("the slug must be 3-40 characters of lowercase letters, digits and hyphens, \
+             starting and ending with a letter or digit")
+    }
+}
+
+/// Validate a flash sale's window (unix seconds): both
+/// bounds are required for a flash sale (a sale with no end
+/// is not a flash sale), and the window must be non-empty.
+pub fn validate_flash_window(starts_at_unix: i64, ends_at_unix: i64) -> Result<(), &'static str> {
+    if ends_at_unix <= starts_at_unix {
+        return Err("the flash sale must end after it starts");
+    }
+    Ok(())
+}
+
+/// Is a flash sale live at `now` (unix seconds)? Active flag
+/// plus the half-open window [starts_at, ends_at) — the same
+/// convention as [`promotion_is_active`], so every timed
+/// placement on the platform starts and stops on the same
+/// rule.
+pub fn flash_sale_is_live(
+    is_active: bool,
+    starts_at_unix: i64,
+    ends_at_unix: i64,
+    now_unix: i64,
+) -> bool {
+    is_active && starts_at_unix <= now_unix && now_unix < ends_at_unix
+}
+
+/// Do two half-open windows [a_start, a_end) and [b_start,
+/// b_end) overlap? The overlap test behind the "at most one
+/// live flash sale" rule: windows that merely TOUCH (one ends
+/// exactly when the other starts) do not overlap, so a sale
+/// may be scheduled back-to-back after another.
+pub fn windows_overlap(a_start: i64, a_end: i64, b_start: i64, b_end: i64) -> bool {
+    a_start < b_end && b_start < a_end
+}
+
+/// Validate a flash sale item's price against the product's
+/// CURRENT base price: a sale price is real only when it is a
+/// genuine reduction — strictly positive and strictly below
+/// the base. A "sale" at or above the base price is refused
+/// at write time, so the storefront can never advertise a
+/// discount that is not one. Returns the price on success.
+pub fn validate_flash_sale_price(
+    sale_price_poisha: i64,
+    base_price_poisha: i64,
+) -> Result<i64, &'static str> {
+    if sale_price_poisha <= 0 {
+        return Err("the sale price must be positive");
+    }
+    if sale_price_poisha >= base_price_poisha {
+        return Err("the sale price must be below the product's current price");
+    }
+    Ok(sale_price_poisha)
+}
+
+/// Validate a flash sale item's stock cap: when present it
+/// must allow at least one unit (a cap of zero would be a
+/// sale that can never sell — refused at write time rather
+/// than silently inert). Returns the cap on success.
+pub fn validate_flash_stock_cap(stock_cap: Option<i64>) -> Result<Option<i64>, &'static str> {
+    match stock_cap {
+        None => Ok(None),
+        Some(cap) if cap >= 1 => Ok(Some(cap)),
+        Some(_) => Err("the stock cap must be at least 1"),
+    }
+}
+
+/// THE flash price resolution rule, given the gathered
+/// facts: the candidate sale price applies — and is returned
+/// — unless the item's stock cap is already exhausted by
+/// units sold at the sale price, in which case there is no
+/// flash price and the product sells at its base price
+/// everywhere. A non-positive candidate is never a price
+/// (defence in depth: write-time validation already refuses
+/// one). Cap accounting's definition of "sold at the sale
+/// price" lives with the API's one aggregate; this function
+/// is only the comparison.
+pub fn resolve_flash_price(
+    sale_price_poisha: i64,
+    stock_cap: Option<i64>,
+    sold_at_sale_price: i64,
+) -> Option<i64> {
+    if sale_price_poisha <= 0 {
+        return None;
+    }
+    if let Some(cap) = stock_cap {
+        if sold_at_sale_price >= cap {
+            return None;
+        }
+    }
+    Some(sale_price_poisha)
+}
+
+/// The whole-percent discount of a sale price against a base
+/// price, for the "-X%" badge: floor of
+/// (base − sale) × 100 / base, computed in i128 so no price
+/// the platform can store overflows it. Zero when the inputs
+/// cannot describe a discount (non-positive base, or a sale
+/// price that is not below the base) — the badge simply does
+/// not render.
+pub fn price_drop_percent(base_price_poisha: i64, sale_price_poisha: i64) -> i64 {
+    if base_price_poisha <= 0 || sale_price_poisha < 0 || sale_price_poisha >= base_price_poisha {
+        return 0;
+    }
+    let drop = i128::from(base_price_poisha - sale_price_poisha) * 100 / i128::from(base_price_poisha);
+    drop as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7445,5 +7709,163 @@ mod tests {
         // Unparseable input fails closed.
         assert!(is_blocked_fetch_ip("not-an-ip"));
         assert!(is_blocked_fetch_ip(""));
+    }
+
+    // -- Wave 52: merchandising rules -------------------------------------
+
+    #[test]
+    fn merch_title_rules() {
+        assert_eq!(validate_merch_title("  Eid Sale  ").unwrap(), "Eid Sale");
+        assert!(validate_merch_title("").is_err());
+        assert!(validate_merch_title("   ").is_err());
+        assert!(validate_merch_title(&"x".repeat(120)).is_ok());
+        assert!(validate_merch_title(&"x".repeat(121)).is_err());
+        // Multi-byte characters count as characters, not bytes.
+        assert!(validate_merch_title(&"অ".repeat(120)).is_ok());
+        assert!(validate_merch_title(&"অ".repeat(121)).is_err());
+    }
+
+    #[test]
+    fn merch_subtitle_rules() {
+        assert_eq!(validate_merch_subtitle(None, 200).unwrap(), None);
+        assert_eq!(validate_merch_subtitle(Some("   "), 200).unwrap(), None);
+        assert_eq!(
+            validate_merch_subtitle(Some("  up to 70% off "), 200).unwrap(),
+            Some("up to 70% off".to_string())
+        );
+        assert!(validate_merch_subtitle(Some(&"x".repeat(201)), 200).is_err());
+        assert!(validate_merch_subtitle(Some(&"x".repeat(200)), 200).is_ok());
+    }
+
+    #[test]
+    fn banner_link_rules() {
+        // Site-relative paths pass, trimmed.
+        assert_eq!(validate_banner_link(" /collections/eid ").unwrap(), "/collections/eid");
+        assert_eq!(validate_banner_link("/").unwrap(), "/");
+        // Absolute http(s) passes.
+        assert!(validate_banner_link("https://example.com/sale").is_ok());
+        assert!(validate_banner_link("http://example.com").is_ok());
+        // Protocol-relative and scheme tricks are refused.
+        assert!(validate_banner_link("//evil.example.com").is_err());
+        assert!(validate_banner_link("javascript:alert(1)").is_err());
+        assert!(validate_banner_link("example.com/sale").is_err());
+        assert!(validate_banner_link("ftp://example.com").is_err());
+        // Spaces, controls and emptiness are refused.
+        assert!(validate_banner_link("/a b").is_err());
+        assert!(validate_banner_link("").is_err());
+        assert!(validate_banner_link("   ").is_err());
+        assert!(validate_banner_link(&format!("/{}", "x".repeat(500))).is_err());
+    }
+
+    #[test]
+    fn banner_visibility_window() {
+        // No window: the flag alone decides.
+        assert!(banner_is_visible(true, None, None, 1_000));
+        assert!(!banner_is_visible(false, None, None, 1_000));
+        // Half-open window: visible at the start second, gone
+        // at the end second.
+        assert!(!banner_is_visible(true, Some(2_000), Some(3_000), 1_999));
+        assert!(banner_is_visible(true, Some(2_000), Some(3_000), 2_000));
+        assert!(banner_is_visible(true, Some(2_000), Some(3_000), 2_999));
+        assert!(!banner_is_visible(true, Some(2_000), Some(3_000), 3_000));
+        // One-sided windows.
+        assert!(banner_is_visible(true, Some(2_000), None, 9_999));
+        assert!(!banner_is_visible(true, None, Some(2_000), 2_000));
+        // The flag beats the window.
+        assert!(!banner_is_visible(false, Some(0), Some(9_999), 1_000));
+    }
+
+    #[test]
+    fn optional_window_rules() {
+        assert!(validate_optional_window(None, None).is_ok());
+        assert!(validate_optional_window(Some(10), None).is_ok());
+        assert!(validate_optional_window(None, Some(10)).is_ok());
+        assert!(validate_optional_window(Some(10), Some(11)).is_ok());
+        assert!(validate_optional_window(Some(10), Some(10)).is_err());
+        assert!(validate_optional_window(Some(11), Some(10)).is_err());
+    }
+
+    #[test]
+    fn collection_slug_rules() {
+        assert_eq!(validate_collection_slug("eid-picks").unwrap(), "eid-picks");
+        assert_eq!(validate_collection_slug("under-999").unwrap(), "under-999");
+        // The store-slug grammar, reused whole: length,
+        // lowercase, no underscores, no edge hyphens.
+        assert!(validate_collection_slug("ab").is_err());
+        assert!(validate_collection_slug("Eid-Picks").is_err());
+        assert!(validate_collection_slug("eid_picks").is_err());
+        assert!(validate_collection_slug("-eid").is_err());
+        assert!(validate_collection_slug("eid-").is_err());
+        assert!(validate_collection_slug(&"x".repeat(41)).is_err());
+    }
+
+    #[test]
+    fn flash_window_and_liveness_rules() {
+        assert!(validate_flash_window(1_000, 2_000).is_ok());
+        assert!(validate_flash_window(2_000, 2_000).is_err());
+        assert!(validate_flash_window(3_000, 2_000).is_err());
+        assert!(flash_sale_is_live(true, 1_000, 2_000, 1_000));
+        assert!(flash_sale_is_live(true, 1_000, 2_000, 1_999));
+        assert!(!flash_sale_is_live(true, 1_000, 2_000, 999));
+        assert!(!flash_sale_is_live(true, 1_000, 2_000, 2_000));
+        assert!(!flash_sale_is_live(false, 1_000, 2_000, 1_500));
+    }
+
+    #[test]
+    fn windows_overlap_rules() {
+        // Genuine overlaps in both directions and containment.
+        assert!(windows_overlap(0, 100, 50, 150));
+        assert!(windows_overlap(50, 150, 0, 100));
+        assert!(windows_overlap(0, 200, 50, 60));
+        // Touching windows do NOT overlap (back-to-back sales
+        // are schedulable).
+        assert!(!windows_overlap(0, 100, 100, 200));
+        assert!(!windows_overlap(100, 200, 0, 100));
+        // Disjoint windows.
+        assert!(!windows_overlap(0, 50, 100, 200));
+    }
+
+    #[test]
+    fn flash_price_validation_rules() {
+        assert_eq!(validate_flash_sale_price(80_000, 100_000).unwrap(), 80_000);
+        assert_eq!(validate_flash_sale_price(1, 100_000).unwrap(), 1);
+        assert!(validate_flash_sale_price(0, 100_000).is_err());
+        assert!(validate_flash_sale_price(-5, 100_000).is_err());
+        // At or above the base is not a sale.
+        assert!(validate_flash_sale_price(100_000, 100_000).is_err());
+        assert!(validate_flash_sale_price(100_001, 100_000).is_err());
+        assert!(validate_flash_stock_cap(None).unwrap().is_none());
+        assert_eq!(validate_flash_stock_cap(Some(1)).unwrap(), Some(1));
+        assert!(validate_flash_stock_cap(Some(0)).is_err());
+        assert!(validate_flash_stock_cap(Some(-2)).is_err());
+    }
+
+    #[test]
+    fn flash_price_resolution_rules() {
+        // Uncapped: the sale price always resolves.
+        assert_eq!(resolve_flash_price(80_000, None, 0), Some(80_000));
+        assert_eq!(resolve_flash_price(80_000, None, 999_999), Some(80_000));
+        // Capped: resolves until the cap is reached, then the
+        // price reverts (None = sell at base).
+        assert_eq!(resolve_flash_price(80_000, Some(3), 2), Some(80_000));
+        assert_eq!(resolve_flash_price(80_000, Some(3), 3), None);
+        assert_eq!(resolve_flash_price(80_000, Some(3), 4), None);
+        assert_eq!(resolve_flash_price(80_000, Some(1), 1), None);
+        // A non-positive candidate never resolves.
+        assert_eq!(resolve_flash_price(0, None, 0), None);
+        assert_eq!(resolve_flash_price(-1, None, 0), None);
+    }
+
+    #[test]
+    fn price_drop_percent_rules() {
+        assert_eq!(price_drop_percent(100_000, 80_000), 20);
+        assert_eq!(price_drop_percent(100_000, 99_999), 0);
+        assert_eq!(price_drop_percent(300, 200), 33);
+        assert_eq!(price_drop_percent(100_000, 1), 99);
+        // Not a discount at all: no badge.
+        assert_eq!(price_drop_percent(100_000, 100_000), 0);
+        assert_eq!(price_drop_percent(100_000, 120_000), 0);
+        assert_eq!(price_drop_percent(0, 0), 0);
+        assert_eq!(price_drop_percent(-5, -10), 0);
     }
 }
