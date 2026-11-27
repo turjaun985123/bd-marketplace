@@ -248,7 +248,6 @@ impl FromRequestParts<AppState> for AuthUser {
 struct OtpRow {
     code_hash: String,
     expires_at: DateTime<Utc>,
-    attempts: i32,
 }
 
 /// Request an OTP for a phone number: validate + normalize the number,
@@ -359,7 +358,7 @@ pub async fn verify_otp_code(
     let row: Option<OtpRow> = sqlx::query_as(
         "UPDATE otp_codes SET attempts = attempts + 1 \
          WHERE phone = $1 AND attempts < $2 \
-         RETURNING code_hash, expires_at, attempts",
+         RETURNING code_hash, expires_at",
     )
     .bind(&phone)
     .bind(OTP_MAX_ATTEMPTS)
