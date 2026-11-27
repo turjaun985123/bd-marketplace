@@ -28,7 +28,7 @@ jobs:
       # which runs the real migrations against this database.
       DATABASE_URL: postgres://marketplace:marketplace@localhost:5432/marketplace_test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -84,7 +84,7 @@ jobs:
   web:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -143,7 +143,7 @@ jobs:
       contents: read
       checks: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The committed Cargo.lock is intentionally minimal around the
       # Wave 39 jsonwebtoken bump (cargo completes it at build time);
       # cargo-audit parses the lock strictly, so resolve it in-job
@@ -190,7 +190,7 @@ jobs:
   docker:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build API image
         run: docker build -f Dockerfile.api -t bd-marketplace-api .
       - name: Build worker image
