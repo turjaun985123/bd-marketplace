@@ -73,7 +73,7 @@ jobs:
       - name: Build release server binaries
         run: cargo build --release -p api -p worker
       - name: Upload server binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: server-binaries
           path: |
@@ -115,7 +115,7 @@ jobs:
           cp -r .next/static .next/standalone/.next/static
           cp -r public .next/standalone/public
           tar -czf /tmp/web-standalone.tar.gz -C .next/standalone .
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: web-standalone
           path: /tmp/web-standalone.tar.gz
