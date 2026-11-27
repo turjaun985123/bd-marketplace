@@ -64,7 +64,11 @@
 //! and `GET /v1/admin/search-analytics` reads the top and
 //! zero-result queries back for the operator.
 
-use axum::{extract::Query, extract::State, http::HeaderMap, Json};
+use axum::{extract::State, http::HeaderMap, Json};
+// Wave 53 fix: repeated filter params (?category=a&category=b)
+// need axum-extra's htmlform-backed Query; axum's built-in
+// serde_urlencoded Query rejects them before the handler runs.
+use axum_extra::extract::Query;
 use chrono::{DateTime, Utc};
 use domain::{
     search_like_pattern, search_prefix_pattern, validate_browse_filters, BrowseFilterInput,

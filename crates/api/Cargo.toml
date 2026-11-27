@@ -7,6 +7,11 @@ license.workspace = true
 [dependencies]
 # Wave 51: `multipart` for the image upload endpoints.
 axum = { version = "0.7", features = ["multipart"] }
+# Wave 53 fix: axum-extra's Query extractor (serde_htmlform)
+# is the one that deserialises repeated query params
+# (?category=a&category=b) into a Vec — serde_urlencoded
+# (axum's built-in Query) rejects them with a plain-text 400.
+axum-extra = { version = "0.9", features = ["query"] }
 # Wave 51: the media store trait is object-safe async
 # (`Arc<dyn MediaStore>` in AppState) — the same crate the
 # notify crate's senders use.
