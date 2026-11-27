@@ -89,10 +89,11 @@ export default function ImageUploader({
   const fullList = useCallback(
     (change: (image: ProductImageView) => ProductImageUpdate) =>
       images.map((image) => ({
-        id: image.id,
         position: image.position,
         is_primary: image.is_primary,
         ...change(image),
+        // The row's own id always wins over anything the change carries.
+        id: image.id,
       })),
     [images]
   );

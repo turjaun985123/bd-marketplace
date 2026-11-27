@@ -1643,9 +1643,13 @@ mod tests {
                     let authorization = headers
                         .lines()
                         .find_map(|line| {
-                            line.to_ascii_lowercase()
-                                .strip_prefix("authorization:")
-                                .map(|value| value.trim().to_string())
+                            // Match the header NAME case-insensitively
+                            // but keep the VALUE's original case — SigV4
+                            // values are case-sensitive.
+                            let (name, value) = line.split_once(':')?;
+                            name.trim()
+                                .eq_ignore_ascii_case("authorization")
+                                .then(|| value.trim().to_string())
                         })
                         .unwrap_or_default();
                     log.lock().expect("log lock").push((method.clone(), target.clone(), authorization));
