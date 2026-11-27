@@ -1776,12 +1776,31 @@ async fn wave51_product_media_system() {
 
     // 27. The download disposition: the same object with
     // ?download=1 arrives as an attachment named by the
-    // key's last segment; without it, no disposition.
-    let (status, headers, _) = call_headers(&app, &first_original).await;
+    // key's last segment; without it, no disposition. A
+    // fresh product + upload provides the object — the
+    // first product's originals were deleted at step 11,
+    // so their URLs must 404 by now, not serve.
+    let download_product = create_product(
+        &app,
+        &seller,
+        &store,
+        "Wave51 Download Check",
+        10_000,
+        1,
+    )
+    .await;
+    let (status, fresh) =
+        upload_image(&app, &seller, &download_product, PNG_4X4, "image/png", None).await;
+    assert_eq!(status, StatusCode::CREATED, "fresh upload: {fresh}");
+    let download_original = fresh["url_original"]
+        .as_str()
+        .expect("fresh original url")
+        .to_string();
+    let (status, headers, _) = call_headers(&app, &download_original).await;
     assert_eq!(status, StatusCode::OK);
     assert!(headers.get("content-disposition").is_none());
     let (status, headers, _) =
-        call_headers(&app, &format!("{first_original}?download=1")).await;
+        call_headers(&app, &format!("{download_original}?download=1")).await;
     assert_eq!(status, StatusCode::OK);
     let disposition = headers
         .get("content-disposition")
