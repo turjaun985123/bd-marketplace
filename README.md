@@ -4360,8 +4360,20 @@ the MySQL/SQLite drivers — and libsqlite3-sys's
 bundled-SQLite CVE, RUSTSEC-2026-0459 — in the graph;
 `json` provably unexercised, the jsonb text-cast
 pattern; `any` unused), so the SQLite/MySQL driver
-crates leave the resolved graph, verified by the
-audit job's next report on the in-job-resolved lock.
+crates leave every buildable graph — verified in CI:
+`cargo tree --target all -i libsqlite3-sys` prints
+"nothing to print", so no target compiles or links
+them. One subtlety the first audit run exposed: the
+committed lock is the Wave 39 hand-completed one and
+`cargo generate-lockfile` updates it only minimally,
+never pruning entries the manifests no longer reach,
+so cargo-audit kept flagging the stale entry. The
+audit job now resolves its lock from scratch
+(`rm -f Cargo.lock` first) and scans the graph the
+manifests actually describe; a fresh resolve may pick
+newer semver-compatible versions than the committed
+lock for some crates, which is acceptable for this
+non-gating advisory job.
 `.cargo/audit.toml` records exactly two accepted-risk
 ignores — RUSTSEC-2023-0071 (rsa, via jsonwebtoken's
 rust_crypto; unbumpable, its manifest pins ^0.9.6)
