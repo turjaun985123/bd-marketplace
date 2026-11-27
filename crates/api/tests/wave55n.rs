@@ -248,7 +248,11 @@ async fn wave55n_public_tracking_privacy_and_online_payment_timeline() {
     assert_eq!(status, StatusCode::NOT_FOUND, "wrong phone: {refused}");
     let uri = format!("/v1/track?order_id={order_id}");
     let (status, refused) = call(&app, Method::GET, &uri, None, None).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "missing phone: {refused}");
+    // The W16 privacy rule: unknown, malformed, MISSING and
+    // wrong credentials all return the identical 404 — the
+    // endpoint never reveals which half of the credential
+    // failed.
+    assert_eq!(status, StatusCode::NOT_FOUND, "missing phone: {refused}");
     let uri = "/v1/track?order_id=00000000-0000-0000-0000-000000000000&phone=01999999999";
     let (status, refused) = call(&app, Method::GET, uri, None, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "unknown order: {refused}");
