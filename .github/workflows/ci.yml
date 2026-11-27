@@ -138,6 +138,13 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
+      # The committed Cargo.lock is intentionally minimal around the
+      # Wave 39 jsonwebtoken bump (cargo completes it at build time);
+      # cargo-audit parses the lock strictly, so resolve it in-job
+      # first or the audit fails on the lock instead of reporting.
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Complete the lockfile for the audit
+        run: cargo generate-lockfile
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
