@@ -101,6 +101,10 @@ export default function AdminShell({
         {" · "}
         <Link href="/admin/collections">কালেকশন</Link>
         {" · "}
+        <Link href="/admin/categories">ক্যাটাগরি</Link>
+        {" · "}
+        <Link href="/admin/categories/tree">ক্যাটাগরি ট্রি</Link>
+        {" · "}
         <Link href="/admin/flash-sales">ফ্ল্যাশ সেল</Link>
         {" · "}
         <Link href="/admin/home-preview">হোম প্রিভিউ</Link>

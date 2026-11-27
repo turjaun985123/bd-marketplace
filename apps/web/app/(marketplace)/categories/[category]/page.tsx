@@ -1,16 +1,16 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import BrowseResults from "@/components/BrowseResults";
+import CategoryLanding from "@/components/CategoryLanding";
 
 /**
- * A category landing page (Wave 53): the category as its
- * own shareable, indexable shelf — the shared faceted
- * BrowseResults pinned to this category by the route,
- * with every other filter (price, rating, stock, sale,
- * stores) still available around it. The heading and
- * metadata name the category; the tiles on /categories
- * and the home page link here through /browse, and this
- * route is the canonical landing the metadata describes.
+ * A category landing page (Wave 53; taxonomy in Wave 56):
+ * the route segment is resolved by the CategoryLanding
+ * client component — a taxonomy SLUG renders the node's
+ * own page (children tiles + the subtree browse), any
+ * other segment renders the Wave 53 free-text label
+ * landing unchanged. The metadata stays segment-based:
+ * the server cannot know which kind a segment is without
+ * the API round-trip the resolver makes.
  */
 export async function generateMetadata({
   params,
@@ -58,11 +58,7 @@ export default function CategoryLandingPage({
       <p>
         <Link href="/categories">← সব ক্যাটাগরি — All categories</Link>
       </p>
-      <BrowseResults
-        basePath={`/categories/${params.category}`}
-        heading={`ক্যাটাগরি: ${category}`}
-        forcedCategory={category}
-      />
+      <CategoryLanding segment={category} />
     </>
   );
 }

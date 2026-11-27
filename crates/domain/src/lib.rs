@@ -6026,6 +6026,541 @@ pub fn sub_order_tracking_steps(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Category taxonomy (Wave 56)
+// ---------------------------------------------------------------------------
+//
+// The managed category tree that replaces free-text-only
+// categorisation. A product still carries its seller-typed
+// text label (`products.category` — the denormalised display
+// name every existing surface reads), and now also an
+// optional link (`products.category_id`) into this tree. The
+// rules below are the whole taxonomy contract, in pure
+// functions over flat rows so the API layer, tests and any
+// future tooling share one implementation:
+//
+// - A slug is the node's stable public identifier, unique
+//   across the WHOLE tree (a slug is a URL segment).
+// - The tree is at most [`MAX_CATEGORY_DEPTH`] levels deep:
+//   top level, child, grandchild. Deeper trees are a
+//   navigation burden on a phone-first storefront.
+// - Reparenting may never create a cycle, and may never push
+//   any part of the moved subtree past the depth cap.
+// - A category with children, or with products still linked
+//   to it, cannot be deleted — the admin reassigns or empties
+//   it first. (Merging is the supported bulk alternative.)
+// - A free-text label links to a node only on an EXACT match
+//   ([`resolve_category_link`]) — the same rule the Wave 56
+//   backfill migration applies, so behaviour is identical
+//   whether a product was linked at migration time or at
+//   write time.
+
+/// The deepest a category may sit: 1 = top level, 2 = child,
+/// 3 = grandchild. The cap is a merchandising rule (phone
+/// navigation), enforced here rather than in a database
+/// constraint so the error can name the offending move.
+pub const MAX_CATEGORY_DEPTH: i64 = 3;
+
+/// A category name (either language) may carry at most this
+/// many characters.
+pub const MAX_CATEGORY_NAME_CHARS: usize = 80;
+
+/// The icon a category falls back to when none is chosen.
+pub const DEFAULT_CATEGORY_ICON: &str = "tag";
+
+/// The built-in icon set a category's `icon_key` may name.
+/// Icons are KEYS into this set — the web app renders each
+/// key with its own glyph — never uploaded images, so a
+/// category can never point at a broken or hostile asset.
+pub const CATEGORY_ICON_KEYS: &[&str] = &[
+    "tag",
+    "shirt",
+    "phone",
+    "cart",
+    "basket",
+    "home",
+    "sparkles",
+    "baby",
+    "trophy",
+    "car",
+    "leaf",
+    "book",
+    "grid",
+    "watch",
+    "shoe",
+    "laptop",
+    "heart",
+    "gift",
+];
+
+/// One flat taxonomy row, as the API layer loads it from the
+/// `categories` table. Ids are strings so the pure tree
+/// functions stay storage-agnostic (the API converts its
+/// uuids at the boundary).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CategoryFlat {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub slug: String,
+    pub name_en: String,
+    pub name_bn: Option<String>,
+    pub icon_key: String,
+    pub sort_order: i64,
+    pub is_active: bool,
+    pub is_featured: bool,
+}
+
+/// One node of the built taxonomy tree: the flat row, its
+/// 1-based depth, and its children in display order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CategoryNode {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub slug: String,
+    pub name_en: String,
+    pub name_bn: Option<String>,
+    pub icon_key: String,
+    pub sort_order: i64,
+    pub is_active: bool,
+    pub is_featured: bool,
+    pub depth: i64,
+    pub children: Vec<CategoryNode>,
+}
+
+/// Validate a category slug. Slugs follow the platform-wide
+/// slug rule ([`is_valid_slug`]): 3–40 chars, lowercase ASCII
+/// letters/digits/hyphens, starting and ending with a letter
+/// or digit. The error is bilingual like every storefront
+/// validation.
+pub fn validate_category_slug(slug: &str) -> Result<String, String> {
+    let slug = slug.trim();
+    if is_valid_slug(slug) {
+        Ok(slug.to_string())
+    } else {
+        Err(
+            "category slug must be 3-40 chars of lowercase letters, digits and hyphens, \
+             starting and ending with a letter or digit — \
+             ক্যাটাগরির স্লাগ ৩–৪০ অক্ষরের হতে হবে (ছোট হাতের অক্ষর, সংখ্যা ও হাইফেন)"
+                .to_string(),
+        )
+    }
+}
+
+/// Validate a category's names: the English name is required
+/// (1..=[`MAX_CATEGORY_NAME_CHARS`] chars after trimming);
+/// the Bangla name is optional, blank clears it, and the
+/// same cap applies. Returns the normalised pair.
+pub fn validate_category_names(
+    name_en: &str,
+    name_bn: Option<&str>,
+) -> Result<(String, Option<String>), String> {
+    let name_en = name_en.trim();
+    if name_en.is_empty() {
+        return Err(
+            "category needs an English name — ক্যাটাগরির ইংরেজি নাম আবশ্যক".to_string(),
+        );
+    }
+    if name_en.chars().count() > MAX_CATEGORY_NAME_CHARS {
+        return Err(format!(
+            "category name is too long (max {MAX_CATEGORY_NAME_CHARS} characters) — \
+             ক্যাটাগরির নাম সর্বোচ্চ {MAX_CATEGORY_NAME_CHARS} অক্ষরের হতে পারবে"
+        ));
+    }
+    let name_bn = match name_bn {
+        Some(raw) if !raw.trim().is_empty() => {
+            let trimmed = raw.trim();
+            if trimmed.chars().count() > MAX_CATEGORY_NAME_CHARS {
+                return Err(format!(
+                    "category Bangla name is too long (max {MAX_CATEGORY_NAME_CHARS} characters) — \
+                     ক্যাটাগরির বাংলা নাম সর্বোচ্চ {MAX_CATEGORY_NAME_CHARS} অক্ষরের হতে পারবে"
+                ));
+            }
+            Some(trimmed.to_string())
+        }
+        _ => None,
+    };
+    Ok((name_en.to_string(), name_bn))
+}
+
+/// Validate an icon key: absent (or blank) means the
+/// [`DEFAULT_CATEGORY_ICON`]; a present key must name a
+/// member of the built-in set.
+pub fn validate_category_icon(icon_key: Option<&str>) -> Result<String, String> {
+    match icon_key {
+        Some(raw) if !raw.trim().is_empty() => {
+            let key = raw.trim();
+            if CATEGORY_ICON_KEYS.contains(&key) {
+                Ok(key.to_string())
+            } else {
+                Err(format!(
+                    "unknown category icon '{key}' — অজানা ক্যাটাগরি আইকন '{key}'"
+                ))
+            }
+        }
+        _ => Ok(DEFAULT_CATEGORY_ICON.to_string()),
+    }
+}
+
+/// Look up one flat row by id.
+pub fn category_by_id<'a>(rows: &'a [CategoryFlat], id: &str) -> Option<&'a CategoryFlat> {
+    rows.iter().find(|row| row.id == id)
+}
+
+/// Look up one flat row by slug.
+pub fn category_by_slug<'a>(rows: &'a [CategoryFlat], slug: &str) -> Option<&'a CategoryFlat> {
+    rows.iter().find(|row| row.slug == slug)
+}
+
+/// The 1-based depth of a node (top level = 1), computed by
+/// walking the parent chain. Returns `None` when the id is
+/// unknown. The walk is cycle-safe: a chain longer than the
+/// row count is by definition corrupt, and the walk stops
+/// there (reporting the cap-exceeding depth so validators
+/// reject the state rather than loop forever).
+pub fn category_depth(rows: &[CategoryFlat], id: &str) -> Option<i64> {
+    let mut current = category_by_id(rows, id)?;
+    let mut depth: i64 = 1;
+    while let Some(parent_id) = current.parent_id.as_deref() {
+        depth += 1;
+        if depth > rows.len() as i64 + 1 {
+            return Some(depth);
+        }
+        current = category_by_id(rows, parent_id)?;
+    }
+    Some(depth)
+}
+
+/// Every id in a node's subtree, the node itself first, then
+/// descendants in tree order (siblings by sort order, then
+/// name). Empty when the id is unknown. This is the id set a
+/// subtree browse resolves a slug to.
+pub fn subtree_ids(rows: &[CategoryFlat], id: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if category_by_id(rows, id).is_none() {
+        return out;
+    }
+    collect_subtree_ids(rows, id, &mut out);
+    out
+}
+
+fn collect_subtree_ids(rows: &[CategoryFlat], id: &str, out: &mut Vec<String>) {
+    if out.iter().any(|seen| seen == id) {
+        return; // corrupt cycle in the stored rows: stop, never loop
+    }
+    out.push(id.to_string());
+    let mut children: Vec<&CategoryFlat> = rows
+        .iter()
+        .filter(|row| row.parent_id.as_deref() == Some(id))
+        .collect();
+    children.sort_by(|a, b| category_display_order(a, b));
+    for child in children {
+        collect_subtree_ids(rows, &child.id, out);
+    }
+}
+
+/// The height of a node's subtree: 1 for a leaf, +1 per level
+/// of descendants. 0 when the id is unknown. Cycle-safe like
+/// [`category_depth`].
+pub fn subtree_height(rows: &[CategoryFlat], id: &str) -> i64 {
+    if category_by_id(rows, id).is_none() {
+        return 0;
+    }
+    subtree_ids(rows, id)
+        .iter()
+        .filter_map(|member| category_depth(rows, member))
+        .max()
+        .map(|deepest| deepest - category_depth(rows, id).unwrap_or(1) + 1)
+        .unwrap_or(1)
+}
+
+/// Would hanging `id` under `new_parent_id` create a cycle?
+/// True when the new parent is the node itself or one of its
+/// descendants (or when either id is unknown — an unknown
+/// parent is not a valid move either, and callers surface
+/// both through the same bilingual error).
+pub fn would_create_cycle(rows: &[CategoryFlat], id: &str, new_parent_id: &str) -> bool {
+    if category_by_id(rows, new_parent_id).is_none() {
+        return true;
+    }
+    subtree_ids(rows, id).iter().any(|member| member == new_parent_id)
+}
+
+/// Validate a create-or-reparent placement and return the
+/// depth the node would sit at.
+///
+/// - `node_id`: `None` for a create (a new leaf), `Some` for
+///   a reparent of an existing subtree.
+/// - `parent_id`: `None` places the node at the top level.
+///
+/// Rejects, bilingually: an unknown parent, a cycle (parent
+/// is the node or inside its subtree), and any placement
+/// whose subtree would reach past [`MAX_CATEGORY_DEPTH`].
+pub fn validate_category_parent(
+    rows: &[CategoryFlat],
+    node_id: Option<&str>,
+    parent_id: Option<&str>,
+) -> Result<i64, String> {
+    let parent_depth = match parent_id {
+        None => 0,
+        Some(parent) => {
+            if let Some(node) = node_id {
+                if would_create_cycle(rows, node, parent) {
+                    return Err(
+                        "a category cannot be moved under itself or one of its own \
+                         sub-categories — একটি ক্যাটাগরিকে নিজের বা নিজের উপ-ক্যাটাগরির \
+                         অধীনে সরানো যাবে না"
+                            .to_string(),
+                    );
+                }
+            }
+            match category_depth(rows, parent) {
+                Some(depth) => depth,
+                None => {
+                    return Err(
+                        "parent category not found — মূল ক্যাটাগরিটি পাওয়া যায়নি"
+                            .to_string(),
+                    )
+                }
+            }
+        }
+    };
+    let height = node_id.map(|node| subtree_height(rows, node)).unwrap_or(1);
+    let deepest = parent_depth + height;
+    if deepest > MAX_CATEGORY_DEPTH {
+        return Err(format!(
+            "categories can be at most {MAX_CATEGORY_DEPTH} levels deep — \
+             ক্যাটাগরি সর্বোচ্চ {MAX_CATEGORY_DEPTH} স্তর গভীর হতে পারবে"
+        ));
+    }
+    Ok(parent_depth + 1)
+}
+
+/// The display order of siblings: the admin's `sort_order`
+/// first, then the English name, then the slug (a total
+/// order, so tree building is deterministic).
+pub fn category_display_order(a: &CategoryFlat, b: &CategoryFlat) -> std::cmp::Ordering {
+    a.sort_order
+        .cmp(&b.sort_order)
+        .then_with(|| a.name_en.cmp(&b.name_en))
+        .then_with(|| a.slug.cmp(&b.slug))
+}
+
+/// Build the nested tree from flat rows. Roots are rows with
+/// no parent PLUS orphans whose parent id is missing from
+/// the row set (a deleted or filtered-out parent must not
+/// make a whole branch vanish — it surfaces at the top
+/// instead; the admin tree passes the full row set, so
+/// orphans only appear when a caller filters, e.g. the
+/// public tree dropping an inactive parent keeps its active
+/// children visible at the top rather than hiding them).
+/// Siblings are ordered by [`category_display_order`] and
+/// every node carries its true depth.
+pub fn build_category_tree(rows: &[CategoryFlat]) -> Vec<CategoryNode> {
+    let known: std::collections::HashSet<&str> =
+        rows.iter().map(|row| row.id.as_str()).collect();
+    let mut roots: Vec<&CategoryFlat> = rows
+        .iter()
+        .filter(|row| match row.parent_id.as_deref() {
+            None => true,
+            Some(parent) => !known.contains(parent),
+        })
+        .collect();
+    roots.sort_by(|a, b| category_display_order(a, b));
+    roots
+        .into_iter()
+        .map(|root| build_category_node(rows, root, 1))
+        .collect()
+}
+
+fn build_category_node(rows: &[CategoryFlat], row: &CategoryFlat, depth: i64) -> CategoryNode {
+    let mut children: Vec<&CategoryFlat> = rows
+        .iter()
+        .filter(|child| child.parent_id.as_deref() == Some(row.id.as_str()))
+        .collect();
+    children.sort_by(|a, b| category_display_order(a, b));
+    CategoryNode {
+        id: row.id.clone(),
+        parent_id: row.parent_id.clone(),
+        slug: row.slug.clone(),
+        name_en: row.name_en.clone(),
+        name_bn: row.name_bn.clone(),
+        icon_key: row.icon_key.clone(),
+        sort_order: row.sort_order,
+        is_active: row.is_active,
+        is_featured: row.is_featured,
+        depth,
+        children: children
+            .into_iter()
+            .map(|child| build_category_node(rows, child, depth + 1))
+            .collect(),
+    }
+}
+
+/// The breadcrumb path of a node: the chain from the top
+/// level down to the node itself, in display order. `None`
+/// when the id is unknown. A broken chain (missing parent)
+/// yields the partial path from the highest reachable
+/// ancestor — a breadcrumb with a gap is still honest.
+pub fn category_path(rows: &[CategoryFlat], id: &str) -> Option<Vec<CategoryFlat>> {
+    let mut chain = Vec::new();
+    let mut current = category_by_id(rows, id)?;
+    loop {
+        chain.push(current.clone());
+        match current.parent_id.as_deref() {
+            Some(parent) => {
+                if chain.iter().any(|row: &CategoryFlat| row.id == parent) {
+                    break; // corrupt cycle: stop at the repeat
+                }
+                match category_by_id(rows, parent) {
+                    Some(next) => current = next,
+                    None => break,
+                }
+            }
+            None => break,
+        }
+    }
+    chain.reverse();
+    Some(chain)
+}
+
+/// The delete guard, as one rule: a category with children
+/// cannot be deleted (reparent or delete the children
+/// first), and a category with products still linked cannot
+/// be deleted (reassign the products first — the merge
+/// endpoint is the bulk way). The errors are bilingual and
+/// carry the counts so the admin sees exactly what blocks.
+pub fn validate_category_delete(child_count: i64, product_count: i64) -> Result<(), String> {
+    if child_count > 0 {
+        return Err(format!(
+            "this category still has {child_count} sub-categories — move or delete them first — \
+             এই ক্যাটাগরিতে এখনো {child_count}টি উপ-ক্যাটাগরি আছে — আগে সেগুলো সরান বা মুছুন"
+        ));
+    }
+    if product_count > 0 {
+        return Err(format!(
+            "this category still has {product_count} products linked — reassign them first — \
+             এই ক্যাটাগরিতে এখনো {product_count}টি পণ্য যুক্ত আছে — আগে সেগুলো অন্য ক্যাটাগরিতে সরান"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a merge of `source_id` into `target_id`: the two
+/// must differ, both must exist, and the target must not sit
+/// inside the source's subtree (the source's children move
+/// under the target — a target inside the source would cycle
+/// the tree). The merged subtree must still fit the depth
+/// cap. Returns the depth the source's children would land
+/// at under the target.
+pub fn validate_category_merge(
+    rows: &[CategoryFlat],
+    source_id: &str,
+    target_id: &str,
+) -> Result<(), String> {
+    if source_id == target_id {
+        return Err(
+            "a category cannot be merged into itself — \
+             একটি ক্যাটাগরিকে নিজের মধ্যেই মার্জ করা যাবে না"
+                .to_string(),
+        );
+    }
+    category_by_id(rows, source_id).ok_or_else(|| {
+        "source category not found — সোর্স ক্যাটাগরিটি পাওয়া যায়নি".to_string()
+    })?;
+    category_by_id(rows, target_id).ok_or_else(|| {
+        "target category not found — টার্গেট ক্যাটাগরিটি পাওয়া যায়নি".to_string()
+    })?;
+    if subtree_ids(rows, source_id)
+        .iter()
+        .any(|member| member == target_id)
+    {
+        return Err(
+            "a category cannot be merged into one of its own sub-categories — \
+             একটি ক্যাটাগরিকে নিজের উপ-ক্যাটাগরির মধ্যে মার্জ করা যাবে না"
+                .to_string(),
+        );
+    }
+    // The source's children re-root under the target: the
+    // deepest moved branch is the source's height minus the
+    // source level itself.
+    let moved_height = subtree_height(rows, source_id) - 1;
+    let target_depth = category_depth(rows, target_id).unwrap_or(1);
+    if target_depth + moved_height > MAX_CATEGORY_DEPTH {
+        return Err(format!(
+            "merging here would push categories past {MAX_CATEGORY_DEPTH} levels — \
+             এখানে মার্জ করলে ক্যাটাগরি {MAX_CATEGORY_DEPTH} স্তরের বেশি গভীর হয়ে যাবে"
+        ));
+    }
+    Ok(())
+}
+
+/// THE text→taxonomy resolution rule, shared by product
+/// create/patch and mirrored by the Wave 56 backfill
+/// migration: a seller-typed label links to a node only on
+/// an EXACT match against an ACTIVE node, tried in this
+/// order —
+///
+/// 1. the slug (the label lowercased: `fashion`),
+/// 2. the English name, case-insensitively (`Fashion`),
+/// 3. the Bangla name, exactly (`ফ্যাশন`).
+///
+/// The label itself is never rewritten by a link — it stays
+/// the product's display name exactly as typed. No match
+/// means no link (`None`): free-text products remain
+/// possible, by design. When several nodes could match at
+/// the same priority (an admin-created name clash), the
+/// first in display order wins, deterministically.
+pub fn resolve_category_link(text: &str, rows: &[CategoryFlat]) -> Option<String> {
+    let label = text.trim();
+    if label.is_empty() {
+        return None;
+    }
+    let mut active: Vec<&CategoryFlat> = rows.iter().filter(|row| row.is_active).collect();
+    active.sort_by(|a, b| category_display_order(a, b));
+    let lowered = label.to_lowercase();
+    for row in &active {
+        if row.slug == lowered {
+            return Some(row.id.clone());
+        }
+    }
+    for row in &active {
+        if row.name_en.to_lowercase() == lowered {
+            return Some(row.id.clone());
+        }
+    }
+    for row in &active {
+        if row.name_bn.as_deref() == Some(label) {
+            return Some(row.id.clone());
+        }
+    }
+    None
+}
+
+/// Derive a slug candidate from a category name (the
+/// taxonomy import's helper for rows that arrive without
+/// one): lowercase, collapse every run of non-alphanumeric
+/// characters to a single hyphen, trim hyphens. The result
+/// may still fail [`validate_category_slug`] (too short, or
+/// empty for a Bangla-only name) — the import reports those
+/// rows instead of inventing a different name silently.
+pub fn slugify_category_name(name: &str) -> String {
+    let mut out = String::new();
+    let mut last_was_hyphen = true; // also trims leading hyphens
+    for ch in name.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_hyphen = false;
+        } else if !last_was_hyphen {
+            out.push('-');
+            last_was_hyphen = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10645,5 +11180,351 @@ mod tests {
         // district — the table is district-level, so the
         // name is unknown here (Dhaka district covers it).
         assert!(district_by_name("Keraniganj").is_none());
+    }
+
+    // -- Wave 56: category taxonomy -------------------------------------
+
+    fn cat(
+        id: &str,
+        parent: Option<&str>,
+        slug: &str,
+        name_en: &str,
+        sort_order: i64,
+    ) -> CategoryFlat {
+        CategoryFlat {
+            id: id.to_string(),
+            parent_id: parent.map(str::to_string),
+            slug: slug.to_string(),
+            name_en: name_en.to_string(),
+            name_bn: None,
+            icon_key: DEFAULT_CATEGORY_ICON.to_string(),
+            sort_order,
+            is_active: true,
+            is_featured: false,
+        }
+    }
+
+    /// A small three-level tree:
+    /// fashion ─┬─ mens ─── panjabi
+    ///          └─ womens
+    /// electronics ── phones
+    fn taxonomy_fixture() -> Vec<CategoryFlat> {
+        vec![
+            cat("electronics", None, "electronics", "Electronics", 20),
+            cat("fashion", None, "fashion", "Fashion", 10),
+            cat("womens", Some("fashion"), "womens-fashion", "Women's Fashion", 20),
+            cat("mens", Some("fashion"), "mens-fashion", "Men's Fashion", 10),
+            cat("panjabi", Some("mens"), "panjabi", "Panjabi", 10),
+            cat("phones", Some("electronics"), "mobile-phones", "Mobile Phones", 10),
+        ]
+    }
+
+    #[test]
+    fn category_slug_rule_reuses_the_platform_slug_rule() {
+        assert_eq!(validate_category_slug("fashion").unwrap(), "fashion");
+        assert_eq!(
+            validate_category_slug(" mens-fashion ").unwrap(),
+            "mens-fashion"
+        );
+        for bad in ["ab", "Fashion", "has space", "-lead", "trail-", "under_score", ""] {
+            assert!(
+                validate_category_slug(bad).is_err(),
+                "slug {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn category_names_are_trimmed_capped_and_bn_optional() {
+        let (en, bn) = validate_category_names("  Fashion ", Some(" ফ্যাশন ")).unwrap();
+        assert_eq!(en, "Fashion");
+        assert_eq!(bn.as_deref(), Some("ফ্যাশন"));
+        let (_, bn) = validate_category_names("Fashion", Some("   ")).unwrap();
+        assert_eq!(bn, None);
+        assert!(validate_category_names("   ", None).is_err());
+        let long = "x".repeat(MAX_CATEGORY_NAME_CHARS + 1);
+        assert!(validate_category_names(&long, None).is_err());
+        assert!(validate_category_names("ok", Some(&long)).is_err());
+        let at_cap = "x".repeat(MAX_CATEGORY_NAME_CHARS);
+        assert!(validate_category_names(&at_cap, None).is_ok());
+    }
+
+    #[test]
+    fn category_icon_must_be_a_builtin_key() {
+        assert_eq!(validate_category_icon(None).unwrap(), DEFAULT_CATEGORY_ICON);
+        assert_eq!(validate_category_icon(Some(" ")).unwrap(), DEFAULT_CATEGORY_ICON);
+        assert_eq!(validate_category_icon(Some("shirt")).unwrap(), "shirt");
+        assert!(validate_category_icon(Some("uploaded.png")).is_err());
+        for key in CATEGORY_ICON_KEYS {
+            assert!(validate_category_icon(Some(key)).is_ok(), "key {key}");
+        }
+    }
+
+    #[test]
+    fn category_depth_and_subtree_walk_the_fixture_tree() {
+        let rows = taxonomy_fixture();
+        assert_eq!(category_depth(&rows, "fashion"), Some(1));
+        assert_eq!(category_depth(&rows, "mens"), Some(2));
+        assert_eq!(category_depth(&rows, "panjabi"), Some(3));
+        assert_eq!(category_depth(&rows, "missing"), None);
+        assert_eq!(subtree_height(&rows, "fashion"), 3);
+        assert_eq!(subtree_height(&rows, "panjabi"), 1);
+        assert_eq!(subtree_height(&rows, "missing"), 0);
+        // Subtree ids: self first, then descendants in
+        // display order (mens before womens by sort_order).
+        assert_eq!(
+            subtree_ids(&rows, "fashion"),
+            vec!["fashion", "mens", "panjabi", "womens"]
+        );
+        assert_eq!(subtree_ids(&rows, "missing"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn category_tree_builds_nested_and_sorts_siblings() {
+        let rows = taxonomy_fixture();
+        let tree = build_category_tree(&rows);
+        // Roots in display order: fashion (10) before
+        // electronics (20), regardless of row order.
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree[0].slug, "fashion");
+        assert_eq!(tree[0].depth, 1);
+        assert_eq!(tree[1].slug, "electronics");
+        let fashion = &tree[0];
+        assert_eq!(fashion.children.len(), 2);
+        assert_eq!(fashion.children[0].slug, "mens-fashion");
+        assert_eq!(fashion.children[0].depth, 2);
+        assert_eq!(fashion.children[0].children.len(), 1);
+        assert_eq!(fashion.children[0].children[0].slug, "panjabi");
+        assert_eq!(fashion.children[0].children[0].depth, 3);
+        assert_eq!(fashion.children[1].slug, "womens-fashion");
+    }
+
+    #[test]
+    fn category_tree_promotes_orphans_to_roots() {
+        // A row whose parent is absent from the set (e.g. the
+        // parent was filtered out as inactive) surfaces at
+        // the top instead of vanishing with its branch.
+        let rows = vec![
+            cat("child", Some("ghost"), "child-cat", "Child", 5),
+            cat("root", None, "root-cat", "Root", 10),
+        ];
+        let tree = build_category_tree(&rows);
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree[0].slug, "child-cat");
+        assert_eq!(tree[0].depth, 1);
+    }
+
+    #[test]
+    fn category_path_is_the_root_to_node_chain() {
+        let rows = taxonomy_fixture();
+        let path = category_path(&rows, "panjabi").unwrap();
+        let slugs: Vec<&str> = path.iter().map(|row| row.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["fashion", "mens-fashion", "panjabi"]);
+        let root_path = category_path(&rows, "fashion").unwrap();
+        assert_eq!(root_path.len(), 1);
+        assert!(category_path(&rows, "missing").is_none());
+    }
+
+    #[test]
+    fn category_parent_validation_blocks_cycles_and_depth_overflow() {
+        let rows = taxonomy_fixture();
+        // Plain placements that fit.
+        assert_eq!(validate_category_parent(&rows, None, None).unwrap(), 1);
+        assert_eq!(
+            validate_category_parent(&rows, None, Some("mens")).unwrap(),
+            3
+        );
+        assert_eq!(
+            validate_category_parent(&rows, Some("womens"), Some("electronics")).unwrap(),
+            2
+        );
+        // A new child under a grandchild would be level 4.
+        assert!(validate_category_parent(&rows, None, Some("panjabi")).is_err());
+        // Moving fashion (height 3) under phones (depth 2)
+        // would reach level 5.
+        assert!(validate_category_parent(&rows, Some("fashion"), Some("phones")).is_err());
+        // Cycles: under itself, and under its own descendant.
+        assert!(would_create_cycle(&rows, "fashion", "fashion"));
+        assert!(would_create_cycle(&rows, "fashion", "panjabi"));
+        assert!(!would_create_cycle(&rows, "fashion", "phones"));
+        assert!(validate_category_parent(&rows, Some("fashion"), Some("panjabi")).is_err());
+        assert!(validate_category_parent(&rows, Some("fashion"), Some("fashion")).is_err());
+        // Unknown parent.
+        assert!(validate_category_parent(&rows, None, Some("ghost")).is_err());
+    }
+
+    #[test]
+    fn category_delete_guard_names_both_blockers() {
+        assert!(validate_category_delete(0, 0).is_ok());
+        let err = validate_category_delete(2, 0).unwrap_err();
+        assert!(err.contains('2'), "child count in the error: {err}");
+        let err = validate_category_delete(0, 7).unwrap_err();
+        assert!(err.contains('7'), "product count in the error: {err}");
+        // Children are reported before products.
+        let err = validate_category_delete(1, 7).unwrap_err();
+        assert!(err.contains('1'), "children first: {err}");
+    }
+
+    #[test]
+    fn category_merge_guard_blocks_self_descendant_and_depth() {
+        let rows = taxonomy_fixture();
+        assert!(validate_category_merge(&rows, "womens", "mens").is_ok());
+        assert!(validate_category_merge(&rows, "fashion", "fashion").is_err());
+        // Target inside the source's own subtree.
+        assert!(validate_category_merge(&rows, "fashion", "panjabi").is_err());
+        // Unknown ids.
+        assert!(validate_category_merge(&rows, "ghost", "mens").is_err());
+        assert!(validate_category_merge(&rows, "mens", "ghost").is_err());
+        // Merging fashion (children reach height 2 below it)
+        // into phones (depth 2) would reach level 4.
+        assert!(validate_category_merge(&rows, "fashion", "phones").is_err());
+    }
+
+    #[test]
+    fn category_link_resolution_is_exact_match_in_priority_order() {
+        let mut rows = taxonomy_fixture();
+        rows[1].name_bn = Some("ফ্যাশন".to_string()); // fashion
+        // Slug match, case-insensitive via lowercasing.
+        assert_eq!(
+            resolve_category_link("FASHION", &rows).as_deref(),
+            Some("fashion")
+        );
+        // English name match, case-insensitive.
+        assert_eq!(
+            resolve_category_link("mobile phones", &rows).as_deref(),
+            Some("phones")
+        );
+        // Bangla name match, exact.
+        assert_eq!(
+            resolve_category_link("ফ্যাশন", &rows).as_deref(),
+            Some("fashion")
+        );
+        // Trimming is part of the rule.
+        assert_eq!(
+            resolve_category_link("  Panjabi ", &rows).as_deref(),
+            Some("panjabi")
+        );
+        // No fuzzy matching: near-misses and substrings stay
+        // unlinked, as do blank labels.
+        assert_eq!(resolve_category_link("Fashions", &rows), None);
+        assert_eq!(resolve_category_link("Fash", &rows), None);
+        assert_eq!(resolve_category_link("Men's", &rows), None);
+        assert_eq!(resolve_category_link("   ", &rows), None);
+        // Inactive nodes never resolve.
+        let mut inactive = taxonomy_fixture();
+        inactive[1].is_active = false; // fashion
+        assert_eq!(resolve_category_link("Fashion", &inactive), None);
+    }
+
+    #[test]
+    fn category_slugify_derives_import_slugs() {
+        assert_eq!(slugify_category_name("Home & Living"), "home-living");
+        assert_eq!(slugify_category_name("  Baby  &  Kids "), "baby-kids");
+        assert_eq!(slugify_category_name("Rice & Grains!"), "rice-grains");
+        assert_eq!(slugify_category_name("মুদি বাজার"), "");
+        assert_eq!(slugify_category_name("T-Shirts"), "t-shirts");
+    }
+
+    #[test]
+    fn category_resolution_prefers_a_slug_over_a_colliding_name() {
+        // One node's SLUG equals another node's NAME: the
+        // slug match wins — the documented priority is
+        // what keeps resolution deterministic when the two
+        // namespaces collide.
+        let rows = vec![
+            cat("a", None, "phones", "Gadgets", 10),
+            cat("b", None, "gadgets", "Phones", 20),
+        ];
+        assert_eq!(resolve_category_link("phones", &rows).as_deref(), Some("a"));
+        assert_eq!(resolve_category_link("PHONES", &rows).as_deref(), Some("a"));
+        // And the name still resolves when no slug claims
+        // the label first.
+        assert_eq!(resolve_category_link("Gadgets", &rows).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn category_walks_are_total_on_unknown_and_cyclic_rows() {
+        let rows = taxonomy_fixture();
+        // Unknown ids yield None / empty, never a panic.
+        assert_eq!(category_depth(&rows, "ghost"), None);
+        assert!(subtree_ids(&rows, "ghost").is_empty());
+        assert_eq!(category_path(&rows, "ghost"), None);
+        assert_eq!(subtree_height(&rows, "ghost"), 0);
+        // A root's path is itself; a leaf's subtree is
+        // itself; a root's subtree is the whole branch.
+        let path = category_path(&rows, "fashion").expect("root path");
+        assert_eq!(path.len(), 1);
+        assert_eq!(subtree_ids(&rows, "panjabi"), vec!["panjabi".to_string()]);
+        assert_eq!(subtree_ids(&rows, "fashion").len(), 4);
+        // Cyclic rows (a corrupt import the guards exist
+        // to prevent) terminate instead of looping: depth
+        // and path bail out past the row count.
+        let cyclic = vec![
+            cat("x", Some("y"), "x-slug", "X", 10),
+            cat("y", Some("x"), "y-slug", "Y", 10),
+        ];
+        assert!(would_create_cycle(&cyclic, "x", Some("y")));
+        assert!(category_depth(&cyclic, "x").is_none_or(|d| d > 2));
+        assert!(subtree_ids(&cyclic, "x").len() <= 2);
+    }
+
+    #[test]
+    fn category_parent_validation_allows_the_legal_moves() {
+        let rows = taxonomy_fixture();
+        // A leaf may move to any root or depth-2 parent.
+        assert_eq!(
+            validate_category_parent(&rows, Some("panjabi"), Some("electronics")),
+            Ok(2)
+        );
+        assert_eq!(
+            validate_category_parent(&rows, Some("panjabi"), Some("phones")),
+            Ok(3)
+        );
+        assert_eq!(validate_category_parent(&rows, Some("panjabi"), None), Ok(1));
+        // A brand-new node (no id yet — the create call)
+        // may hang at depth 3 but not below it.
+        assert_eq!(validate_category_parent(&rows, None, Some("mens")), Ok(3));
+        assert!(validate_category_parent(&rows, None, Some("panjabi")).is_err());
+        // Moving a node under ITSELF is a cycle.
+        assert!(validate_category_parent(&rows, Some("mens"), Some("mens")).is_err());
+        // An unknown parent is rejected, not treated as a
+        // root.
+        assert!(validate_category_parent(&rows, Some("panjabi"), Some("ghost")).is_err());
+    }
+
+    #[test]
+    fn category_display_order_breaks_ties_by_name_then_slug() {
+        let mut rows = vec![
+            cat("c", None, "zeta", "Same", 10),
+            cat("a", None, "alpha", "Same", 10),
+            cat("b", None, "beta", "Another", 10),
+            cat("d", None, "delta", "Zulu", 5),
+        ];
+        rows.sort_by(category_display_order);
+        let order: Vec<&str> = rows.iter().map(|row| row.slug.as_str()).collect();
+        // sort_order first (delta at 5), then name_en
+        // (Another before Same), then slug (alpha < zeta).
+        assert_eq!(order, vec!["delta", "beta", "alpha", "zeta"]);
+    }
+
+    #[test]
+    fn category_tree_keeps_grandchildren_nested_at_depth_three() {
+        let rows = taxonomy_fixture();
+        let tree = build_category_tree(&rows);
+        let fashion = tree
+            .iter()
+            .find(|node| node.slug == "fashion")
+            .expect("fashion root");
+        assert_eq!(fashion.depth, 1);
+        let mens = fashion
+            .children
+            .iter()
+            .find(|node| node.slug == "mens-fashion")
+            .expect("mens child");
+        assert_eq!(mens.depth, 2);
+        assert_eq!(mens.children.len(), 1);
+        assert_eq!(mens.children[0].slug, "panjabi");
+        assert_eq!(mens.children[0].depth, 3);
+        assert!(mens.children[0].children.is_empty());
     }
 }

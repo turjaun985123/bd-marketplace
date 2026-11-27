@@ -375,16 +375,30 @@ export default function ProductDetailPage({
     <main>
       {/* Wave 54: real breadcrumbs — home, the product's
           category landing, its store, and the product
-          itself (the current page, unlinked). */}
+          itself (the current page, unlinked). Wave 56:
+          a taxonomy-linked product walks its full
+          category_path (each node to its own landing);
+          an unlinked product keeps the label link. */}
       <nav aria-label="breadcrumb" className="breadcrumbs">
         <Link href="/">মার্কেটপ্লেস — Home</Link>
-        {product.category && (
-          <>
-            {" › "}
-            <Link href={`/categories/${encodeURIComponent(product.category)}`}>
-              {product.category}
-            </Link>
-          </>
+        {product.category_path.length > 0 ? (
+          product.category_path.map((entry) => (
+            <span key={entry.id}>
+              {" › "}
+              <Link href={`/categories/${entry.slug}`}>
+                {entry.name_bn ?? entry.name_en}
+              </Link>
+            </span>
+          ))
+        ) : (
+          product.category && (
+            <>
+              {" › "}
+              <Link href={`/categories/${encodeURIComponent(product.category)}`}>
+                {product.category}
+              </Link>
+            </>
+          )
         )}
         {" › "}
         <Link href={`/${product.store_slug}`}>{store?.name ?? product.store_slug}</Link>

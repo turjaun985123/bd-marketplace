@@ -94,6 +94,19 @@ export interface Product {
   description: string | null;
   /** Free-text category label (Wave 15); null when uncategorised. */
   category: string | null;
+  /**
+   * Taxonomy link (Wave 56): the managed category this
+   * product is filed under, or null when its label matched
+   * no node. When set, `category` carries the node's
+   * English name (the API keeps the two in sync).
+   */
+  category_id: string | null;
+  /**
+   * Breadcrumb path of the taxonomy link (Wave 56),
+   * root-first; empty when unlinked or on card rails that
+   * never render a breadcrumb.
+   */
+  category_path: CategoryPathEntry[];
   price_poisha: number;
   compare_at_poisha: number | null;
   /**
@@ -315,6 +328,12 @@ export interface CreateProductInput {
   description?: string;
   /** Optional category label (Wave 15). */
   category?: string;
+  /**
+   * Optional taxonomy link (Wave 56): wins over the label
+   * when present — the API validates it and syncs the
+   * stored label to the node's English name.
+   */
+  category_id?: string;
   price_poisha: number;
   compare_at_poisha?: number;
   stock: number;
@@ -1332,9 +1351,19 @@ export function listProducts(params?: {
 /** GET /v1/stores/{slug}/products — one store's storefront listing. */
 export function getStoreProducts(
   slug: string,
-  token?: string | null
+  token?: string | null,
+  params?: {
+    /** Wave 56: scope to one taxonomy subtree by slug. */
+    category_slug?: string;
+  }
 ): Promise<ProductList> {
-  return call(`/v1/stores/${encodeURIComponent(slug)}/products`, { token });
+  const search = new URLSearchParams();
+  if (params?.category_slug) search.set("category_slug", params.category_slug);
+  const qs = search.toString();
+  return call(
+    `/v1/stores/${encodeURIComponent(slug)}/products${qs ? `?${qs}` : ""}`,
+    { token }
+  );
 }
 
 /**
@@ -1427,6 +1456,8 @@ export function searchProducts(params?: {
   store_slug?: string;
   category?: string;
   categories?: string[];
+  /** Wave 56: taxonomy slugs — scope to the union of their subtrees. */
+  category_slugs?: string[];
   stores?: string[];
   min_price_poisha?: number;
   max_price_poisha?: number;
@@ -1444,6 +1475,9 @@ export function searchProducts(params?: {
   if (params?.category) search.append("category", params.category);
   for (const category of params?.categories ?? []) {
     search.append("category", category);
+  }
+  for (const slug of params?.category_slugs ?? []) {
+    search.append("category_slug", slug);
   }
   for (const store of params?.stores ?? []) {
     search.append("store", store);
@@ -1480,6 +1514,12 @@ export interface SearchSuggestions {
   }[];
   categories: { category: string; product_count: number }[];
   stores: { slug: string; name: string }[];
+  /**
+   * Wave 56: the suggested labels resolved into taxonomy
+   * nodes (landing-page links for the dropdown); labels
+   * that resolve to nothing simply have no node here.
+   */
+  category_nodes: SuggestedCategoryNode[];
 }
 
 /**
@@ -5495,6 +5535,12 @@ export interface FeaturedStore {
 export interface HomeFeed {
   banners: HomeBanner[];
   categories: HomeCategory[];
+  /**
+   * Wave 56: the taxonomy strip — top-level managed
+   * category nodes, featured first. Additive; the legacy
+   * `categories` tiles above are unchanged.
+   */
+  taxonomy: CategoryTreeNode[];
   flash_sale: HomeFlashSale | null;
   collections: HomeCollectionSection[];
   new_arrivals: Product[];
@@ -5512,16 +5558,327 @@ export function getHomeFeed(): Promise<HomeFeed> {
 /** GET /v1/categories — the full category list (Wave 53). */
 export interface CategoryList {
   categories: HomeCategory[];
+  /**
+   * Wave 56: the managed taxonomy tree (additive — the
+   * `categories` aggregate above is byte-identical to the
+   * Wave 53 response). Absent only when the caller asks
+   * for `?flat=1`.
+   */
+  tree?: CategoryTreeNode[];
 }
 
 /**
  * GET /v1/categories — every category label in the
  * catalogue with its product count and cover image, from
  * the same aggregate the home feed's tiles use (one
- * vocabulary, two surfaces). Sorted by count desc.
+ * vocabulary, two surfaces). Sorted by count desc. Since
+ * Wave 56 the response also carries the taxonomy `tree`.
  */
 export function getCategories(): Promise<CategoryList> {
   return call("/v1/categories");
+}
+
+// ---------------------------------------------------------------------------
+// Category taxonomy (Wave 56)
+// ---------------------------------------------------------------------------
+
+/** One breadcrumb entry of a taxonomy path (Wave 56). */
+export interface CategoryPathEntry {
+  id: string;
+  slug: string;
+  name_en: string;
+  name_bn: string | null;
+}
+
+/**
+ * One node of the managed category tree (Wave 56).
+ * `product_count` rolls the whole subtree up;
+ * `own_product_count` counts only directly linked
+ * products. Counts cover visible products (active
+ * products of active stores), like every public surface.
+ */
+export interface CategoryTreeNode {
+  id: string;
+  parent_id: string | null;
+  slug: string;
+  name_en: string;
+  name_bn: string | null;
+  /** A key into the built-in icon set — never an image URL. */
+  icon_key: string;
+  sort_order: number;
+  is_active: boolean;
+  is_featured: boolean;
+  depth: number;
+  product_count: number;
+  own_product_count: number;
+  image_url: string | null;
+  children: CategoryTreeNode[];
+}
+
+/** GET /v1/categories/tree — the public taxonomy tree. */
+export function getCategoryTree(): Promise<{ tree: CategoryTreeNode[] }> {
+  return call("/v1/categories/tree");
+}
+
+/** One node's public detail: the tree node + its breadcrumb path. */
+export interface CategoryDetail {
+  category: CategoryTreeNode;
+  path: CategoryPathEntry[];
+}
+
+/**
+ * GET /v1/categories/:slug — one active node's detail.
+ * Rejects (404) for unknown or inactive slugs; callers
+ * that treat a slug as "maybe a legacy label" catch and
+ * fall back.
+ */
+export function getCategoryBySlug(slug: string): Promise<CategoryDetail> {
+  return call(`/v1/categories/${encodeURIComponent(slug)}`);
+}
+
+/**
+ * GET /v1/categories/:slug/products — the node's subtree
+ * product list (the plain list scoped to the subtree;
+ * the faceted browse stays the richer surface). Rejects
+ * (404) for unknown or inactive slugs.
+ */
+export function getCategoryProducts(
+  slug: string,
+  params: { page?: number; limit?: number; sort?: string } = {}
+): Promise<ProductList> {
+  const query = new URLSearchParams();
+  if (params.page !== undefined) query.set("page", String(params.page));
+  if (params.limit !== undefined) query.set("limit", String(params.limit));
+  if (params.sort) query.set("sort", params.sort);
+  const qs = query.toString();
+  return call(
+    `/v1/categories/${encodeURIComponent(slug)}/products${qs ? `?${qs}` : ""}`
+  );
+}
+
+/** One of a store's top taxonomy categories (Wave 56). */
+export interface StoreCategorySpecialty {
+  id: string;
+  slug: string;
+  name_en: string;
+  name_bn: string | null;
+  icon_key: string;
+  product_count: number;
+  path: CategoryPathEntry[];
+}
+
+/**
+ * GET /v1/stores/:slug/categories — the store's taxonomy
+ * specialisation: its top categories by linked active
+ * products, computed from real product links.
+ */
+export function getStoreCategories(
+  slug: string
+): Promise<{ store_slug: string; categories: StoreCategorySpecialty[] }> {
+  return call(`/v1/stores/${encodeURIComponent(slug)}/categories`);
+}
+
+/** A suggested label resolved into the taxonomy (Wave 56). */
+export interface SuggestedCategoryNode {
+  id: string;
+  slug: string;
+  name_en: string;
+  name_bn: string | null;
+  icon_key: string;
+  /** The text label this node was resolved from. */
+  label: string;
+  product_count: number;
+  path: CategoryPathEntry[];
+}
+
+/** The admin's flat view of one category (Wave 56). */
+export interface CategoryAdminView {
+  id: string;
+  parent_id: string | null;
+  slug: string;
+  name_en: string;
+  name_bn: string | null;
+  icon_key: string;
+  sort_order: number;
+  is_active: boolean;
+  is_featured: boolean;
+  depth: number;
+  child_count: number;
+  /** Products linked in ANY status — the delete guard's number. */
+  product_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** The admin category list envelope (tree display order). */
+export interface CategoryAdminList {
+  items: CategoryAdminView[];
+  total: number;
+}
+
+/** The admin's create-category payload (Wave 56). */
+export interface CreateCategoryInput {
+  slug: string;
+  name_en: string;
+  name_bn?: string;
+  parent_id?: string;
+  icon_key?: string;
+  sort_order?: number;
+  is_active?: boolean;
+  is_featured?: boolean;
+}
+
+/**
+ * The admin's patch-category payload (Wave 56).
+ * `parent_id` is tri-state: omit to keep, null to move to
+ * the top level, a value to reparent.
+ */
+export interface UpdateCategoryInput {
+  slug?: string;
+  name_en?: string;
+  name_bn?: string;
+  parent_id?: string | null;
+  icon_key?: string;
+  sort_order?: number;
+  is_active?: boolean;
+  is_featured?: boolean;
+}
+
+/** GET /v1/admin/categories — the flat admin list. */
+export function listAdminCategories(
+  token: string
+): Promise<CategoryAdminList> {
+  return call("/v1/admin/categories", { token });
+}
+
+/** GET /v1/admin/categories/tree — the full tree, inactive nodes included. */
+export function getAdminCategoryTree(
+  token: string
+): Promise<{ tree: CategoryTreeNode[] }> {
+  return call("/v1/admin/categories/tree", { token });
+}
+
+/** POST /v1/admin/categories — create (audited). */
+export function createCategory(
+  token: string,
+  input: CreateCategoryInput
+): Promise<CategoryAdminView> {
+  return call("/v1/admin/categories", { method: "POST", token, body: input });
+}
+
+/** PATCH /v1/admin/categories/:id — patch (audited). */
+export function updateCategory(
+  token: string,
+  id: string,
+  patch: UpdateCategoryInput
+): Promise<CategoryAdminView> {
+  return call(`/v1/admin/categories/${id}`, {
+    method: "PATCH",
+    token,
+    body: patch,
+  });
+}
+
+/** DELETE /v1/admin/categories/:id — guarded delete (audited). */
+export function deleteCategory(
+  token: string,
+  id: string
+): Promise<{ deleted: boolean; id: string }> {
+  return call(`/v1/admin/categories/${id}`, { method: "DELETE", token });
+}
+
+/** PUT /v1/admin/categories/reorder — bulk sort_order update (audited). */
+export function reorderCategories(
+  token: string,
+  items: { id: string; sort_order: number }[]
+): Promise<CategoryAdminList> {
+  return call("/v1/admin/categories/reorder", {
+    method: "PUT",
+    token,
+    body: { items },
+  });
+}
+
+/** What a category merge did (Wave 56). */
+export interface MergeCategoryReport {
+  target: CategoryAdminView;
+  products_moved: number;
+  children_moved: number;
+}
+
+/** POST /v1/admin/categories/:id/merge — merge into target (audited). */
+export function mergeCategory(
+  token: string,
+  id: string,
+  targetId: string
+): Promise<MergeCategoryReport> {
+  return call(`/v1/admin/categories/${id}/merge`, {
+    method: "POST",
+    token,
+    body: { target_id: targetId },
+  });
+}
+
+/**
+ * GET /v1/admin/categories/:id/products — every product
+ * linked into the node's subtree, any status (the
+ * drill-in behind the delete guard's count).
+ */
+export function getAdminCategoryProducts(
+  token: string,
+  id: string,
+  params?: { page?: number; limit?: number }
+): Promise<ProductList> {
+  const search = new URLSearchParams();
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/admin/categories/${id}/products${qs ? `?${qs}` : ""}`, {
+    token,
+  });
+}
+
+/**
+ * One row of the taxonomy import/export format (Wave 56):
+ * slug-keyed, parents by slug, so a tree moves between
+ * environments. On import, `slug` may be omitted (derived
+ * from the English name).
+ */
+export interface TaxonomyPortRow {
+  slug?: string | null;
+  parent_slug?: string | null;
+  name_en: string;
+  name_bn?: string | null;
+  icon_key?: string | null;
+  sort_order?: number | null;
+  is_active?: boolean | null;
+  is_featured?: boolean | null;
+}
+
+/** GET /v1/admin/categories/export — the whole tree as slug-keyed rows. */
+export function exportTaxonomy(
+  token: string
+): Promise<{ categories: TaxonomyPortRow[] }> {
+  return call("/v1/admin/categories/export", { token });
+}
+
+/** What a taxonomy import did (Wave 56). */
+export interface TaxonomyImportReport {
+  created: number;
+  updated: number;
+  slugs: string[];
+}
+
+/** POST /v1/admin/categories/import — slug-keyed upsert (audited). */
+export function importTaxonomy(
+  token: string,
+  categories: TaxonomyPortRow[]
+): Promise<TaxonomyImportReport> {
+  return call("/v1/admin/categories/import", {
+    method: "POST",
+    token,
+    body: { categories },
+  });
 }
 
 /**

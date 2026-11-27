@@ -6,6 +6,7 @@ import FollowButton from "./FollowButton";
 import MessageStoreButton from "./MessageStoreButton";
 import ProductGrid from "./ProductGrid";
 import StoreCategories from "./StoreCategories";
+import StoreSpecialties from "./StoreSpecialties";
 import StoreCollections from "./StoreCollections";
 import StoreStats from "./StoreStats";
 import StorefrontSections from "./StorefrontSections";
@@ -149,6 +150,8 @@ export default function StorefrontView({ slug }: { slug: string }) {
       <StorefrontSections slug={slug} />
       {/* Wave 54 extension: the seller's own collections. */}
       <StoreCollections slug={slug} />
+      {/* Wave 56: the store's taxonomy specialisation. */}
+      <StoreSpecialties slug={slug} />
       {/* Wave 54: the store's own category tiles. */}
       <StoreCategories slug={slug} />
       <h2>সব পণ্য — All products</h2>

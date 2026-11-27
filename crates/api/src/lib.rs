@@ -339,6 +339,7 @@ pub mod api_keys;
 pub mod audit;
 pub mod auth;
 pub mod cart;
+pub mod categories;
 pub mod coupons;
 pub mod delivery_estimates;
 pub mod exports;
@@ -2151,7 +2152,63 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/home", get(merch::home_feed_handler))
         // Wave 53 — the public category vocabulary, from
         // the same aggregate as the home feed's tiles.
-        .route("/v1/categories", get(merch::list_categories_handler))
+        // Wave 56 — the handler moved to the categories
+        // module: the response keeps the Wave 53 aggregate
+        // in `categories` byte-identically and adds the
+        // managed taxonomy as a `tree` field (`?flat=1`
+        // returns exactly the old shape). The tree and the
+        // per-slug detail sit beside it (the static `tree`
+        // segment wins over `:slug`, the wishlist-ids
+        // precedent), plus the admin taxonomy CRUD
+        // (audited; static segments export/import/reorder/
+        // tree win over `:id` the same way) and the store
+        // specialisation read.
+        .route("/v1/categories", get(categories::list_categories_handler))
+        .route("/v1/categories/tree", get(categories::category_tree_handler))
+        .route("/v1/categories/:slug", get(categories::get_category_handler))
+        .route(
+            "/v1/categories/:slug/products",
+            get(categories::category_products_handler),
+        )
+        .route(
+            "/v1/stores/:slug/categories",
+            get(categories::store_categories_handler),
+        )
+        .route(
+            "/v1/admin/categories",
+            get(categories::admin_list_categories_handler)
+                .post(categories::admin_create_category_handler),
+        )
+        .route(
+            "/v1/admin/categories/tree",
+            get(categories::admin_tree_handler),
+        )
+        .route(
+            "/v1/admin/categories/export",
+            get(categories::admin_export_taxonomy_handler),
+        )
+        .route(
+            "/v1/admin/categories/import",
+            post(categories::admin_import_taxonomy_handler),
+        )
+        .route(
+            "/v1/admin/categories/reorder",
+            put(categories::admin_reorder_categories_handler),
+        )
+        .route(
+            "/v1/admin/categories/:id",
+            get(categories::admin_get_category_handler)
+                .patch(categories::admin_update_category_handler)
+                .delete(categories::admin_delete_category_handler),
+        )
+        .route(
+            "/v1/admin/categories/:id/merge",
+            post(categories::admin_merge_category_handler),
+        )
+        .route(
+            "/v1/admin/categories/:id/products",
+            get(categories::admin_category_products_handler),
+        )
         .route(
             "/v1/collections/:slug",
             get(merch::get_collection_public_handler),

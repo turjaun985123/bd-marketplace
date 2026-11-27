@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
+import CategoryIcon from "./CategoryIcon";
 import HeroCarousel from "./HeroCarousel";
 import ProductCard from "./ProductCard";
 import ProductRail from "./ProductRail";
@@ -62,6 +63,50 @@ export default function HomeFeed() {
   return (
     <>
       <HeroCarousel banners={feed.banners} />
+
+      {feed.taxonomy.length > 0 && (
+        <section>
+          <SectionHeader
+            title="ক্যাটাগরি অনুযায়ী কিনুন — Shop by category"
+            linkHref="/categories"
+            linkLabel="সব ক্যাটাগরি — All categories"
+          />
+          <div className="category-tiles">
+            {feed.taxonomy.map((node) => (
+              <Link
+                key={node.id}
+                href={`/categories/${node.slug}`}
+                className="category-tile"
+              >
+                {node.image_url ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    src={node.image_url}
+                    alt={node.name_en}
+                    className="category-tile-image"
+                    loading="lazy"
+                  />
+                ) : (
+                  <span
+                    className="category-tile-image product-image-placeholder"
+                    aria-hidden="true"
+                  >
+                    <CategoryIcon iconKey={node.icon_key} />
+                  </span>
+                )}
+                <span className="category-tile-body">
+                  <span className="category-tile-name">
+                    {node.name_bn ?? node.name_en}
+                  </span>
+                  <span className="category-tile-count">
+                    {node.product_count}টি পণ্য — products
+                  </span>
+                </span>
+              </Link>
+            ))}
+          </div>
+        </section>
+      )}
 
       {feed.categories.length > 0 && (
         <section>

@@ -64,6 +64,8 @@
 //! and `GET /v1/admin/search-analytics` reads the top and
 //! zero-result queries back for the operator.
 
+use std::collections::HashMap;
+
 use axum::{extract::State, http::HeaderMap, Json};
 // Wave 53 fix: repeated filter params (?category=a&category=b)
 // need axum-extra's htmlform-backed Query; axum's built-in
@@ -206,10 +208,21 @@ fn push_browse_from(qb: &mut QueryBuilder<'_, Postgres>) {
 /// values are bound parameters — the only text pushed is
 /// fixed fragments and the fixed effective-price /
 /// effective-stock expressions.
+///
+/// Wave 56: `taxonomy_ids` is the category-slug subtree
+/// filter, resolved by the handler from the taxonomy (it
+/// deliberately lives OUTSIDE `BrowseFilters`, so the
+/// validated filter shape, the analytics fingerprint and
+/// the saved-search form stay byte-identical). It belongs
+/// to the CATEGORIES facet group: it is applied everywhere
+/// the text category filter is applied, and left out
+/// exactly where that filter is left out — the Wave 53
+/// convention, unchanged.
 fn push_browse_conditions(
     qb: &mut QueryBuilder<'_, Postgres>,
     filters: &BrowseFilters,
     exclude: FacetExclusion,
+    taxonomy_ids: Option<&[Uuid]>,
 ) {
     qb.push(" WHERE p.status = 'active' AND s.status = 'active'");
     if let Some(q) = &filters.q {
@@ -233,6 +246,13 @@ fn push_browse_conditions(
         qb.push(" AND lower(p.category) = ANY(");
         qb.push_bind(lowered);
         qb.push(")");
+    }
+    if exclude != FacetExclusion::Categories {
+        if let Some(ids) = taxonomy_ids {
+            qb.push(" AND p.category_id = ANY(");
+            qb.push_bind(ids.to_vec());
+            qb.push(")");
+        }
     }
     if exclude != FacetExclusion::Stores && !filters.store_slugs.is_empty() {
         qb.push(" AND s.slug = ANY(");
@@ -352,11 +372,23 @@ pub async fn search_products(
     pool: &PgPool,
     filters: &BrowseFilters,
 ) -> Result<SearchResults, ApiError> {
+    search_products_scoped(pool, filters, None).await
+}
+
+/// Run one faceted browse, optionally scoped to a taxonomy
+/// subtree (Wave 56: the `category_slug` filter, resolved
+/// to category ids by the caller). The scoping joins the
+/// categories facet group — see `push_browse_conditions`.
+pub async fn search_products_scoped(
+    pool: &PgPool,
+    filters: &BrowseFilters,
+    taxonomy_ids: Option<&[Uuid]>,
+) -> Result<SearchResults, ApiError> {
     let offset = (filters.page - 1) * filters.per_page;
 
     let mut count_qb = QueryBuilder::<Postgres>::new("SELECT COUNT(*)");
     push_browse_from(&mut count_qb);
-    push_browse_conditions(&mut count_qb, filters, FacetExclusion::None);
+    push_browse_conditions(&mut count_qb, filters, FacetExclusion::None, taxonomy_ids);
     let total: i64 = count_qb
         .build_query_scalar()
         .fetch_one(pool)
@@ -366,7 +398,7 @@ pub async fn search_products(
     let mut items_qb = QueryBuilder::<Postgres>::new("SELECT ");
     items_qb.push(PRODUCT_COLUMNS);
     push_browse_from(&mut items_qb);
-    push_browse_conditions(&mut items_qb, filters, FacetExclusion::None);
+    push_browse_conditions(&mut items_qb, filters, FacetExclusion::None, taxonomy_ids);
     push_browse_order(&mut items_qb, filters);
     items_qb.push(" LIMIT ");
     items_qb.push_bind(filters.per_page);
@@ -384,12 +416,14 @@ pub async fn search_products(
     // every other product surface — the same resolution the
     // SQL twin priced the filters by, so the fields agree.
     crate::merch::attach_flash_prices(pool, &mut items, Utc::now()).await?;
+    // Wave 56: and their taxonomy breadcrumb paths.
+    crate::categories::attach_category_paths(pool, &mut items).await?;
 
     let facets = SearchFacets {
-        categories: load_category_facet(pool, filters).await?,
-        stores: load_store_facet(pool, filters).await?,
-        price: load_price_facet(pool, filters).await?,
-        ratings: load_rating_facet(pool, filters).await?,
+        categories: load_category_facet(pool, filters, taxonomy_ids).await?,
+        stores: load_store_facet(pool, filters, taxonomy_ids).await?,
+        price: load_price_facet(pool, filters, taxonomy_ids).await?,
+        ratings: load_rating_facet(pool, filters, taxonomy_ids).await?,
     };
 
     Ok(SearchResults {
@@ -409,12 +443,13 @@ pub async fn search_products(
 async fn load_category_facet(
     pool: &PgPool,
     filters: &BrowseFilters,
+    taxonomy_ids: Option<&[Uuid]>,
 ) -> Result<Vec<CategoryFacet>, ApiError> {
     let mut qb = QueryBuilder::<Postgres>::new(
         "SELECT p.category AS category, COUNT(*)::bigint AS count",
     );
     push_browse_from(&mut qb);
-    push_browse_conditions(&mut qb, filters, FacetExclusion::Categories);
+    push_browse_conditions(&mut qb, filters, FacetExclusion::Categories, taxonomy_ids);
     qb.push(" AND p.category IS NOT NULL AND btrim(p.category) <> ''");
     qb.push(" GROUP BY p.category ORDER BY count DESC, p.category ASC");
     qb.build_query_as::<CategoryFacet>()
@@ -428,12 +463,13 @@ async fn load_category_facet(
 async fn load_store_facet(
     pool: &PgPool,
     filters: &BrowseFilters,
+    taxonomy_ids: Option<&[Uuid]>,
 ) -> Result<Vec<StoreFacet>, ApiError> {
     let mut qb = QueryBuilder::<Postgres>::new(
         "SELECT s.slug AS slug, s.name AS name, COUNT(*)::bigint AS count",
     );
     push_browse_from(&mut qb);
-    push_browse_conditions(&mut qb, filters, FacetExclusion::Stores);
+    push_browse_conditions(&mut qb, filters, FacetExclusion::Stores, taxonomy_ids);
     qb.push(" GROUP BY s.slug, s.name ORDER BY count DESC, s.slug ASC");
     qb.build_query_as::<StoreFacet>()
         .fetch_all(pool)
@@ -446,6 +482,7 @@ async fn load_store_facet(
 async fn load_price_facet(
     pool: &PgPool,
     filters: &BrowseFilters,
+    taxonomy_ids: Option<&[Uuid]>,
 ) -> Result<PriceFacet, ApiError> {
     let mut qb = QueryBuilder::<Postgres>::new("SELECT MIN(");
     qb.push(EFFECTIVE_PRICE_SQL);
@@ -453,7 +490,7 @@ async fn load_price_facet(
     qb.push(EFFECTIVE_PRICE_SQL);
     qb.push(")::bigint AS max_poisha");
     push_browse_from(&mut qb);
-    push_browse_conditions(&mut qb, filters, FacetExclusion::Price);
+    push_browse_conditions(&mut qb, filters, FacetExclusion::Price, taxonomy_ids);
     let (min_poisha, max_poisha): (Option<i64>, Option<i64>) = qb
         .build_query_as::<(Option<i64>, Option<i64>)>()
         .fetch_one(pool)
@@ -461,7 +498,7 @@ async fn load_price_facet(
         .map_err(|e| ApiError::internal("browse price facet", e))?;
     let histogram = match (min_poisha, max_poisha) {
         (Some(min), Some(max)) => {
-            load_price_histogram(pool, filters, min, max).await?
+            load_price_histogram(pool, filters, taxonomy_ids, min, max).await?
         }
         _ => Vec::new(),
     };
@@ -480,6 +517,7 @@ async fn load_price_facet(
 async fn load_price_histogram(
     pool: &PgPool,
     filters: &BrowseFilters,
+    taxonomy_ids: Option<&[Uuid]>,
     min_poisha: i64,
     max_poisha: i64,
 ) -> Result<Vec<PriceHistogramBucket>, ApiError> {
@@ -503,7 +541,7 @@ async fn load_price_histogram(
     }
     qb.push("]::bigint[]");
     push_browse_from(&mut qb);
-    push_browse_conditions(&mut qb, filters, FacetExclusion::Price);
+    push_browse_conditions(&mut qb, filters, FacetExclusion::Price, taxonomy_ids);
     let row: Vec<i64> = qb
         .build_query_scalar::<Vec<i64>>()
         .fetch_one(pool)
@@ -530,6 +568,7 @@ async fn load_price_histogram(
 async fn load_rating_facet(
     pool: &PgPool,
     filters: &BrowseFilters,
+    taxonomy_ids: Option<&[Uuid]>,
 ) -> Result<Vec<RatingFacet>, ApiError> {
     let mut qb = QueryBuilder::<Postgres>::new("SELECT ");
     for (index, threshold) in RATING_FACET_THRESHOLDS.iter().enumerate() {
@@ -541,7 +580,7 @@ async fn load_rating_facet(
         qb.push(")::bigint");
     }
     push_browse_from(&mut qb);
-    push_browse_conditions(&mut qb, filters, FacetExclusion::Rating);
+    push_browse_conditions(&mut qb, filters, FacetExclusion::Rating, taxonomy_ids);
     let counts: (i64, i64, i64) = qb
         .build_query_as::<(i64, i64, i64)>()
         .fetch_one(pool)
@@ -609,13 +648,36 @@ pub struct SuggestedCategory {
     pub product_count: i64,
 }
 
+/// One suggested TAXONOMY node (Wave 56): a suggested
+/// category label that resolves into the managed tree,
+/// with the node's identity, names and breadcrumb path —
+/// the dropdown can land the buyer on the category's
+/// landing page instead of a text-filtered browse. Labels
+/// that resolve to nothing produce no node (the text
+/// suggestion above still stands on its own).
+#[derive(Debug, Serialize)]
+pub struct SuggestedCategoryNode {
+    pub id: Uuid,
+    pub slug: String,
+    pub name_en: String,
+    pub name_bn: Option<String>,
+    pub icon_key: String,
+    /// The label the node was resolved from.
+    pub label: String,
+    pub product_count: i64,
+    pub path: Vec<crate::categories::CategoryPathEntry>,
+}
+
 /// The suggestion payload: up to 8 products, 5 categories
-/// and 4 stores.
+/// and 4 stores. Wave 56 adds `category_nodes` — the
+/// taxonomy resolution of the text categories, additive;
+/// the Wave 53 fields are untouched.
 #[derive(Debug, Serialize)]
 pub struct SuggestResults {
     pub products: Vec<SuggestedProduct>,
     pub categories: Vec<SuggestedCategory>,
     pub stores: Vec<SuggestedStore>,
+    pub category_nodes: Vec<SuggestedCategoryNode>,
 }
 
 /// Minimum suggestion text length, in characters: below this the
@@ -634,6 +696,7 @@ pub async fn search_suggestions(pool: &PgPool, q: &str) -> Result<SuggestResults
             products: Vec::new(),
             categories: Vec::new(),
             stores: Vec::new(),
+            category_nodes: Vec::new(),
         });
     }
     let pattern = search_like_pattern(trimmed);
@@ -721,11 +784,59 @@ pub async fn search_suggestions(pool: &PgPool, q: &str) -> Result<SuggestResults
     .await
     .map_err(|e| ApiError::internal("suggest stores", e))?;
 
+    // Wave 56: resolve the suggested labels into taxonomy
+    // nodes (the domain's exact-match rule over the active
+    // tree) so the dropdown can offer the curated landing
+    // page next to the text browse. Unresolvable labels
+    // simply have no node.
+    let category_nodes = resolve_suggested_category_nodes(pool, &categories).await?;
+
     Ok(SuggestResults {
         products,
         categories,
         stores,
+        category_nodes,
     })
+}
+
+/// Resolve suggested text categories to taxonomy nodes
+/// (Wave 56). One taxonomy load for the whole suggestion
+/// set; resolution is the domain rule, so a label lands on
+/// the same node a product write with that label would.
+async fn resolve_suggested_category_nodes(
+    pool: &PgPool,
+    categories: &[SuggestedCategory],
+) -> Result<Vec<SuggestedCategoryNode>, ApiError> {
+    if categories.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = crate::categories::load_taxonomy_rows(pool).await?;
+    let flats = crate::categories::rows_to_flat(&rows);
+    let by_id: HashMap<Uuid, &crate::categories::CategoryRow> =
+        rows.iter().map(|row| (row.id, row)).collect();
+    let mut nodes = Vec::new();
+    for suggested in categories {
+        let Some(id_text) = domain::resolve_category_link(&suggested.category, &flats) else {
+            continue;
+        };
+        let Some(id) = Uuid::parse_str(&id_text).ok() else {
+            continue;
+        };
+        let Some(row) = by_id.get(&id).copied() else {
+            continue;
+        };
+        nodes.push(SuggestedCategoryNode {
+            id: row.id,
+            slug: row.slug.clone(),
+            name_en: row.name_en.clone(),
+            name_bn: row.name_bn.clone(),
+            icon_key: row.icon_key.clone(),
+            label: suggested.category.clone(),
+            product_count: suggested.product_count,
+            path: crate::categories::path_entries(&flats, &id_text),
+        });
+    }
+    Ok(nodes)
 }
 
 // ---------------------------------------------------------------------------
@@ -966,6 +1077,14 @@ pub struct SearchQuery {
     pub q: Option<String>,
     #[serde(default)]
     pub category: Vec<String>,
+    /// Wave 56: taxonomy slugs to scope the browse by
+    /// SUBTREE (repeatable; the union of the named
+    /// subtrees). Resolved to category ids by the handler
+    /// and passed to the service OUTSIDE `BrowseFilters`,
+    /// so the validated filter shape, the analytics
+    /// fingerprint and the saved-search form are untouched.
+    #[serde(default)]
+    pub category_slug: Vec<String>,
     #[serde(default)]
     pub store: Vec<String>,
     pub store_slug: Option<String>,
@@ -1012,7 +1131,28 @@ pub async fn search_handler(
         limit: query.limit,
     })
     .map_err(ApiError::bad_request)?;
-    let results = search_products(pool, &filters).await?;
+    // Wave 56: resolve the category slugs to their subtree
+    // id sets. An unknown (or inactive) slug contributes an
+    // EMPTY set — the browse simply matches nothing for it,
+    // the same answer an unknown text label has always
+    // given, never an error that leaks the taxonomy's
+    // contents.
+    let taxonomy_ids: Option<Vec<Uuid>> = if query.category_slug.is_empty() {
+        None
+    } else {
+        let mut ids: Vec<Uuid> = Vec::new();
+        for slug in &query.category_slug {
+            if let Some(mut subtree) =
+                crate::categories::resolve_category_subtree_ids(pool, slug).await?
+            {
+                ids.append(&mut subtree);
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        Some(ids)
+    };
+    let results = search_products_scoped(pool, &filters, taxonomy_ids.as_deref()).await?;
     // Wave 53: the analytics log rides the handler (the
     // service stays a pure read); a logging failure never
     // fails the search.

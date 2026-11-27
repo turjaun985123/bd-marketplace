@@ -4617,6 +4617,180 @@ confirm/manual-flip moments are unknowable from the
 schema, stated above rather than papered over); the
 district statistics count only district-known orders.
 
+Wave 56 (category taxonomy v2 — the Shopify-parity
+program continues):
+
+**Categories stop being free-text strings and become a
+managed taxonomy — without breaking one existing
+surface.** Migration 0060 adds `categories` (id,
+`parent_id` self-FK, `slug` UNIQUE across the whole
+tree, `name_en` + `name_bn`, `icon_key`, `sort_order`,
+`is_active`, `is_featured`, timestamps) and
+`products.category_id` (nullable FK). The legacy
+`products.category` text column STAYS as the
+denormalised display label, kept in sync by the service
+layer, so search facets, exports and every text-based
+consumer keep working byte-identically (below).
+
+**The model.** Depth is capped at 3 levels (root, child,
+grandchild) by the domain's one validation
+(`validate_category_parent`): reparenting rejects
+cycles and any move that would push a subtree past the
+cap; slugs follow `is_valid_slug` and are unique
+tree-wide (the database UNIQUE answers with a friendly
+bilingual 409); names cap at 80 chars; `icon_key` is a
+KEY into a small built-in set (`tag`, `shirt`, `phone`,
+`cart`, …) — an icon is a glyph the web renders, never
+an uploaded image. Display order is `sort_order`, then
+English name, then slug — one rule, shared by the
+admin list, both trees and the home strip. A category
+with children or with products CANNOT be deleted (409
+naming the counts); the merge endpoint is the bulk
+alternative (below). Orphan rule: a node whose parent
+is missing (retired) surfaces at the top of the public
+tree rather than vanishing with its products.
+
+**The seed (migration 0061) is reference data in a
+migration** — a deliberate new convention: no earlier
+migration carries data, but migrations are the repo's
+only run-exactly-once mechanism, so the taxonomy ships
+there, idempotently (`ON CONFLICT (slug) DO NOTHING`).
+Eleven roots — Fashion/ফ্যাশন, Electronics/ইলেকট্রনিক্স,
+Grocery/মুদি বাজার, Home & Living, Beauty & Health,
+Baby & Kids, Sports & Fitness, Motors, Agriculture,
+Books & Stationery, Others/অন্যান্য — with 36 children
+and 6 grandchildren (Panjabi under Men's Fashion under
+Fashion, and so on), real Bangla + English names.
+Fashion and Electronics are `is_featured`. Migration
+0062 backfills `category_id` for existing products
+whose label matches a taxonomy slug or name EXACTLY
+(case-insensitive on slug/English, exact on Bangla) and
+unambiguously (exactly one candidate node); the label
+itself is never rewritten by the backfill, and
+unmatched products stay NULL with their text intact.
+
+**Linking products — the resolution rule, stated
+once.** Create and patch resolve through ONE service
+function. An explicit `category_id` wins: it must exist
+and be active (400 otherwise), and the text label
+SYNCS to the node's English name. Without an id, a
+non-blank text label resolves by exact match — slug,
+then English name (case-insensitive), then Bangla name
+— against ACTIVE nodes, and the label stays exactly as
+typed; no match keeps the product free-text with
+`category_id` NULL. A patch carrying a label re-resolves
+(and unlinks when the new label matches nothing); a
+patch carrying neither keeps the stored link; a blank
+label in a patch still means "no change". A product may
+sit on an INTERIOR node — leaf-ness is not required;
+interior products are exactly what subtree browse rolls
+up. Product views gain `category_id` and
+`category_path` (the root→node breadcrumb) additively.
+
+**Admin (audited, one transaction per operation):**
+`GET`/`POST /v1/admin/categories`, `GET
+/v1/admin/categories/tree`, `GET`/`PATCH`/`DELETE
+/v1/admin/categories/{id}`, `PUT
+/v1/admin/categories/reorder` (bulk sort orders, all or
+nothing), `POST /v1/admin/categories/{id}/merge`
+(products re-link — a product whose label was the
+source's synced name re-syncs to the target's — children
+re-root, the source is deleted, one report),
+`GET /v1/admin/categories/{id}/products` (the subtree's
+products in ANY status — the delete guard's count,
+inspectable), and `GET /v1/admin/categories/export` +
+`POST /v1/admin/categories/import` (a slug-keyed JSON
+round-trip: parents travel by slug, never ids; import
+upserts by slug and validates the merged tree BEFORE
+writing, so a cyclic or dangling document changes
+nothing). Audit actions `category.create/update/
+delete/reorder/merge/import` join the Wave 28 funnel.
+The web admin gains /admin/categories: tree-ordered
+list, create/edit form (parent picker, icon picker),
+sibling reorder, drill-in, delete, merge and the
+import/export panel.
+
+**Public surfaces — additive by design.**
+`GET /v1/categories` still returns the Wave 53
+free-text aggregate in `categories` (the home feed's
+tiles and the aggregate are pinned byte-identical by
+the Wave 52/53 tests, so the taxonomy did NOT replace
+them) and ADDS the tree as a `tree` field; `?flat=1`
+returns exactly the pre-Wave-56 shape. `GET
+/v1/categories/tree` serves the tree alone; `GET
+/v1/categories/{slug}` serves one node + its path (404
+for unknown or retired slugs). Tree counts are subtree
+ROLLUPS over visible products (active product, active
+store) — deliberately unlike the legacy aggregate,
+which counts direct labels only. The home feed gains a
+`taxonomy` field (top-level nodes, featured first) and
+keeps `categories` untouched; the web home renders the
+taxonomy strip above the legacy tiles, /categories
+renders taxonomy sections first and the labels no node
+covers under "আরও লেবেল", and /categories/[slug] is a
+taxonomy landing (breadcrumb, children tiles, subtree
+browse) that falls back to the legacy text landing for
+non-taxonomy segments. Product-page breadcrumbs follow
+`category_path` when the product is linked.
+`GET /v1/categories/{slug}/products` serves the node's
+subtree as a plain product list (direct addressing:
+unknown or retired slugs 404, unlike the list filter).
+A category navigation bar (quick roots + the full-tree
+mega panel) rides in the marketplace frame on every
+marketplace page, and a store's specialisation tiles
+land on IN-STORE category pages
+(`/<store>/categories/<slug>` — the same landing,
+scoped to the store) rather than leaving the store.
+
+**Browse.** `GET /v1/search` and the product lists gain
+a repeatable `category_slug` parameter resolving to
+subtree id sets. The Wave 53 facet convention is
+UNCHANGED: the slug filter belongs to the categories
+facet group — items and total apply it, the categories
+facet is computed without it, the other facets with it —
+and the facet itself still groups by the text column.
+The slug travels OUTSIDE `BrowseFilters`, so the
+analytics fingerprint and saved searches keep their
+Wave 53 meaning; a slug-scoped search logs under the
+plain fingerprint (stated, not hidden). Suggestions
+gain `category_nodes` (labels resolved into taxonomy
+nodes with paths) beside the unchanged text fields.
+`GET /v1/stores/{slug}/categories` reports a store's top
+linked categories with paths — its specialisation,
+computed from its real active products — rendered on
+the storefront above the legacy label tiles.
+
+**Seller UX.** The product form's free-text category
+input becomes a tree PICKER (`CategoryPicker`, fed by
+the public tree) with an explicit "use a custom label"
+escape — a taxonomy can lag a seller's vocabulary, and
+forcing a wrong node would corrupt the data the picker
+exists to clean; the seeded Others/অন্যান্য node is the
+catch-all for products that fit the taxonomy's shape
+but no specific branch. The seller product list filters
+by category subtree (the same `category_slug`
+parameter).
+
+Honest limits: free-text products remain possible via
+the API whenever a label matches no taxonomy node —
+the taxonomy organises the catalogue, it does not gate
+it; renaming a category does not rewrite labels already
+synced onto its products (a label re-syncs on the
+product's own next write) and resolution always uses
+CURRENT names, so a renamed node's old name stops
+linking new products immediately; `category_path` is filled on list, detail, browse
+and drill-in reads, and stays empty on the card rails
+(home rails, recommendations) to keep those payloads
+lean; a retired (inactive) node keeps its products'
+links — they stay searchable by text and reappear if
+the node is reactivated — but the node leaves the
+public tree and its slug stops resolving for browse;
+slug-scoped searches are not distinguished in the
+search analytics (above); icons are keys rendered as
+glyphs, not category images (a node borrows its cover
+from its best-selling imaged product, the Wave 53
+pattern).
+
 ## How to run
 
 With a database (Wave 2 features):
@@ -6156,6 +6330,35 @@ timeline, shelf bulk move-all/clear, the buy-again rail
 `addresses` section, admin orders-by-zone + address-book
 stats, and the shared DistrictSelect. See the Wave 55
 section.
+
+**Real (Wave 56):** the managed category taxonomy —
+migration 0060 (`categories` tree, depth ≤ 3, tree-wide
+unique slugs, icon keys, featured flag) +
+`products.category_id`, the seeded Bangladesh taxonomy
+(migration 0061, 11 roots / 36 children / 6
+grandchildren, Bangla + English) and the exact-match
+backfill (migration 0062); domain tree rules (cycle +
+depth guards, display order, orphan promotion, delete
+guard, link resolution); the audited admin API (CRUD,
+bulk reorder, merge with label re-sync, subtree
+drill-in, slug-keyed import/export validated before
+writing) and /admin/categories; product linking through
+one resolution rule (explicit id syncs the label, text
+resolves exactly, no match stays free-text) with
+`category_id` + `category_path` on product views; the
+additive public contract (`GET /v1/categories` keeps
+the Wave 53 aggregate and adds `tree`, `?flat=1` is the
+old shape, `/v1/categories/tree`, `/v1/categories/{slug}`,
+home feed `taxonomy` beside the untouched tiles);
+subtree browse via `category_slug` on search + product
+lists with the Wave 53 facet convention intact;
+taxonomy suggestion nodes; store specialisation
+(`GET /v1/stores/{slug}/categories`); the seller
+CategoryPicker + subtree filter, taxonomy landings,
+taxonomy-first /categories, the subtree product list
+endpoint, the marketplace category nav bar with its
+mega panel, and in-store category landings. See the
+Wave 56 section.
 
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real

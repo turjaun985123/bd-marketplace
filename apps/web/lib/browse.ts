@@ -19,6 +19,14 @@ import { formatBdt } from "./format";
 export interface BrowseState {
   q: string;
   categories: string[];
+  /**
+   * Taxonomy slugs (Wave 56): scope the browse to the
+   * union of the named categories' SUBTREES. Travels as
+   * the API's `category_slug` parameter; deliberately NOT
+   * part of saved searches (the API's saved filter shape
+   * has no slug group).
+   */
+  categorySlugs: string[];
   stores: string[];
   /** Legacy single-store scope (`store_slug`), kept for storefront links. */
   storeSlug: string;
@@ -98,6 +106,7 @@ export function browseStateFromParams(params: URLSearchParams): BrowseState {
   return {
     q,
     categories: allValues(params, "category"),
+    categorySlugs: allValues(params, "category_slug"),
     stores: allValues(params, "store"),
     storeSlug: params.get("store_slug") ?? "",
     minPricePoisha: poishaParam(params, "min_price_poisha"),
@@ -125,6 +134,7 @@ export function browseParamsFromState(state: BrowseState): URLSearchParams {
   const params = new URLSearchParams();
   if (state.q) params.set("q", state.q);
   for (const category of state.categories) params.append("category", category);
+  for (const slug of state.categorySlugs) params.append("category_slug", slug);
   for (const store of state.stores) params.append("store", store);
   if (state.storeSlug) params.set("store_slug", state.storeSlug);
   if (state.minPricePoisha !== null)
@@ -153,6 +163,7 @@ export function emptyBrowseState(): BrowseState {
   return {
     q: "",
     categories: [],
+    categorySlugs: [],
     stores: [],
     storeSlug: "",
     minPricePoisha: null,
@@ -175,6 +186,7 @@ export function emptyBrowseState(): BrowseState {
 export function activeFilterCount(state: BrowseState): number {
   let count = 0;
   if (state.categories.length > 0) count += 1;
+  if (state.categorySlugs.length > 0) count += 1;
   if (state.stores.length > 0 || state.storeSlug) count += 1;
   if (state.minPricePoisha !== null || state.maxPricePoisha !== null)
     count += 1;
@@ -208,6 +220,7 @@ export function browseStateFromSaved(filters: SavedSearchFilters): BrowseState {
   return {
     q: filters.q ?? "",
     categories: filters.categories,
+    categorySlugs: [],
     stores: filters.store_slugs,
     storeSlug: "",
     minPricePoisha: filters.min_price_poisha,

@@ -1,3 +1,4 @@
+import CategoryNav from "@/components/CategoryNav";
 import FlashStrip from "@/components/FlashStrip";
 import NotificationBell from "@/components/NotificationBell";
 
@@ -17,6 +18,11 @@ export default function MarketplaceLayout({
   return (
     <>
       <FlashStrip />
+      {/* Wave 56: the taxonomy navigation bar (quick roots
+          + the mega panel) rides under the strip on every
+          marketplace page. It renders nothing until the
+          public tree loads, and nothing if it fails. */}
+      <CategoryNav />
       {/* Wave 54 extension: the signed-in visitor's inbox
           bell (unread badge) rides the marketplace frame. */}
       <NotificationBell />

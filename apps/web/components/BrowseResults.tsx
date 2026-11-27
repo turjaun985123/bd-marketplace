@@ -51,6 +51,7 @@ export default function BrowseResults({
   heading,
   forcedStoreSlug,
   forcedCategory,
+  forcedCategorySlug,
 }: {
   basePath: string;
   heading: string;
@@ -66,6 +67,13 @@ export default function BrowseResults({
    * category filter group is hidden.
    */
   forcedCategory?: string;
+  /**
+   * Pin the browse to one TAXONOMY subtree (Wave 56 — the
+   * taxonomy category landing): the slug scopes the
+   * browse server-side to the node's whole subtree, and
+   * the category filter group is hidden the same way.
+   */
+  forcedCategorySlug?: string;
 }) {
   return (
     <Suspense fallback={<p>লোড হচ্ছে… (Loading…)</p>}>
@@ -74,6 +82,7 @@ export default function BrowseResults({
         heading={heading}
         forcedStoreSlug={forcedStoreSlug}
         forcedCategory={forcedCategory}
+        forcedCategorySlug={forcedCategorySlug}
       />
     </Suspense>
   );
@@ -84,11 +93,13 @@ function BrowseResultsInner({
   heading,
   forcedStoreSlug,
   forcedCategory,
+  forcedCategorySlug,
 }: {
   basePath: string;
   heading: string;
   forcedStoreSlug?: string;
   forcedCategory?: string;
+  forcedCategorySlug?: string;
 }) {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -103,8 +114,14 @@ function BrowseResultsInner({
   if (forcedCategory) {
     state = { ...state, categories: [forcedCategory] };
   }
+  if (forcedCategorySlug) {
+    state = { ...state, categorySlugs: [forcedCategorySlug] };
+  }
   const stateKey =
-    searchParams.toString() + (forcedStoreSlug ?? "") + (forcedCategory ?? "");
+    searchParams.toString() +
+    (forcedStoreSlug ?? "") +
+    (forcedCategory ?? "") +
+    (forcedCategorySlug ?? "");
 
   const [results, setResults] = useState<SearchResult | null>(null);
   const [offline, setOffline] = useState(false);
@@ -154,6 +171,7 @@ function BrowseResultsInner({
     searchProducts({
       q: state.q || undefined,
       categories: state.categories,
+      category_slugs: state.categorySlugs,
       stores: state.stores,
       store_slug: state.storeSlug || undefined,
       min_price_poisha: state.minPricePoisha ?? undefined,
@@ -226,6 +244,18 @@ function BrowseResultsInner({
       clear: {
         ...state,
         categories: state.categories.filter((entry) => entry !== category),
+        page: 1,
+      },
+    });
+  }
+  for (const slug of state.categorySlugs) {
+    if (forcedCategorySlug && slug === forcedCategorySlug) continue;
+    chips.push({
+      key: `category_slug:${slug}`,
+      label: `ক্যাটাগরি: ${slug}`,
+      clear: {
+        ...state,
+        categorySlugs: state.categorySlugs.filter((entry) => entry !== slug),
         page: 1,
       },
     });
@@ -315,7 +345,7 @@ function BrowseResultsInner({
             facets={results?.facets ?? null}
             onChange={navigate}
             hideStores={!!forcedStoreSlug}
-            hideCategories={!!forcedCategory}
+            hideCategories={!!forcedCategory || !!forcedCategorySlug}
           />
         </aside>
 
@@ -601,7 +631,7 @@ function BrowseResultsInner({
               facets={results?.facets ?? null}
               onChange={navigate}
               hideStores={!!forcedStoreSlug}
-            hideCategories={!!forcedCategory}
+            hideCategories={!!forcedCategory || !!forcedCategorySlug}
             />
           </div>
         </div>

@@ -1,12 +1,19 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
+import CategoryPicker, {
+  EMPTY_CATEGORY_PICK,
+  flattenCategoryTree,
+  type CategoryPick,
+  type FlatCategoryOption,
+} from "@/components/CategoryPicker";
 import ImageUploader from "@/components/ImageUploader";
 import ProductCard from "@/components/ProductCard";
 import VariantManager from "@/components/VariantManager";
 import {
   createProduct,
+  getCategoryTree,
   getStore,
   getStoreProducts,
   type Product,
@@ -39,20 +46,28 @@ export default function SellerProductsPage() {
   // Create-product form state (price typed in taka for humans).
   const [title, setTitle] = useState("");
   const [titleBn, setTitleBn] = useState("");
-  const [category, setCategory] = useState("");
+  // Wave 56: the category is a taxonomy PICK, not free
+  // text (the picker keeps a custom-label escape hatch).
+  const [pick, setPick] = useState<CategoryPick>(EMPTY_CATEGORY_PICK);
+  // Wave 56: the list's category-subtree filter (a slug;
+  // the API scopes the list to the node's whole subtree).
+  const [filterSlug, setFilterSlug] = useState("");
+  const [filterOptions, setFilterOptions] = useState<FlatCategoryOption[]>([]);
   const [priceTaka, setPriceTaka] = useState("");
   const [stock, setStock] = useState("0");
   const [status, setStatus] = useState("draft");
   const [weightGrams, setWeightGrams] = useState("1000");
 
   const loadStore = useCallback(
-    async (storeSlug: string) => {
+    async (storeSlug: string, categorySlug: string = filterSlug) => {
       if (!token) return;
       setMessage(null);
       try {
         const found = await getStore(storeSlug);
         setStore(found);
-        const list = await getStoreProducts(storeSlug, token);
+        const list = await getStoreProducts(storeSlug, token, {
+          category_slug: categorySlug || undefined,
+        });
         setProducts(list.items);
       } catch (err) {
         setStore(null);
@@ -62,8 +77,24 @@ export default function SellerProductsPage() {
         );
       }
     },
-    [token]
+    [token, filterSlug]
   );
+
+  // The filter's options are the public taxonomy tree,
+  // flattened like the picker's.
+  useEffect(() => {
+    let cancelled = false;
+    getCategoryTree()
+      .then((result) => {
+        if (!cancelled) setFilterOptions(flattenCategoryTree(result.tree));
+      })
+      .catch(() => {
+        if (!cancelled) setFilterOptions([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Nothing auto-loads: the seller enters one of their store slugs and
   // loads it explicitly via the form above.
@@ -77,7 +108,13 @@ export default function SellerProductsPage() {
         store_id: store.id,
         title: title.trim(),
         title_bn: titleBn.trim() || undefined,
-        category: category.trim() || undefined,
+        // Wave 56: a picked node sends its id (the API
+        // syncs the label); the custom-label mode sends
+        // only the typed text.
+        category_id: pick.category_id ?? undefined,
+        category: pick.category_id
+          ? undefined
+          : pick.category.trim() || undefined,
         price_poisha: Math.round(Number(priceTaka) * 100),
         stock: Number(stock),
         status,
@@ -86,7 +123,7 @@ export default function SellerProductsPage() {
       setProducts((prev) => [created, ...prev]);
       setTitle("");
       setTitleBn("");
-      setCategory("");
+      setPick(EMPTY_CATEGORY_PICK);
       setPriceTaka("");
       setStock("0");
       setWeightGrams("1000");
@@ -148,6 +185,26 @@ export default function SellerProductsPage() {
       {store && (
         <>
           <h2>{store.name}</h2>
+          <p>
+            <label>
+              ক্যাটাগরি অনুযায়ী ছাঁকুন — Filter by category{" "}
+              <select
+                value={filterSlug}
+                onChange={(e) => {
+                  setFilterSlug(e.target.value);
+                  void loadStore(store.slug, e.target.value);
+                }}
+              >
+                <option value="">সব ক্যাটাগরি — All categories</option>
+                {filterOptions.map((option) => (
+                  <option key={option.id} value={option.slug}>
+                    {"  ".repeat(Math.max(0, option.depth - 1))}
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </p>
           {products.length === 0 ? (
             <p>এই স্টোরে এখনো কোনো পণ্য নেই। (No products in this store yet.)</p>
           ) : (
@@ -237,13 +294,8 @@ export default function SellerProductsPage() {
               <input value={titleBn} onChange={(e) => setTitleBn(e.target.value)} />
             </label>
             <label>
-              ক্যাটাগরি (Category) — খোঁজার ফিল্টারে ব্যবহৃত হয়
-              <input
-                value={category}
-                onChange={(e) => setCategory(e.target.value)}
-                placeholder="যেমন: clothing"
-                maxLength={60}
-              />
+              ক্যাটাগরি (Category) — তালিকা থেকে বেছে নিন
+              <CategoryPicker value={pick} onChange={setPick} />
             </label>
             <label>
               দাম (টাকা)

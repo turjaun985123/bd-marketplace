@@ -1853,6 +1853,14 @@ pub struct FeaturedStore {
 pub struct HomeFeed {
     pub banners: Vec<HomeBanner>,
     pub categories: Vec<HomeCategory>,
+    /// The taxonomy strip (Wave 56): the top-level nodes of
+    /// the managed category tree, featured first, then in
+    /// display order, capped like the legacy tiles. ADDITIVE
+    /// — the `categories` tiles above are the Wave 52/53
+    /// free-text aggregate, byte-identical to before; this
+    /// field is the curated tree the storefront now leads
+    /// with.
+    pub taxonomy: Vec<crate::categories::CategoryTreeNode>,
     pub flash_sale: Option<HomeFlashSale>,
     pub collections: Vec<HomeCollectionSection>,
     pub new_arrivals: Vec<Product>,
@@ -1970,6 +1978,13 @@ pub async fn build_home_feed(pool: &PgPool, now: DateTime<Utc>) -> Result<HomeFe
     // extracted it for `GET /v1/categories`).
     let categories = load_categories(pool, HOME_CATEGORY_LIMIT).await?;
 
+    // The taxonomy strip (Wave 56): top-level nodes of the
+    // managed tree, featured first. The legacy tiles above
+    // are untouched — this is an additive field.
+    let mut taxonomy = crate::categories::load_public_tree(pool).await?;
+    taxonomy.sort_by_key(|node| !node.is_featured);
+    taxonomy.truncate(HOME_CATEGORY_LIMIT as usize);
+
     // The flash sale live at `now`, with its cards.
     let flash_sale = load_home_flash_sale(pool, now).await?;
 
@@ -2073,6 +2088,7 @@ pub async fn build_home_feed(pool: &PgPool, now: DateTime<Utc>) -> Result<HomeFe
     Ok(HomeFeed {
         banners,
         categories,
+        taxonomy,
         flash_sale,
         collections,
         new_arrivals,
@@ -2172,27 +2188,12 @@ pub async fn home_feed_handler(
 /// not a display choice.
 pub const CATEGORIES_LIST_LIMIT: i64 = 200;
 
-/// The public category list payload (Wave 53): the same
-/// tile shape the home feed carries, under its own
-/// envelope so the endpoint can grow without the feed
-/// changing.
-#[derive(Debug, Serialize)]
-pub struct CategoryList {
-    pub categories: Vec<HomeCategory>,
-}
-
-/// `GET /v1/categories` — the platform's category
-/// vocabulary with product counts and cover images, from
-/// the same aggregate as the home feed's tiles
-/// ([`load_categories`]). Public and anonymous, so it
-/// carries the catalogue cache header.
-pub async fn list_categories_handler(
-    State(state): State<AppState>,
-) -> Result<(HeaderMap, Json<CategoryList>), ApiError> {
-    let pool = state.require_pool()?;
-    let categories = load_categories(pool, CATEGORIES_LIST_LIMIT).await?;
-    Ok((public_cache_headers(true), Json(CategoryList { categories })))
-}
+/// The public category list payload (Wave 53) lived here
+/// until Wave 56: `GET /v1/categories` is now served by
+/// `categories::list_categories_handler`, which returns
+/// this same aggregate in its `categories` field (from
+/// [`load_categories`], byte-identical) plus the taxonomy
+/// tree as an additive `tree` field.
 
 /// The admin preview query: `at` is an RFC 3339 timestamp.
 #[derive(Deserialize)]

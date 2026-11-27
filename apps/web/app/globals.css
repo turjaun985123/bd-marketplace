@@ -342,6 +342,57 @@ a { color: var(--brand-600); }
 .category-tile-name { font-weight: 700; display: block; }
 .category-tile-count { color: var(--text-muted); font-size: var(--text-sm); }
 
+/* Wave 56: taxonomy surfaces — the category index sections
+   and child chips, the landing breadcrumb, the store
+   specialisation path line, the seller picker's note and
+   the admin taxonomy list. */
+.category-index-section { margin-bottom: var(--space-5); }
+.category-index-children { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-top: var(--space-2); }
+.category-chip { display: inline-block; padding: var(--space-1) var(--space-3); border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--text); text-decoration: none; font-size: var(--text-sm); }
+.category-chip:hover { border-color: var(--brand-700); }
+.category-breadcrumb { margin-bottom: var(--space-2); color: var(--text-muted); }
+.category-landing-en { font-weight: 400; color: var(--text-muted); }
+.store-specialties { margin: var(--space-6) 0; }
+.store-category-path { color: var(--text-muted); font-size: var(--text-sm); }
+.category-picker-note { display: block; color: var(--text-muted); font-size: var(--text-sm); margin-top: var(--space-1); }
+.admin-category-list { list-style: none; padding: 0; }
+.admin-category-list > li { padding: var(--space-2) 0; border-bottom: 1px solid var(--border); }
+.admin-category-drill { margin: var(--space-2) 0 var(--space-2) var(--space-4); }
+
+/* Wave 56: the category navigation bar + mega panel in
+   the marketplace frame. The panel is a column grid on
+   wide screens and collapses to one stacked, scrollable
+   column on narrow ones. */
+.category-nav { position: relative; border-bottom: 1px solid var(--border); background: var(--surface); }
+.category-nav-bar { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-2) var(--space-4); }
+.category-nav-toggle { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-raised); color: var(--text); padding: var(--space-1) var(--space-3); cursor: pointer; font-weight: 600; white-space: nowrap; }
+.category-nav-toggle:hover { border-color: var(--brand-700); }
+.category-nav-quick { display: flex; gap: var(--space-3); overflow-x: auto; }
+.category-nav-quick-link { color: var(--text); text-decoration: none; white-space: nowrap; font-size: var(--text-sm); }
+.category-nav-quick-link:hover { color: var(--brand-700); }
+.category-nav-panel { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: var(--space-4); padding: var(--space-4); border-top: 1px solid var(--border); background: var(--surface-raised); max-height: 70vh; overflow-y: auto; }
+.category-nav-col { display: flex; flex-direction: column; gap: var(--space-1); }
+.category-nav-root { color: var(--text); text-decoration: none; font-weight: 700; }
+.category-nav-root:hover { color: var(--brand-700); }
+.category-nav-count { color: var(--text-muted); font-weight: 400; font-size: var(--text-sm); margin-left: var(--space-2); }
+.category-nav-root-en { color: var(--text-muted); font-size: var(--text-sm); margin-bottom: var(--space-1); }
+.category-nav-child-wrap { display: flex; flex-direction: column; }
+.category-nav-child { color: var(--text); text-decoration: none; font-size: var(--text-sm); padding-left: var(--space-2); }
+.category-nav-child:hover { color: var(--brand-700); }
+.category-nav-grandchild { color: var(--text-muted); text-decoration: none; font-size: var(--text-sm); padding-left: var(--space-4); }
+.category-nav-grandchild:hover { color: var(--brand-700); }
+@media (max-width: 640px) {
+  .category-nav-panel { grid-template-columns: 1fr; max-height: 60vh; }
+  .category-nav-quick { display: none; }
+}
+
+/* Wave 56: the admin taxonomy tree editor rows. */
+.admin-tree { list-style: none; padding: 0; }
+.admin-tree-row { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-1); padding: var(--space-2) 0; border-bottom: 1px solid var(--border); }
+.admin-tree-toggle { border: none; background: none; color: var(--text); cursor: pointer; width: 20px; padding: 0; }
+.admin-tree-toggle-spacer { display: inline-block; width: 20px; }
+.admin-tree-actions { margin-left: auto; }
+
 .featured-stores { display: flex; gap: var(--space-3); overflow-x: auto; padding-bottom: var(--space-2); }
 .featured-store { flex: 0 0 auto; width: 220px; border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; text-decoration: none; color: var(--text); background: var(--surface-raised); box-shadow: var(--shadow-sm); }
 .featured-store-banner { width: 100%; height: 72px; object-fit: cover; display: block; background: var(--brand-50); }

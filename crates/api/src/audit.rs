@@ -23,6 +23,14 @@
 //!   hiding a question on their own product is routine
 //!   moderation, not a platform action.
 //! - `return.refund_done` — target `return_request`, no detail.
+//! - `category.create` (detail `{slug}`), `category.update`
+//!   (detail `{changed_keys}` — key NAMES only, the settings
+//!   pattern), `category.delete` (detail `{slug}`),
+//!   `category.reorder` (detail `{count}`, no target),
+//!   `category.merge` (target = the deleted source, detail
+//!   `{target_slug, products_moved, children_moved}`),
+//!   `category.import` (detail `{created, updated}`, no
+//!   target) — target `category` (Wave 56).
 //!
 //! What is NEVER logged: secrets of any kind (passwords do not
 //! exist here, but JWT secrets, gateway credentials, OTP codes

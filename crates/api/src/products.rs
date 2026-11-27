@@ -82,8 +82,26 @@ pub struct Product {
     pub description: Option<String>,
     /// Free-text category label (Wave 15); null when the seller
     /// did not set one. Search filters on it (case-insensitive
-    /// exact match).
+    /// exact match). Since Wave 56 this is the DENORMALISED
+    /// display name of the taxonomy link below: setting
+    /// `category_id` writes the node's English name here, and
+    /// a label typed without a link stays exactly as typed.
     pub category: Option<String>,
+    /// The product's link into the managed category taxonomy
+    /// (Wave 56); null when the label matched no node (or no
+    /// label was set) — free-text products remain possible
+    /// by design. A real column, selected by
+    /// `PRODUCT_COLUMNS`.
+    pub category_id: Option<Uuid>,
+    /// The breadcrumb path of the taxonomy link (Wave 56):
+    /// root-first `CategoryPathEntry`s, filled after load by
+    /// `categories::attach_category_paths` on the reads that
+    /// render breadcrumbs (product list/detail, faceted
+    /// browse, the admin category drill-in); empty for
+    /// unlinked products and on card rails that never render
+    /// a breadcrumb.
+    #[sqlx(default)]
+    pub category_path: Vec<crate::categories::CategoryPathEntry>,
     pub price_poisha: i64,
     pub compare_at_poisha: Option<i64>,
     /// The EFFECTIVE stock (Wave 33): the sum of the active
@@ -220,7 +238,7 @@ pub(crate) const EFFECTIVE_STOCK_SQL: &str = "CASE WHEN EXISTS (\
 /// of "sold" for every surface, so the number a card shows
 /// can never disagree with the rail that ranked it.
 pub(crate) const PRODUCT_COLUMNS: &str = "p.id, p.store_id, s.slug AS store_slug, p.title, p.title_bn, \
-    p.description, p.category, p.price_poisha, p.compare_at_poisha, \
+    p.description, p.category, p.category_id, p.price_poisha, p.compare_at_poisha, \
     CASE WHEN EXISTS (SELECT 1 FROM product_variants pv \
                       WHERE pv.product_id = p.id AND pv.is_active) \
          THEN (SELECT COALESCE(SUM(pv2.stock), 0)::int FROM product_variants pv2 \
@@ -367,6 +385,7 @@ pub async fn list_products(
     limit: Option<i64>,
     viewer_user_id: Option<Uuid>,
     sort: Option<&str>,
+    category_ids: Option<Vec<Uuid>>,
 ) -> Result<ProductList, ApiError> {
     let (page, limit) = clamp_pagination(page, limit);
     let offset = (page - 1) * limit;
@@ -376,13 +395,20 @@ pub async fn list_products(
         .filter(|s| !s.is_empty())
         .map(|s| format!("%{s}%"));
 
+    // Wave 56: the taxonomy subtree filter. `None` = no
+    // taxonomy scoping; `Some(ids)` (possibly empty, for an
+    // unknown slug) scopes to products linked into the set.
+    // Bound as one uuid[] parameter in a fixed position in
+    // both queries, like the static fragments above.
     let total: i64 = sqlx::query_scalar(&format!(
         "SELECT COUNT(*) FROM products p JOIN stores s ON s.id = p.store_id \
-         WHERE {PRODUCT_WHERE}"
+         WHERE {PRODUCT_WHERE} \
+         AND ($4::uuid[] IS NULL OR p.category_id = ANY($4))"
     ))
     .bind(&pattern)
     .bind(store_slug)
     .bind(viewer_user_id)
+    .bind(&category_ids)
     .fetch_one(pool)
     .await
     .map_err(|e| ApiError::internal("count products", e))?;
@@ -416,12 +442,15 @@ pub async fn list_products(
     let mut items: Vec<Product> = sqlx::query_as(&format!(
         "SELECT {PRODUCT_COLUMNS} FROM products p JOIN stores s ON s.id = p.store_id \
          {PRODUCT_RATING_JOIN} {} \
-         WHERE {PRODUCT_WHERE} {order_by} LIMIT $4 OFFSET $5",
+         WHERE {PRODUCT_WHERE} \
+         AND ($4::uuid[] IS NULL OR p.category_id = ANY($4)) \
+         {order_by} LIMIT $5 OFFSET $6",
         crate::merch::FLASH_PRICE_JOIN
     ))
     .bind(&pattern)
     .bind(store_slug)
     .bind(viewer_user_id)
+    .bind(&category_ids)
     .bind(limit)
     .bind(offset)
     .fetch_all(pool)
@@ -433,6 +462,8 @@ pub async fn list_products(
     // Wave 52: live flash prices ride the shared view (see
     // the field doc on `Product`).
     crate::merch::attach_flash_prices(pool, &mut items, Utc::now()).await?;
+    // Wave 56: breadcrumb paths for the linked products.
+    crate::categories::attach_category_paths(pool, &mut items).await?;
 
     Ok(ProductList {
         items,
@@ -458,6 +489,8 @@ pub async fn get_product_by_id(pool: &PgPool, id: Uuid) -> Result<Product, ApiEr
     // like every other product surface.
     let mut single = vec![with_stock_status(product)];
     crate::merch::attach_flash_prices(pool, &mut single, Utc::now()).await?;
+    // Wave 56: and its taxonomy breadcrumb path.
+    crate::categories::attach_category_paths(pool, &mut single).await?;
     Ok(single.pop().expect("one product in, one product out"))
 }
 
@@ -510,6 +543,12 @@ pub struct NewProduct {
     pub description: Option<String>,
     /// Category label (Wave 15); the Facebook import passes None.
     pub category: Option<String>,
+    /// Taxonomy link (Wave 56), already resolved by the
+    /// caller through `categories::resolve_product_category`;
+    /// the Facebook import passes None (its posts carry no
+    /// taxonomy pick — the label resolution there stays the
+    /// seller's later edit).
+    pub category_id: Option<Uuid>,
     pub price_poisha: i64,
     pub compare_at_poisha: Option<i64>,
     pub stock: i32,
@@ -532,8 +571,8 @@ where
     sqlx::query_scalar(
         "INSERT INTO products (store_id, title, title_bn, description, category, \
          price_poisha, compare_at_poisha, stock, status, weight_grams, \
-         source, source_ref) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id",
+         source, source_ref, category_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id",
     )
     .bind(input.store_id)
     .bind(input.title.trim())
@@ -547,6 +586,7 @@ where
     .bind(input.weight_grams)
     .bind(&input.source)
     .bind(&input.source_ref)
+    .bind(input.category_id)
     .fetch_one(executor)
     .await
     .map_err(|e| ApiError::internal("create product", e))
@@ -623,6 +663,19 @@ pub async fn create_product_for_owner(
         )));
     }
 
+    // Wave 56: resolve the taxonomy link BEFORE the write,
+    // through the one resolver — an explicit `category_id`
+    // is validated (exists + active) and syncs the stored
+    // label to the node's English name; a label alone links
+    // only on the domain's exact-match rule and is stored
+    // exactly as typed.
+    let (category_id, category) = crate::categories::resolve_product_category(
+        pool,
+        input.category_id,
+        normalize_category(input.category.as_deref()).as_deref(),
+    )
+    .await?;
+
     // Wave 54: the insert runs in a transaction so a
     // product born `active` announces itself to the
     // store's followers in the SAME commit (the
@@ -641,7 +694,8 @@ pub async fn create_product_for_owner(
             title: input.title.clone(),
             title_bn: input.title_bn.clone(),
             description: input.description.clone(),
-            category: normalize_category(input.category.as_deref()),
+            category,
+            category_id,
             price_poisha: input.price_poisha,
             compare_at_poisha: input.compare_at_poisha,
             stock: input.stock,
@@ -703,6 +757,28 @@ pub async fn update_product_for_owner(
     // Like the other optional text fields, a PATCH can set the
     // category but not clear it back to NULL.
     let merged_category = normalize_category(patch.category.as_deref()).or(existing.category);
+    // Wave 56: the taxonomy link follows the category inputs
+    // through the one resolver, mirroring create —
+    // * a `category_id` in the patch wins outright: it is
+    //   validated and the label syncs to the node's name;
+    // * a label-only patch re-resolves the merged label: a
+    //   match (re)links, no match UNLINKS (the seller moved
+    //   the product out of the taxonomy by renaming its
+    //   label — leaving the old link would file it under a
+    //   category its own label contradicts);
+    // * a patch touching neither keeps the stored link.
+    let category_patch_active = patch.category_id.is_some()
+        || normalize_category(patch.category.as_deref()).is_some();
+    let (merged_category_id, merged_category) = if category_patch_active {
+        crate::categories::resolve_product_category(
+            pool,
+            patch.category_id,
+            merged_category.as_deref(),
+        )
+        .await?
+    } else {
+        (existing.category_id, merged_category)
+    };
 
     // Wave 33: a price change must not strand a variant at a
     // zero or negative final price (base + delta). The variant
@@ -750,7 +826,8 @@ pub async fn update_product_for_owner(
     sqlx::query(
         "UPDATE products SET title = $2, title_bn = $3, description = $4, \
          price_poisha = $5, compare_at_poisha = $6, status = $7, \
-         weight_grams = $8, category = $9, updated_at = now() WHERE id = $1",
+         weight_grams = $8, category = $9, category_id = $10, \
+         updated_at = now() WHERE id = $1",
     )
     .bind(id)
     .bind(merged.title.trim())
@@ -761,6 +838,7 @@ pub async fn update_product_for_owner(
     .bind(&merged.status)
     .bind(merged_weight_grams)
     .bind(&merged_category)
+    .bind(merged_category_id)
     .execute(&mut *tx)
     .await
     .map_err(|e| ApiError::internal("update product", e))?;
@@ -786,6 +864,12 @@ pub struct CreateProductInput {
     pub description: Option<String>,
     /// Optional category label (Wave 15), validated by the domain.
     pub category: Option<String>,
+    /// Optional taxonomy link (Wave 56): when present it
+    /// wins over the label — validated (exists + active) and
+    /// the stored label syncs to the node's English name.
+    /// When absent, the label alone resolves a link on the
+    /// exact-match rule (see `categories` module doc).
+    pub category_id: Option<Uuid>,
     pub price_poisha: i64,
     pub compare_at_poisha: Option<i64>,
     #[serde(default)]
@@ -812,6 +896,11 @@ pub struct UpdateProductInput {
     pub description: Option<String>,
     /// Optional category label (Wave 15); set-only, like title_bn.
     pub category: Option<String>,
+    /// Optional taxonomy link (Wave 56); set-only like the
+    /// label. Present → validated + the label syncs to the
+    /// node's name. A label-only patch re-resolves the link
+    /// (see `update_product_for_owner`).
+    pub category_id: Option<Uuid>,
     pub price_poisha: Option<i64>,
     pub compare_at_poisha: Option<i64>,
     /// No `stock` field (Wave 23): stock changes go through
@@ -829,6 +918,29 @@ pub struct ListProductsQuery {
     /// Wave 53: the list sort (`newest` default, or
     /// `price_asc` / `price_desc` / `rating` / `sold`).
     pub sort: Option<String>,
+    /// Wave 56: scope the list to one taxonomy subtree by
+    /// slug (the seller list's category filter rides this).
+    /// An unknown or inactive slug scopes to nothing — the
+    /// empty-result precedent, never an error.
+    pub category_slug: Option<String>,
+}
+
+/// Resolve a list request's `category_slug` to the subtree
+/// id set `list_products` filters by: `None` when the
+/// request names no slug (unscoped), `Some` (possibly
+/// empty) when it does.
+async fn resolve_list_category_ids(
+    pool: &PgPool,
+    slug: Option<&str>,
+) -> Result<Option<Vec<Uuid>>, ApiError> {
+    match slug {
+        None => Ok(None),
+        Some(slug) => Ok(Some(
+            crate::categories::resolve_category_subtree_ids(pool, slug)
+                .await?
+                .unwrap_or_default(),
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -852,6 +964,7 @@ pub async fn list_products_handler(
 ) -> Result<(HeaderMap, Json<ProductList>), ApiError> {
     let pool = state.require_pool()?;
     let viewer = authenticate_optional(&state, &headers).map(|u| u.user_id);
+    let category_ids = resolve_list_category_ids(pool, query.category_slug.as_deref()).await?;
     let list = list_products(
         pool,
         query.q.as_deref(),
@@ -860,6 +973,7 @@ pub async fn list_products_handler(
         query.limit,
         viewer,
         query.sort.as_deref(),
+        category_ids,
     )
     .await?;
     // Wave 32: publicly cacheable only for anonymous reads
@@ -875,6 +989,7 @@ pub async fn list_store_products(
 ) -> Result<Json<ProductList>, ApiError> {
     let pool = state.require_pool()?;
     let viewer = authenticate_optional(&state, &headers).map(|u| u.user_id);
+    let category_ids = resolve_list_category_ids(pool, query.category_slug.as_deref()).await?;
     let list = list_products(
         pool,
         query.q.as_deref(),
@@ -883,6 +998,7 @@ pub async fn list_store_products(
         query.limit,
         viewer,
         query.sort.as_deref(),
+        category_ids,
     )
     .await?;
     Ok(Json(list))

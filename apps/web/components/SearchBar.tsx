@@ -138,6 +138,17 @@ export default function SearchBar({ storeSlug }: { storeSlug?: string }) {
     if (index < productCount + categoryCount) {
       const category = suggestions.categories[index - productCount];
       if (!category) return null;
+      // Wave 56: a label that resolves into the taxonomy
+      // lands on the category's own page (subtree browse)
+      // instead of the text-filtered browse — unless the
+      // search is scoped to one store, where the in-store
+      // text search stays the honest target.
+      const node = suggestions.category_nodes.find(
+        (entry) => entry.label === category.category
+      );
+      if (node && !storeSlug) {
+        return `/categories/${node.slug}`;
+      }
       const params = new URLSearchParams();
       const q = text.trim();
       if (q) params.set("q", q);
