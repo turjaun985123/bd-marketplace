@@ -3390,6 +3390,41 @@ claim with its budget spent lands in `failed` and is
 never claimed again, and an aged-out claim recovers
 through the same path.
 
+Wave 49 (launch runbook — `docs/LAUNCH.md`):
+
+**Docs only — no code, no config.** Forty-eight waves
+of honest limits, onboarding-confirm items and owner
+decisions were scattered across this README's wave
+sections, `.env.example` and the security-audit doc.
+`docs/LAUNCH.md` consolidates them into one
+operator-facing runbook that takes a fresh operator
+from "repo cloned" to "live and selling": the owner
+decisions owed before launch (CR-15's
+advance-degradation policy — flag-and-proceed today,
+the owner's call to change; the 8% commission and
+৳500 payout-minimum defaults to ratify; the
+placeholder product name), the credentials & accounts
+checklist (the SMS gateway as THE launch blocker —
+one `SmsSender` implementation in the `notify` crate
+away; the four payment gateways with the
+signature-verification caveat; the five API couriers
+with each one's written-confirm items; Meta app
+review for Page import; the SIDRA bridge), the
+production configuration checklist (the must-set env,
+the three dev simulators that must be OFF, SQL-only
+first-admin promotion, the platform_settings knobs
+worth reviewing), the ordered go-live sequence with
+the end-to-end smoke path, the known-limits shortlist
+(the Wave 46 smoke is not a load test, CR-13's
+test-isolation redesign is still owed, the audit
+register beyond Waves 39/41/44's named closures, the
+never-audited frontend, the remaining Dependabot
+majors, the two accepted-risk audit ignores), and
+the where-the-signals-live guide for when something
+breaks. Everything in it is derived from the repo's
+own sources; where this README and the runbook
+disagree, this README (and the code) wins.
+
 Wave 8 (reviews, ratings and seller replies):
 
 | Method | Path | What it does |
@@ -4971,6 +5006,21 @@ the counts ride the worker's summary line
 (`reaped_pending` / `reaped_failed`). At-least-once
 is unchanged: a false reap could only duplicate an
 SMS, never lose one. See the Wave 48 section.
+
+**Real (Wave 49):** the launch runbook —
+`docs/LAUNCH.md` consolidates 48 waves of honest
+limits, onboarding-confirm items and owner decisions
+into one operator document: the decisions owed
+(CR-15, commission/minimum-payout defaults, the
+placeholder name), the credentials checklist (SMS
+gateway first — the one launch-blocking integration,
+a single `SmsSender` implementation in the `notify`
+crate), the production configuration checklist, the
+go-live sequence with its smoke path, the
+known-limits shortlist, and the signals guide.
+Docs only; every claim in it traces to this README,
+`.env.example`, the audit doc or the code. See the
+Wave 49 section.
 
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
