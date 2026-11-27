@@ -503,6 +503,66 @@ fn find_response_status(payload: &Value, fields: &[&str]) -> Option<String> {
     None
 }
 
+/// Does a create-order response body carry an explicit FAILURE
+/// verdict — even when it also carries an id? (Wave 39, security
+/// audit CR-05.) Returns the failure message to report (the body's
+/// own `message` when it sent one, else a generic line).
+///
+/// Failure signals, checked at the top level and under `data`:
+/// `success` explicitly false (boolean or the string "false"); a
+/// non-empty `error` field (string, object or array); a numeric
+/// `status`/`code` of 400 or above; or a string `status`/`code`
+/// reading failed / failure / error.
+///
+/// A `message` alone is NOT a failure signal — all three couriers
+/// send an informational message on success too ("Parcel
+/// created"), which the established success fixtures carry. Nor
+/// can this gate demand a positive success envelope: none of the
+/// three couriers' documented success shapes carries one, and
+/// their exact envelopes remain a merchant-onboarding confirm
+/// item (see the README). So an id with NO failure signal is
+/// accepted exactly as before, while an id accompanied by a
+/// failure verdict — the audit's case, an HTTP-200 error body
+/// that happens to include a stale or partial id — is rejected
+/// before the id is ever trusted. Steadfast and Pathao do not
+/// need this gate: their parsers already demand their positive
+/// verdicts (`status` 200 + consignment, `code` 200).
+fn create_body_failure(payload: &Value, courier_label: &str) -> Option<String> {
+    let data = payload.get("data");
+    for scope in [Some(payload), data].into_iter().flatten() {
+        let success_failed = match scope.get("success") {
+            Some(Value::Bool(value)) => !value,
+            Some(Value::String(s)) => s.trim().eq_ignore_ascii_case("false"),
+            _ => false,
+        };
+        let has_error = match scope.get("error") {
+            Some(Value::String(s)) => !s.trim().is_empty(),
+            Some(Value::Object(_)) | Some(Value::Array(_)) => true,
+            _ => false,
+        };
+        let status_failed = ["status", "code"].iter().any(|field| match scope.get(*field) {
+            Some(Value::Number(n)) => n.as_i64().is_some_and(|v| v >= 400),
+            Some(Value::String(s)) => {
+                let word = s.trim();
+                word.eq_ignore_ascii_case("failed")
+                    || word.eq_ignore_ascii_case("failure")
+                    || word.eq_ignore_ascii_case("error")
+            }
+            _ => false,
+        });
+        if success_failed || has_error || status_failed {
+            let message = payload
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|m| !m.trim().is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{courier_label} create order reported failure"));
+            return Some(message);
+        }
+    }
+    None
+}
+
 /// Parse a Steadfast `create_order` response body into a [`Shipment`].
 /// Pure, so the response shapes are unit-testable without a network.
 /// Success is the body's own verdict: `status` field 200 AND a
@@ -677,11 +737,14 @@ impl CourierAdapter for SteadfastAdapter {
         // no credentials are involved, and the result is an estimate
         // under OUR tariff — Steadfast's own charge is confirmed on
         // the consignment after booking.
-        Ok(domain::calculate_delivery_charge(
+        // Wave 39: the domain rule returns a Result now — a
+        // negative COD amount is a gateway error, not a panic.
+        domain::calculate_delivery_charge(
             parcel.zone,
             parcel.weight_kg,
             parcel.cod_amount_poisha,
-        ))
+        )
+        .map_err(CourierError::Gateway)
     }
 }
 
@@ -1054,11 +1117,14 @@ impl CourierAdapter for PathaoAdapter {
         // slow, so routing stays offline. The result is an estimate
         // under OUR tariff — Pathao's own charge is confirmed on the
         // consignment after booking.
-        Ok(domain::calculate_delivery_charge(
+        // Wave 39: the domain rule returns a Result now — a
+        // negative COD amount is a gateway error, not a panic.
+        domain::calculate_delivery_charge(
             parcel.zone,
             parcel.weight_kg,
             parcel.cod_amount_poisha,
-        ))
+        )
+        .map_err(CourierError::Gateway)
     }
 }
 
@@ -1117,12 +1183,17 @@ impl RedxAdapter {
 /// Pure, so it is unit-testable without a network. Success is a
 /// non-empty `tracking_id` (top-level, or nested under `data`) —
 /// that id is both the consignment id and the customer-facing
-/// tracking code for RedX. Anything else is a gateway error carrying
-/// RedX's `message` when it sent one.
+/// tracking code for RedX — AND no explicit failure verdict in the
+/// body (Wave 39, audit CR-05: see [`create_body_failure`]).
+/// Anything else is a gateway error carrying RedX's `message`
+/// when it sent one.
 pub fn parse_redx_create_response(
     courier: &str,
     payload: &Value,
 ) -> Result<Shipment, CourierError> {
+    if let Some(message) = create_body_failure(payload, "redx") {
+        return Err(CourierError::Gateway(message));
+    }
     let tracking_id = payload
         .get("tracking_id")
         .or_else(|| payload.get("data").and_then(|d| d.get("tracking_id")))
@@ -1294,11 +1365,14 @@ impl CourierAdapter for RedxAdapter {
         // A purely local estimate from the domain delivery-charge
         // function, exactly like the other adapters — no network
         // call, and an estimate under OUR tariff, not a RedX quote.
-        Ok(domain::calculate_delivery_charge(
+        // Wave 39: the domain rule returns a Result now — a
+        // negative COD amount is a gateway error, not a panic.
+        domain::calculate_delivery_charge(
             parcel.zone,
             parcel.weight_kg,
             parcel.cod_amount_poisha,
-        ))
+        )
+        .map_err(CourierError::Gateway)
     }
 }
 
@@ -1374,14 +1448,19 @@ const ECOURIER_STATUS_FIELDS: [&str; 3] = ["status", "order_status", "current_st
 /// Parse an eCourier create-order response body into a [`Shipment`].
 /// Pure, so it is unit-testable without a network. Success is a
 /// recognisable order id (see [`ECOURIER_ID_FIELDS`], top level or
-/// nested under `data`, string or number). The `tracking` field,
-/// when the response carries one distinct from the id, is kept as
-/// the customer-facing tracking code. Anything else is a gateway
+/// nested under `data`, string or number) AND no explicit failure
+/// verdict in the body (Wave 39, audit CR-05: see
+/// [`create_body_failure`]). The `tracking` field, when the
+/// response carries one distinct from the id, is kept as the
+/// customer-facing tracking code. Anything else is a gateway
 /// error carrying eCourier's `message` when it sent one.
 pub fn parse_ecourier_create_response(
     courier: &str,
     payload: &Value,
 ) -> Result<Shipment, CourierError> {
+    if let Some(message) = create_body_failure(payload, "ecourier") {
+        return Err(CourierError::Gateway(message));
+    }
     let consignment_id = find_response_id(payload, &ECOURIER_ID_FIELDS);
     match consignment_id {
         Some(id) => {
@@ -1554,11 +1633,14 @@ impl CourierAdapter for EcourierAdapter {
         // function, exactly like the other adapters — no network
         // call, and an estimate under OUR tariff, not an eCourier
         // quote.
-        Ok(domain::calculate_delivery_charge(
+        // Wave 39: the domain rule returns a Result now — a
+        // negative COD amount is a gateway error, not a panic.
+        domain::calculate_delivery_charge(
             parcel.zone,
             parcel.weight_kg,
             parcel.cod_amount_poisha,
-        ))
+        )
+        .map_err(CourierError::Gateway)
     }
 }
 
@@ -1644,12 +1726,17 @@ const PAPERFLY_STATUS_FIELDS: [&str; 3] = ["status", "order_status", "current_st
 /// Success is a recognisable tracking id (see
 /// [`PAPERFLY_ID_FIELDS`], top level or nested under `data`, string
 /// or number) — that id is both the consignment id and the
-/// customer-facing tracking code for Paperfly. Anything else is a
-/// gateway error carrying Paperfly's `message` when it sent one.
+/// customer-facing tracking code for Paperfly — AND no explicit
+/// failure verdict in the body (Wave 39, audit CR-05: see
+/// [`create_body_failure`]). Anything else is a gateway error
+/// carrying Paperfly's `message` when it sent one.
 pub fn parse_paperfly_create_response(
     courier: &str,
     payload: &Value,
 ) -> Result<Shipment, CourierError> {
+    if let Some(message) = create_body_failure(payload, "paperfly") {
+        return Err(CourierError::Gateway(message));
+    }
     let tracking_id = find_response_id(payload, &PAPERFLY_ID_FIELDS);
     match tracking_id {
         Some(id) => Ok(Shipment {
@@ -1857,11 +1944,14 @@ impl CourierAdapter for PaperflyAdapter {
         // function, exactly like the other adapters — no network
         // call, and an estimate under OUR tariff, not a Paperfly
         // quote.
-        Ok(domain::calculate_delivery_charge(
+        // Wave 39: the domain rule returns a Result now — a
+        // negative COD amount is a gateway error, not a panic.
+        domain::calculate_delivery_charge(
             parcel.zone,
             parcel.weight_kg,
             parcel.cod_amount_poisha,
-        ))
+        )
+        .map_err(CourierError::Gateway)
     }
 }
 
@@ -1941,11 +2031,14 @@ impl CourierAdapter for DevCourierAdapter {
 
     async fn price_estimate(&self, parcel: &Parcel) -> Result<i64, CourierError> {
         // Same local domain estimate as the real adapters.
-        Ok(domain::calculate_delivery_charge(
+        // Wave 39: the domain rule returns a Result now — a
+        // negative COD amount is a gateway error, not a panic.
+        domain::calculate_delivery_charge(
             parcel.zone,
             parcel.weight_kg,
             parcel.cod_amount_poisha,
-        ))
+        )
+        .map_err(CourierError::Gateway)
     }
 }
 
@@ -2390,6 +2483,81 @@ mod tests {
             .expect_err("error payload is rejected");
         assert!(matches!(err, CourierError::Gateway(_)), "{err}");
         assert!(err.to_string().contains("Invalid area id"), "{err}");
+    }
+
+    #[test]
+    fn create_parsers_reject_failure_bodies_that_carry_ids() {
+        // Wave 39 (audit CR-05): an HTTP-200 body that reports
+        // failure must be rejected even when it also carries a
+        // tracking/order id — before this gate, all three parsers
+        // accepted the id and recorded a booking the courier never
+        // made.
+
+        // RedX: a failure status string plus a (stale) tracking id.
+        let payload = json!({
+            "status": "failed",
+            "message": "Insufficient balance",
+            "tracking_id": "REDX-STALE"
+        });
+        let err = parse_redx_create_response("redx", &payload)
+            .expect_err("failure body with an id is rejected");
+        assert!(matches!(err, CourierError::Gateway(_)), "{err}");
+        assert!(err.to_string().contains("Insufficient balance"), "{err}");
+
+        // RedX: a numeric in-body error code plus an id.
+        let payload = json!({ "code": 422, "tracking_id": "REDX-STALE" });
+        assert!(matches!(
+            parse_redx_create_response("redx", &payload),
+            Err(CourierError::Gateway(_))
+        ));
+
+        // eCourier: success=false plus an order id.
+        let payload = json!({
+            "success": false,
+            "message": "Area not covered",
+            "order_id": "EC-STALE"
+        });
+        let err = parse_ecourier_create_response("ecourier", &payload)
+            .expect_err("failure body with an id is rejected");
+        assert!(matches!(err, CourierError::Gateway(_)), "{err}");
+        assert!(err.to_string().contains("Area not covered"), "{err}");
+
+        // eCourier: an `error` object plus an id nested under data.
+        let payload = json!({
+            "data": { "e_id": "E-STALE" },
+            "error": { "code": "VALIDATION", "detail": "bad area" }
+        });
+        assert!(matches!(
+            parse_ecourier_create_response("ecourier", &payload),
+            Err(CourierError::Gateway(_))
+        ));
+
+        // Paperfly: success=false plus a tracking id.
+        let payload = json!({
+            "success": false,
+            "message": "Invalid merchant key",
+            "trackingId": "PF-STALE"
+        });
+        let err = parse_paperfly_create_response("paperfly", &payload)
+            .expect_err("failure body with an id is rejected");
+        assert!(matches!(err, CourierError::Gateway(_)), "{err}");
+        assert!(err.to_string().contains("Invalid merchant key"), "{err}");
+
+        // Paperfly: a string error status plus a refNo.
+        let payload = json!({ "status": "error", "refNo": "PF-STALE" });
+        assert!(matches!(
+            parse_paperfly_create_response("paperfly", &payload),
+            Err(CourierError::Gateway(_))
+        ));
+
+        // And the established success shapes still parse: an
+        // informational message is not a failure verdict.
+        let payload = json!({ "tracking_id": "REDX1", "message": "Parcel created" });
+        assert!(parse_redx_create_response("redx", &payload).is_ok());
+        let payload = json!({ "order_id": 42, "message": "Order created" });
+        assert!(parse_ecourier_create_response("ecourier", &payload).is_ok());
+        let payload = json!({ "trackingId": "PF1", "message": "Order placed" });
+        assert!(parse_paperfly_create_response("paperfly", &payload).is_ok());
     }
 
     #[test]

@@ -2428,6 +2428,198 @@ designed brand icon — real brand artwork is future
 design work. iOS install is manual via the Share menu
 (Apple offers no prompt API), and iOS evicts caches
 under storage pressure like every web app there.
+Wave 39 (security fixes — the Critical money-path and
+credential findings of the 2026-11-27 security audit,
+PR #1; audit ids below are the audit's own, cited from
+its full list with the executive-list number where the
+two differ):
+
+**Forged DEV payment callbacks (CR-01 executive /
+CR-09 full).** The DEV gateway's HMAC secret had a
+public default, so anyone could sign a "paid" webhook.
+No default exists anywhere now: the secret comes from
+`PAYMENTS_DEV_SECRET`, and when dev mode is on without
+it the API generates an EPHEMERAL random secret at
+startup and logs a warning saying so (dev payments then
+cannot settle across restarts — set the variable for a
+stable local secret). Related (HI-50): DEV references
+now verify ONLY while dev mode is on — with dev mode
+off a DEV callback is unverifiable (401) instead of
+being checked against a possibly-empty secret.
+
+**jsonwebtoken CVE (CR-02 executive / CR-04 full).**
+`jsonwebtoken` 9.3.1 → 10.4.0, fixing CVE-2026-25537
+(type confusion via a crafted JWK header). v10 splits
+its crypto backend behind features; the API crate uses
+`rust_crypto` (the provider matching the previous
+HS256 usage) with default features off. JWT shape is
+unchanged: HS256, 7-day expiry, same claims.
+
+**Known compose passwords (CR-03).** The root
+`docker-compose.yml` no longer ships a default database
+password: `POSTGRES_PASSWORD` is a REQUIRED variable
+(`${POSTGRES_PASSWORD:?...}`) for the postgres service
+and for the api/worker `DATABASE_URL`s built from it —
+compose fails fast until a real one is set (generate:
+`openssl rand -hex 24`). The local-dev
+`infra/docker-compose.yml` lost its hardcoded Postgres
+password and MinIO root credentials the same way
+(HI-12). `.env.example` ships no usable password, and
+its dev-mode defaults are now the safe ones
+(`APP_ENV=production`, `SMS_DEV_MODE=false` — local
+development opts in explicitly).
+
+**Payout double-spend race (CR-04 executive / CR-10
+full).** Payout creation is one transaction: the store
+row is locked `FOR UPDATE` first (the pattern the
+promotion/subscription charges already used), the
+payout account and the earnings are re-read inside,
+then the insert — two concurrent requests can no
+longer both pass the balance check. The audit's
+approve-time half also landed: admin approval re-checks
+the payout against the store's CURRENT (unclamped)
+earnings inside the transition transaction and refuses
+with a 409 when earnings dropped after the request.
+The audit's third element for this finding, an
+`Idempotency-Key` on payout creation, is deferred
+(below).
+
+**Non-atomic payment settlement (CR-05 executive /
+CR-02 full).** `apply_payment_callback` now settles in
+ONE transaction: the audit event is written first (on
+the pool, as before, so rejected callbacks stay
+auditable), then the order row and payment row are
+locked `FOR UPDATE`, the payment status is re-read
+under the lock, and the payment update, the order
+`payment_status` update and the Wave 17 advance branch
+commit together or not at all. Idempotency is
+unchanged (duplicate callback → 200, no double
+effects). Payment retry got the same treatment (HI-07:
+one transaction, both rows locked, status re-checked
+under the lock — a retry can no longer overwrite a
+settled `paid` back to `pending`).
+
+**OTP attempt-cap race (CR-06 executive / CR-01
+full).** Verify counted attempts read-check-write, so
+parallel guesses could pass the cap. The count is now
+a single conditional `UPDATE ... WHERE attempts < 5
+RETURNING`, which increments atomically or matches no
+row; the cap, the 5-minute expiry and every error
+shape (no code 400, cap 400, expired 400, wrong code
+401) are unchanged.
+
+**Paid-order cancel without refund (CR-07).** Buyer
+whole-order cancel and seller single sub-order cancel
+now refuse with a bilingual 409 when the order's money
+was actually collected online — `payment_status =
+'paid'`, or a COD advance already paid — naming the
+refund path (the admin returns flow), and restock
+nothing. The audit allowed either a refund record or
+"at minimum block with 409"; the 409 block is what
+landed (real gateway refunds stay unimplemented —
+HI-52 below). Cancels where nothing was collected
+(COD pay-on-delivery, advance still pending) are
+unchanged.
+
+**Late webhook settles a cancelled order (CR-08).**
+The settlement transaction locks and reads the order's
+status: a callback for a cancelled order is
+audit-logged and returns the payment UNCHANGED — no
+money state moves. Buyer cancel additionally voids the
+order's pending payment row (`failed` — the payment
+lifecycle has no `cancelled`) in the cancel
+transaction, so nothing settleable survives; payment
+retry refuses cancelled orders the same way.
+
+**Courier over-collects on coupon orders (CR-06
+full).** The booking computation never subtracted the
+coupon discount: a coupon COD order's courier was told
+to collect the discount a second time in cash. The
+booking row now carries `discount_poisha` and every
+collection share — the plain share and the
+advance-branch allocation total — subtracts it, so a
+booked parcel collects exactly the receipt's
+`cod_amount_due_poisha` (the wave39 test pins the two
+equal).
+
+**Domain money safety (CR-11 + CR-12, with HI-18 /
+HI-19).** The money boundary no longer panics or wraps:
+`build_order_totals` returns a `Result` and rejects
+negative unit prices, negative unit weights and
+negative group subtotals at the boundary;
+`calculate_delivery_charge` returns its negative-COD
+error instead of asserting; `line_total_poisha`,
+`split_cart_by_seller` and every totals sum use
+checked arithmetic (overflow is an error, never a
+wrapped figure); `compute_commission` computes in
+i128, rejects a negative base and a rate above 100%.
+All callers (checkout, coupon allocation, the courier
+price estimates, the Wave 1 demo endpoints) map the
+error to a 400 / gateway error. Defence in depth:
+`[profile.release] overflow-checks = true` in the
+workspace manifest. Domain unit tests pin the new
+behaviour (negative → Err, near-`i64::MAX` → Err,
+normal totals — including the wave9 anchor numbers —
+unchanged).
+
+**Courier create parsers accept fake success (CR-05
+full).** The RedX, eCourier and Paperfly create
+parsers accepted any body carrying a tracking/order
+id, including HTTP-200 error bodies. All three now
+reject a body carrying an explicit failure verdict —
+`success: false`, a non-empty `error` field, a numeric
+`status`/`code` ≥ 400, or a failed/failure/error
+status string, at the top level or under `data` —
+before any id is trusted (Steadfast and Pathao already
+required their positive verdicts). Fixture tests pin
+error-plus-id bodies as errors for all three. What did
+NOT change: an id with no failure signal is still
+accepted, because none of the three couriers'
+documented success envelopes carries a positive
+success flag to demand — their exact envelopes remain
+a merchant-onboarding confirm item (see Waves 7/11),
+and demanding one blindly would break every real
+booking.
+
+**Silent test skips (CR-14, the cheap half).**
+`crates/api/tests/ci_gate.rs` is one always-run test
+that panics when `CI` is set but `DATABASE_URL` is
+missing/empty, so a misconfigured CI can never report
+green with zero integration assertions. Locally (no
+`CI`) it passes quietly.
+
+**Deferred — named, not dropped.** The rest of the
+audit's 363 findings stay in the backlog (PR #1 holds
+the full register); the ones nearest this wave, with
+their reasons:
+- CR-13 (all integration tests share one database and
+  truncate each other's tables): CI history is green;
+  per-test isolation is a harness redesign and gets
+  its own wave.
+- CR-15 (Wave 17's degradation policy — when no gateway
+  can collect a required COD advance, checkout proceeds
+  as flagged plain COD): behaviour deliberately NOT
+  changed. Policy decision owed by the owner — fail
+  checkout vs flag-and-proceed.
+- The payout `Idempotency-Key` (the third element of
+  CR-10's prescription): the race itself is closed by
+  the lock; key-based dedup is API surface that needs
+  a client contract first.
+- HI-51 (callback amount is checked against the
+  payment row, not re-derived from the order total):
+  needs the order-total contract decided alongside
+  gateway onboarding.
+- HI-52 (no gateway refund is wired — refunds are
+  manual/admin today): blocked on real merchant
+  accounts, like every live gateway call.
+- HI-53 (`gateway_ref` has no UNIQUE constraint —
+  duplicate refs resolve newest-first): a migration
+  plus a duplicate-handling contract; its own wave.
+- Everything else in the audit (the remaining High,
+  Medium and Low findings — session/transport
+  hardening, upload and export surfaces, the frontend,
+  which the audit did not cover): future waves, in the
+  audit's priority order.
 
 Wave 8 (reviews, ratings and seller replies):
 
@@ -2648,9 +2840,10 @@ sellers receive ৳4,094.
 With a database (Wave 2 features):
 
 ```bash
+export POSTGRES_PASSWORD=$(openssl rand -hex 24)   # Wave 39: no default exists
 docker compose -f infra/docker-compose.yml up -d   # Postgres on :5432
-cp .env.example .env                               # APP_ENV=dev by default
-DATABASE_URL=postgres://marketplace:marketplace_dev_only@localhost:5432/marketplace \
+cp .env.example .env                               # safe defaults; set APP_ENV=dev for local dev
+DATABASE_URL=postgres://marketplace:$POSTGRES_PASSWORD@localhost:5432/marketplace \
 JWT_SECRET=any-long-random-string \
 APP_ENV=dev \
   cargo run -p api            # connects, runs migrations/, listens on 8080
@@ -2786,7 +2979,7 @@ broken or unsafe without it.
 | `ADVANCE_PERCENT_BPS` / `ADVANCE_THRESHOLD_POISHA` | Startup COD-advance fallback (admin settings override) | No |
 | `PROMOTION_PRICE_PER_DAY_POISHA` | Startup per-day sponsored-promotion price fallback (admin settings override; Wave 26) | No |
 | `NEXT_PUBLIC_API_BASE_URL` | API origin baked into the browser bundle at web build time | **Yes** for the web image — the public API origin |
-| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Compose Postgres credentials (defaults match the dev database) | **Yes** — change the password from the dev default |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Compose Postgres credentials. Wave 39 (audit CR-03): `POSTGRES_PASSWORD` is REQUIRED — there is no default, and compose refuses to start without it | **Yes** — set a real one (`openssl rand -hex 24`) |
 | `S3_ENDPOINT` / `S3_BUCKET` / `S3_ACCESS_KEY` / `S3_SECRET_KEY` | Object storage placeholders | No — not wired to any code yet |
 | `SMS_API_KEY` / `SMS_SENDER_ID` | Real SMS gateway credentials | Not yet — no real gateway exists (see the checklist) |
 | `STEADFAST_API_KEY` / `STEADFAST_SECRET_KEY` / `STEADFAST_BASE_URL` | Steadfast merchant credentials + optional sandbox base URL | For live Steadfast bookings |
@@ -2799,7 +2992,7 @@ broken or unsafe without it.
 | `NAGAD_MERCHANT_ID` / `NAGAD_API_KEY` | Nagad merchant credentials | For Nagad availability |
 | `SSLCOMMERZ_STORE_ID` / `SSLCOMMERZ_STORE_PASSWORD` | SSLCommerz store credentials | For SSLCommerz availability |
 | `SHURJOPAY_USERNAME` / `SHURJOPAY_PASSWORD` | ShurjoPay credentials | For ShurjoPay availability |
-| `PAYMENTS_DEV_MODE` / `PAYMENTS_DEV_SECRET` | DEV payment simulator (local/CI only) | **Must be off** — simulated payments are not real money |
+| `PAYMENTS_DEV_MODE` / `PAYMENTS_DEV_SECRET` | DEV payment simulator (local/CI only). Wave 39 (audit CR-01): the secret has NO default — unset with dev mode on, an ephemeral random secret is generated per process (warned at startup) | **Must be off** — simulated payments are not real money |
 | `COURIER_DEV_MODE` | DEV courier simulator (local/CI only) | **Must be off** — simulated shipments are not real bookings |
 | `FACEBOOK_APP_ID` / `FACEBOOK_APP_SECRET` | Meta app credentials (presence only is read) | For the Graph API status to report configured |
 | `SIDRA_API_URL` / `SIDRA_WEBHOOK_SECRET` | SIDRA bridge endpoint + shared HMAC secret (both or neither) | For the AI salesperson bridge |
@@ -3775,6 +3968,39 @@ viewport themeColor); and the dependency-free
 job. No API change, no migration. Offline is a
 read-only catalogue shell by design — see the Wave 38
 section for the caching table and the honest limits.
+**Real (Wave 39):** the security-fix wave — no new
+endpoints and no migration; behaviour changes only
+where the 2026-11-27 audit (PR #1) proved a defect.
+jsonwebtoken 10.4.0 (CVE-2026-25537); no public DEV
+payment secret anywhere (env or ephemeral, never a
+default) and DEV callbacks unverifiable with dev mode
+off; compose files with required (defaultless)
+database/MinIO credentials and safe `.env.example`
+dev-mode defaults; payout creation serialized per
+store in one transaction plus an approve-time balance
+re-check; payment settlement and retry atomic in one
+locked transaction each, with a cancelled-order guard
+and the buyer cancel voiding pending payments; the
+OTP attempt cap as one conditional UPDATE; paid /
+advance-paid cancels blocked with a bilingual 409
+(nothing restocked); courier booking amounts net of
+the coupon discount (booking == receipt); the domain
+money boundary returning errors instead of panicking
+or wrapping (checked arithmetic throughout, release
+overflow checks on); RedX/eCourier/Paperfly create
+parsers rejecting failure-verdict bodies that carry
+ids; and the `ci_gate` test that makes a CI run
+without `DATABASE_URL` fail instead of silently
+skipping. An integration test
+(`crates/api/tests/wave39.rs`, same `DATABASE_URL`
+gate) covers the forged-secret 401, the dev-mode-off
+401, the OTP cap, the concurrent payout race and the
+approve re-check, all three paid-cancel blocks plus
+the COD regression, the late-webhook no-op, and the
+coupon booking == receipt equality. The audit items
+NOT addressed are listed as deferred, with reasons,
+in the Wave 39 section above — the backlog stays
+visible, never silently dropped.
 
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real

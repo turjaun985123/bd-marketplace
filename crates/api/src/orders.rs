@@ -568,9 +568,23 @@ async fn apply_coupon_to_groups(
     for group in groups.iter() {
         let store_id = Uuid::parse_str(&group.store_id)
             .map_err(|_| ApiError::internal("parse store id", sqlx::Error::RowNotFound))?;
+        // Wave 39 (audit CR-12): line totals are checked — an
+        // overflowing group is a 400, never a wrapped subtotal
+        // the coupon math would then price against.
+        let mut goods_subtotal_poisha: i64 = 0;
+        for item in &group.items {
+            let line_total = item.line_total_poisha().map_err(ApiError::bad_request)?;
+            goods_subtotal_poisha = goods_subtotal_poisha
+                .checked_add(line_total)
+                .ok_or_else(|| {
+                    ApiError::bad_request(
+                        "কার্টের মোট হিসাব সীমা ছাড়িয়ে গেছে — cart goods total overflows the money range",
+                    )
+                })?;
+        }
         group_goods.push(GroupGoods {
             store_id,
-            goods_subtotal_poisha: group.items.iter().map(|item| item.line_total_poisha()).sum(),
+            goods_subtotal_poisha,
         });
     }
 
@@ -789,7 +803,10 @@ pub async fn place_order(
     // The split items carry their real unit weights, so each group's
     // parcel weight is derived inside `build_order_totals` from the
     // items themselves — no weight is passed in separately.
+    // Wave 39 (audit CR-12): the split returns a Result — an
+    // overflowing cart is a 400, never a wrapped total.
     let mut groups: Vec<OrderGroupInput> = split_cart_by_seller(&domain_items)
+        .map_err(ApiError::bad_request)?
         .iter()
         .map(|sub| OrderGroupInput {
             store_id: sub.store_id.clone(),
@@ -824,7 +841,12 @@ pub async fn place_order(
             Some(crate::subscriptions::effective_commission_bps_for_store(state, store_id).await?);
     }
     let commission_rate_bps = crate::admin::effective_commission_bps(state).await;
-    let totals = build_order_totals(&groups, zone, commission_rate_bps);
+    // Wave 39 (audit CR-11/CR-12): totals return a Result — a
+    // negative or overflowing money input is a 400 here, inside
+    // the transaction, so the checkout rolls back cleanly instead
+    // of panicking or storing a wrapped figure.
+    let totals =
+        build_order_totals(&groups, zone, commission_rate_bps).map_err(ApiError::bad_request)?;
 
     // Wave 35: redeem loyalty points, AFTER the coupon (the
     // brief's order: points price against post-coupon goods).
@@ -1105,6 +1127,12 @@ pub async fn place_order(
                 ),
                 None => None,
             };
+            // Wave 39 (audit CR-12): the line total is checked
+            // (checkout's totals pass already proved it fits, so
+            // this cannot fail in practice — but it must never
+            // silently wrap if a future caller reaches here
+            // without that pass).
+            let line_total_poisha = item.line_total_poisha().map_err(ApiError::bad_request)?;
             sqlx::query(
                 "INSERT INTO order_items (sub_order_id, product_id, variant_id, variant_name, \
                  title_snapshot, unit_price_poisha, quantity, line_total_poisha) \
@@ -1117,7 +1145,7 @@ pub async fn place_order(
             .bind(&locked_item.title)
             .bind(item.unit_price_poisha)
             .bind(item.quantity as i32)
-            .bind(item.line_total_poisha())
+            .bind(line_total_poisha)
             .execute(&mut *tx)
             .await
             .map_err(|e| ApiError::internal("insert order item", e))?;
@@ -1423,14 +1451,16 @@ pub async fn cancel_order_for_buyer(
         .await
         .map_err(|e| ApiError::internal("begin cancel transaction", e))?;
 
-    let buyer_user_id: Uuid = sqlx::query_scalar(
-        "SELECT buyer_user_id FROM orders WHERE id = $1 FOR UPDATE",
+    let order_facts: Option<(Uuid, String, i64)> = sqlx::query_as(
+        "SELECT buyer_user_id, payment_status, advance_paid_poisha \
+         FROM orders WHERE id = $1 FOR UPDATE",
     )
     .bind(order_id)
     .fetch_optional(&mut *tx)
     .await
-    .map_err(|e| ApiError::internal("lock order for cancel", e))?
-    .ok_or_else(|| ApiError::not_found("order not found"))?;
+    .map_err(|e| ApiError::internal("lock order for cancel", e))?;
+    let (buyer_user_id, order_payment_status, advance_paid_poisha) =
+        order_facts.ok_or_else(|| ApiError::not_found("order not found"))?;
     if buyer_user_id != user.user_id {
         // Same rule as the detail endpoint: never leak another
         // buyer's order through a distinguishable error.
@@ -1452,11 +1482,47 @@ pub async fn cancel_order_for_buyer(
         ));
     }
 
+    // Wave 39 (security audit CR-07): an order whose money was
+    // actually COLLECTED online — paid in full, or a COD advance
+    // already paid — cannot be cancelled here: this path has no
+    // refund machinery, and cancelling used to flip the order
+    // while the platform silently kept the buyer's money. The
+    // cancel is blocked with a 409 naming the refund path (the
+    // admin returns flow); nothing is flipped and nothing is
+    // restocked. Orders where nothing was collected (COD
+    // pay-on-delivery, an advance still pending, a failed or
+    // never-started online payment) cancel exactly as before.
+    if order_payment_status == "paid" || advance_paid_poisha > 0 {
+        return Err(ApiError::conflict(
+            "এই অর্ডারের টাকা অনলাইনে পরিশোধ হয়ে গেছে — বাতিল করতে হলে রিফান্ডের \
+             জন্য অ্যাডমিনের রিটার্ন প্রক্রিয়া ব্যবহার করুন (this order was already \
+             paid online — it cannot be cancelled directly; the refund goes through \
+             the admin returns flow)",
+        ));
+    }
+
     sqlx::query("UPDATE orders SET status = 'cancelled' WHERE id = $1")
         .bind(order_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| ApiError::internal("cancel order", e))?;
+
+    // Wave 39 (security audit CR-08): void the order's still-
+    // pending payment row in the same transaction, so nothing
+    // settleable survives the cancel — a gateway callback that
+    // arrives later finds a `failed` row (and the settlement
+    // path's own cancelled-order guard refuses to move money
+    // regardless). `failed` is the honest void state: the domain
+    // payment lifecycle has no `cancelled`, and the buyer's
+    // retry path only revives payments on live orders.
+    sqlx::query(
+        "UPDATE payments SET status = 'failed', updated_at = now() \
+         WHERE order_id = $1 AND status = 'pending'",
+    )
+    .bind(order_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| ApiError::internal("void pending payments on cancel", e))?;
     sqlx::query("UPDATE sub_orders SET status = 'cancelled' WHERE order_id = $1")
         .bind(order_id)
         .execute(&mut *tx)
@@ -1786,6 +1852,28 @@ pub async fn update_sub_order_status(
         .await
         .map_err(|e| ApiError::internal("begin status transaction", e))?;
 
+    // Wave 39 (security audit CR-07): for a CANCELLATION, lock the
+    // parent order row and read its payment facts FIRST — before
+    // the sub-order lock below, so this transaction takes the
+    // order-then-sub-order lock order the buyer-cancel path uses
+    // (the reverse order could deadlock the two cancels against
+    // each other). The facts decide below whether the cancel may
+    // proceed at all; locking the order also means a payment
+    // settlement cannot land between the check and the cancel.
+    let cancel_parent_facts: Option<(String, i64)> = if new_status == "cancelled" {
+        sqlx::query_as(
+            "SELECT o.payment_status, o.advance_paid_poisha FROM orders o \
+             JOIN sub_orders so ON so.order_id = o.id \
+             WHERE so.id = $1 FOR UPDATE OF o",
+        )
+        .bind(sub_order_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ApiError::internal("lock parent order for cancel guard", e))?
+    } else {
+        None
+    };
+
     let current: Option<(String, Uuid, Uuid)> = sqlx::query_as(
         "SELECT so.status, s.owner_user_id, so.store_id FROM sub_orders so \
          JOIN stores s ON s.id = so.store_id WHERE so.id = $1 FOR UPDATE OF so",
@@ -1816,6 +1904,25 @@ pub async fn update_sub_order_status(
     }
 
     if new_status == "cancelled" && current_status != "cancelled" {
+        // Wave 39 (security audit CR-07): the seller-side mirror
+        // of the buyer-cancel rule, judged on the parent order's
+        // payment facts locked at the top of this transaction.
+        // Cancelling a sub-order whose parent order was already
+        // PAID online (in full, or a COD advance collected) would
+        // strand the buyer's money with no refund path, so it is
+        // blocked with a 409 naming the admin returns flow —
+        // before any restock happens. Orders where nothing was
+        // collected cancel (and restock) as before.
+        if let Some((parent_payment_status, parent_advance_paid)) = &cancel_parent_facts {
+            if parent_payment_status == "paid" || *parent_advance_paid > 0 {
+                return Err(ApiError::conflict(
+                    "এই অর্ডারের টাকা অনলাইনে পরিশোধ হয়ে গেছে — সাব-অর্ডার বাতিল করা \
+                     যাবে না; রিফান্ডের জন্য অ্যাডমিনের রিটার্ন প্রক্রিয়া ব্যবহার করুন \
+                     (this order was already paid online — the sub-order cannot be \
+                     cancelled; the refund goes through the admin returns flow)",
+                ));
+            }
+        }
         restock_sub_order_items(&mut tx, sub_order_id, "cancel_restock").await?;
     }
 

@@ -15,16 +15,22 @@
 # local flow uses (env_file below). DATABASE_URL is the one
 # deliberate override — inside the api container "localhost" is
 # the container itself, so compose rewrites it to reach the
-# postgres service, using the POSTGRES_* values (set them in
-# .env for a real deployment; the defaults match .env.example's
-# dev database).
+# postgres service, using the POSTGRES_* values from .env.
+#
+# Wave 39 (security audit CR-03): POSTGRES_PASSWORD is REQUIRED —
+# there is no default. The stack previously shipped a known
+# password as the fallback default, so every deployment that
+# forgot to set it ran its database on a public credential. Set
+# a real one in .env first (generate: openssl rand -hex 24);
+# `docker compose up` now fails fast with a clear error until
+# you do.
 
 services:
   postgres:
     image: postgres:16
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-marketplace}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-marketplace_dev_only}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env (generate one: openssl rand -hex 24)}
       POSTGRES_DB: ${POSTGRES_DB:-marketplace}
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -46,7 +52,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-marketplace}:${POSTGRES_PASSWORD:-marketplace_dev_only}@postgres:5432/${POSTGRES_DB:-marketplace}
+      DATABASE_URL: postgres://${POSTGRES_USER:-marketplace}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env (generate one: openssl rand -hex 24)}@postgres:5432/${POSTGRES_DB:-marketplace}
     depends_on:
       postgres:
         condition: service_healthy
@@ -62,7 +68,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-marketplace}:${POSTGRES_PASSWORD:-marketplace_dev_only}@postgres:5432/${POSTGRES_DB:-marketplace}
+      DATABASE_URL: postgres://${POSTGRES_USER:-marketplace}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env (generate one: openssl rand -hex 24)}@postgres:5432/${POSTGRES_DB:-marketplace}
     depends_on:
       postgres:
         condition: service_healthy

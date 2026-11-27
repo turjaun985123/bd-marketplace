@@ -143,7 +143,14 @@ pub struct PaymentsConfig {
     /// Enables the DEV gateway simulator. Local/CI only — never true
     /// in a real deployment.
     pub dev_mode: bool,
-    /// HMAC secret for dev callback signatures.
+    /// HMAC secret for dev callback signatures. Wave 39 (security
+    /// audit CR-01): there is NO default or public value for this
+    /// secret anywhere — it comes from `PAYMENTS_DEV_SECRET`, or,
+    /// when dev mode is on and that is unset, from an ephemeral
+    /// random value the API generates at startup. An empty secret
+    /// verifies nothing (the HMAC key would be public knowledge:
+    /// the empty string), and DEV references are only ever
+    /// verified while dev mode is on (audit HI-50).
     pub dev_secret: String,
     pub bkash: GatewayConfig,
     pub nagad: GatewayConfig,

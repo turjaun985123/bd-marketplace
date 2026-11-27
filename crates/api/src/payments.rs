@@ -260,6 +260,34 @@ pub async fn advance_policy_view(state: &AppState) -> AdvancePolicy {
 /// illegal move is rejected 409 by the domain transition table.
 /// On success the payment and its order's `payment_status` move
 /// together.
+///
+/// Wave 39 (security audit CR-02 in the audit's full list —
+/// non-atomic settlement; CR-08 — a late webhook settling a
+/// cancelled order; HI-50 — DEV references verified with dev mode
+/// off):
+///
+/// * The audit row is written FIRST, on the pool, and commits on
+///   its own — deliberately OUTSIDE the settlement transaction,
+///   so a rejected callback stays auditable exactly as before.
+/// * Everything that moves money state — the payment row update,
+///   the order `payment_status` update and the Wave 17 advance
+///   branch — then commits in ONE transaction that locks the
+///   order row and the payment row (`FOR UPDATE`, in that order,
+///   the same order the cancel path locks them) and re-reads the
+///   payment's status under the lock. A failure anywhere in the
+///   settlement leaves no partial state, and two racing callbacks
+///   can no longer interleave their updates.
+/// * If the locked order is `cancelled`, the callback is logged
+///   (above) and the payment is returned UNCHANGED: no money
+///   state moves for an order that no longer exists as a sale.
+///   (The buyer-cancel path also voids the pending payment row,
+///   so a settleable row should not normally survive a cancel —
+///   this guard is the backstop for races and older rows.)
+/// * DEV references verify ONLY while dev mode is on. With dev
+///   mode off a DEV reference is unverifiable (401) — previously
+///   it was checked against the configured secret anyway, which
+///   for a default/empty secret meant an empty-key HMAC anyone
+///   could compute.
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_payment_callback(
     pool: &PgPool,
@@ -282,19 +310,22 @@ pub async fn apply_payment_callback(
     .ok_or_else(|| ApiError::not_found("payment not found for gateway reference"))?;
 
     // Signature verdict. Only DEV simulator references can be verified
-    // today (HMAC scheme in the payments crate). Real gateway
+    // today (HMAC scheme in the payments crate) — and only while the
+    // simulator is enabled (Wave 39, audit HI-50). Real gateway
     // verification is a deliberate TODO: it needs each gateway's
     // merchant credentials and documented signature scheme, neither of
     // which exists yet, so non-dev callbacks are treated as
     // unverifiable and rejected below instead of being trusted.
     let signature_valid = match payment.gateway_ref.as_deref() {
-        Some(reference) if is_dev_reference(reference) => verify_dev_callback(
-            &config.dev_secret,
-            reference,
-            amount_poisha,
-            callback_status,
-            signature,
-        ),
+        Some(reference) if is_dev_reference(reference) && config.dev_mode => {
+            verify_dev_callback(
+                &config.dev_secret,
+                reference,
+                amount_poisha,
+                callback_status,
+                signature,
+            )
+        }
         _ => false,
     };
 
@@ -338,15 +369,51 @@ pub async fn apply_payment_callback(
             "callback amount does not match the payment amount",
         ));
     }
-    if payment.status == target {
+
+    // -- Settlement: ONE transaction, both rows locked. ----------
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| ApiError::internal("begin settlement transaction", e))?;
+
+    // The order row first (the cancel path locks it first too):
+    // its status decides whether any money state may move at all.
+    let order_facts: (String, String, String, i64) = sqlx::query_as(
+        "SELECT status, payment_method, payment_status, advance_required_poisha \
+         FROM orders WHERE id = $1 FOR UPDATE",
+    )
+    .bind(payment.order_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| ApiError::internal("lock order for settlement", e))?;
+    let (order_status, order_payment_method, order_payment_status, advance_required) = order_facts;
+
+    // The payment row under the lock: the status checked here —
+    // not the unlocked read above — is the one the duplicate and
+    // transition rules judge.
+    let locked: Payment = sqlx::query_as(&format!(
+        "SELECT {PAYMENT_COLUMNS} FROM payments WHERE id = $1 FOR UPDATE"
+    ))
+    .bind(payment.id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| ApiError::internal("lock payment for settlement", e))?;
+
+    if order_status == "cancelled" {
+        // Wave 39 (audit CR-08): a late callback for a cancelled
+        // order is audit-logged (above) and otherwise a no-op —
+        // the payment is returned exactly as it stands.
+        return Ok(locked);
+    }
+    if locked.status == target {
         // Duplicate delivery of an already-applied result: success,
         // no double effects.
-        return Ok(payment);
+        return Ok(locked);
     }
-    if !can_transition_payment(&payment.status, target) {
+    if !can_transition_payment(&locked.status, target) {
         return Err(ApiError::conflict(format!(
             "payment cannot move from '{}' to '{target}'",
-            payment.status
+            locked.status
         )));
     }
 
@@ -359,10 +426,10 @@ pub async fn apply_payment_callback(
         "UPDATE payments SET status = $2, paid_at = COALESCE($3, paid_at), \
          updated_at = now() WHERE id = $1",
     )
-    .bind(payment.id)
+    .bind(locked.id)
     .bind(target)
     .bind(paid_at)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| ApiError::internal("update payment status", e))?;
 
@@ -374,19 +441,13 @@ pub async fn apply_payment_callback(
     // require no advance), and neither can a stale callback for
     // an order whose advance already settled (its status has
     // moved on, and the duplicate-delivery return above has
-    // already handled a repeat of the same result).
-    let order_facts: (String, String, i64) = sqlx::query_as(
-        "SELECT payment_method, payment_status, advance_required_poisha \
-         FROM orders WHERE id = $1",
-    )
-    .bind(payment.order_id)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| ApiError::internal("load order for payment status", e))?;
-    let is_advance_payment = order_facts.0 == "cod"
-        && order_facts.2 > 0
-        && payment.amount_poisha == order_facts.2
-        && order_facts.1 == "advance_pending";
+    // already handled a repeat of the same result). The facts now
+    // come from the LOCKED order row read at the top of this
+    // transaction.
+    let is_advance_payment = order_payment_method == "cod"
+        && advance_required > 0
+        && locked.amount_poisha == advance_required
+        && order_payment_status == "advance_pending";
 
     if target == "paid" && is_advance_payment {
         // The advance settled; the order is NOT paid — the
@@ -396,9 +457,9 @@ pub async fn apply_payment_callback(
             "UPDATE orders SET payment_status = 'advance_paid', \
              advance_paid_poisha = $2 WHERE id = $1",
         )
-        .bind(payment.order_id)
-        .bind(payment.amount_poisha)
-        .execute(pool)
+        .bind(locked.order_id)
+        .bind(locked.amount_poisha)
+        .execute(&mut *tx)
         .await
         .map_err(|e| ApiError::internal("update order advance status", e))?;
     } else if target == "failed" && is_advance_payment {
@@ -408,14 +469,18 @@ pub async fn apply_payment_callback(
         // a bare `failed` that would hide the obligation.
     } else {
         sqlx::query("UPDATE orders SET payment_status = $2 WHERE id = $1")
-            .bind(payment.order_id)
+            .bind(locked.order_id)
             .bind(target)
-            .execute(pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| ApiError::internal("update order payment status", e))?;
     }
 
-    load_payment(pool, payment.id).await
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::internal("commit settlement", e))?;
+
+    load_payment(pool, locked.id).await
 }
 
 // ---------------------------------------------------------------------------
@@ -444,6 +509,16 @@ async fn load_payment_for_owner(
 /// Retry a failed payment: `failed` returns to `pending` (the domain
 /// transition table's only way back), reusing the same gateway
 /// reference, and the order's `payment_status` follows.
+///
+/// Wave 39 (security audit HI-07 + CR-08): the two updates used to
+/// run as separate unlocked statements, so a retry racing a
+/// settlement could overwrite the order's settled `paid` back to
+/// `pending`, and a retry on a cancelled order revived its money
+/// state. Both updates now commit in ONE transaction that locks
+/// the order row and the payment row (in that order — the same
+/// order the settlement and cancel paths lock them), re-checks
+/// the payment's status under the lock, and refuses outright
+/// when the order is cancelled.
 pub async fn retry_payment_for_buyer(
     pool: &PgPool,
     user: &AuthUser,
@@ -455,34 +530,69 @@ pub async fn retry_payment_for_buyer(
             "only a failed payment can be retried",
         ));
     }
+
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| ApiError::internal("begin retry transaction", e))?;
+
+    let order_facts: (String, String, i64) = sqlx::query_as(
+        "SELECT status, payment_method, advance_required_poisha \
+         FROM orders WHERE id = $1 FOR UPDATE",
+    )
+    .bind(payment.order_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| ApiError::internal("lock order for retry", e))?;
+    let (order_status, order_payment_method, advance_required) = order_facts;
+
+    let locked_status: String =
+        sqlx::query_scalar("SELECT status FROM payments WHERE id = $1 FOR UPDATE")
+            .bind(payment.id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| ApiError::internal("lock payment for retry", e))?;
+    if locked_status != "failed" || !can_transition_payment(&locked_status, "pending") {
+        return Err(ApiError::conflict(
+            "only a failed payment can be retried",
+        ));
+    }
+    if order_status == "cancelled" {
+        return Err(ApiError::conflict(
+            "অর্ডারটি বাতিল করা হয়েছে — এই পেমেন্ট আবার চেষ্টা করা যাবে না \
+             (the order is cancelled — this payment can no longer be retried)",
+        ));
+    }
+
     sqlx::query("UPDATE payments SET status = 'pending', updated_at = now() WHERE id = $1")
         .bind(payment.id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| ApiError::internal("retry payment", e))?;
     // Wave 17: retrying an ADVANCE payment restores the order to
     // `advance_pending` (the advance is owed again), not the
     // generic `pending` — the same recognition rule as the
     // callback branch: a COD order whose required advance equals
-    // this payment's amount.
-    let advance_required: Option<i64> = sqlx::query_scalar(
-        "SELECT advance_required_poisha FROM orders \
-         WHERE id = $1 AND payment_method = 'cod'",
-    )
-    .bind(payment.order_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| ApiError::internal("load order advance for retry", e))?;
-    let order_status = match advance_required {
-        Some(required) if required > 0 && required == payment.amount_poisha => "advance_pending",
-        _ => "pending",
+    // this payment's amount. The facts come from the LOCKED order
+    // row above.
+    let order_payment_status = if order_payment_method == "cod"
+        && advance_required > 0
+        && advance_required == payment.amount_poisha
+    {
+        "advance_pending"
+    } else {
+        "pending"
     };
     sqlx::query("UPDATE orders SET payment_status = $2 WHERE id = $1")
         .bind(payment.order_id)
-        .bind(order_status)
-        .execute(pool)
+        .bind(order_payment_status)
+        .execute(&mut *tx)
         .await
         .map_err(|e| ApiError::internal("retry order payment status", e))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::internal("commit retry", e))?;
 
     load_payment(pool, payment.id).await
 }

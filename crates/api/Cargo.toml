@@ -11,7 +11,13 @@ courier = { path = "../courier" }
 domain = { path = "../domain" }
 hex = "0.4"
 hmac = "0.12"
-jsonwebtoken = "9"
+# Wave 39 (security audit CR-02): jsonwebtoken 10.x — 9.3.1 is
+# CVE-2026-25537 (type confusion lets a crafted JWK header bypass
+# verification). v10 splits the crypto backend behind features;
+# `rust_crypto` is the provider matching the previous ring-based
+# HS256 usage, and default features (PEM key parsing) are off
+# because this crate only ever uses `from_secret` HMAC keys.
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
 notify = { path = "../notify" }
 payments = { path = "../payments" }
 rand = "0.8"

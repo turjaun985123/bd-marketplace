@@ -631,7 +631,7 @@ pub async fn transition_payout(
         .await
         .map_err(|e| ApiError::internal("begin payout transition", e))?;
     let current: Option<String> =
-        sqlx::query_scalar("SELECT status FROM payouts WHERE id = $1")
+        sqlx::query_scalar("SELECT status FROM payouts WHERE id = $1 FOR UPDATE")
             .bind(payout_id)
             .fetch_optional(&mut *tx)
             .await
@@ -641,6 +641,41 @@ pub async fn transition_payout(
         return Err(ApiError::conflict(format!(
             "cannot move a payout from '{current}' to '{target_status}'"
         )));
+    }
+
+    // Wave 39 (security audit CR-10, the approve-time half of its
+    // prescription): approving re-checks the payout against the
+    // store's CURRENT earnings, inside this transaction. Earnings
+    // can drop after a request was created (a delivered order is
+    // returned, a charge lands), leaving total pending payouts
+    // above what the seller actually has. Approving into that
+    // hole is refused with a 409; the admin can reject the
+    // request, or wait until earnings cover it again. The check
+    // uses the UNCLAMPED balance — `Earnings.available_poisha`
+    // is clamped at zero for display, which would hide exactly
+    // the hole this check exists to catch. (The payout's own
+    // amount is already inside the requested total the earnings
+    // aggregate subtracts, so a non-negative unclamped balance
+    // is exactly "this payout is still covered".)
+    if target_status == "approved" {
+        let store_id: Uuid =
+            sqlx::query_scalar("SELECT store_id FROM payouts WHERE id = $1")
+                .bind(payout_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| ApiError::internal("load payout store for balance re-check", e))?;
+        let earnings = crate::payouts::seller_earnings_on(&mut *tx, store_id).await?;
+        let unclamped_available = earnings.earned_poisha
+            - earnings.paid_out_poisha
+            - earnings.pending_poisha
+            - earnings.charges_total_poisha;
+        if unclamped_available < 0 {
+            return Err(ApiError::conflict(
+                "পে-আউট অনুমোদন করা যাচ্ছে না — স্টোরের বর্তমান ব্যালেন্স এই পে-আউটের \
+                 জন্য যথেষ্ট নয় (cannot approve: the store's current available balance \
+                 no longer covers its pending payouts)",
+            ));
+        }
     }
 
     let payout: Payout = sqlx::query_as(&format!(

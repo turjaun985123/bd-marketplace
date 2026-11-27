@@ -485,6 +485,12 @@ struct SubOrderBookingRow {
     owner_user_id: Uuid,
     order_id: Uuid,
     goods_subtotal_poisha: i64,
+    /// Wave 39 (security audit CR-06 in the audit's full list):
+    /// this sub-order's allocated coupon discount — the
+    /// collection netting subtracts it (the buyer's payable
+    /// already excludes it; before this wave the courier was
+    /// told to collect it a second time in cash).
+    discount_poisha: i64,
     delivery_charge_poisha: i64,
     /// Wave 35: this sub-order's allocated share of the
     /// order's loyalty discount — the collection netting
@@ -517,7 +523,7 @@ async fn load_booking_row(
 ) -> Result<SubOrderBookingRow, ApiError> {
     let row: Option<SubOrderBookingRow> = sqlx::query_as(
         "SELECT so.status, so.store_id, s.owner_user_id, o.id AS order_id, \
-         so.goods_subtotal_poisha, so.delivery_charge_poisha, so.loyalty_discount_poisha, \
+         so.goods_subtotal_poisha, so.discount_poisha, so.delivery_charge_poisha, so.loyalty_discount_poisha, \
          o.payment_status, o.advance_required_poisha, o.advance_paid_poisha, \
          o.delivery_name, o.delivery_phone, \
          o.delivery_address, o.delivery_zone \
@@ -587,22 +593,27 @@ async fn load_booking_row(
 /// sub-order never collects below zero). Wave 35: every share
 /// is likewise NET of the sub-order's loyalty discount share —
 /// that slice was already paid in points at checkout, so the
-/// courier must not collect it again in cash.
+/// courier must not collect it again in cash. Wave 39 (audit
+/// CR-06): every share is also NET of the sub-order's coupon
+/// discount — the buyer's payable (and the receipt's cash-due)
+/// already excludes it, so a coupon COD order's parcels now
+/// collect exactly the receipt amount instead of over-collecting
+/// the discount in cash.
 async fn compute_booking_cod_amount(
     pool: &PgPool,
     row: &SubOrderBookingRow,
 ) -> Result<i64, ApiError> {
     // This sub-order's cash share before the advance netting:
-    // goods + delivery, minus the slice the buyer paid in
-    // loyalty points.
-    let sub_share =
-        row.goods_subtotal_poisha + row.delivery_charge_poisha - row.loyalty_discount_poisha;
+    // goods minus its coupon discount, plus delivery, minus the
+    // slice the buyer paid in loyalty points.
+    let sub_share = row.goods_subtotal_poisha - row.discount_poisha + row.delivery_charge_poisha
+        - row.loyalty_discount_poisha;
     if row.payment_status == "pay_on_delivery" {
         Ok(sub_share.max(0))
     } else if row.payment_status == "advance_paid" {
         let order_collect_total: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(goods_subtotal_poisha + delivery_charge_poisha \
-             - loyalty_discount_poisha), 0)::bigint \
+            "SELECT COALESCE(SUM(goods_subtotal_poisha - discount_poisha \
+             + delivery_charge_poisha - loyalty_discount_poisha), 0)::bigint \
              FROM sub_orders WHERE order_id = $1",
         )
         .bind(row.order_id)

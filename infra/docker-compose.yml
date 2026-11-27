@@ -1,10 +1,18 @@
 # Local infrastructure for later waves (Wave 1 code does not connect yet).
+#
+# Wave 39 (security audit CR-03 / HI-12): no credential in this
+# file has a default any more — the Postgres password and the
+# MinIO root credentials are REQUIRED environment values, so a
+# developer who starts this stack without setting them gets a
+# fast, clear failure instead of a database running on a
+# password printed in a public repository. Set them in your
+# shell or a local .env (generate: openssl rand -hex 24).
 services:
   postgres:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: marketplace
-      POSTGRES_PASSWORD: marketplace_dev_only
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (generate one: openssl rand -hex 24)}
       POSTGRES_DB: marketplace
     ports:
       - "5432:5432"
@@ -20,8 +28,8 @@ services:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: minio_dev_only
-      MINIO_ROOT_PASSWORD: minio_dev_only
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER must be set}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set (generate one: openssl rand -hex 24)}
     ports:
       - "9000:9000"
       - "9001:9001"

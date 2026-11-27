@@ -860,13 +860,31 @@ fn env_value(name: &str) -> Option<String> {
     }
 }
 
+/// Generate an ephemeral random secret (48 alphanumeric chars from
+/// the OS CSPRNG — the same `rand` sampling the API-key generator
+/// uses). Wave 39 (security audit CR-01): the DEV payment
+/// simulator's HMAC secret must never be a known value, so when
+/// `PAYMENTS_DEV_SECRET` is unset the API invents one per process
+/// instead of falling back to a public default.
+fn generate_ephemeral_secret() -> String {
+    use rand::distributions::Alphanumeric;
+    use rand::Rng;
+    rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(48)
+        .map(char::from)
+        .collect()
+}
+
 /// Build the Wave 5 payments configuration from the environment:
 /// `PAYMENTS_DEV_MODE` gates the DEV simulator (with a loud startup
 /// warning — it must never be on in production), `PAYMENTS_DEV_SECRET`
-/// is its HMAC secret (defaulting to a public dev value, with a
-/// warning, only when dev mode is on), and each gateway's merchant
-/// credentials come from its `*_APP_KEY` / `*_MERCHANT_ID` style
-/// variables (see `.env.example` for the full list per gateway).
+/// is its HMAC secret (Wave 39: NO public default exists — when dev
+/// mode is on and the variable is unset, an ephemeral random secret
+/// is generated for this process and a warning says so), and each
+/// gateway's merchant credentials come from its `*_APP_KEY` /
+/// `*_MERCHANT_ID` style variables (see `.env.example` for the full
+/// list per gateway).
 fn payments_config_from_env() -> PaymentsConfig {
     let dev_mode = std::env::var("PAYMENTS_DEV_MODE")
         .map(|v| v == "true")
@@ -875,10 +893,13 @@ fn payments_config_from_env() -> PaymentsConfig {
         Some(secret) => secret,
         None if dev_mode => {
             eprintln!(
-                "WARNING: PAYMENTS_DEV_SECRET is not set — using the public \
-                 default 'dev-secret' for DEV callback signatures."
+                "WARNING: PAYMENTS_DEV_SECRET is not set — generated an \
+                 EPHEMERAL random DEV callback secret for this process. \
+                 It changes on every restart, so dev-simulated payments \
+                 cannot be settled across restarts. Set PAYMENTS_DEV_SECRET \
+                 to a stable random value for local development."
             );
-            "dev-secret".to_string()
+            generate_ephemeral_secret()
         }
         None => String::new(),
     };
@@ -1148,11 +1169,17 @@ struct DeliveryChargeResponse {
     delivery_charge_poisha: i64,
 }
 
-async fn delivery_charge(Json(req): Json<DeliveryChargeRequest>) -> Json<DeliveryChargeResponse> {
-    let charge = calculate_delivery_charge(req.zone, req.weight_kg, req.cod_amount_poisha);
-    Json(DeliveryChargeResponse {
+async fn delivery_charge(
+    Json(req): Json<DeliveryChargeRequest>,
+) -> Result<Json<DeliveryChargeResponse>, ApiError> {
+    // Wave 39 (audit CR-11): the domain rule returns an error for
+    // a negative COD amount — a clean bilingual 400 here, where
+    // the previous code panicked inside the handler.
+    let charge = calculate_delivery_charge(req.zone, req.weight_kg, req.cod_amount_poisha)
+        .map_err(ApiError::bad_request)?;
+    Ok(Json(DeliveryChargeResponse {
         delivery_charge_poisha: charge,
-    })
+    }))
 }
 
 #[derive(Deserialize)]
@@ -1165,10 +1192,12 @@ struct SplitCartResponse {
     sub_orders: Vec<SellerSubOrder>,
 }
 
-async fn split_cart(Json(req): Json<SplitCartRequest>) -> Json<SplitCartResponse> {
-    Json(SplitCartResponse {
-        sub_orders: split_cart_by_seller(&req.items),
-    })
+async fn split_cart(
+    Json(req): Json<SplitCartRequest>,
+) -> Result<Json<SplitCartResponse>, ApiError> {
+    Ok(Json(SplitCartResponse {
+        sub_orders: split_cart_by_seller(&req.items).map_err(ApiError::bad_request)?,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -1177,8 +1206,12 @@ struct CommissionQuoteRequest {
     rate_bps: u32,
 }
 
-async fn commission_quote(Json(req): Json<CommissionQuoteRequest>) -> Json<CommissionQuote> {
-    Json(compute_commission(req.subtotal_poisha, req.rate_bps))
+async fn commission_quote(
+    Json(req): Json<CommissionQuoteRequest>,
+) -> Result<Json<CommissionQuote>, ApiError> {
+    Ok(Json(
+        compute_commission(req.subtotal_poisha, req.rate_bps).map_err(ApiError::bad_request)?,
+    ))
 }
 
 /// Wave 28 security headers, applied to EVERY response the

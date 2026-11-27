@@ -55,8 +55,18 @@ fn default_unit_weight_grams() -> i64 {
 
 impl CartItem {
     /// Line total in poisha.
-    pub fn line_total_poisha(&self) -> i64 {
-        self.unit_price_poisha * i64::from(self.quantity)
+    ///
+    /// Wave 39 (security audit CR-12): the multiplication is
+    /// CHECKED — a unit price near `i64::MAX` times a quantity
+    /// returns an error instead of wrapping into a small or
+    /// negative total (in release builds the wrap was silent).
+    pub fn line_total_poisha(&self) -> Result<i64, String> {
+        self.unit_price_poisha
+            .checked_mul(i64::from(self.quantity))
+            .ok_or_else(|| {
+                "লাইন টোটাল হিসাব সীমা ছাড়িয়ে গেছে — line total overflows the money range"
+                    .to_string()
+            })
     }
 }
 
@@ -108,18 +118,39 @@ pub fn calculate_delivery_charge(
     zone: DeliveryZone,
     weight_kg: u32,
     cod_amount_poisha: i64,
-) -> i64 {
-    assert!(cod_amount_poisha >= 0, "COD amount cannot be negative");
+) -> Result<i64, String> {
+    // Wave 39 (security audit CR-11): a negative COD amount is a
+    // caller error returned as a value — the previous `assert!`
+    // made it a panic (a denial-of-service on any path that could
+    // feed it attacker-influenced input).
+    if cod_amount_poisha < 0 {
+        return Err(
+            "COD টাকা ঋণাত্মক হতে পারে না — COD amount cannot be negative".to_string(),
+        );
+    }
     let billable_weight = weight_kg.max(1);
     let extra_kg = i64::from(billable_weight - 1);
-    base_charge_poisha(zone) + extra_kg * extra_kg_charge_poisha(zone)
+    let extra_charge = extra_kg
+        .checked_mul(extra_kg_charge_poisha(zone))
+        .ok_or_else(|| {
+            "ডেলিভারি চার্জ হিসাব সীমা ছাড়িয়ে গেছে — delivery charge overflows the money range"
+                .to_string()
+        })?;
+    base_charge_poisha(zone).checked_add(extra_charge).ok_or_else(|| {
+        "ডেলিভারি চার্জ হিসাব সীমা ছাড়িয়ে গেছে — delivery charge overflows the money range"
+            .to_string()
+    })
 }
 
 /// Split a unified cart into one sub-order per seller.
 ///
 /// First-appearance order of sellers is preserved. This is the single
 /// function used by checkout, order splitting and manual seller orders.
-pub fn split_cart_by_seller(items: &[CartItem]) -> Vec<SellerSubOrder> {
+///
+/// Wave 39 (security audit CR-12): subtotals accumulate with
+/// CHECKED arithmetic — an overflowing line total or subtotal is
+/// an error, never a wrapped figure.
+pub fn split_cart_by_seller(items: &[CartItem]) -> Result<Vec<SellerSubOrder>, String> {
     let mut index_by_store: HashMap<String, usize> = HashMap::new();
     let mut sub_orders: Vec<SellerSubOrder> = Vec::new();
 
@@ -137,25 +168,57 @@ pub fn split_cart_by_seller(items: &[CartItem]) -> Vec<SellerSubOrder> {
                 i
             }
         };
-        sub_orders[idx].subtotal_poisha += item.line_total_poisha();
+        let line_total = item.line_total_poisha()?;
+        sub_orders[idx].subtotal_poisha = sub_orders[idx]
+            .subtotal_poisha
+            .checked_add(line_total)
+            .ok_or_else(|| {
+                "কার্টের উপমোট হিসাব সীমা ছাড়িয়ে গেছে — cart subtotal overflows the money range"
+                    .to_string()
+            })?;
         sub_orders[idx].items.push(item.clone());
     }
 
-    sub_orders
+    Ok(sub_orders)
 }
 
 /// Compute platform commission and seller payout for a goods subtotal.
 ///
 /// `rate_bps` is the commission rate in basis points (800 bps = 8%).
 /// Commission is applied to the goods subtotal only — never to delivery
-/// charges. Integer division truncates towards zero (subtotals are
-/// non-negative in practice), keeping the result exact in poisha.
-pub fn compute_commission(subtotal_poisha: i64, rate_bps: u32) -> CommissionQuote {
-    let commission_poisha = subtotal_poisha * i64::from(rate_bps) / 10_000;
-    CommissionQuote {
+/// charges. Integer division truncates towards zero, keeping the
+/// result exact in poisha.
+///
+/// Wave 39 (security audit CR-12 + HI-19): the multiplication runs
+/// in i128 (the pattern `compute_advance_poisha` already used), so
+/// a subtotal near `i64::MAX` can no longer wrap into a negative
+/// commission; a negative subtotal and a rate above 100% (10,000
+/// bps) are rejected as errors instead of producing a payout
+/// larger than the subtotal.
+pub fn compute_commission(
+    subtotal_poisha: i64,
+    rate_bps: u32,
+) -> Result<CommissionQuote, String> {
+    if subtotal_poisha < 0 {
+        return Err(
+            "কমিশনের ভিত্তি ঋণাত্মক হতে পারে না — commission subtotal cannot be negative"
+                .to_string(),
+        );
+    }
+    if rate_bps > 10_000 {
+        return Err(format!(
+            "কমিশনের হার ১০০% এর বেশি হতে পারে না — commission rate {rate_bps} bps exceeds 100%"
+        ));
+    }
+    // i128 intermediate: subtotal (≤ i64::MAX) × rate (≤ 10,000)
+    // always fits, and the quotient never exceeds the subtotal
+    // itself, so both casts back to i64 are exact.
+    let commission_poisha =
+        (i128::from(subtotal_poisha) * i128::from(rate_bps) / 10_000) as i64;
+    Ok(CommissionQuote {
         commission_poisha,
         seller_payout_poisha: subtotal_poisha - commission_poisha,
-    }
+    })
 }
 
 impl DeliveryZone {
@@ -317,30 +380,77 @@ pub struct OrderTotals {
 /// order each store's slice is charged at its own plan's rate,
 /// snapshotted into its sub-order exactly like the single-rate
 /// case.
+///
+/// Wave 39 (security audit CR-11/CR-12): the function returns a
+/// `Result` — negative prices/weights and any arithmetic
+/// overflow are errors, never panics or wrapped figures.
 pub fn build_order_totals(
     groups: &[OrderGroupInput],
     zone: DeliveryZone,
     commission_rate_bps: u32,
-) -> OrderTotals {
+) -> Result<OrderTotals, String> {
     let mut sub_orders = Vec::with_capacity(groups.len());
     let mut goods_total_poisha = 0i64;
     let mut discount_total_poisha = 0i64;
     let mut delivery_total_poisha = 0i64;
 
     for group in groups {
-        let goods_subtotal_poisha: i64 =
-            group.items.iter().map(CartItem::line_total_poisha).sum();
-        let total_weight_grams: i64 = group
-            .items
-            .iter()
-            .map(|item| item.unit_weight_grams * i64::from(item.quantity))
-            .sum();
+        // Wave 39 (security audit CR-11): the totals boundary
+        // REJECTS impossible money inputs instead of panicking on
+        // them downstream — a negative unit price, a negative
+        // unit weight, or a group whose goods subtotal lands
+        // negative. (The audit showed a negative price previously
+        // reached `calculate_delivery_charge`'s assert and crashed
+        // the request.) Product prices are also validated when a
+        // product is created; this is the boundary that must hold
+        // no matter what a caller hands in.
+        let mut goods_subtotal_poisha = 0i64;
+        let mut total_weight_grams = 0i64;
+        for item in &group.items {
+            if item.unit_price_poisha < 0 {
+                return Err(
+                    "পণ্যের দাম ঋণাত্মক হতে পারে না — unit price cannot be negative"
+                        .to_string(),
+                );
+            }
+            if item.unit_weight_grams < 0 {
+                return Err(
+                    "পণ্যের ওজন ঋণাত্মক হতে পারে না — unit weight cannot be negative"
+                        .to_string(),
+                );
+            }
+            goods_subtotal_poisha = goods_subtotal_poisha
+                .checked_add(item.line_total_poisha()?)
+                .ok_or_else(|| {
+                    "পণ্যের মোট হিসাব সীমা ছাড়িয়ে গেছে — goods subtotal overflows the money range"
+                        .to_string()
+                })?;
+            let line_weight = item
+                .unit_weight_grams
+                .checked_mul(i64::from(item.quantity))
+                .ok_or_else(|| {
+                    "ওজনের হিসাব সীমা ছাড়িয়ে গেছে — parcel weight overflows the range"
+                        .to_string()
+                })?;
+            total_weight_grams = total_weight_grams
+                .checked_add(line_weight)
+                .ok_or_else(|| {
+                    "ওজনের হিসাব সীমা ছাড়িয়ে গেছে — parcel weight overflows the range"
+                        .to_string()
+                })?;
+        }
+        if goods_subtotal_poisha < 0 {
+            return Err(
+                "পণ্যের উপমোট ঋণাত্মক হতে পারে না — goods subtotal cannot be negative"
+                    .to_string(),
+            );
+        }
         let billable_weight_kg = weight_kg_from_grams(total_weight_grams).ceil() as u32;
         let delivery_charge_poisha = calculate_delivery_charge(
             zone,
             billable_weight_kg,
             goods_subtotal_poisha,
-        );
+        )?;
         let discount_poisha = group.discount_poisha.clamp(0, goods_subtotal_poisha);
         let commission_base_poisha = if group.commission_on_discounted {
             goods_subtotal_poisha - discount_poisha
@@ -352,10 +462,25 @@ pub fn build_order_totals(
         // one it pays the order-wide rate, exactly as before.
         let group_rate_bps = group.commission_rate_bps.unwrap_or(commission_rate_bps);
         let commission_poisha =
-            compute_commission(commission_base_poisha, group_rate_bps).commission_poisha;
-        goods_total_poisha += goods_subtotal_poisha;
-        discount_total_poisha += discount_poisha;
-        delivery_total_poisha += delivery_charge_poisha;
+            compute_commission(commission_base_poisha, group_rate_bps)?.commission_poisha;
+        goods_total_poisha = goods_total_poisha
+            .checked_add(goods_subtotal_poisha)
+            .ok_or_else(|| {
+                "অর্ডারের মোট হিসাব সীমা ছাড়িয়ে গেছে — order goods total overflows the money range"
+                    .to_string()
+            })?;
+        discount_total_poisha = discount_total_poisha
+            .checked_add(discount_poisha)
+            .ok_or_else(|| {
+                "অর্ডারের মোট হিসাব সীমা ছাড়িয়ে গেছে — order discount total overflows the money range"
+                    .to_string()
+            })?;
+        delivery_total_poisha = delivery_total_poisha
+            .checked_add(delivery_charge_poisha)
+            .ok_or_else(|| {
+                "অর্ডারের মোট হিসাব সীমা ছাড়িয়ে গেছে — order delivery total overflows the money range"
+                    .to_string()
+            })?;
         sub_orders.push(SubOrderTotals {
             goods_subtotal_poisha,
             discount_poisha,
@@ -365,13 +490,21 @@ pub fn build_order_totals(
         });
     }
 
-    OrderTotals {
+    let grand_total_poisha = goods_total_poisha
+        .checked_sub(discount_total_poisha)
+        .and_then(|net| net.checked_add(delivery_total_poisha))
+        .ok_or_else(|| {
+            "অর্ডারের মোট হিসাব সীমা ছাড়িয়ে গেছে — order grand total overflows the money range"
+                .to_string()
+        })?;
+
+    Ok(OrderTotals {
         sub_orders,
         goods_total_poisha,
         discount_total_poisha,
         delivery_total_poisha,
-        grand_total_poisha: goods_total_poisha - discount_total_poisha + delivery_total_poisha,
-    }
+        grand_total_poisha,
+    })
 }
 
 /// Sub-order (per-seller fulfilment) statuses — mirrors the DB CHECK
@@ -3446,17 +3579,17 @@ mod tests {
 
     #[test]
     fn delivery_charge_first_kg_per_zone() {
-        assert_eq!(calculate_delivery_charge(DeliveryZone::InsideDhaka, 1, 0), 6_000);
-        assert_eq!(calculate_delivery_charge(DeliveryZone::DhakaSuburb, 1, 0), 10_000);
-        assert_eq!(calculate_delivery_charge(DeliveryZone::OutsideDhaka, 1, 0), 12_000);
+        assert_eq!(calculate_delivery_charge(DeliveryZone::InsideDhaka, 1, 0), Ok(6_000));
+        assert_eq!(calculate_delivery_charge(DeliveryZone::DhakaSuburb, 1, 0), Ok(10_000));
+        assert_eq!(calculate_delivery_charge(DeliveryZone::OutsideDhaka, 1, 0), Ok(12_000));
     }
 
     #[test]
     fn delivery_charge_extra_weight() {
         // Outside Dhaka, 3 kg: 120 + 2 * 40 = 200 BDT.
-        assert_eq!(calculate_delivery_charge(DeliveryZone::OutsideDhaka, 3, 0), 20_000);
+        assert_eq!(calculate_delivery_charge(DeliveryZone::OutsideDhaka, 3, 0), Ok(20_000));
         // Zero weight is billed as 1 kg.
-        assert_eq!(calculate_delivery_charge(DeliveryZone::InsideDhaka, 0, 0), 6_000);
+        assert_eq!(calculate_delivery_charge(DeliveryZone::InsideDhaka, 0, 0), Ok(6_000));
     }
 
     #[test]
@@ -3466,7 +3599,7 @@ mod tests {
             item("store-b", "p2", 2, 500),
             item("store-a", "p3", 1, 250),
         ];
-        let subs = split_cart_by_seller(&cart);
+        let subs = split_cart_by_seller(&cart).expect("split succeeds");
         assert_eq!(subs.len(), 2);
         assert_eq!(subs[0].store_id, "store-a");
         assert_eq!(subs[0].subtotal_poisha, 125_000);
@@ -3477,14 +3610,93 @@ mod tests {
 
     #[test]
     fn split_empty_cart_gives_no_sub_orders() {
-        assert!(split_cart_by_seller(&[]).is_empty());
+        assert!(split_cart_by_seller(&[]).expect("empty split succeeds").is_empty());
     }
 
     #[test]
     fn commission_eight_percent() {
-        let q = compute_commission(100_000, 800); // 1000 BDT at 8%
+        let q = compute_commission(100_000, 800).expect("commission computes"); // 1000 BDT at 8%
         assert_eq!(q.commission_poisha, 8_000);
         assert_eq!(q.seller_payout_poisha, 92_000);
+    }
+
+    /// A raw-poisha cart line for the Wave 39 money-safety tests
+    /// (the `item`/`witem` helpers take taka and scale, which
+    /// cannot express the boundary values these tests need).
+    fn raw_item(store: &str, quantity: u32, unit_price_poisha: i64) -> CartItem {
+        CartItem {
+            product_id: "p-raw".to_string(),
+            store_id: store.to_string(),
+            quantity,
+            unit_price_poisha,
+            unit_weight_grams: 1_000,
+            variant_id: None,
+        }
+    }
+
+    fn raw_group(items: Vec<CartItem>) -> OrderGroupInput {
+        OrderGroupInput {
+            store_id: "store-a".to_string(),
+            items,
+            discount_poisha: 0,
+            commission_on_discounted: false,
+            commission_rate_bps: None,
+        }
+    }
+
+    #[test]
+    fn money_safety_negative_inputs_are_errors_not_panics() {
+        // Wave 39 (audit CR-11): a negative unit price used to
+        // sail through the totals and detonate the assert inside
+        // the delivery-charge rule. Every boundary now returns an
+        // error value instead.
+        let groups = vec![raw_group(vec![raw_item("store-a", 1, -1)])];
+        assert!(build_order_totals(&groups, DeliveryZone::InsideDhaka, 800).is_err());
+
+        // A negative unit weight is rejected at the same boundary.
+        let mut bad_weight = raw_item("store-a", 1, 1_000);
+        bad_weight.unit_weight_grams = -5;
+        let groups = vec![raw_group(vec![bad_weight])];
+        assert!(build_order_totals(&groups, DeliveryZone::InsideDhaka, 800).is_err());
+
+        // The delivery rule itself: negative COD is an error,
+        // never a panic.
+        assert!(calculate_delivery_charge(DeliveryZone::InsideDhaka, 1, -1).is_err());
+
+        // Commission: negative base and a rate above 100% are
+        // errors (audit HI-19).
+        assert!(compute_commission(-100, 800).is_err());
+        assert!(compute_commission(100_000, 10_001).is_err());
+    }
+
+    #[test]
+    fn money_safety_overflow_is_an_error_not_a_wrap() {
+        // Wave 39 (audit CR-12): i64::MAX poisha x 2 must not wrap
+        // into a negative line total.
+        let huge = raw_item("store-a", 2, i64::MAX);
+        assert!(huge.line_total_poisha().is_err());
+        let groups = vec![raw_group(vec![huge])];
+        assert!(build_order_totals(&groups, DeliveryZone::InsideDhaka, 800).is_err());
+
+        // Two individually-legal lines whose SUM overflows are an
+        // error too, in both the totals and the cart split.
+        let cart = vec![
+            raw_item("store-a", 1, i64::MAX),
+            raw_item("store-a", 1, i64::MAX),
+        ];
+        assert!(split_cart_by_seller(&cart).is_err());
+        let groups = vec![raw_group(cart)];
+        assert!(build_order_totals(&groups, DeliveryZone::InsideDhaka, 800).is_err());
+
+        // Commission on a near-max subtotal stays EXACT via the
+        // i128 intermediate (an i64 multiplication would wrap):
+        // the quote equals the true mathematical result.
+        let q = compute_commission(i64::MAX, 800).expect("commission computes");
+        assert_eq!(
+            q.commission_poisha,
+            (i128::from(i64::MAX) * 800 / 10_000) as i64
+        );
+        assert_eq!(q.commission_poisha + q.seller_payout_poisha, i64::MAX);
     }
 
     #[test]
@@ -3496,14 +3708,14 @@ mod tests {
             item("store-a", "p1", 1, 2_450),
             item("store-b", "p2", 1, 2_000),
         ];
-        let subs = split_cart_by_seller(&cart);
+        let subs = split_cart_by_seller(&cart).expect("split succeeds");
         let goods_total: i64 = subs.iter().map(|s| s.subtotal_poisha).sum();
         assert_eq!(goods_total, 445_000);
 
         // Each seller ships one 1 kg parcel outside Dhaka: 120 BDT each.
         let delivery_total: i64 = subs
             .iter()
-            .map(|_| calculate_delivery_charge(DeliveryZone::OutsideDhaka, 1, 0))
+            .map(|_| calculate_delivery_charge(DeliveryZone::OutsideDhaka, 1, 0).expect("delivery charge"))
             .sum();
         assert_eq!(delivery_total, 24_000);
         assert_eq!(goods_total + delivery_total, 469_000); // 4,690 BDT payable
@@ -3511,7 +3723,7 @@ mod tests {
         let mut commission_total = 0;
         let mut payout_total = 0;
         for s in &subs {
-            let q = compute_commission(s.subtotal_poisha, 800);
+            let q = compute_commission(s.subtotal_poisha, 800).expect("commission computes");
             commission_total += q.commission_poisha;
             payout_total += q.seller_payout_poisha;
         }
@@ -3712,7 +3924,7 @@ mod tests {
                 witem("store-a", "p2", 1, 2_000, 2_500),
             ],
         )];
-        let totals = build_order_totals(&groups, DeliveryZone::OutsideDhaka, 800);
+        let totals = build_order_totals(&groups, DeliveryZone::OutsideDhaka, 800).expect("totals compute");
         assert_eq!(totals.goods_total_poisha, 400_000);
         assert_eq!(totals.delivery_total_poisha, 24_000);
         assert_eq!(totals.grand_total_poisha, 424_000);
@@ -3721,7 +3933,7 @@ mod tests {
         assert_eq!(totals.sub_orders[0].seller_payout_poisha, 368_000);
 
         // The same items inside Dhaka at 4 kg: 60 + 3*20 = 120 BDT.
-        let totals = build_order_totals(&groups, DeliveryZone::InsideDhaka, 800);
+        let totals = build_order_totals(&groups, DeliveryZone::InsideDhaka, 800).expect("totals compute");
         assert_eq!(totals.delivery_total_poisha, 12_000);
 
         // An exact whole number of kilograms is NOT rounded further:
@@ -3731,7 +3943,7 @@ mod tests {
             "store-a",
             vec![witem("store-a", "p1", 2, 1_000, 2_500)],
         )];
-        let totals = build_order_totals(&groups, DeliveryZone::OutsideDhaka, 800);
+        let totals = build_order_totals(&groups, DeliveryZone::OutsideDhaka, 800).expect("totals compute");
         assert_eq!(totals.delivery_total_poisha, 28_000);
     }
 
@@ -3807,7 +4019,7 @@ mod tests {
             group("store-a", vec![item("store-a", "p1", 1, 2_450)]),
             group("store-b", vec![item("store-b", "p2", 1, 2_000)]),
         ];
-        let totals = build_order_totals(&groups, DeliveryZone::OutsideDhaka, 800);
+        let totals = build_order_totals(&groups, DeliveryZone::OutsideDhaka, 800).expect("totals compute");
         assert_eq!(totals.goods_total_poisha, 445_000);
         assert_eq!(totals.delivery_total_poisha, 24_000);
         assert_eq!(totals.grand_total_poisha, 469_000); // 4,690 BDT
@@ -3838,7 +4050,7 @@ mod tests {
                 item("store-a", "p2", 1, 500),
             ],
         )];
-        let totals = build_order_totals(&groups, DeliveryZone::InsideDhaka, 800);
+        let totals = build_order_totals(&groups, DeliveryZone::InsideDhaka, 800).expect("totals compute");
         assert_eq!(totals.goods_total_poisha, 350_000);
         assert_eq!(totals.delivery_total_poisha, 10_000);
         assert_eq!(totals.grand_total_poisha, 360_000);
@@ -3855,7 +4067,7 @@ mod tests {
             discounted_group("store-a", vec![item("store-a", "p1", 1, 2_450)], 2_753, false),
             discounted_group("store-b", vec![item("store-b", "p2", 1, 2_000)], 2_247, false),
         ];
-        let totals = build_order_totals(&groups, DeliveryZone::OutsideDhaka, 800);
+        let totals = build_order_totals(&groups, DeliveryZone::OutsideDhaka, 800).expect("totals compute");
         assert_eq!(totals.discount_total_poisha, 5_000);
         assert_eq!(totals.grand_total_poisha, 469_000 - 5_000);
         // Commission unchanged vs the no-coupon worked example.
@@ -3876,7 +4088,7 @@ mod tests {
             discounted_group("store-a", vec![item("store-a", "p1", 1, 2_450)], 10_000, true),
             group("store-b", vec![item("store-b", "p2", 1, 2_000)]),
         ];
-        let totals = build_order_totals(&groups, DeliveryZone::OutsideDhaka, 800);
+        let totals = build_order_totals(&groups, DeliveryZone::OutsideDhaka, 800).expect("totals compute");
         assert_eq!(totals.discount_total_poisha, 10_000);
         assert_eq!(totals.sub_orders[0].commission_poisha, 18_800);
         assert_eq!(totals.sub_orders[0].seller_payout_poisha, 245_000 - 10_000 - 18_800);
@@ -4023,7 +4235,7 @@ mod tests {
 
     #[test]
     fn order_totals_empty_groups_are_zero() {
-        let totals = build_order_totals(&[], DeliveryZone::DhakaSuburb, 800);
+        let totals = build_order_totals(&[], DeliveryZone::DhakaSuburb, 800).expect("totals compute");
         assert!(totals.sub_orders.is_empty());
         assert_eq!(totals.goods_total_poisha, 0);
         assert_eq!(totals.delivery_total_poisha, 0);
@@ -4681,7 +4893,7 @@ mod tests {
             group("store-free", vec![item("store-free", "p2", 1, 2_000)]),
             discounted,
         ];
-        let totals = build_order_totals(&groups, DeliveryZone::InsideDhaka, 800);
+        let totals = build_order_totals(&groups, DeliveryZone::InsideDhaka, 800).expect("totals compute");
         assert_eq!(totals.sub_orders[0].commission_poisha, 16_000);
         assert_eq!(totals.sub_orders[0].seller_payout_poisha, 184_000);
         assert_eq!(totals.sub_orders[1].commission_poisha, 14_000);

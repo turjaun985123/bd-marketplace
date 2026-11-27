@@ -13,3 +13,11 @@ members = [
 edition = "2021"
 license = "MIT"
 version = "0.1.0"
+
+# Wave 39 (security audit CR-11/CR-12 defence in depth): release
+# builds keep integer overflow checks ON. Money arithmetic in the
+# domain crate is checked explicitly and returns errors, but any
+# arithmetic path missed anywhere else must panic loudly in
+# production rather than silently wrap a money figure.
+[profile.release]
+overflow-checks = true

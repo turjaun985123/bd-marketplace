@@ -334,6 +334,19 @@ pub async fn request_otp_code(
 /// Verify an OTP: check attempts, expiry and hash; on success create the
 /// user if new (role `buyer`) and return the user row. Codes are
 /// single-use — a successful verify deletes them.
+///
+/// Wave 39 (security audit CR-01 in the audit's full list — the
+/// OTP attempt-cap race): the attempt count used to be a
+/// read-check-write sequence (SELECT the row, compare attempts,
+/// UPDATE on mismatch), so parallel verify calls could all read
+/// `attempts = 4`, all pass the cap check, and brute-force past
+/// the 5-attempt limit. The count is now ONE conditional UPDATE
+/// that increments and returns the row only while the cap has
+/// not been reached — the increment itself is the lock, so
+/// concurrent verifies can never exceed the cap. Every verify
+/// attempt counts (a successful one consumes the code anyway, so
+/// the outcome is identical); error shapes are unchanged: no
+/// code 400, cap reached 400, expired 400, wrong code 401.
 pub async fn verify_otp_code(
     state: &AppState,
     raw_phone: &str,
@@ -344,29 +357,43 @@ pub async fn verify_otp_code(
         .ok_or_else(|| ApiError::bad_request("invalid Bangladeshi phone number"))?;
 
     let row: Option<OtpRow> = sqlx::query_as(
-        "SELECT code_hash, expires_at, attempts FROM otp_codes \
-         WHERE phone = $1 ORDER BY created_at DESC LIMIT 1",
+        "UPDATE otp_codes SET attempts = attempts + 1 \
+         WHERE phone = $1 AND attempts < $2 \
+         RETURNING code_hash, expires_at, attempts",
     )
     .bind(&phone)
+    .bind(OTP_MAX_ATTEMPTS)
     .fetch_optional(pool)
     .await
-    .map_err(|e| ApiError::internal("load OTP", e))?;
-    let row = row.ok_or_else(|| ApiError::bad_request("no OTP was requested for this phone"))?;
+    .map_err(|e| ApiError::internal("count OTP attempt", e))?;
+    let row = match row {
+        Some(row) => row,
+        None => {
+            // The conditional update matched nothing: either no
+            // code was ever requested for this phone, or the
+            // attempt cap is already reached. One existence read
+            // tells the two apart so each keeps its own error.
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM otp_codes WHERE phone = $1)")
+                    .bind(&phone)
+                    .fetch_one(pool)
+                    .await
+                    .map_err(|e| ApiError::internal("check OTP existence", e))?;
+            if exists {
+                return Err(ApiError::bad_request(
+                    "too many OTP attempts — request a new code",
+                ));
+            }
+            return Err(ApiError::bad_request(
+                "no OTP was requested for this phone",
+            ));
+        }
+    };
 
-    if row.attempts >= OTP_MAX_ATTEMPTS {
-        return Err(ApiError::bad_request(
-            "too many OTP attempts — request a new code",
-        ));
-    }
     if row.expires_at < Utc::now() {
         return Err(ApiError::bad_request("OTP has expired — request a new code"));
     }
     if hash_otp(&phone, code) != row.code_hash {
-        sqlx::query("UPDATE otp_codes SET attempts = attempts + 1 WHERE phone = $1")
-            .bind(&phone)
-            .execute(pool)
-            .await
-            .map_err(|e| ApiError::internal("count OTP attempt", e))?;
         return Err(ApiError::unauthorized("incorrect OTP code"));
     }
 

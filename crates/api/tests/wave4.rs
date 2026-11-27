@@ -260,7 +260,10 @@ async fn wave4_weight_cancel_receipt_flow() {
     add_to_cart(&app, &buyer, &light_id, 1).await;
     let (status, order1) = checkout(&app, &buyer, "outside_dhaka").await;
     assert_eq!(status, StatusCode::CREATED, "checkout 1: {order1}");
-    let expected_a = calculate_delivery_charge(DeliveryZone::OutsideDhaka, 5, 200_000);
+    // Wave 39: the domain rule returns a Result now (audit
+    // CR-11/CR-12) — same value, unwrapped.
+    let expected_a =
+        calculate_delivery_charge(DeliveryZone::OutsideDhaka, 5, 200_000).expect("delivery charge");
     assert_eq!(expected_a, 28_000); // 120 + 4*40 BDT, pins the domain rule
     let sub_a1 = sub_for_store(&order1, &store_a);
     assert_eq!(sub_a1["delivery_charge_poisha"], expected_a, "5 kg charge: {order1}");

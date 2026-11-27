@@ -444,20 +444,43 @@ pub async fn request_payout(
         ));
     }
 
+    // Wave 39 (security audit CR-10 in the audit's full list —
+    // the payout double-spend race): the account read, the
+    // earnings computation and the INSERT used to be three
+    // separate pool operations with no lock, so two concurrent
+    // requests could both read the same available balance, both
+    // pass the balance check, and together pay out more than the
+    // seller had earned. They now run in ONE transaction that
+    // first locks the store row FOR UPDATE — the exact pattern
+    // the promotion and subscription charges already use — so
+    // concurrent payout requests for a store serialize on that
+    // row and each one re-reads earnings that already include
+    // every earlier request's pending amount.
+    let min_payout_poisha = crate::admin::effective_min_payout(state).await;
+
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| ApiError::internal("begin payout request", e))?;
+    sqlx::query("SELECT id FROM stores WHERE id = $1 FOR UPDATE")
+        .bind(store.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::internal("lock store for payout request", e))?;
+
     let account: Option<PayoutAccount> = sqlx::query_as(
         "SELECT id, store_id, method, account_name, account_number, created_at, updated_at \
          FROM payout_accounts WHERE store_id = $1",
     )
     .bind(store.id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| ApiError::internal("load payout account", e))?;
     let account = account.ok_or_else(|| {
         ApiError::bad_request("add a payout account first, then request a payout")
     })?;
 
-    let earnings = seller_earnings(pool, store.id).await?;
-    let min_payout_poisha = crate::admin::effective_min_payout(state).await;
+    let earnings = seller_earnings_on(&mut *tx, store.id).await?;
     validate_payout_amount_with_min(
         amount_poisha,
         earnings.available_poisha,
@@ -465,7 +488,7 @@ pub async fn request_payout(
     )
     .map_err(ApiError::bad_request)?;
 
-    sqlx::query_as(
+    let payout: Payout = sqlx::query_as(
         "INSERT INTO payouts (store_id, amount_poisha, method, account_name, account_number) \
          VALUES ($1, $2, $3, $4, $5) \
          RETURNING id, store_id, amount_poisha, method, account_name, account_number, \
@@ -476,9 +499,14 @@ pub async fn request_payout(
     .bind(&account.method)
     .bind(&account.account_name)
     .bind(&account.account_number)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await
-    .map_err(|e| ApiError::internal("create payout", e))
+    .map_err(|e| ApiError::internal("create payout", e))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::internal("commit payout request", e))?;
+    Ok(payout)
 }
 
 /// The caller's payout requests (their payout store's),
