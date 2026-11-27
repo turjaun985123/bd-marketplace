@@ -213,7 +213,7 @@ fn money_snapshot(order: &Value) -> (i64, i64, i64, i64, i64, i64, i64) {
         order["grand_total_poisha"].as_i64().expect("grand"),
         sub["seller_payout_poisha"].as_i64().expect("payout"),
         sub["commission_poisha"].as_i64().expect("commission"),
-        sub["cod_collect_poisha"].as_i64().expect("cod collect"),
+        order["cod_amount_due_poisha"].as_i64().expect("cod due"),
     )
 }
 
