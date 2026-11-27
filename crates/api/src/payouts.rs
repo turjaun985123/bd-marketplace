@@ -458,7 +458,10 @@ pub async fn save_payout_account(
 /// replay/conflict rules, instead of patching a half-finished
 /// transaction back together.
 enum PayoutAttempt {
-    Done(Payout, bool),
+    // Boxed: the unit variant would otherwise inflate every
+    // value of this enum to the size of a full `Payout`
+    // (clippy::large_enum_variant).
+    Done(Box<Payout>, bool),
     LostIdempotencyRace,
 }
 
@@ -537,7 +540,7 @@ pub async fn request_payout(
         match request_payout_once(pool, store, amount_poisha, min_payout_poisha, idempotency_key)
             .await?
         {
-            PayoutAttempt::Done(payout, created) => return Ok((payout, created)),
+            PayoutAttempt::Done(payout, created) => return Ok((*payout, created)),
             PayoutAttempt::LostIdempotencyRace => {
                 if attempt == 2 {
                     return Err(ApiError::conflict(
@@ -614,7 +617,7 @@ async fn request_payout_once(
             // A true retry: hand back the original row. The
             // transaction has written nothing, so dropping it
             // (rollback) is the clean exit.
-            return Ok(PayoutAttempt::Done(existing, false));
+            return Ok(PayoutAttempt::Done(Box::new(existing), false));
         }
     }
 
@@ -672,7 +675,7 @@ async fn request_payout_once(
     tx.commit()
         .await
         .map_err(|e| ApiError::internal("commit payout request", e))?;
-    Ok(PayoutAttempt::Done(payout, true))
+    Ok(PayoutAttempt::Done(Box::new(payout), true))
 }
 
 /// The caller's payout requests (their payout store's),
