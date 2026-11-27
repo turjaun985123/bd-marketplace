@@ -204,7 +204,10 @@ async fn test_app() -> Option<(Router, PgPool)> {
 }
 
 /// The money fields two equivalent checkouts must share.
-fn money_snapshot(order: &Value) -> (i64, i64, i64, i64, i64, i64, i64) {
+/// The COD amount due is not on the checkout response — it
+/// is the receipt's field (the W39 canon), so it is read
+/// from GET /v1/orders/:id/receipt and passed in.
+fn money_snapshot(order: &Value, cod_due_poisha: i64) -> (i64, i64, i64, i64, i64, i64, i64) {
     let sub = &order["sub_orders"][0];
     (
         order["goods_total_poisha"].as_i64().expect("goods"),
@@ -213,8 +216,25 @@ fn money_snapshot(order: &Value) -> (i64, i64, i64, i64, i64, i64, i64) {
         order["grand_total_poisha"].as_i64().expect("grand"),
         sub["seller_payout_poisha"].as_i64().expect("payout"),
         sub["commission_poisha"].as_i64().expect("commission"),
-        order["cod_amount_due_poisha"].as_i64().expect("cod due"),
+        cod_due_poisha,
     )
+}
+
+/// The receipt's COD amount due for one order.
+async fn receipt_cod_due(app: &Router, token: &str, order: &Value) -> i64 {
+    let id = order["id"].as_str().expect("order id");
+    let (status, receipt) = call(
+        app,
+        Method::GET,
+        &format!("/v1/orders/{id}/receipt"),
+        None,
+        Some(token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "receipt: {receipt}");
+    receipt["cod_amount_due_poisha"]
+        .as_i64()
+        .expect("receipt cod due")
 }
 
 #[tokio::test]
@@ -290,7 +310,7 @@ async fn wave55i_address_checkout_keeps_the_money_canon() {
     assert_eq!(status, StatusCode::CREATED, "manual checkout: {manual}");
     // goods 200_000, coupon min(10%, cap) = 5_000, delivery
     // 6_000 (2 × 500 g = 1 kg inside Dhaka), grand 201_000.
-    let manual_money = money_snapshot(&manual);
+    let manual_money = money_snapshot(&manual, receipt_cod_due(&app, &buyer, &manual).await);
     assert_eq!(manual_money.0, 200_000);
     assert_eq!(manual_money.1, 5_000);
     assert_eq!(manual_money.2, 6_000);
@@ -316,7 +336,10 @@ async fn wave55i_address_checkout_keeps_the_money_canon() {
     .await;
     assert_eq!(status, StatusCode::CREATED, "address checkout: {via_address}");
     assert_eq!(
-        money_snapshot(&via_address),
+        money_snapshot(
+            &via_address,
+            receipt_cod_due(&app, &buyer, &via_address).await
+        ),
         manual_money,
         "the address path must not move a single poisha"
     );
