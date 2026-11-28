@@ -203,7 +203,7 @@ async fn adminorders_filters_and_summary_match_metrics() {
     let state = AppState::new(Some(pool.clone()), "adminordersb-test-secret".to_string(), true)
         .with_payments_config(PaymentsConfig {
             dev_mode: true,
-            dev_secret: Some("adminordersb-test-secret".to_string()),
+            dev_secret: "adminordersb-test-secret".to_string(),
             ..PaymentsConfig::default()
         })
         .with_couriers_config(CouriersConfig {
