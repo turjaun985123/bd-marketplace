@@ -326,6 +326,33 @@ export default function SellerDashboardPage() {
           · <Link href="/seller/subscription">প্ল্যান দেখুন — View plan</Link>
         </p>
       )}
+      {/* Admin stores remake: the suspension banner. The
+          note and the stamp ride the dashboard response
+          (migration 0075) — the seller sees the admin's
+          reason here, the same text the notice carried. */}
+      {dashboard && dashboard.store.status === "suspended" && (
+        <section>
+          <div className="card" role="alert">
+            <h2>আপনার স্টোর সাময়িকভাবে স্থগিত আছে — Store suspended</h2>
+            <p>
+              {dashboard.suspension_note
+                ? `কারণ: ${dashboard.suspension_note}`
+                : "কারণ: — (এই স্থগিতের সঙ্গে কোনো কারণ লেখা হয়নি)"}
+              {dashboard.status_changed_at
+                ? ` · ${new Date(dashboard.status_changed_at).toLocaleDateString(
+                    "bn-BD"
+                  )} থেকে`
+                : ""}
+            </p>
+            <p>
+              স্থগিত থাকা অবস্থায় আপনার পণ্য পাবলিকভাবে দেখা যাবে না এবং নতুন
+              অর্ডার নেওয়া যাবে না — তবে কিছুই মুছে যায়নি, আর আপনি সাইন ইন
+              করে ক্যাটালগ সামলাতে পারবেন। পে-আউটের সিদ্ধান্ত এই সময়ে জমে
+              থাকবে। সমস্যাটি ঠিক করে প্ল্যাটফর্ম টিমের সঙ্গে যোগাযোগ করুন।
+            </p>
+          </div>
+        </section>
+      )}
       <p>
         <Link href="/seller/products">আমার পণ্য — My products</Link>
         {" · "}

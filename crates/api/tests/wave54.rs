@@ -371,7 +371,7 @@ async fn wave54_follow_flow_counts_and_lists() {
         &app,
         Method::PATCH,
         &format!("/v1/admin/stores/{store_id}/status"),
-        Some(json!({ "status": "suspended" })),
+        Some(json!({ "status": "suspended", "note": "Test suspension" })),
         Some(&admin),
     )
     .await;

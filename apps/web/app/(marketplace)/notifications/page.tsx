@@ -234,8 +234,16 @@ function kindLabel(kind: string): string {
       return "রিটার্ন আপডেট — Return update";
     case "store_new_product":
       return "নতুন পণ্য — New product";
+    case "store_new_post":
+      return "নতুন পোস্ট — New post";
     case "store_flash_sale":
       return "ফ্ল্যাশ সেল — Flash sale";
+    case "gift_card_expiring":
+      return "গিফট কার্ডের মেয়াদ — Gift card expiring";
+    case "store_suspended":
+      return "স্টোর স্থগিত — Store suspended";
+    case "store_reactivated":
+      return "স্টোর চালু — Store reactivated";
     default:
       return "আপডেট — Update";
   }

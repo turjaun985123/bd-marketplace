@@ -1778,7 +1778,7 @@ pub struct ReorderSkipped {
     pub title: String,
     /// The domain reason code (`product_unavailable`,
     /// `variant_unavailable`, `out_of_stock`,
-    /// `cart_limit`).
+    /// `cart_limit`, `store_suspended`).
     pub reason: String,
     /// The buyer-facing bilingual explanation.
     pub message: String,
@@ -1807,6 +1807,10 @@ struct ReorderLine {
     title_snapshot: String,
     quantity: i32,
     product_status: Option<String>,
+    /// The product's store's status (admin stores remake);
+    /// `None` when the product row is gone (its store is
+    /// unreachable too, and the product check fires first).
+    store_status: Option<String>,
     product_stock: Option<i32>,
     variant_active: Option<bool>,
     variant_stock: Option<i32>,
@@ -1840,13 +1844,15 @@ pub async fn reorder_order(
 
     let lines: Vec<ReorderLine> = sqlx::query_as(
         "SELECT oi.product_id, oi.variant_id, oi.title_snapshot, oi.quantity, \
-         p.status AS product_status, p.stock AS product_stock, \
+         p.status AS product_status, s.status AS store_status, \
+         p.stock AS product_stock, \
          v.is_active AS variant_active, v.stock AS variant_stock, \
          EXISTS (SELECT 1 FROM product_variants pv \
                  WHERE pv.product_id = p.id AND pv.is_active) AS has_active_variants \
          FROM order_items oi \
          JOIN sub_orders so ON so.id = oi.sub_order_id \
          LEFT JOIN products p ON p.id = oi.product_id \
+         LEFT JOIN stores s ON s.id = p.store_id \
          LEFT JOIN product_variants v ON v.id = oi.variant_id \
          WHERE so.order_id = $1 ORDER BY so.created_at, oi.id",
     )
@@ -1901,6 +1907,7 @@ pub async fn reorder_order(
         let headroom = i64::from(domain::MAX_CART_QUANTITY) - in_cart;
         let decision = reorder_decision(
             line.product_status.as_deref(),
+            line.store_status.as_deref(),
             variant_state,
             stock,
             i64::from(line.quantity),
@@ -2066,6 +2073,7 @@ pub async fn buy_again_rail(pool: &PgPool, user: &AuthUser) -> Result<BuyAgainLi
          JOIN stores s ON s.id = p.store_id \
          WHERE o.buyer_user_id = $1 AND o.status <> 'cancelled' \
            AND so.status <> 'cancelled' AND p.status = 'active' \
+           AND s.status = 'active' \
            AND ((NOT EXISTS (SELECT 1 FROM product_variants pv3 \
                              WHERE pv3.product_id = p.id AND pv3.is_active) \
                  AND p.stock > 0) \

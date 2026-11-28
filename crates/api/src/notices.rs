@@ -44,6 +44,19 @@
 //!   an approved notice carries the granted tier, a rejected
 //!   notice the reviewer's note. The wording claims manual
 //!   platform review only — no government NID check exists.
+//! - `store_suspended` / `store_reactivated` (admin stores
+//!   remake) — `admin::set_store_status`, to the store
+//!   owner, inside the transition's own transaction. Both
+//!   kinds share the one funnel
+//!   ([`enqueue_store_status_notice`]); a suspended notice
+//!   carries the admin's required note, a reactivated
+//!   notice carries none. The wording says TEMPORARY —
+//!   suspension deletes nothing and cancels no payout.
+//!   The follower funnels above (`store_new_product`,
+//!   `store_new_post`, `store_flash_sale`) enqueue NOTHING
+//!   while their store is suspended: a dark store's
+//!   publishes do not ping followers about pages they
+//!   cannot open, and nothing retro-fires on reactivation.
 //! - `return_update` — `returns::decide_return_request`
 //!   (approved / rejected) and `returns::mark_return_received`
 //!   (received), to the buyer.
@@ -194,10 +207,12 @@ pub async fn enqueue_store_new_product_notices(
     struct ProductNoticeRow {
         store_id: Uuid,
         store_name: String,
+        store_status: String,
         product_title: String,
     }
     let product: ProductNoticeRow = sqlx::query_as(
-        "SELECT p.store_id, s.name AS store_name, p.title AS product_title \
+        "SELECT p.store_id, s.name AS store_name, s.status AS store_status, \
+         p.title AS product_title \
          FROM products p JOIN stores s ON s.id = p.store_id \
          WHERE p.id = $1",
     )
@@ -205,6 +220,17 @@ pub async fn enqueue_store_new_product_notices(
     .fetch_one(&mut *conn)
     .await
     .map_err(|e| ApiError::internal("load new-product notice subject", e))?;
+
+    // Admin stores remake: a SUSPENDED store's publishes
+    // enqueue nothing. The seller may keep preparing the
+    // catalogue while suspended (their management access
+    // survives), but followers must not be pinged about
+    // products they cannot open — the store's pages are
+    // dark. Nothing retro-fires on reactivation either:
+    // the funnel runs at publish time only.
+    if product.store_status != "active" {
+        return Ok(0);
+    }
 
     #[derive(FromRow)]
     struct FollowerRow {
@@ -268,11 +294,13 @@ pub async fn enqueue_store_new_post_notices(
     struct PostNoticeRow {
         store_id: Uuid,
         store_name: String,
+        store_status: String,
         post_slug: String,
         post_title: String,
     }
     let post: PostNoticeRow = sqlx::query_as(
-        "SELECT p.store_id, s.name AS store_name, p.slug AS post_slug, \
+        "SELECT p.store_id, s.name AS store_name, s.status AS store_status, \
+         p.slug AS post_slug, \
          p.title AS post_title \
          FROM store_posts p JOIN stores s ON s.id = p.store_id \
          WHERE p.id = $1",
@@ -281,6 +309,13 @@ pub async fn enqueue_store_new_post_notices(
     .fetch_one(&mut *conn)
     .await
     .map_err(|e| ApiError::internal("load new-post notice subject", e))?;
+
+    // Admin stores remake: a SUSPENDED store's post
+    // publishes enqueue nothing — the same dark-store rule
+    // as the new-product funnel above.
+    if post.store_status != "active" {
+        return Ok(0);
+    }
 
     #[derive(FromRow)]
     struct FollowerRow {
@@ -359,6 +394,7 @@ pub async fn enqueue_store_flash_sale_notices(
          JOIN store_follows f ON f.store_id = s.id \
          JOIN users u ON u.id = f.user_id \
          WHERE p.id = ANY($1) AND f.notify_new_products \
+           AND s.status = 'active' \
          ORDER BY f.created_at ASC",
     )
     .bind(product_ids)
@@ -478,5 +514,49 @@ pub async fn enqueue_verification_notice(
     notify::enqueue(&mut *conn, owner_user_id, &phone, kind, &payload)
         .await
         .map_err(|e| ApiError::internal("enqueue verification notification", e))?;
+    Ok(())
+}
+
+/// Queue one store-status notice for a store's owner
+/// (admin stores remake): the recipient is the seller at
+/// their ACCOUNT phone, exactly like the payout and
+/// verification funnels — a suspension is an account-level
+/// event. One funnel for both store kinds
+/// (`store_suspended`, `store_reactivated`), called from
+/// `admin::set_store_status` inside the transition's own
+/// transaction, so the notice commits or rolls back with
+/// the status change it announces.
+///
+/// The store name is a caller-supplied PARAMETER, never
+/// re-read from the store: the caller has just written the
+/// transition inside the same transaction. The note (the
+/// admin's suspension reason) rides ONLY on the suspended
+/// kind — reactivation takes no note, and its payload
+/// stays note-free.
+pub async fn enqueue_store_status_notice(
+    conn: &mut PgConnection,
+    store_id: Uuid,
+    store_name: &str,
+    kind: &str,
+    note: Option<&str>,
+) -> Result<(), ApiError> {
+    let (owner_user_id, phone): (Uuid, String) = sqlx::query_as(
+        "SELECT s.owner_user_id, u.phone FROM stores s \
+         JOIN users u ON u.id = s.owner_user_id WHERE s.id = $1",
+    )
+    .bind(store_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| ApiError::internal("load store-status notice recipient", e))?;
+    let mut payload = json!({
+        "store_id": store_id.to_string(),
+        "store_name": store_name,
+    });
+    if let Some(note) = note {
+        payload["note"] = serde_json::Value::String(note.to_string());
+    }
+    notify::enqueue(&mut *conn, owner_user_id, &phone, kind, &payload)
+        .await
+        .map_err(|e| ApiError::internal("enqueue store-status notification", e))?;
     Ok(())
 }

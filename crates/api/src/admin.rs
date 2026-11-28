@@ -19,6 +19,22 @@
 //! (enforced in `orders::place_order`). The seller can still sign
 //! in and manage the catalogue; reactivation restores everything.
 //!
+//! Admin stores remake: the list carries decision context
+//! (verification tier, effective subscription plan, delivered
+//! GMV, pending-payout exposure, open returns) with the owner's
+//! phone MASKED — the pre-remake list leaked the full phone,
+//! against the Wave 28 list canon. Suspension now REQUIRES a
+//! note (`domain::validate_suspension_note`): it is stored on
+//! the store row (migration 0075), written into the audit
+//! detail, shown to the seller on their dashboard, and quoted
+//! in the `store_suspended` notice the transition enqueues in
+//! its own transaction. A transition to the status the store
+//! already holds is a 409, never a silent no-op with a phantom
+//! audit row (security audit LO-93). Suspension does NOT pause
+//! subscription billing and does NOT cancel payouts — payout
+//! decisions on a suspended store are frozen (see
+//! `transition_payout`), and that is all.
+//!
 //! Settings: rows in `platform_settings` override startup values
 //! at read time — `commission_bps` beats the startup
 //! `COMMISSION_RATE_BPS`, and `min_payout_poisha` beats the domain
@@ -60,10 +76,11 @@ use domain::{
     search_like_pattern, to_local_phone, validate_advance_bps, validate_advance_threshold,
     validate_commission_bps, validate_payout_list_sort, validate_payout_rejection_reason,
     validate_payment_reference, validate_plan_free_product_cap, validate_promotion_price_per_day,
-    validate_subscription_price, PayoutSort, ADVANCE_PERCENT_BPS_KEY, ADVANCE_THRESHOLD_KEY,
-    COMMISSION_BPS_KEY, KYC_PAYOUT_GATE_KEY, MIN_PAYOUT_KEY, MIN_PAYOUT_POISHA, PLAN_BUSINESS,
-    PLAN_FREE_PRODUCT_CAP_KEY, PLAN_PRO, PROMOTION_PRICE_PER_DAY_KEY, SUBSCRIPTION_PRICE_BUSINESS_KEY,
-    SUBSCRIPTION_PRICE_PRO_KEY,
+    validate_store_list_sort, validate_subscription_price, validate_suspension_note, PayoutSort,
+    StoreSort, ADVANCE_PERCENT_BPS_KEY, ADVANCE_THRESHOLD_KEY, COMMISSION_BPS_KEY,
+    KYC_PAYOUT_GATE_KEY, MIN_PAYOUT_KEY, MIN_PAYOUT_POISHA, NOTIFICATION_STORE_REACTIVATED,
+    NOTIFICATION_STORE_SUSPENDED, PLAN_BUSINESS, PLAN_FREE_PRODUCT_CAP_KEY, PLAN_PRO,
+    PROMOTION_PRICE_PER_DAY_KEY, SUBSCRIPTION_PRICE_BUSINESS_KEY, SUBSCRIPTION_PRICE_PRO_KEY,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
@@ -72,7 +89,7 @@ use uuid::Uuid;
 use crate::audit::record_admin_action;
 use crate::auth::{load_user, AuthUser, User};
 use crate::orders::{load_order, OrderList};
-use crate::payouts::Payout;
+use crate::payouts::{Earnings, Payout};
 use crate::products::clamp_pagination;
 use crate::stores::Store;
 use crate::{ApiError, AppState};
@@ -377,17 +394,105 @@ pub async fn get_overview(pool: &PgPool) -> Result<AdminOverview, ApiError> {
 // Stores: list + suspension
 // ---------------------------------------------------------------------------
 
-/// A store as the admin sees it: the public store fields plus the
-/// owner's phone and the product count.
-#[derive(Debug, Serialize, FromRow)]
+/// The raw admin store row, before the owner's phone is
+/// masked. Shared by the queue list and the single-store
+/// detail — one projection, so the two can never disagree
+/// about what a store row carries. The full phone exists
+/// ONLY inside this struct; every serialized view is built
+/// from it through [`AdminStore::from_row`], which masks.
+#[derive(Debug, FromRow)]
+struct AdminStoreRow {
+    id: Uuid,
+    owner_user_id: Uuid,
+    owner_phone: String,
+    owner_name: Option<String>,
+    slug: String,
+    name: String,
+    description: Option<String>,
+    status: String,
+    verified_tier: String,
+    /// The EFFECTIVE plan: the subscription's plan while a
+    /// subscription is live (`active` and unexpired), else
+    /// `free` — the same live-plan rule the subscription
+    /// module applies, computed in SQL so a lapsed paid plan
+    /// never presents as current.
+    plan: String,
+    product_count: i64,
+    logo_url: Option<String>,
+    follower_count: i64,
+    order_count: i64,
+    /// Delivered GMV in poisha: SUM(goods − discount +
+    /// delivery) over DELIVERED sub-orders — the overview
+    /// remake's canonical GMV definition.
+    delivered_gmv_poisha: i64,
+    /// Payouts in `requested` — the only status that is
+    /// still the platform's decision (the payouts canon).
+    pending_payout_count: i64,
+    pending_payout_poisha: i64,
+    /// Return requests still open (`requested`/`approved`)
+    /// — the metrics canon.
+    open_returns_count: i64,
+    /// The admin's reason for the CURRENT suspension
+    /// (migration 0075); `None` while the store is active.
+    suspension_note: Option<String>,
+    /// When the store's status last changed, either way.
+    status_changed_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+}
+
+/// The admin store projection shared by the list query and
+/// the detail read: one SELECT text, so a column added for
+/// one surface cannot be forgotten by the other.
+const ADMIN_STORE_PROJECTION: &str = "SELECT s.id, s.owner_user_id, \
+    u.phone AS owner_phone, u.name AS owner_name, s.slug, s.name, \
+    s.description, s.status, s.verified_tier, \
+    CASE WHEN ss.status = 'active' AND ss.expires_at > now() \
+         THEN ss.plan ELSE 'free' END AS plan, \
+    (SELECT COUNT(*) FROM products p WHERE p.store_id = s.id) AS product_count, \
+    s.logo_url, \
+    (SELECT COUNT(*) FROM store_follows f WHERE f.store_id = s.id) AS follower_count, \
+    (SELECT COUNT(*) FROM sub_orders so WHERE so.store_id = s.id) AS order_count, \
+    COALESCE((SELECT SUM(so.goods_subtotal_poisha - so.discount_poisha \
+        + so.delivery_charge_poisha)::bigint FROM sub_orders so \
+        WHERE so.store_id = s.id AND so.status = 'delivered'), 0) \
+        AS delivered_gmv_poisha, \
+    (SELECT COUNT(*) FROM payouts po \
+        WHERE po.store_id = s.id AND po.status = 'requested') AS pending_payout_count, \
+    COALESCE((SELECT SUM(po.amount_poisha)::bigint FROM payouts po \
+        WHERE po.store_id = s.id AND po.status = 'requested'), 0) \
+        AS pending_payout_poisha, \
+    (SELECT COUNT(*) FROM return_requests rr \
+        WHERE rr.store_id = s.id AND rr.status IN ('requested', 'approved')) \
+        AS open_returns_count, \
+    s.suspension_note, s.status_changed_at, s.created_at \
+    FROM stores s \
+    JOIN users u ON u.id = s.owner_user_id \
+    LEFT JOIN store_subscriptions ss ON ss.store_id = s.id";
+
+/// A store as the admin sees it: identity, tier + effective
+/// plan, the decision aggregates (products, followers,
+/// orders, delivered GMV, pending-payout exposure, open
+/// returns), and the suspension metadata. The owner's phone
+/// is MASKED (admin stores remake — the pre-remake list
+/// carried the full phone, the leak the payouts remake
+/// removed from its own list). No admin store response
+/// carries the full phone: unlike a payout, no store
+/// decision is executed BY phone, so no detail-level reveal
+/// is justified here.
+#[derive(Debug, Serialize)]
 pub struct AdminStore {
     pub id: Uuid,
     pub owner_user_id: Uuid,
-    pub owner_phone: String,
+    pub owner_name: Option<String>,
+    /// The store owner's phone, masked via
+    /// `domain::mask_phone`.
+    pub owner_phone_masked: String,
     pub slug: String,
     pub name: String,
     pub description: Option<String>,
     pub status: String,
+    pub verified_tier: String,
+    pub plan: String,
     pub product_count: i64,
     /// The store's logo URL (Wave 51 extension) — the
     /// admin list shows the mark it moderates.
@@ -396,22 +501,136 @@ pub struct AdminStore {
     /// list shows the audience a moderation decision
     /// affects.
     pub follower_count: i64,
+    pub order_count: i64,
+    pub delivered_gmv_poisha: i64,
+    pub pending_payout_count: i64,
+    pub pending_payout_poisha: i64,
+    pub open_returns_count: i64,
+    pub suspension_note: Option<String>,
+    pub status_changed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 
-/// A page of admin stores plus the total count.
+impl AdminStore {
+    fn from_row(row: AdminStoreRow) -> Self {
+        AdminStore {
+            id: row.id,
+            owner_user_id: row.owner_user_id,
+            owner_name: row.owner_name,
+            owner_phone_masked: mask_phone(&row.owner_phone),
+            slug: row.slug,
+            name: row.name,
+            description: row.description,
+            status: row.status,
+            verified_tier: row.verified_tier,
+            plan: row.plan,
+            product_count: row.product_count,
+            logo_url: row.logo_url,
+            follower_count: row.follower_count,
+            order_count: row.order_count,
+            delivered_gmv_poisha: row.delivered_gmv_poisha,
+            pending_payout_count: row.pending_payout_count,
+            pending_payout_poisha: row.pending_payout_poisha,
+            open_returns_count: row.open_returns_count,
+            suspension_note: row.suspension_note,
+            status_changed_at: row.status_changed_at,
+            created_at: row.created_at,
+        }
+    }
+}
+
+/// Whole-queue store counts for the admin list header
+/// (admin stores remake): counts by status and by
+/// verification tier over ALL stores, deliberately
+/// UNFILTERED — the summary describes the platform, not
+/// the page (the payout summary's rule).
+#[derive(Debug, Serialize)]
+pub struct AdminStoreSummary {
+    pub total: i64,
+    pub active: i64,
+    pub suspended: i64,
+    pub unverified: i64,
+    pub basic: i64,
+    pub verified: i64,
+}
+
+/// A page of admin stores plus the total count and the
+/// whole-queue summary.
 #[derive(Debug, Serialize)]
 pub struct AdminStoreList {
     pub items: Vec<AdminStore>,
     pub total: i64,
     pub page: i64,
     pub limit: i64,
+    pub summary: AdminStoreSummary,
 }
 
-/// List stores, newest first; `q` matches name or slug.
+/// The whole-queue summary query (admin stores remake), in
+/// the payout summary's FILTER-count style.
+async fn store_summary(pool: &PgPool) -> Result<AdminStoreSummary, ApiError> {
+    #[derive(FromRow)]
+    struct StoreSummaryRow {
+        total: i64,
+        active: i64,
+        suspended: i64,
+        unverified: i64,
+        basic: i64,
+        verified: i64,
+    }
+    let row: StoreSummaryRow = sqlx::query_as(
+        "SELECT COUNT(*)::bigint AS total, \
+           (COUNT(*) FILTER (WHERE status = 'active'))::bigint AS active, \
+           (COUNT(*) FILTER (WHERE status = 'suspended'))::bigint AS suspended, \
+           (COUNT(*) FILTER (WHERE verified_tier = 'unverified'))::bigint AS unverified, \
+           (COUNT(*) FILTER (WHERE verified_tier = 'basic'))::bigint AS basic, \
+           (COUNT(*) FILTER (WHERE verified_tier = 'verified'))::bigint AS verified \
+         FROM stores",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::internal("admin store summary", e))?;
+    Ok(AdminStoreSummary {
+        total: row.total,
+        active: row.active,
+        suspended: row.suspended,
+        unverified: row.unverified,
+        basic: row.basic,
+        verified: row.verified,
+    })
+}
+
+/// The ORDER BY fragment for a store-list sort — a fixed
+/// string per variant (user input never reaches the SQL
+/// text), every arm ending in the `id` tiebreaker the
+/// deterministic-order rule requires.
+fn store_order_by(sort: StoreSort) -> &'static str {
+    match sort {
+        StoreSort::Newest => "ORDER BY s.created_at DESC, s.id DESC",
+        StoreSort::Oldest => "ORDER BY s.created_at ASC, s.id ASC",
+        StoreSort::NameAsc => "ORDER BY s.name ASC, s.id DESC",
+        StoreSort::GmvDesc => "ORDER BY delivered_gmv_poisha DESC, s.id DESC",
+        StoreSort::FollowersDesc => "ORDER BY follower_count DESC, s.id DESC",
+    }
+}
+
+/// List stores for the admin queue (admin stores remake):
+/// `q` matches name or slug (LIKE-escaped via
+/// `domain::search_like_pattern` — the pre-remake query
+/// interpolated the raw text, so `%` and `_` acted as
+/// wildcards); `status` and `tier` filter exactly and are
+/// validated fail-closed (an unknown value is a 400, never
+/// a silently empty page); `sort` is validated by the
+/// domain. The total and the items run the SAME joins and
+/// filters (the pre-remake count query lacked the users
+/// join, so a store whose owner row was missing counted
+/// toward the total but never appeared).
+#[allow(clippy::too_many_arguments)]
 pub async fn list_stores(
     pool: &PgPool,
     q: Option<&str>,
+    status: Option<&str>,
+    tier: Option<&str>,
+    sort: Option<&str>,
     page: Option<i64>,
     limit: Option<i64>,
 ) -> Result<AdminStoreList, ApiError> {
@@ -420,65 +639,279 @@ pub async fn list_stores(
     let pattern: Option<String> = q
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| format!("%{s}%"));
+        .map(search_like_pattern);
+    let status: Option<&str> = match status.map(str::trim) {
+        None | Some("") => None,
+        Some("active") => Some("active"),
+        Some("suspended") => Some("suspended"),
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "status must be one of: active, suspended",
+            ))
+        }
+    };
+    let tier: Option<&str> = match tier.map(str::trim) {
+        None | Some("") => None,
+        Some("unverified") => Some("unverified"),
+        Some("basic") => Some("basic"),
+        Some("verified") => Some("verified"),
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "tier must be one of: unverified, basic, verified",
+            ))
+        }
+    };
+    let sort = validate_store_list_sort(sort).map_err(ApiError::bad_request)?;
 
     let total: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM stores s \
-         WHERE ($1::text IS NULL OR s.name ILIKE $1 OR s.slug ILIKE $1)",
+         JOIN users u ON u.id = s.owner_user_id \
+         WHERE ($1::text IS NULL OR s.name ILIKE $1 OR s.slug ILIKE $1) \
+           AND ($2::text IS NULL OR s.status = $2) \
+           AND ($3::text IS NULL OR s.verified_tier = $3)",
     )
     .bind(&pattern)
+    .bind(status)
+    .bind(tier)
     .fetch_one(pool)
     .await
     .map_err(|e| ApiError::internal("count admin stores", e))?;
 
-    let items: Vec<AdminStore> = sqlx::query_as(
-        "SELECT s.id, s.owner_user_id, u.phone AS owner_phone, s.slug, s.name, \
-         s.description, s.status, \
-         (SELECT COUNT(*) FROM products p WHERE p.store_id = s.id) AS product_count, \
-         s.logo_url, \
-         (SELECT COUNT(*) FROM store_follows f WHERE f.store_id = s.id) AS follower_count, \
-         s.created_at \
-         FROM stores s JOIN users u ON u.id = s.owner_user_id \
+    let rows: Vec<AdminStoreRow> = sqlx::query_as(&format!(
+        "{ADMIN_STORE_PROJECTION} \
          WHERE ($1::text IS NULL OR s.name ILIKE $1 OR s.slug ILIKE $1) \
-         ORDER BY s.created_at DESC LIMIT $2 OFFSET $3",
-    )
+           AND ($2::text IS NULL OR s.status = $2) \
+           AND ($3::text IS NULL OR s.verified_tier = $3) \
+         {} LIMIT $4 OFFSET $5",
+        store_order_by(sort)
+    ))
     .bind(&pattern)
+    .bind(status)
+    .bind(tier)
     .bind(limit)
     .bind(offset)
     .fetch_all(pool)
     .await
     .map_err(|e| ApiError::internal("list admin stores", e))?;
 
+    let summary = store_summary(pool).await?;
+
     Ok(AdminStoreList {
-        items,
+        items: rows.into_iter().map(AdminStore::from_row).collect(),
         total,
         page,
         limit,
+        summary,
     })
 }
 
-/// Set a store's status (`active` or `suspended`; anything else is
-/// a 400). Returns the shared store view. Suspending is reversible
-/// and deletes nothing — see the module docs for what it blocks.
-/// Wave 28: the update and its audit row (`store.suspend` /
-/// `store.reactivate`) commit in one transaction.
+/// One of a store owner's stores, on the admin store
+/// detail: the verification detail's rollup shape PLUS the
+/// store's own status — a suspended sibling is exactly
+/// what a reviewer of THIS store needs to see.
+#[derive(Debug, Serialize, FromRow)]
+pub struct AdminOwnerStoreSummary {
+    pub store_id: Uuid,
+    pub store_slug: String,
+    pub store_name: String,
+    pub status: String,
+    pub tier: String,
+    /// The store's verification application status, or
+    /// `none` when it never applied.
+    pub verification_status: String,
+}
+
+/// One store in full, for the admin who must decide on it
+/// (admin stores remake): the queue row (flattened) plus
+/// the subscription view, the canonical earnings, the
+/// returns exposure (the payout detail's own block), the
+/// verification summary, the owner's other stores, and the
+/// store's audit history. Composed from the canonical
+/// readers — no aggregate is re-derived here. The owner
+/// phone stays MASKED even here (see [`AdminStore`]).
+#[derive(Debug, Serialize)]
+pub struct AdminStoreDetail {
+    #[serde(flatten)]
+    pub store: AdminStore,
+    pub subscription: crate::subscriptions::SubscriptionView,
+    pub earnings: Earnings,
+    pub returns_exposure: PayoutReturnsExposure,
+    pub verification: crate::verification::SellerVerificationView,
+    pub owner_stores: Vec<AdminOwnerStoreSummary>,
+    pub audit_history: Vec<crate::audit::AdminAuditEntry>,
+}
+
+/// Read one store's admin detail. The store row is read
+/// first and 404s before any sub-read runs (the payout
+/// detail's order).
+pub async fn get_admin_store_detail(
+    state: &AppState,
+    store_id: Uuid,
+) -> Result<AdminStoreDetail, ApiError> {
+    let pool = state.require_pool()?;
+    let row: AdminStoreRow = sqlx::query_as(&format!(
+        "{ADMIN_STORE_PROJECTION} WHERE s.id = $1"
+    ))
+    .bind(store_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ApiError::internal("load admin store detail", e))?
+    .ok_or_else(|| ApiError::not_found("store not found"))?;
+    let owner_user_id = row.owner_user_id;
+    let verified_tier = row.verified_tier.clone();
+    let store = AdminStore::from_row(row);
+
+    let subscription = crate::subscriptions::get_subscription_view(state, store_id).await?;
+    let earnings = crate::payouts::seller_earnings_on(pool, store_id).await?;
+
+    #[derive(FromRow)]
+    struct StoreReturnsExposureRow {
+        in_flight_count: i64,
+        at_risk_payout_poisha: i64,
+        received_refund_pending_count: i64,
+        received_refund_pending_poisha: i64,
+    }
+    let exposure: StoreReturnsExposureRow = sqlx::query_as(
+        "SELECT \
+           (COUNT(*) FILTER (WHERE rr.status IN ('requested', 'approved')))::bigint \
+             AS in_flight_count, \
+           COALESCE(SUM(so.seller_payout_poisha) FILTER \
+             (WHERE rr.status IN ('requested', 'approved') \
+                AND so.status = 'delivered'), 0)::bigint AS at_risk_payout_poisha, \
+           (COUNT(*) FILTER (WHERE rr.refund_status = 'pending'))::bigint \
+             AS received_refund_pending_count, \
+           COALESCE(SUM(rr.refund_poisha) FILTER \
+             (WHERE rr.refund_status = 'pending'), 0)::bigint \
+             AS received_refund_pending_poisha \
+         FROM return_requests rr \
+         JOIN sub_orders so ON so.id = rr.sub_order_id \
+         WHERE rr.store_id = $1",
+    )
+    .bind(store_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::internal("load store returns exposure", e))?;
+    let returns_exposure = PayoutReturnsExposure {
+        in_flight_count: exposure.in_flight_count,
+        at_risk_payout_poisha: exposure.at_risk_payout_poisha,
+        received_refund_pending_count: exposure.received_refund_pending_count,
+        received_refund_pending_poisha: exposure.received_refund_pending_poisha,
+    };
+
+    let verification =
+        crate::verification::admin_verification_summary(pool, store_id, &verified_tier).await?;
+
+    let owner_stores: Vec<AdminOwnerStoreSummary> = sqlx::query_as(
+        "SELECT s.id AS store_id, s.slug AS store_slug, s.name AS store_name, \
+         s.status, s.verified_tier AS tier, \
+         COALESCE(v.status, 'none') AS verification_status \
+         FROM stores s LEFT JOIN store_verifications v ON v.store_id = s.id \
+         WHERE s.owner_user_id = $1 \
+         ORDER BY s.created_at ASC",
+    )
+    .bind(owner_user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::internal("load admin owner stores", e))?;
+
+    let audit_history =
+        crate::audit::list_audit_for_target(pool, "store", &store_id.to_string(), 20).await?;
+
+    Ok(AdminStoreDetail {
+        store,
+        subscription,
+        earnings,
+        returns_exposure,
+        verification,
+        owner_stores,
+        audit_history,
+    })
+}
+
+/// The Bangla label of a store status, for error prose —
+/// the same words the web's `storeStatusLabel` shows.
+fn store_status_label_bn(status: &str) -> &str {
+    match status {
+        "active" => "চালু",
+        "suspended" => "স্থগিত",
+        _ => status,
+    }
+}
+
+/// Set a store's status (`active` or `suspended`; anything
+/// else is a 400). Returns the shared store view.
+/// Suspending is reversible and deletes nothing — see the
+/// module docs for what it blocks.
+///
+/// Admin stores remake — the gates, in the order they fire
+/// (the payouts/verifications precedence):
+///
+/// 1. INPUT (400): the status value, then — for a suspend —
+///    the REQUIRED note
+///    ([`validate_suspension_note`]). Reactivation takes
+///    no note; one sent anyway is ignored, never stored.
+/// 2. LOCK: the store row is read `FOR UPDATE` inside the
+///    transition transaction (404 when absent) — the
+///    store-first lock order every money path here uses.
+/// 3. NO-OP (409): a transition to the status the store
+///    already holds is refused, naming the current status.
+///    The pre-remake code updated unconditionally, so a
+///    repeated suspend wrote a phantom `store.suspend`
+///    audit row every time and told the admin it had acted
+///    (security audit LO-93 prescribes exactly this 409).
+///    Nothing is written: no stamp bump, no audit row, no
+///    notice, and the stored note is untouched.
+/// 4. WRITE + AUDIT + NOTICE, one transaction: the status,
+///    the note (set on suspend, cleared on reactivate),
+///    the `status_changed_at` stamp and the acting admin
+///    (migration 0075); ONE audit row whose detail carries
+///    the note on suspend; and the `store_suspended` /
+///    `store_reactivated` notice to the owner, enqueued
+///    through the one funnel in `notices`.
 pub async fn set_store_status(
     pool: &PgPool,
     admin_id: Uuid,
     store_id: Uuid,
     status: &str,
+    note: Option<&str>,
 ) -> Result<Store, ApiError> {
     if status != "active" && status != "suspended" {
         return Err(ApiError::bad_request(
             "store status must be 'active' or 'suspended'",
         ));
     }
+    let note: Option<String> = if status == "suspended" {
+        Some(
+            validate_suspension_note(note.unwrap_or(""))
+                .map_err(ApiError::bad_request)?,
+        )
+    } else {
+        None
+    };
     let mut tx = pool
         .begin()
         .await
         .map_err(|e| ApiError::internal("begin set store status", e))?;
+    let current: Option<(String, String)> = sqlx::query_as(
+        "SELECT status, name FROM stores WHERE id = $1 FOR UPDATE",
+    )
+    .bind(store_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| ApiError::internal("lock store for status change", e))?;
+    let (current_status, store_name) =
+        current.ok_or_else(|| ApiError::not_found("store not found"))?;
+    if current_status == status {
+        return Err(ApiError::conflict(format!(
+            "স্টোরটি ইতিমধ্যে {} আছে — the store is already {}",
+            store_status_label_bn(&current_status),
+            current_status
+        )));
+    }
     let store: Store = sqlx::query_as(
-        "UPDATE stores SET status = $2 WHERE id = $1 \
+        "UPDATE stores SET status = $2, suspension_note = $3, \
+         status_changed_at = now(), status_changed_by_user_id = $4 \
+         WHERE id = $1 \
          RETURNING id, owner_user_id, slug, name, description, status, \
          facebook_page_id, facebook_page_name, sidra_auto_reply, \
          theme_key, brand_color, logo_url, banner_url, announcement, verified_tier, \
@@ -486,14 +919,19 @@ pub async fn set_store_status(
     )
     .bind(store_id)
     .bind(status)
-    .fetch_optional(&mut *tx)
+    .bind(&note)
+    .bind(admin_id)
+    .fetch_one(&mut *tx)
     .await
-    .map_err(|e| ApiError::internal("set store status", e))?
-    .ok_or_else(|| ApiError::not_found("store not found"))?;
-    let action = if status == "suspended" {
-        "store.suspend"
+    .map_err(|e| ApiError::internal("set store status", e))?;
+    let (action, notice_kind) = if status == "suspended" {
+        ("store.suspend", NOTIFICATION_STORE_SUSPENDED)
     } else {
-        "store.reactivate"
+        ("store.reactivate", NOTIFICATION_STORE_REACTIVATED)
+    };
+    let detail = match &note {
+        Some(note) => serde_json::json!({ "status": status, "note": note }),
+        None => serde_json::json!({ "status": status }),
     };
     record_admin_action(
         &mut *tx,
@@ -501,7 +939,15 @@ pub async fn set_store_status(
         action,
         "store",
         Some(&store_id.to_string()),
-        Some(serde_json::json!({ "status": status })),
+        Some(detail),
+    )
+    .await?;
+    crate::notices::enqueue_store_status_notice(
+        &mut tx,
+        store_id,
+        &store_name,
+        notice_kind,
+        note.as_deref(),
     )
     .await?;
     tx.commit()
@@ -1912,6 +2358,15 @@ pub async fn update_settings(
 #[derive(Deserialize)]
 pub struct AdminStoresQuery {
     pub q: Option<String>,
+    /// Status filter: `active` | `suspended` (admin stores
+    /// remake); an unknown value is a 400.
+    pub status: Option<String>,
+    /// Verification-tier filter: `unverified` | `basic` |
+    /// `verified`; an unknown value is a 400.
+    pub tier: Option<String>,
+    /// newest | oldest | name_asc | gmv_desc |
+    /// followers_desc.
+    pub sort: Option<String>,
     pub page: Option<i64>,
     pub limit: Option<i64>,
 }
@@ -1945,6 +2400,13 @@ pub struct AdminUsersQuery {
 #[derive(Deserialize)]
 pub struct SetStoreStatusInput {
     pub status: String,
+    /// The suspension note. REQUIRED when suspending (a
+    /// missing body field, an absent note, or a blank note
+    /// are all the same 400 — the field stays `Option` here
+    /// so an absent note reaches the service's validation
+    /// instead of dying in the extractor, the
+    /// `RejectPayoutInput` pattern). Ignored on reactivation.
+    pub note: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2034,8 +2496,26 @@ pub async fn list_stores_handler(
     require_admin(&state, &user).await?;
     let pool = state.require_pool()?;
     Ok(Json(
-        list_stores(pool, query.q.as_deref(), query.page, query.limit).await?,
+        list_stores(
+            pool,
+            query.q.as_deref(),
+            query.status.as_deref(),
+            query.tier.as_deref(),
+            query.sort.as_deref(),
+            query.page,
+            query.limit,
+        )
+        .await?,
     ))
+}
+
+pub async fn get_admin_store_detail_handler(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<AdminStoreDetail>, ApiError> {
+    require_admin(&state, &user).await?;
+    Ok(Json(get_admin_store_detail(&state, id).await?))
 }
 
 pub async fn set_store_status_handler(
@@ -2047,7 +2527,7 @@ pub async fn set_store_status_handler(
     let admin = require_admin(&state, &user).await?;
     let pool = state.require_pool()?;
     Ok(Json(
-        set_store_status(pool, admin.id, id, &input.status).await?,
+        set_store_status(pool, admin.id, id, &input.status, input.note.as_deref()).await?,
     ))
 }
 

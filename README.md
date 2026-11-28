@@ -4272,8 +4272,9 @@ Wave 10 (platform admin):
 | Method | Path | What it does |
 | --- | --- | --- |
 | GET | `/v1/admin/overview` | Bearer, admin. Platform metrics: user/store/product/order counts, GMV, commission earned, pending payouts (count + amount), pending online payments |
-| GET | `/v1/admin/stores?q=&page=&limit=` | Bearer, admin. Every store with owner phone, product count and status; `q` matches name or slug |
-| PATCH | `/v1/admin/stores/{id}/status` | Bearer, admin. Set a store `active` or `suspended` (anything else: 400); returns the store view |
+| GET | `/v1/admin/stores?q=&status=&tier=&sort=&page=&limit=` | Bearer, admin. The store queue: MASKED owner phone, tier + effective plan, decision aggregates (products, followers, orders, delivered GMV, pending-payout exposure, open returns), suspension note + stamp, and a whole-queue summary; `q` matches name or slug (LIKE-escaped); unknown filter/sort values: 400 |
+| GET | `/v1/admin/stores/{id}` | Bearer, admin. One store in full: the queue row plus subscription view, canonical earnings, returns exposure, verification summary, the owner's stores (with statuses) and the store's audit history; owner phone stays masked |
+| PATCH | `/v1/admin/stores/{id}/status` | Bearer, admin. Set a store `active` or `suspended` (anything else: 400). Suspending REQUIRES a `note` (missing/blank: 400) — stored on the store, audited, seller-visible, notified. A transition to the current status is a 409 and writes nothing. Returns the store view |
 | GET | `/v1/admin/orders?status=&page=&limit=` | Bearer, admin. Every order (the shared buyer order view), newest first, optional order-status filter |
 | GET | `/v1/admin/payouts?status=&q=&sort=&page=&limit=` | Bearer, admin. The payout queue: store name, MASKED owner phone and account number, per-row coverage for in-flight payouts, a possible-duplicate flag, and a whole-queue `summary` by status. `status` is validated (unknown: 400); `q` searches store / phone / account and idempotency keys; `sort` is `newest` (default) / `oldest` / `amount_desc` / `amount_asc`. Full identifiers live only in the detail below (admin payouts remake) |
 | GET | `/v1/admin/payouts/{id}` | Bearer, admin. The payout detail: the queue row plus the FULL destination and owner phone, the store's earnings, returns exposure, recent seller charges, verification state, the store's current account beside the payout's snapshot (with a divergence flag), store payout history, duplicate candidates, and the payout's audit entries (admin payouts remake) |
@@ -4470,6 +4471,100 @@ audited, despite the page claiming it was. What changed —
   still a seller-hosted hotlink, so the reviewed evidence
   can change after approval (the URL at decision time is
   preserved in the submission events and audit trail).
+
+**Admin stores remake (2026-11-28, the fourth surface of the
+admin remake program; 25 analysis agents):** the store
+moderation queue was rebuilt around the decision it exists
+for — suspending a business — after the analysis found the
+surface both leaking and blind:
+
+- **Privacy fix:** the admin store list carried the owner's
+  FULL phone (the same leak class the payouts remake removed
+  from its list). The list — and the new detail endpoint —
+  now carry `owner_phone_masked` only; no admin store
+  response contains the full number, because no store
+  decision is executed by phone (a deliberate divergence
+  from the payout detail, which sends money to its number).
+- **Suspension requires a reason.** `PATCH
+  /v1/admin/stores/{id}/status` with `{"status":
+  "suspended"}` now requires a `note`
+  (`domain::validate_suspension_note`, ≤500 chars; missing
+  or blank is a 400 that writes nothing). Migration 0075
+  adds `stores.suspension_note`, `status_changed_at` and
+  `status_changed_by_user_id` (the stamp backfilled from the
+  audit log's latest pivot only where it still matches the
+  current status; the note is never backfilled). The note
+  is stored on the store, written into the audit detail,
+  shown to the seller on their dashboard banner, and quoted
+  in the new `store_suspended` notice (the `store_reactivated`
+  kind announces a restore); both kinds are enqueued inside
+  the transition's own transaction through
+  `notices::enqueue_store_status_notice`. Reactivation
+  clears the note and takes none.
+- **No-op transitions are a 409.** The old code updated
+  unconditionally, so a repeated suspend appended a phantom
+  `store.suspend` audit row every time. The transition now
+  locks the store row (`FOR UPDATE`), and a request for the
+  status the store already holds is refused with a bilingual
+  409 naming the current status — no write, no audit row, no
+  notice, the stored note untouched (security audit LO-93
+  prescribes exactly this).
+- **Decision-ready queue.** The list gains status and
+  verified-tier filters (fail-closed 400s), sorts
+  (`newest`/`oldest`/`name_asc`/`gmv_desc`/`followers_desc`,
+  domain-validated), LIKE-escaped search (the old query
+  interpolated the raw text — `%` matched everything), a
+  whole-queue `summary` (counts by status and tier), and
+  per-row aggregates: effective subscription plan (live-plan
+  rule), product/follower/order counts, delivered GMV
+  (goods − discount + delivery over delivered sub-orders),
+  pending-payout count + amount (`requested` only), and open
+  returns. The count query now runs the same join as the
+  list (it previously did not, so totals could exceed the
+  items shown). Migration 0076 adds the queue index. New
+  `GET /v1/admin/stores/{id}` composes the canonical readers
+  (subscription view, `seller_earnings_on`, the payout
+  detail's returns-exposure block, the verification summary,
+  the audit log) plus an owner rollup that — unlike the
+  verification detail's — includes each store's status.
+- **Blast-radius holes closed.** Suspension already sealed
+  discovery and checkout; three paths still leaked. Cart add
+  read only the product's status, so a suspended store's
+  product could be carted — it now refuses with the cart
+  module's bilingual 400. Reorder gains a dedicated domain
+  skip reason (`store_suspended`, checked in
+  `reorder_decision`) instead of misreporting the line, and
+  the buy-again rail filters suspended stores. All three
+  follower-notice funnels (new product, new post, flash
+  sale) ignored the store's status, pinging followers about
+  pages that publicly 404 — they now enqueue nothing while
+  the store is suspended (publishing itself still works;
+  nothing retro-fires on reactivation).
+- **Web:** `/admin/stores` rebuilt to the remake standard
+  (summary chips, status/tier filters, sort, debounced
+  search, pagination, expandable detail, one Dialog —
+  danger variant for suspend with the required note and the
+  honest consequence list, including that subscription
+  billing CONTINUES and payouts are frozen, not cancelled);
+  the followers page brought to the same standard
+  (unchanged API — it was already masked and paginated);
+  a suspension banner on the seller dashboard; Bangla
+  labels for the two new notice kinds (plus the previously
+  unlabelled `store_new_post` / `gift_card_expiring`).
+- **Honest limits:** suspension does NOT pause subscription
+  billing (the worker charges suspended stores identically —
+  documented asymmetry, unchanged); the public store PROFILE
+  of a suspended store still resolves (identity and stats
+  only — its products are already hidden everywhere; making
+  it 404 is a named follow-up, not done here); the
+  recently-viewed rail is a client-side snapshot and does
+  not revalidate store status; there is deliberately no
+  bulk suspend/restore (one click would freeze many stores'
+  payouts at once, and no workload evidence justifies it)
+  and no store deletion anywhere (suspension is the kill
+  switch by design); stores suspended before this remake
+  carry no note and possibly no stamp — the UI says so
+  instead of inventing either.
 
 **Settings override precedence:** a row in `platform_settings`
 (migration 0013) beats the startup value, which beats the

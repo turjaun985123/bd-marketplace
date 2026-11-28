@@ -292,18 +292,35 @@ pub async fn add_cart_item(
 ) -> Result<CartView, ApiError> {
     let add_qty = validate_cart_quantity(quantity).map_err(ApiError::bad_request)?;
 
-    let status: Option<String> = sqlx::query_scalar("SELECT status FROM products WHERE id = $1")
-        .bind(product_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| ApiError::internal("load product for cart", e))?;
-    match status.as_deref() {
+    let statuses: Option<(String, String)> = sqlx::query_as(
+        "SELECT p.status, s.status FROM products p \
+         JOIN stores s ON s.id = p.store_id WHERE p.id = $1",
+    )
+    .bind(product_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ApiError::internal("load product for cart", e))?;
+    match statuses {
         None => return Err(ApiError::not_found("product not found")),
-        Some("active") => {}
-        Some(_) => {
-            return Err(ApiError::bad_request(
-                "only active products can be added to the cart",
-            ))
+        Some((product_status, store_status)) => {
+            if product_status != "active" {
+                return Err(ApiError::bad_request(
+                    "only active products can be added to the cart",
+                ));
+            }
+            // Admin stores remake: a SUSPENDED store takes
+            // no orders, so its products cannot enter a cart
+            // either. The pre-remake check read only the
+            // product's own status, so a suspended store's
+            // stock could be carted (and then sat in the
+            // cart view) until checkout's 409 stopped it —
+            // the refusal belongs here, at the door, in the
+            // cart module's own 400 style.
+            if store_status != "active" {
+                return Err(ApiError::bad_request(
+                    "স্টোরটি সাময়িকভাবে স্থগিত আছে — this store is temporarily suspended and cannot take orders right now",
+                ));
+            }
         }
     }
 

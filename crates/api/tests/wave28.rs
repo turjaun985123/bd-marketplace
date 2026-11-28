@@ -467,7 +467,7 @@ async fn wave28_security_hardening_and_audit_log_flow() {
         &app,
         Method::PATCH,
         &uri,
-        Some(json!({ "status": "suspended" })),
+        Some(json!({ "status": "suspended", "note": "Test suspension" })),
         Some(&admin),
     )
     .await;

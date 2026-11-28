@@ -14,7 +14,8 @@
 //!   mark-paid: non-secret proof-of-payment context. Account
 //!   numbers and phones are NEVER written here).
 //! - `store.suspend`, `store.reactivate` — target `store`,
-//!   detail `{status}`.
+//!   detail `{status}` (plus `note` on a suspension — the
+//!   reason, required since the admin stores remake).
 //! - `settings.update` — target `platform_settings`, detail
 //!   `{changed_keys}`: the NAMES of the settings the patch
 //!   changed, never their values.

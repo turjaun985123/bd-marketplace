@@ -2560,7 +2560,7 @@ export interface ReorderAdded {
 export interface ReorderSkipped {
   /** The title as bought (the order's snapshot). */
   title: string;
-  /** product_unavailable | variant_unavailable | out_of_stock | cart_limit */
+  /** product_unavailable | variant_unavailable | out_of_stock | cart_limit | store_suspended */
   reason: string;
   /** The buyer-facing bilingual explanation. */
   message: string;
@@ -3350,6 +3350,12 @@ export interface SellerDashboard {
   /** Fulfillment queue tallies over the dashboard's scope
    * (Wave 40) — the summary card linking into the queue. */
   fulfillment: FulfillmentCounts;
+  /** The admin's reason for the store's current suspension
+   * (admin stores remake); null unless a note stands. */
+  suspension_note: string | null;
+  /** When the store's status last changed; null when
+   * unprovable (suspended before the remake). */
+  status_changed_at: string | null;
 }
 
 /** Where a store's payout money goes (Wave 9). */
@@ -3399,9 +3405,21 @@ export interface PayoutList {
   limit: number;
 }
 
+/** Bangla label for a store status (admin stores remake). */
+export function storeStatusLabel(status: string): string {
+  switch (status) {
+    case "active":
+      return "চালু";
+    case "suspended":
+      return "স্থগিত";
+    default:
+      return status;
+  }
+}
+
 /** Bangla label for a payout status (Wave 9). */
 export function payoutStatusLabel(status: string): string {
-  switch (status) {
+  switch (status) {  switch (status) {
     case "requested":
       return "অনুরোধ করা হয়েছে";
     case "approved":
@@ -4158,22 +4176,57 @@ export interface AdminOverview {
   payments_pending_count: number;
 }
 
-/** A store in the admin list: owner phone + product count added. */
+/**
+ * A store in the admin list (admin stores remake): identity,
+ * verification tier + effective plan, the decision aggregates
+ * (products, followers, orders, delivered GMV, pending-payout
+ * exposure, open returns) and the suspension metadata. The
+ * owner's phone is MASKED — the pre-remake list carried the
+ * full number; no admin store response carries it now.
+ */
 export interface AdminStore {
   id: string;
   owner_user_id: string;
-  owner_phone: string;
+  owner_name: string | null;
+  /** The store owner's phone, masked (e.g. 017****222). */
+  owner_phone_masked: string;
   slug: string;
   name: string;
   description: string | null;
   /** active | suspended */
   status: string;
+  /** unverified | basic | verified */
+  verified_tier: string;
+  /** The EFFECTIVE plan: the live subscription's plan, else free. */
+  plan: string;
   product_count: number;
   /** The store's logo URL (Wave 51 ext); null when unset. */
   logo_url: string | null;
   /** The store's follower count (Wave 54). */
   follower_count: number;
+  order_count: number;
+  /** SUM(goods − discount + delivery) over delivered sub-orders. */
+  delivered_gmv_poisha: number;
+  /** Payouts in `requested` — still the platform's decision. */
+  pending_payout_count: number;
+  pending_payout_poisha: number;
+  /** Return requests in requested | approved. */
+  open_returns_count: number;
+  /** The admin's reason for the current suspension; null while active. */
+  suspension_note: string | null;
+  /** When the status last changed; null when unprovable (pre-remake). */
+  status_changed_at: string | null;
   created_at: string;
+}
+
+/** Whole-queue store counts (never the filtered page). */
+export interface AdminStoreSummary {
+  total: number;
+  active: number;
+  suspended: number;
+  unverified: number;
+  basic: number;
+  verified: number;
 }
 
 export interface AdminStoreList {
@@ -4181,6 +4234,43 @@ export interface AdminStoreList {
   total: number;
   page: number;
   limit: number;
+  summary: AdminStoreSummary;
+}
+
+/** Sort orders the admin store queue accepts. */
+export type AdminStoreSort =
+  | "newest"
+  | "oldest"
+  | "name_asc"
+  | "gmv_desc"
+  | "followers_desc";
+
+/** One of a store owner's stores, on the admin store detail. */
+export interface AdminOwnerStoreSummary {
+  store_id: string;
+  store_slug: string;
+  store_name: string;
+  /** active | suspended */
+  status: string;
+  tier: string;
+  /** none | pending | approved | rejected */
+  verification_status: string;
+}
+
+/**
+ * GET /v1/admin/stores/{id} (admin stores remake): the queue
+ * row plus the subscription view, canonical earnings, returns
+ * exposure, verification summary, the owner's other stores
+ * (with their statuses), and the store's audit history. The
+ * owner phone stays masked even here.
+ */
+export interface AdminStoreDetail extends AdminStore {
+  subscription: SubscriptionView;
+  earnings: Earnings;
+  returns_exposure: PayoutReturnsExposure;
+  verification: SellerVerification;
+  owner_stores: AdminOwnerStoreSummary[];
+  audit_history: AdminAuditEntry[];
 }
 
 /** Sort orders the admin payout queue accepts. */
@@ -4403,33 +4493,55 @@ export function getAdminOverview(token: string): Promise<AdminOverview> {
   return call("/v1/admin/overview", { token });
 }
 
-/** GET /v1/admin/stores — every store, optional name/slug search. */
+/** GET /v1/admin/stores — the store queue: search, status /
+ * tier filters, sort, pagination, whole-queue summary. */
 export function listAdminStores(
   token: string,
-  params?: { q?: string; page?: number; limit?: number }
+  params?: {
+    q?: string;
+    status?: string;
+    tier?: string;
+    sort?: AdminStoreSort;
+    page?: number;
+    limit?: number;
+  }
 ): Promise<AdminStoreList> {
   const search = new URLSearchParams();
   if (params?.q) search.set("q", params.q);
+  if (params?.status) search.set("status", params.status);
+  if (params?.tier) search.set("tier", params.tier);
+  if (params?.sort) search.set("sort", params.sort);
   if (params?.page) search.set("page", String(params.page));
   if (params?.limit) search.set("limit", String(params.limit));
   const qs = search.toString();
   return call(`/v1/admin/stores${qs ? `?${qs}` : ""}`, { token });
 }
 
+/** GET /v1/admin/stores/{id} — one store's decision detail. */
+export function getAdminStoreDetail(
+  token: string,
+  storeId: string
+): Promise<AdminStoreDetail> {
+  return call(`/v1/admin/stores/${encodeURIComponent(storeId)}`, { token });
+}
+
 /**
  * PATCH /v1/admin/stores/{id}/status — suspend or reactivate a
  * store. Suspension hides its products publicly and blocks its
- * checkouts (409); it deletes nothing.
+ * checkouts (409); it deletes nothing. Suspending REQUIRES a
+ * note (the seller sees it on their dashboard and in the
+ * notice); a transition to the current status is a 409.
  */
 export function setAdminStoreStatus(
   token: string,
   storeId: string,
-  status: "active" | "suspended"
+  status: "active" | "suspended",
+  note?: string
 ): Promise<Store> {
   return call(`/v1/admin/stores/${encodeURIComponent(storeId)}/status`, {
     method: "PATCH",
     token,
-    body: { status },
+    body: note ? { status, note } : { status },
   });
 }
 

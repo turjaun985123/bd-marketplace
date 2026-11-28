@@ -2071,6 +2071,10 @@ pub fn build_app(state: AppState) -> Router {
         )
         .route("/v1/admin/stores", get(admin::list_stores_handler))
         .route(
+            "/v1/admin/stores/:id",
+            get(admin::get_admin_store_detail_handler),
+        )
+        .route(
             "/v1/admin/stores/:id/status",
             patch(admin::set_store_status_handler),
         )

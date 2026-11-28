@@ -276,7 +276,7 @@ async fn adminverif_decision_gates() {
         &app,
         Method::PATCH,
         &format!("/v1/admin/stores/{store_c}/status"),
-        Some(json!({ "status": "suspended" })),
+        Some(json!({ "status": "suspended", "note": "Test suspension" })),
         Some(&admin),
     )
     .await;

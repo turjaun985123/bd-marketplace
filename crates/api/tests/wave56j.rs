@@ -231,7 +231,11 @@ async fn set_store_status(app: &Router, admin: &str, store_id: &str, status: &st
         app,
         Method::PATCH,
         &format!("/v1/admin/stores/{store_id}/status"),
-        Some(json!({ "status": status })),
+        Some(if status == "suspended" {
+            json!({ "status": status, "note": "Test suspension" })
+        } else {
+            json!({ "status": status })
+        }),
         Some(admin),
     )
     .await;

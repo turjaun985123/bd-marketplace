@@ -155,6 +155,21 @@ pub struct SellerDashboard {
     /// the ONE counts function the fulfillment list itself
     /// uses, so the card and the queue always agree.
     pub fulfillment: crate::fulfillment::FulfillmentCounts,
+    /// The dashboard store's suspension note (admin stores
+    /// remake): the admin's reason for the CURRENT
+    /// suspension, read from the store row (migration 0075)
+    /// so the seller's dashboard banner can show why the
+    /// store is dark. `None` unless a note stands — an
+    /// active store's note is cleared at reactivation, and
+    /// stores suspended before the column existed carry
+    /// none (never fabricated).
+    pub suspension_note: Option<String>,
+    /// When the dashboard store's status last changed,
+    /// either direction (migration 0075); the banner's
+    /// "since" stamp. `None` for a store whose status has
+    /// never changed since the column landed and whose
+    /// history the backfill could not prove.
+    pub status_changed_at: Option<DateTime<Utc>>,
 }
 
 /// Where a store's payout money goes; also a `payout_accounts` row.
@@ -566,6 +581,12 @@ async fn build_dashboard(
     }
 
     let earnings = seller_earnings(pool, store.id).await?;
+    let (suspension_note, status_changed_at): (Option<String>, Option<DateTime<Utc>>) =
+        sqlx::query_as("SELECT suspension_note, status_changed_at FROM stores WHERE id = $1")
+            .bind(store.id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| ApiError::internal("load store suspension metadata", e))?;
     let recent =
         crate::orders::list_seller_sub_orders_scoped(pool, scope, Some(1), Some(5)).await?;
     let low_stock_items = crate::inventory::low_stock_items_for_seller(pool, scope).await?;
@@ -583,6 +604,8 @@ async fn build_dashboard(
         low_stock_items,
         unanswered_questions,
         fulfillment,
+        suspension_note,
+        status_changed_at,
     })
 }
 

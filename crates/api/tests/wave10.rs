@@ -341,7 +341,7 @@ async fn wave10_admin_panel_flow() {
     assert_eq!(status, StatusCode::OK, "admin stores: {list}");
     assert_eq!(list["total"], 1);
     assert_eq!(list["items"][0]["id"], store);
-    assert_eq!(list["items"][0]["owner_phone"], "+8801722222222");
+    assert_eq!(list["items"][0]["owner_phone_masked"], "017****222");
     assert_eq!(list["items"][0]["product_count"], 1);
     assert_eq!(list["items"][0]["status"], "active");
 
@@ -488,7 +488,7 @@ async fn wave10_admin_panel_flow() {
         &app,
         Method::PATCH,
         &uri,
-        Some(json!({ "status": "suspended" })),
+        Some(json!({ "status": "suspended", "note": "Test suspension" })),
         Some(&admin),
     )
     .await;
