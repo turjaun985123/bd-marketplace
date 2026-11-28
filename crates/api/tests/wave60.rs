@@ -249,7 +249,7 @@ async fn wave60_issue_reveal_masking_and_balance_check() {
     assert_eq!(balance["last4"], &code[code.len() - 4..]);
     let grouped = format!(
         "{}-{} {}-{} {}",
-        &code[..9].to_lowercase(),
+        code[..9].to_lowercase(),
         &code[9..13],
         &code[13..17],
         &code[17..21],
