@@ -222,7 +222,7 @@ async fn wave57_bulk_import_creates_with_category_resolution_and_follower_notice
     let (status, report) = call_csv(
         &app,
         &format!("/v1/seller/products/bulk-import?store_id={store_id}"),
-        csv,
+        &csv,
         &seller,
     )
     .await;
