@@ -244,7 +244,8 @@ async fn build_seller_export(
 
     let payouts: Vec<Payout> = sqlx::query_as(
         "SELECT id, store_id, amount_poisha, method, account_name, account_number, \
-         status, note, created_at, processed_at, idempotency_key \
+         status, note, created_at, processed_at, approved_at, paid_at, rejected_at, \
+         payment_reference, idempotency_key \
          FROM payouts WHERE store_id = ANY($1) ORDER BY created_at DESC",
     )
     .bind(store_ids)

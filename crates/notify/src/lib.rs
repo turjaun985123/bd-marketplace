@@ -155,7 +155,9 @@ pub fn sender_from_env(dev_mode: bool) -> Box<dyn SmsSender> {
 
 /// The template variables one payload carries, read out of
 /// the JSON the API funnels store: `order_id`, `store_name`,
-/// `amount_poisha`, `status`, and (Wave 54) `product_title`.
+/// `amount_poisha`, `status`, (Wave 54) `product_title`,
+/// `sale_title`, `post_title`, (Wave 60) `card_last4`, and
+/// (admin payouts remake) `note` + `payment_reference`.
 /// Missing fields render as the domain defaults (empty /
 /// none) — `render_body` has a defined output for every
 /// combination.
@@ -194,6 +196,16 @@ fn vars_from_payload(payload: &Value) -> NotificationVars {
             .to_string(),
         card_last4: payload
             .get("card_last4")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        note: payload
+            .get("note")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        payment_reference: payload
+            .get("payment_reference")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),

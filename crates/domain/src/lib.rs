@@ -1516,11 +1516,79 @@ pub fn is_valid_payout_status(status: &str) -> bool {
 /// rejected. (The endpoints that drive these moves land with the
 /// admin wave; the table lives here now so the rule exists in
 /// exactly one place from the start.)
+///
+/// Admin payouts remake: `approved → rejected` is legal. An
+/// approval commits the amount (it counts as paid out in the
+/// earnings aggregate); without an exit, an approval whose
+/// coverage later disappears (a return is received, a charge
+/// lands) could only sit in `approved` forever or be marked
+/// paid against money the store no longer has. Rejecting an
+/// approved payout releases the committed amount back to the
+/// seller's available balance, under the same required-reason
+/// rule as rejecting a request.
 pub fn can_transition_payout(from: &str, to: &str) -> bool {
     matches!(
         (from, to),
-        ("requested", "approved") | ("requested", "rejected") | ("approved", "paid")
+        ("requested", "approved")
+            | ("requested", "rejected")
+            | ("approved", "paid")
+            | ("approved", "rejected")
     )
+}
+
+/// Maximum length of an admin's payout rejection reason, in
+/// characters.
+pub const MAX_PAYOUT_REJECTION_REASON_CHARS: usize = 500;
+
+/// Validate an admin's reason for rejecting a payout. The
+/// reason is REQUIRED (a seller told only "no" cannot fix
+/// anything, and the amount silently returning to their
+/// available balance is not an explanation), so blank is an
+/// error — the same rule as the verification reviewer note
+/// ([`validate_reviewer_note`]), with payout wording. The
+/// value is trimmed and may be at most
+/// [`MAX_PAYOUT_REJECTION_REASON_CHARS`] characters, counted
+/// in Unicode characters (Bangla reasons are expected).
+pub fn validate_payout_rejection_reason(raw: &str) -> Result<String, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("a payout rejection reason is required");
+    }
+    if trimmed.chars().count() > MAX_PAYOUT_REJECTION_REASON_CHARS {
+        return Err("payout rejection reason must be at most 500 characters");
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Maximum length of a payout payment reference, in
+/// characters; mirrors the `payment_reference` CHECK on the
+/// payouts table (migration 0072).
+pub const MAX_PAYMENT_REFERENCE_CHARS: usize = 128;
+
+/// Validate the payment reference an admin records when
+/// marking a payout paid: the bKash/Nagad transaction id or
+/// the bank transfer reference proving the money was sent.
+/// Required, 4 to 128 characters after trimming (the floor
+/// keeps a stray keystroke from becoming "proof"), printable
+/// ASCII only — internal spaces are allowed because bank
+/// references carry them, and no gateway-specific shape is
+/// imposed because bank references are free-form. The value
+/// is stored verbatim after the trim: it must match the
+/// gateway/bank record byte for byte when reconciled, so
+/// nothing is case-folded or stripped.
+pub fn validate_payment_reference(raw: &str) -> Result<String, &'static str> {
+    let trimmed = raw.trim();
+    let char_count = trimmed.chars().count();
+    if char_count < 4 {
+        return Err("a payment reference of at least 4 characters is required");
+    }
+    if char_count > MAX_PAYMENT_REFERENCE_CHARS {
+        return Err("payment reference must be at most 128 characters");
+    }
+    if !trimmed.chars().all(|c| (' '..='~').contains(&c)) {
+        return Err("payment reference must contain only printable ASCII characters");
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Validate a seller's payout account — where payout money goes.
@@ -3334,6 +3402,35 @@ pub fn validate_review_sort(sort: Option<&str>) -> Result<ReviewSort, &'static s
     }
 }
 
+/// The admin payout queue's sort orders (admin payouts
+/// remake). `Newest` is the pre-remake behaviour and the
+/// default; `Oldest` is the working order for a processing
+/// queue (first in, first decided); the amount orders serve
+/// triage and reconciliation. The API layer maps each
+/// variant to a fixed ORDER BY fragment — user input never
+/// reaches the SQL text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayoutSort {
+    Newest,
+    Oldest,
+    AmountDesc,
+    AmountAsc,
+}
+
+/// Validate an admin payout-list `sort` parameter (admin
+/// payouts remake): absent means [`PayoutSort::Newest`]; an
+/// unknown value is an error naming the allowed set, in the
+/// style of [`validate_review_sort`].
+pub fn validate_payout_list_sort(sort: Option<&str>) -> Result<PayoutSort, &'static str> {
+    match sort {
+        None | Some("newest") => Ok(PayoutSort::Newest),
+        Some("oldest") => Ok(PayoutSort::Oldest),
+        Some("amount_desc") => Ok(PayoutSort::AmountDesc),
+        Some("amount_asc") => Ok(PayoutSort::AmountAsc),
+        Some(_) => Err("sort must be one of: newest, oldest, amount_desc, amount_asc"),
+    }
+}
+
 /// May this user cast a helpful vote on a review (Wave 54
 /// extension)? Everyone except the review's AUTHOR: a
 /// vote is other buyers certifying the review helped
@@ -4149,6 +4246,16 @@ pub const NOTIFICATION_SUB_ORDER_DELIVERED: &str = "sub_order_delivered";
 pub const NOTIFICATION_SUB_ORDER_CANCELLED: &str = "sub_order_cancelled";
 pub const NOTIFICATION_SUB_ORDER_RETURNED: &str = "sub_order_returned";
 pub const NOTIFICATION_PAYOUT_PAID: &str = "payout_paid";
+/// Admin payouts remake: a payout request was approved.
+/// The wording must never claim the money was SENT —
+/// approval only commits it; the `payout_paid` notice is
+/// the one that announces the send.
+pub const NOTIFICATION_PAYOUT_APPROVED: &str = "payout_approved";
+/// Admin payouts remake: a payout request (or an approved
+/// payout) was rejected. The body carries the admin's
+/// reason via [`NotificationVars::note`], and the amount
+/// returns to the seller's available balance.
+pub const NOTIFICATION_PAYOUT_REJECTED: &str = "payout_rejected";
 pub const NOTIFICATION_RETURN_UPDATE: &str = "return_update";
 /// Wave 54: a store a user follows published a new product;
 /// the notice goes to each follower (see the API's
@@ -4216,6 +4323,18 @@ pub struct NotificationVars {
     /// last4: a notification body is not a place for a
     /// bearer credential.
     pub card_last4: String,
+    /// Free text a template must quote back to the reader
+    /// (admin payouts remake) — read only by the
+    /// `payout_rejected` template, which prints it as the
+    /// rejection reason; empty for every other kind.
+    pub note: String,
+    /// The payment reference recorded when a payout was
+    /// marked paid (admin payouts remake) — read only by
+    /// the `payout_paid` template, which appends it so the
+    /// seller can match the credit in their wallet or bank
+    /// statement; empty when no reference was recorded
+    /// (every payout paid before the remake).
+    pub payment_reference: String,
 }
 
 /// The short display form of an order id: its first 8
@@ -4262,13 +4381,53 @@ pub fn render_body(kind: &str, vars: &NotificationVars) -> String {
         NOTIFICATION_SUB_ORDER_RETURNED => format!(
             "BD Marketplace: আপনার অর্ডার #{short}-এর পণ্য {store}-তে ফেরত এসেছে।"
         ),
-        NOTIFICATION_PAYOUT_PAID => match vars.amount_poisha {
+        NOTIFICATION_PAYOUT_PAID => {
+            // The reference (when one was recorded) rides
+            // along so the seller can match the credit
+            // against their wallet history or bank statement
+            // — it is the only proof tying the message to a
+            // real transfer.
+            let reference = if vars.payment_reference.is_empty() {
+                String::new()
+            } else {
+                format!(" রেফারেন্স: {}।", vars.payment_reference)
+            };
+            match vars.amount_poisha {
+                Some(amount) => format!(
+                    "BD Marketplace: আপনার {} পে-আউট পাঠানো হয়েছে।{reference}",
+                    format_taka(amount)
+                ),
+                None => format!("BD Marketplace: আপনার পে-আউট পাঠানো হয়েছে।{reference}"),
+            }
+        }
+        NOTIFICATION_PAYOUT_APPROVED => match vars.amount_poisha {
+            // Approval commits the money; it does NOT send
+            // it. The wording says exactly that — the paid
+            // notice above is the only one that may claim a
+            // send.
             Some(amount) => format!(
-                "BD Marketplace: আপনার {} পে-আউট পাঠানো হয়েছে।",
+                "BD Marketplace: আপনার {} পে-আউট অনুরোধ অনুমোদিত হয়েছে। টাকা পাঠানো হলে আবার জানানো হবে।",
                 format_taka(amount)
             ),
-            None => "BD Marketplace: আপনার পে-আউট পাঠানো হয়েছে।".to_string(),
+            None => "BD Marketplace: আপনার পে-আউট অনুরোধ অনুমোদিত হয়েছে। টাকা পাঠানো হলে আবার জানানো হবে।"
+                .to_string(),
         },
+        NOTIFICATION_PAYOUT_REJECTED => {
+            let reason = if vars.note.is_empty() {
+                String::new()
+            } else {
+                format!(" কারণ: {}।", vars.note)
+            };
+            match vars.amount_poisha {
+                Some(amount) => format!(
+                    "BD Marketplace: আপনার {} পে-আউট অনুরোধটি গৃহীত হয়নি।{reason} টাকাটি আপনার উপলব্ধ ব্যালেন্সে ফেরত গেছে।",
+                    format_taka(amount)
+                ),
+                None => format!(
+                    "BD Marketplace: আপনার পে-আউট অনুরোধটি গৃহীত হয়নি।{reason} টাকাটি আপনার উপলব্ধ ব্যালেন্সে ফেরত গেছে।"
+                ),
+            }
+        }
         NOTIFICATION_RETURN_UPDATE => match vars.status.as_str() {
             "approved" => format!(
                 "BD Marketplace: আপনার রিটার্ন অনুমোদিত হয়েছে ({store}, অর্ডার #{short})। পণ্যটি ফেরত পাঠিয়ে দিন।"
@@ -10630,14 +10789,16 @@ mod tests {
         assert!(!is_valid_payout_status(""));
 
         // The legal path: requested -> approved -> paid, and
-        // requested -> rejected.
+        // requested -> rejected. The admin payouts remake adds
+        // approved -> rejected: the escape hatch that releases
+        // a committed amount whose coverage later disappears.
         assert!(can_transition_payout("requested", "approved"));
         assert!(can_transition_payout("requested", "rejected"));
         assert!(can_transition_payout("approved", "paid"));
+        assert!(can_transition_payout("approved", "rejected"));
         // Everything else is illegal: skips, backwards moves,
         // same-state, and anything out of the final states.
         assert!(!can_transition_payout("requested", "paid"));
-        assert!(!can_transition_payout("approved", "rejected"));
         assert!(!can_transition_payout("approved", "requested"));
         assert!(!can_transition_payout("paid", "requested"));
         assert!(!can_transition_payout("rejected", "approved"));
@@ -10665,6 +10826,77 @@ mod tests {
         // Unknown methods are rejected outright.
         assert!(validate_payout_account("rocket", "Rahim Uddin", "01712345678").is_err());
         assert!(validate_payout_account("", "Rahim Uddin", "01712345678").is_err());
+    }
+
+    #[test]
+    fn payout_rejection_reason_is_required_trimmed_and_capped() {
+        assert!(validate_payout_rejection_reason("").is_err());
+        assert!(validate_payout_rejection_reason("   ").is_err());
+        assert_eq!(
+            validate_payout_rejection_reason("  অ্যাকাউন্ট নম্বর ভুল  ").unwrap(),
+            "অ্যাকাউন্ট নম্বর ভুল"
+        );
+        // The cap counts Unicode characters, not bytes: 500
+        // Bangla characters pass, 501 fail.
+        assert!(validate_payout_rejection_reason(&"ক".repeat(500)).is_ok());
+        assert!(validate_payout_rejection_reason(&"ক".repeat(501)).is_err());
+        assert_eq!(
+            validate_payout_rejection_reason(""),
+            Err("a payout rejection reason is required")
+        );
+    }
+
+    #[test]
+    fn payment_reference_validation_rules() {
+        // Blank and too-short references are not proof.
+        assert!(validate_payment_reference("").is_err());
+        assert!(validate_payment_reference("   ").is_err());
+        assert!(validate_payment_reference("AB1").is_err());
+        // A bKash-shaped TrxID passes unchanged.
+        assert_eq!(
+            validate_payment_reference("BKASH9X2KLM4").unwrap(),
+            "BKASH9X2KLM4"
+        );
+        // Trimmed at the edges, verbatim inside: bank
+        // references carry spaces, slashes and hyphens.
+        assert_eq!(
+            validate_payment_reference("  FT 2026/11-28.09  ").unwrap(),
+            "FT 2026/11-28.09"
+        );
+        // The cap is 128 characters.
+        assert!(validate_payment_reference(&"A".repeat(128)).is_ok());
+        assert!(validate_payment_reference(&"A".repeat(129)).is_err());
+        // Control characters and non-ASCII are refused.
+        assert!(validate_payment_reference("ABC\nDEF1").is_err());
+        assert!(validate_payment_reference("ABC\tDEF1").is_err());
+        assert!(validate_payment_reference("রেফারেন্স1234").is_err());
+    }
+
+    #[test]
+    fn payout_list_sort_validation() {
+        assert_eq!(validate_payout_list_sort(None), Ok(PayoutSort::Newest));
+        assert_eq!(
+            validate_payout_list_sort(Some("newest")),
+            Ok(PayoutSort::Newest)
+        );
+        assert_eq!(
+            validate_payout_list_sort(Some("oldest")),
+            Ok(PayoutSort::Oldest)
+        );
+        assert_eq!(
+            validate_payout_list_sort(Some("amount_desc")),
+            Ok(PayoutSort::AmountDesc)
+        );
+        assert_eq!(
+            validate_payout_list_sort(Some("amount_asc")),
+            Ok(PayoutSort::AmountAsc)
+        );
+        assert_eq!(
+            validate_payout_list_sort(Some("")),
+            Err("sort must be one of: newest, oldest, amount_desc, amount_asc")
+        );
+        assert!(validate_payout_list_sort(Some("largest")).is_err());
+        assert!(validate_payout_list_sort(Some("AmountDesc")).is_err());
     }
 
     #[test]
@@ -12260,6 +12492,8 @@ mod tests {
             sale_title: String::new(),
             post_title: String::new(),
             card_last4: String::new(),
+            note: String::new(),
+            payment_reference: String::new(),
         };
         // The short order id (first 8 chars) is what prints.
         let placed = render_body(NOTIFICATION_ORDER_PLACED, &vars);
@@ -12283,6 +12517,36 @@ mod tests {
         let payout = render_body(NOTIFICATION_PAYOUT_PAID, &vars);
         assert!(payout.contains("৳2060"), "{payout}");
         assert!(payout.contains("পে-আউট"), "{payout}");
+        assert!(!payout.contains("রেফারেন্স"), "{payout}");
+
+        // Admin payouts remake: a recorded reference rides the
+        // paid body so the seller can match the credit.
+        let mut paid_vars = vars.clone();
+        paid_vars.payment_reference = "BKASH9X2KLM4".to_string();
+        let paid_ref = render_body(NOTIFICATION_PAYOUT_PAID, &paid_vars);
+        assert!(paid_ref.contains("রেফারেন্স: BKASH9X2KLM4"), "{paid_ref}");
+
+        // The approved body announces approval only — it must
+        // never claim the money was sent.
+        let approved_payout = render_body(NOTIFICATION_PAYOUT_APPROVED, &vars);
+        assert!(approved_payout.contains("অনুমোদিত হয়েছে"), "{approved_payout}");
+        assert!(!approved_payout.contains("পাঠানো হয়েছে"), "{approved_payout}");
+
+        // The rejected body carries the reason and the
+        // balance-release fact; without a reason it still
+        // renders both facts.
+        let mut rejected_vars = vars.clone();
+        rejected_vars.note = "অ্যাকাউন্ট নম্বর মিলছে না".to_string();
+        let rejected_payout = render_body(NOTIFICATION_PAYOUT_REJECTED, &rejected_vars);
+        assert!(rejected_payout.contains("গৃহীত হয়নি"), "{rejected_payout}");
+        assert!(
+            rejected_payout.contains("কারণ: অ্যাকাউন্ট নম্বর মিলছে না"),
+            "{rejected_payout}"
+        );
+        assert!(rejected_payout.contains("ফেরত গেছে"), "{rejected_payout}");
+        let rejected_no_reason = render_body(NOTIFICATION_PAYOUT_REJECTED, &vars);
+        assert!(rejected_no_reason.contains("গৃহীত হয়নি"), "{rejected_no_reason}");
+        assert!(!rejected_no_reason.contains("কারণ:"), "{rejected_no_reason}");
 
         // return_update reads its status var.
         let mut return_vars = vars.clone();

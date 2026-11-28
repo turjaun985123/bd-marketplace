@@ -185,6 +185,23 @@ pub async fn get_seller_verification(
     Ok(seller_view(&store.verified_tier, row))
 }
 
+/// The verification summary for an admin surface that holds
+/// only a store id + tier (admin payouts remake: the payout
+/// detail shows the deciding admin whether the store is
+/// verified and where an application stands). Returns the
+/// seller view verbatim — masked by construction, and a
+/// store that never applied reads as status `none`, never
+/// an error: "no application" is a normal state, not a
+/// missing resource.
+pub async fn admin_verification_summary(
+    pool: &PgPool,
+    store_id: Uuid,
+    verified_tier: &str,
+) -> Result<SellerVerificationView, ApiError> {
+    let row = load_verification(pool, store_id).await?;
+    Ok(seller_view(verified_tier, row))
+}
+
 /// What a seller submits to apply (or re-apply) for verification.
 #[derive(Debug, Deserialize)]
 pub struct SubmitVerificationInput {

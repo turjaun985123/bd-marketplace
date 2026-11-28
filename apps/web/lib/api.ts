@@ -1115,6 +1115,37 @@ function apiBase(): string {
   return process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8080";
 }
 
+/**
+ * An API failure with its HTTP status — and, when the API
+ * sent them, the structured `details` (admin payouts
+ * remake: the coverage refusal carries the earnings
+ * picture). The message is byte-identical to what a plain
+ * Error carried before (`data.error ?? API returned N`),
+ * and every consumer keys on `err instanceof Error` +
+ * `.message`, so the richer type changes nothing for them;
+ * the one consumer that cares (the payout dialogs) narrows
+ * with `isPayoutCoverage`.
+ */
+export class ApiCallError extends Error {
+  readonly status: number;
+  readonly details?: unknown;
+
+  constructor(status: number, message: string, details?: unknown) {
+    super(message);
+    this.name = "ApiCallError";
+    this.status = status;
+    this.details = details;
+    Object.setPrototypeOf(this, ApiCallError.prototype);
+  }
+}
+
+function apiErrorFrom(
+  status: number,
+  data: { error?: string; details?: unknown }
+): ApiCallError {
+  return new ApiCallError(status, data.error ?? `API returned ${status}`, data.details);
+}
+
 async function call<T>(
   path: string,
   options: {
@@ -1133,9 +1164,12 @@ async function call<T>(
     headers,
     body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
   });
-  const data = (await res.json().catch(() => ({}))) as { error?: string } & T;
+  const data = (await res.json().catch(() => ({}))) as {
+    error?: string;
+    details?: unknown;
+  } & T;
   if (!res.ok) {
-    throw new Error(data.error ?? `API returned ${res.status}`);
+    throw apiErrorFrom(res.status, data);
   }
   return data;
 }
@@ -1157,9 +1191,12 @@ async function callForm<T>(
     headers,
     body: form,
   });
-  const data = (await res.json().catch(() => ({}))) as { error?: string } & T;
+  const data = (await res.json().catch(() => ({}))) as {
+    error?: string;
+    details?: unknown;
+  } & T;
   if (!res.ok) {
-    throw new Error(data.error ?? `API returned ${res.status}`);
+    throw apiErrorFrom(res.status, data);
   }
   return data;
 }
@@ -1195,9 +1232,12 @@ async function callText<T>(
     if (!res.ok) throw new Error(text || `API returned ${res.status}`);
     return text as T;
   }
-  const data = (await res.json().catch(() => ({}))) as { error?: string } & T;
+  const data = (await res.json().catch(() => ({}))) as {
+    error?: string;
+    details?: unknown;
+  } & T;
   if (!res.ok) {
-    throw new Error(data.error ?? `API returned ${res.status}`);
+    throw apiErrorFrom(res.status, data);
   }
   return data;
 }
@@ -3337,6 +3377,17 @@ export interface Payout {
   note: string | null;
   created_at: string;
   processed_at: string | null;
+  /** Per-stage stamps (admin payouts remake, migration 0072):
+   * when the payout was approved / paid / rejected. Null for
+   * a stage the payout has not reached (and, for payouts
+   * decided before the columns existed, possibly null even
+   * when it has — the backfill is best-effort). */
+  approved_at: string | null;
+  paid_at: string | null;
+  rejected_at: string | null;
+  /** The payment reference recorded at mark-paid (the
+   * bKash/Nagad transaction id or bank reference), or null. */
+  payment_reference: string | null;
   /** The Idempotency-Key the request carried (Wave 44), or null. */
   idempotency_key: string | null;
 }
@@ -3361,6 +3412,24 @@ export function payoutStatusLabel(status: string): string {
       return "প্রত্যাখ্যাত";
     default:
       return status;
+  }
+}
+
+/**
+ * Bilingual label for a payout method (admin payouts
+ * remake). Payout vocabulary only — the checkout's own
+ * method labels are a different surface and stay separate.
+ */
+export function payoutMethodLabel(method: string): string {
+  switch (method) {
+    case "bkash":
+      return "বিকাশ — bKash";
+    case "nagad":
+      return "নগদ — Nagad";
+    case "bank":
+      return "ব্যাংক — Bank";
+    default:
+      return method;
   }
 }
 
@@ -4114,23 +4183,82 @@ export interface AdminStoreList {
   limit: number;
 }
 
-/** A payout in the admin queue: store name + owner phone added. */
+/** Sort orders the admin payout queue accepts. */
+export type AdminPayoutSort = "newest" | "oldest" | "amount_desc" | "amount_asc";
+
+/**
+ * A payout in the admin queue (admin payouts remake): the
+ * payout itself plus store context, MASKED identifiers
+ * (full values live only in the detail), the store's
+ * suspension/KYC state, and — for in-flight payouts — the
+ * store's coverage at read time.
+ */
 export interface AdminPayout {
   id: string;
   store_id: string;
-  store_name: string;
-  owner_phone: string;
   amount_poisha: number;
+  /** bkash | nagad | bank */
   method: string;
   account_name: string;
-  account_number: string;
   /** requested | approved | paid | rejected */
   status: string;
   note: string | null;
   created_at: string;
   processed_at: string | null;
-  /** The Idempotency-Key the request carried (Wave 44), or null. */
+  approved_at: string | null;
+  paid_at: string | null;
+  rejected_at: string | null;
+  payment_reference: string | null;
   idempotency_key: string | null;
+  store_name: string;
+  /** The store owner's phone, masked (Wave 28 canon). */
+  owner_phone_masked: string;
+  /** The destination account number, masked to its last
+   * four characters. */
+  account_number_masked: string;
+  /** The admin who approved / paid / rejected, when known. */
+  approved_by_user_id: string | null;
+  paid_by_user_id: string | null;
+  rejected_by_user_id: string | null;
+  /** active | suspended */
+  store_status: string;
+  /** unverified | basic | full */
+  store_verified_tier: string;
+  /**
+   * The store's unclamped available balance (earned − paid
+   * out − pending − charges) at read time — only for
+   * `requested` / `approved` rows; null for terminal ones.
+   * STORE-level: it covers all of the store's in-flight
+   * payouts together, not this row alone.
+   */
+  coverage_unclamped_poisha: number | null;
+  /** `coverage_unclamped_poisha >= 0`, same nullability. */
+  covered: boolean | null;
+  /** Another in-flight payout for the same store and the
+   * same amount exists (a possible duplicate — inspect the
+   * detail before paying twice). */
+  possible_duplicate: boolean;
+}
+
+/** One lifecycle bucket of the whole-queue summary. */
+export interface PayoutStatusBucket {
+  count: number;
+  amount_poisha: number;
+  /** Seconds since the bucket's oldest payout was filed;
+   * null when the bucket is empty. */
+  oldest_age_secs: number | null;
+}
+
+/**
+ * The payout queue by status, over the WHOLE queue (never
+ * the filtered page). `paid` / `rejected` are lifetime
+ * totals; their age is informational only.
+ */
+export interface PayoutStatusSummary {
+  requested: PayoutStatusBucket;
+  approved: PayoutStatusBucket;
+  paid: PayoutStatusBucket;
+  rejected: PayoutStatusBucket;
 }
 
 export interface AdminPayoutList {
@@ -4138,6 +4266,86 @@ export interface AdminPayoutList {
   total: number;
   page: number;
   limit: number;
+  summary: PayoutStatusSummary;
+}
+
+/** Money still at risk from returns (payout detail). */
+export interface PayoutReturnsExposure {
+  in_flight_count: number;
+  at_risk_payout_poisha: number;
+  received_refund_pending_count: number;
+  received_refund_pending_poisha: number;
+}
+
+/** One seller charge line (payout detail): what was taken
+ * from the seller's balance outside payouts, and why. */
+export interface SellerChargeView {
+  id: string;
+  kind: string;
+  amount_poisha: number;
+  label: string;
+  caption: string | null;
+  created_at: string;
+}
+
+/**
+ * The payout detail (GET /v1/admin/payouts/{id}): the
+ * queue row plus the full destination, the earnings behind
+ * the amount, and everything a decision needs. An
+ * ADVISORY snapshot — the transition re-checks remain the
+ * authority.
+ */
+export interface AdminPayoutDetail extends AdminPayout {
+  /** Full values — this response only. */
+  owner_phone: string;
+  account_number: string;
+  store: { slug: string; status: string; verified_tier: string };
+  earnings: Earnings;
+  unclamped_available_poisha: number;
+  covered: boolean;
+  returns_exposure: PayoutReturnsExposure;
+  charges_recent: SellerChargeView[];
+  charges_total_poisha: number;
+  charges_count: number;
+  verification: SellerVerification;
+  current_account: PayoutAccount | null;
+  /** The store's current account differs from this
+   * payout's snapshot (or is gone). Payouts always pay
+   * their snapshot — this only warns. */
+  account_diverged: boolean;
+  store_payout_history: AdminPayout[];
+  audit_entries: AdminAuditEntry[];
+  duplicate_candidate_ids: string[];
+}
+
+/**
+ * The structured details of a coverage refusal (409): the
+ * earnings picture at decision time, computed by the API
+ * inside the transition transaction.
+ */
+export interface PayoutCoverageDetails {
+  kind: "payout_coverage";
+  payout_id: string;
+  store_id: string;
+  amount_poisha: number;
+  earned_poisha: number;
+  paid_out_poisha: number;
+  pending_poisha: number;
+  charges_total_poisha: number;
+  available_unclamped_poisha: number;
+  shortfall_poisha: number;
+}
+
+/** Narrow an unknown error to a coverage refusal. */
+export function isPayoutCoverage(err: unknown): err is ApiCallError & { details: PayoutCoverageDetails } {
+  if (!(err instanceof ApiCallError)) return false;
+  const details = err.details as PayoutCoverageDetails | undefined;
+  return (
+    err.status === 409 &&
+    typeof details === "object" &&
+    details !== null &&
+    details.kind === "payout_coverage"
+  );
 }
 
 /** A user in the admin list: store count added. */
@@ -4238,17 +4446,37 @@ export function listAdminOrders(
   return call(`/v1/admin/orders${qs ? `?${qs}` : ""}`, { token });
 }
 
-/** GET /v1/admin/payouts — the processing queue, optional status filter. */
+/**
+ * GET /v1/admin/payouts — the processing queue: status
+ * filter, search (store / phone / account substring, or an
+ * idempotency key), sort, and the whole-queue summary.
+ */
 export function listAdminPayouts(
   token: string,
-  params?: { status?: string; page?: number; limit?: number }
+  params?: {
+    status?: string;
+    q?: string;
+    sort?: AdminPayoutSort;
+    page?: number;
+    limit?: number;
+  }
 ): Promise<AdminPayoutList> {
   const search = new URLSearchParams();
   if (params?.status) search.set("status", params.status);
+  if (params?.q) search.set("q", params.q);
+  if (params?.sort) search.set("sort", params.sort);
   if (params?.page) search.set("page", String(params.page));
   if (params?.limit) search.set("limit", String(params.limit));
   const qs = search.toString();
   return call(`/v1/admin/payouts${qs ? `?${qs}` : ""}`, { token });
+}
+
+/** GET /v1/admin/payouts/{id} — the decision-ready detail. */
+export function getAdminPayout(
+  token: string,
+  payoutId: string
+): Promise<AdminPayoutDetail> {
+  return call(`/v1/admin/payouts/${encodeURIComponent(payoutId)}`, { token });
 }
 
 /** POST /v1/admin/payouts/{id}/approve — requested -> approved. */
@@ -4259,11 +4487,16 @@ export function approvePayout(token: string, payoutId: string): Promise<Payout> 
   });
 }
 
-/** POST /v1/admin/payouts/{id}/reject — requested -> rejected, with a reason. */
+/**
+ * POST /v1/admin/payouts/{id}/reject — -> rejected. The
+ * reason is REQUIRED (the API answers 400 without one): it
+ * is stored on the payout, shown to the seller, and sent
+ * in the rejection notice.
+ */
 export function rejectPayout(
   token: string,
   payoutId: string,
-  note?: string
+  note: string
 ): Promise<Payout> {
   return call(`/v1/admin/payouts/${encodeURIComponent(payoutId)}/reject`, {
     method: "POST",
@@ -4272,11 +4505,21 @@ export function rejectPayout(
   });
 }
 
-/** POST /v1/admin/payouts/{id}/mark-paid — approved -> paid. */
-export function markPayoutPaid(token: string, payoutId: string): Promise<Payout> {
+/**
+ * POST /v1/admin/payouts/{id}/mark-paid — approved ->
+ * paid. The payment reference is REQUIRED (the API answers
+ * 400 without one): it is recorded on the payout and sent
+ * to the seller in the paid notice.
+ */
+export function markPayoutPaid(
+  token: string,
+  payoutId: string,
+  paymentReference: string
+): Promise<Payout> {
   return call(`/v1/admin/payouts/${encodeURIComponent(payoutId)}/mark-paid`, {
     method: "POST",
     token,
+    body: { payment_reference: paymentReference },
   });
 }
 

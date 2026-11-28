@@ -1065,7 +1065,11 @@ payout creation demands verification. When ON,
 `POST /v1/seller/payouts` rejects an `unverified` store
 with a 400 that names verification (in Bangla and English)
 and points the seller at the verification page; `basic` and
-`verified` stores pass to the ordinary Wave 9 rules. When
+`verified` stores pass to the ordinary Wave 9 rules. Since
+the admin payouts remake the gate is ALSO re-checked at
+approval (same 400 class): a payout requested while the
+gate was off cannot be approved after it comes on while
+the store is still unverified. When
 OFF — the default — payout behaviour is exactly Wave 9's:
 existing sellers are never surprised by a rule that did not
 exist when they joined, and the platform enables the gate
@@ -1551,7 +1555,7 @@ miss one that committed:
 
 | Action | Target | Written by |
 | --- | --- | --- |
-| `payout.approve` / `payout.reject` / `payout.mark_paid` | payout id | the payout transition (detail: `{from, to}`, plus the note when supplied) |
+| `payout.approve` / `payout.reject` / `payout.mark_paid` | payout id | the payout transition (detail: `{from, to}`, plus `note` on a rejection — required since the admin payouts remake — and `payment_reference` on a mark-paid; account numbers and phones are never written to the log) |
 | `store.suspend` / `store.reactivate` | store id | the store status change |
 | `settings.update` | — | the settings patch (detail: `{changed_keys}` — key NAMES only, never values; a no-op patch writes no row) |
 | `verification.approve` / `verification.reject` | store id | the KYC decision (detail: the granted tier, resp. the reviewer note the seller reads) |
@@ -1607,9 +1611,12 @@ grand total); the seller status PATCH →
 refresh + manual status updates) → `sub_order_delivered`
 / `sub_order_returned` (RTO) — each sub-order reaches
 delivered exactly once, so no funnel pair can
-double-notify; the payout transition to paid →
-`payout_paid` (to the seller at their ACCOUNT phone,
-with the amount); return approve / reject / received →
+double-notify; the payout transitions → `payout_approved`
+/ `payout_rejected` / `payout_paid` (to the seller at
+their ACCOUNT phone, with the amount; the rejected notice
+carries the reason, the paid notice the recorded payment
+reference — admin payouts remake; before it only the paid
+move notified); return approve / reject / received →
 `return_update` (buyer, account phone; a platform return
 is not an RTO and never produces `sub_order_returned`).
 The **worker is real now**: it connects to `DATABASE_URL`
@@ -4214,9 +4221,14 @@ seller's. One aggregate (`seller_earnings` in
 the dashboard, the balance endpoint and payout creation all read
 it, so the numbers cannot disagree.
 
-**Balance formula:** available = earned − paid out − pending,
-where paid out sums payouts in `approved` (committed) or `paid`
-(gone), and pending sums payouts still `requested`. The pure
+**Balance formula:** available = earned − paid out − pending
+− charges, where paid out sums payouts in `approved` (committed)
+or `paid` (gone), pending sums payouts still `requested`, and
+charges are the seller's `seller_charges` (promotion and
+subscription charges, Wave 26/34 — keyed to the seller as a
+USER, so they subtract from every store the seller owns; this
+line was missing from this section's formula until the admin
+payouts remake audit). The pure
 domain function `compute_available_balance` returns the raw
 arithmetic; the API clamps the reported value at zero (with
 consistent inputs it can never be negative, because a payout may
@@ -4258,10 +4270,11 @@ Wave 10 (platform admin):
 | GET | `/v1/admin/stores?q=&page=&limit=` | Bearer, admin. Every store with owner phone, product count and status; `q` matches name or slug |
 | PATCH | `/v1/admin/stores/{id}/status` | Bearer, admin. Set a store `active` or `suspended` (anything else: 400); returns the store view |
 | GET | `/v1/admin/orders?status=&page=&limit=` | Bearer, admin. Every order (the shared buyer order view), newest first, optional order-status filter |
-| GET | `/v1/admin/payouts?status=&page=&limit=` | Bearer, admin. The payout queue with store name + owner phone, optional status filter |
-| POST | `/v1/admin/payouts/{id}/approve` | Bearer, admin. `requested → approved`; illegal moves are a 409 |
-| POST | `/v1/admin/payouts/{id}/reject` | Bearer, admin. `requested → rejected`; an optional JSON `note` records the reason |
-| POST | `/v1/admin/payouts/{id}/mark-paid` | Bearer, admin. `approved → paid` |
+| GET | `/v1/admin/payouts?status=&q=&sort=&page=&limit=` | Bearer, admin. The payout queue: store name, MASKED owner phone and account number, per-row coverage for in-flight payouts, a possible-duplicate flag, and a whole-queue `summary` by status. `status` is validated (unknown: 400); `q` searches store / phone / account and idempotency keys; `sort` is `newest` (default) / `oldest` / `amount_desc` / `amount_asc`. Full identifiers live only in the detail below (admin payouts remake) |
+| GET | `/v1/admin/payouts/{id}` | Bearer, admin. The payout detail: the queue row plus the FULL destination and owner phone, the store's earnings, returns exposure, recent seller charges, verification state, the store's current account beside the payout's snapshot (with a divergence flag), store payout history, duplicate candidates, and the payout's audit entries (admin payouts remake) |
+| POST | `/v1/admin/payouts/{id}/approve` | Bearer, admin. `requested → approved`; illegal moves are a 409. Coverage, suspension and the KYC gate are re-checked inside the transition (see the remake note) |
+| POST | `/v1/admin/payouts/{id}/reject` | Bearer, admin. `requested → rejected` and `approved → rejected`; the JSON `note` (the reason) is REQUIRED — missing or blank is a 400. The seller sees it and is notified |
+| POST | `/v1/admin/payouts/{id}/mark-paid` | Bearer, admin. `approved → paid`; the JSON `payment_reference` is REQUIRED (4–128 printable ASCII) and is recorded on the payout and sent to the seller |
 | GET | `/v1/admin/users?q=&page=&limit=` | Bearer, admin. Every user with role, admin flag and store count; `q` matches a phone substring |
 | PATCH | `/v1/admin/users/{id}` | Bearer, admin. Set or clear ANOTHER user's `is_admin` (your own flag: 400) |
 | GET | `/v1/admin/settings` | Bearer, admin. The EFFECTIVE settings: `commission_bps`, `min_payout_poisha`, `platform_name` |
@@ -4304,13 +4317,74 @@ is ever deleted.
 **Payout processing (lifecycle completed):** the three
 processing endpoints are thin handlers over ONE service
 function driven by the Wave 9 domain transition table
-(`requested → approved → paid`, `requested → rejected`). A legal
-move stamps `processed_at`; rejection stores the admin's note
-as the reason the seller sees. Rejecting a request releases its
+(`requested → approved → paid`, `requested → rejected`; the
+admin payouts remake added `approved → rejected`). A legal
+move stamps `processed_at` — the MOST RECENT transition
+time; the remake's per-stage stamps (`approved_at` /
+`paid_at` / `rejected_at`, migration 0072) are the ones
+that are never overwritten. Rejection stores the admin's
+note as the reason (required since the remake; it is on
+the seller's payout record and in the `payout_rejected`
+notice). Rejecting a request releases its
 amount back into the seller's available balance (it stops
-counting as pending; nothing was ever paid out). Approving
+counting against the balance — for a `requested` payout it
+leaves `pending`, for an `approved` one it leaves the
+paid-out bucket; nothing was ever sent). Approving
 keeps the amount committed (it counts as paid out from
 approval on, so it can never be requested twice).
+
+**Admin payouts remake (2026-11-28, the second surface of
+the admin remake program; ~66 analysis agents):** what
+changed, beyond the endpoint table above —
+
+- **Mark-paid coverage re-check.** The Wave 39 re-check
+  ran only at approve; earnings can fall after approval
+  (a return is received) and `paid` is final, so the same
+  unclamped-balance check now runs at mark-paid too. The
+  409 carries the earnings picture as structured
+  `details` (`kind: "payout_coverage"`, the shortfall, and
+  the four aggregate components, computed inside the
+  transition transaction).
+- **Decision gates, in order:** input validation (400) →
+  existence (404) → store-then-payout row locks → legality
+  (409, bilingual, naming the current status) → suspension
+  freeze (409: a suspended store's payouts cannot be
+  approved or marked paid; reject stays allowed) → KYC
+  gate re-check at approve only (400, when the gate is on
+  and the store is unverified NOW) → coverage (409).
+- **Decision metadata** (migration 0072): per-stage
+  timestamps and actor ids on the payout row, plus the
+  `payment_reference` (own column, never the note).
+  Backfilled from `processed_at` and the Wave 28 audit log
+  (one pivot per action); pre-audit-log actors stay NULL —
+  unknown is recorded as unknown. Migration 0073 adds the
+  queue and audit-target indexes.
+- **Seller notified of every decision:** `payout_approved`
+  (never claims a send), `payout_rejected` (carries the
+  reason), `payout_paid` (carries the reference when one
+  was recorded) — all through the one in-transaction
+  outbox funnel.
+- **The web queue** is rebuilt to the overview's standard:
+  age-ordered decision cards with coverage per row, the
+  whole-queue summary (its `requested` bucket is the same
+  count the overview's `pending_payouts` links here with),
+  search/sort/pagination, confirm dialogs that restate
+  amount + destination (no more `window.prompt` — whose
+  Cancel used to fire the rejection anyway), an in-card
+  detail with the earnings behind the amount, and a
+  printable payment instruction/record.
+- **Honest limits:** the detail is an advisory snapshot —
+  the transition's in-transaction re-checks remain the
+  authority; a return-received between the last check and
+  the external send is still possible (returns take no
+  payout lock), which is why the detail shows the returns
+  exposure instead of hiding it; there are no bulk actions
+  (per-payout decisions only) and no paid-payouts CSV
+  export yet (month-end reconciliation is a named
+  follow-up); the seller payouts page does not yet render
+  the rejection reason, the recorded reference, or the
+  per-stage stamps (the API record and the notices carry
+  them — a seller-surface follow-up).
 
 **Settings override precedence:** a row in `platform_settings`
 (migration 0013) beats the startup value, which beats the

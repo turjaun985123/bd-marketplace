@@ -361,14 +361,36 @@ async fn wave29_notification_outbox_flow() {
     let (status, body) = call(&app, Method::POST, &uri, None, Some(&admin)).await;
     assert_eq!(status, StatusCode::OK, "approve payout: {body}");
     assert_eq!(count_kind(&pool, "payout_paid").await, 0);
+    // Admin payouts remake: approval now queues its own
+    // payout_approved notice — and its body must NOT claim
+    // the money was sent.
+    assert_eq!(count_kind(&pool, "payout_approved").await, 1);
+    let (body, _, _) = latest_notice(&pool, "payout_approved").await;
+    assert!(
+        !body.contains("পাঠানো হয়েছে"),
+        "approval notice must not claim a send: {body}"
+    );
 
+    // Admin payouts remake: mark-paid requires the payment
+    // reference; the paid notice carries it to the seller.
     let uri = format!("/v1/admin/payouts/{payout_id}/mark-paid");
-    let (status, body) = call(&app, Method::POST, &uri, None, Some(&admin)).await;
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        &uri,
+        Some(json!({ "payment_reference": "WAVE29-TXN-001" })),
+        Some(&admin),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "mark payout paid: {body}");
     assert_eq!(count_kind(&pool, "payout_paid").await, 1);
     let (body, phone, _) = latest_notice(&pool, "payout_paid").await;
     assert_eq!(phone, "+8801799999999", "notice: {body}");
     assert!(body.contains("৳1000"), "body: {body}");
+    assert!(
+        body.contains("রেফারেন্স: WAVE29-TXN-001"),
+        "paid notice carries the reference: {body}"
+    );
 
     // 5. The return flow on the delivered order: approve and
     // received each queue a return_update for the buyer; the
@@ -402,14 +424,15 @@ async fn wave29_notification_outbox_flow() {
     assert!(body.contains("রিফান্ড ৳2000"), "body: {body}");
     assert_eq!(count_kind(&pool, "sub_order_returned").await, 0);
 
-    // 6. The admin view: 8 rows total, all still pending (no
-    // worker runs here), none failed; the status filter
+    // 6. The admin view: 9 rows total (the remake's
+    // payout_approved notice is the ninth), all still pending
+    // (no worker runs here), none failed; the status filter
     // works; phones are masked; a non-admin gets a 403.
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notifications")
         .fetch_one(&pool)
         .await
         .expect("count all notifications");
-    assert_eq!(total, 8, "total notifications");
+    assert_eq!(total, 9, "total notifications");
 
     let (status, view) = call(
         &app,
@@ -420,11 +443,11 @@ async fn wave29_notification_outbox_flow() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "admin notifications: {view}");
-    assert_eq!(view["counts"]["pending"], 8, "view: {view}");
+    assert_eq!(view["counts"]["pending"], 9, "view: {view}");
     assert_eq!(view["counts"]["sending"], 0);
     assert_eq!(view["counts"]["sent"], 0);
     assert_eq!(view["counts"]["failed"], 0);
-    assert_eq!(view["items"].as_array().map(Vec::len), Some(8));
+    assert_eq!(view["items"].as_array().map(Vec::len), Some(9));
     let first_phone = view["items"][0]["phone_masked"]
         .as_str()
         .expect("masked phone");
@@ -444,7 +467,7 @@ async fn wave29_notification_outbox_flow() {
     .await;
     assert_eq!(status, StatusCode::OK, "filtered view: {view}");
     assert_eq!(view["items"].as_array().map(Vec::len), Some(0));
-    assert_eq!(view["counts"]["pending"], 8, "counts stay global: {view}");
+    assert_eq!(view["counts"]["pending"], 9, "counts stay global: {view}");
 
     let (status, body) = call(
         &app,

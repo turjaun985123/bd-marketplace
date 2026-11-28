@@ -388,7 +388,20 @@ async fn wave10_admin_panel_flow() {
     assert_eq!(queue["total"], 1);
     assert_eq!(queue["items"][0]["id"], payout1);
     assert_eq!(queue["items"][0]["store_name"], "Store wave10-store");
-    assert_eq!(queue["items"][0]["owner_phone"], "+8801722222222");
+    // Admin payouts remake: the queue carries MASKED
+    // identifiers only (the full values live in the detail
+    // endpoint) — the raw list body must not leak either the
+    // owner's full phone or the full account number.
+    assert_eq!(queue["items"][0]["owner_phone_masked"], "017****222");
+    let queue_raw = queue.to_string();
+    assert!(
+        !queue_raw.contains("+8801722222222"),
+        "admin payout list leaked the full owner phone: {queue_raw}"
+    );
+    assert!(
+        !queue_raw.contains("01722222222"),
+        "admin payout list leaked the full account number: {queue_raw}"
+    );
 
     let (status, overview) = call(&app, Method::GET, "/v1/admin/overview", None, Some(&admin)).await;
     assert_eq!(status, StatusCode::OK, "overview: {overview}");
@@ -402,14 +415,28 @@ async fn wave10_admin_panel_flow() {
     assert_eq!(status, StatusCode::OK, "approve: {body}");
     assert_eq!(body["status"], "approved");
     assert!(body["processed_at"].is_string(), "processed_at set: {body}");
+    // Admin payouts remake: the per-stage stamp is recorded too.
+    assert!(body["approved_at"].is_string(), "approved_at set: {body}");
+    assert!(body["paid_at"].is_null(), "paid_at not yet set: {body}");
 
     let (status, body) = call(&app, Method::POST, &uri, None, Some(&admin)).await;
     assert_eq!(status, StatusCode::CONFLICT, "approve twice: {body}");
 
+    // Admin payouts remake: mark-paid REQUIRES the payment
+    // reference — the recorded proof of the send.
     let uri = format!("/v1/admin/payouts/{payout1}/mark-paid");
-    let (status, body) = call(&app, Method::POST, &uri, None, Some(&admin)).await;
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        &uri,
+        Some(json!({ "payment_reference": "WAVE10-TXN-001" })),
+        Some(&admin),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "mark-paid: {body}");
     assert_eq!(body["status"], "paid");
+    assert_eq!(body["payment_reference"], "WAVE10-TXN-001");
+    assert!(body["paid_at"].is_string(), "paid_at set: {body}");
 
     let balance = get_balance(&app, &seller).await;
     assert_eq!(balance["earned_poisha"], 184_000, "balance: {balance}");

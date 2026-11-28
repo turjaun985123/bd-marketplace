@@ -221,7 +221,11 @@ function kindLabel(kind: string): string {
     case "sub_order_returned":
       return "রিটার্ন — Returned";
     case "payout_paid":
-      return "পে-আউট — Payout";
+      return "পে-আউট পরিশোধিত — Payout paid";
+    case "payout_approved":
+      return "পে-আউট অনুমোদিত — Payout approved";
+    case "payout_rejected":
+      return "পে-আউট প্রত্যাখ্যাত — Payout rejected";
     case "return_update":
       return "রিটার্ন আপডেট — Return update";
     case "store_new_product":

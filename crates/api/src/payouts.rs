@@ -183,12 +183,35 @@ pub struct Payout {
     pub note: Option<String>,
     pub created_at: DateTime<Utc>,
     pub processed_at: Option<DateTime<Utc>>,
+    /// When an admin approved this payout (admin payouts
+    /// remake, migration 0072); `None` until approval.
+    /// `processed_at` keeps its legacy meaning (the LAST
+    /// transition's time) — these per-stage stamps are the
+    /// ones that are never overwritten.
+    pub approved_at: Option<DateTime<Utc>>,
+    /// When an admin marked this payout paid.
+    pub paid_at: Option<DateTime<Utc>>,
+    /// When an admin rejected this payout.
+    pub rejected_at: Option<DateTime<Utc>>,
+    /// The payment reference the admin recorded at mark-paid
+    /// (admin payouts remake): the bKash/Nagad transaction id
+    /// or bank transfer reference proving the send. The
+    /// seller's reconciliation proof; `None` for payouts not
+    /// yet paid and for every payout paid before the remake.
+    pub payment_reference: Option<String>,
     /// The client's `Idempotency-Key` when the request carried
     /// one (Wave 44); `None` for keyless requests, which keep
     /// the pre-Wave-44 semantics. Echoed so a seller (or a
     /// support lookup) can match a retry to the row it made.
     pub idempotency_key: Option<String>,
 }
+
+/// The payout column list every `Payout`-decoding query in
+/// this module selects (the admin module keeps the same list
+/// for its transition RETURNING).
+const PAYOUT_COLUMNS: &str = "id, store_id, amount_poisha, method, account_name, \
+    account_number, status, note, created_at, processed_at, approved_at, paid_at, \
+    rejected_at, payment_reference, idempotency_key";
 
 /// A page of payout requests plus the total count.
 #[derive(Debug, Serialize)]
@@ -275,6 +298,182 @@ where
 /// non-transactional caller uses.
 pub async fn seller_earnings(pool: &PgPool, store_id: Uuid) -> Result<Earnings, ApiError> {
     seller_earnings_on(pool, store_id).await
+}
+
+/// The earnings aggregate for MANY stores in one query (admin
+/// payouts remake): the admin queue attaches a coverage figure
+/// to every row of a page, and running [`seller_earnings_on`]
+/// per row would make the list N+1. This is the canonical
+/// aggregate's four subqueries correlated over the requested
+/// store set — same definitions, same owner-keyed charges
+/// term — so a store's numbers here are identical to the ones
+/// [`seller_earnings`] reports for it alone. Returns one
+/// [`Earnings`] per requested store id.
+pub async fn seller_earnings_for_stores(
+    pool: &PgPool,
+    store_ids: &[Uuid],
+) -> Result<std::collections::HashMap<Uuid, Earnings>, ApiError> {
+    #[derive(FromRow)]
+    struct EarningsRow {
+        store_id: Uuid,
+        earned_poisha: i64,
+        paid_out_poisha: i64,
+        pending_poisha: i64,
+        charges_total_poisha: i64,
+    }
+
+    let rows: Vec<EarningsRow> = sqlx::query_as(
+        "SELECT s.id AS store_id, \
+           (SELECT COALESCE(SUM(seller_payout_poisha), 0)::bigint \
+              FROM sub_orders \
+             WHERE store_id = s.id AND status = 'delivered') AS earned_poisha, \
+           (SELECT COALESCE(SUM(amount_poisha), 0)::bigint \
+              FROM payouts \
+             WHERE store_id = s.id AND status IN ('approved', 'paid')) AS paid_out_poisha, \
+           (SELECT COALESCE(SUM(amount_poisha), 0)::bigint \
+              FROM payouts \
+             WHERE store_id = s.id AND status = 'requested') AS pending_poisha, \
+           (SELECT COALESCE(SUM(amount_poisha), 0)::bigint \
+              FROM seller_charges \
+             WHERE seller_user_id = s.owner_user_id) AS charges_total_poisha \
+         FROM stores s WHERE s.id = ANY($1)",
+    )
+    .bind(store_ids)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::internal("load seller earnings for stores", e))?;
+
+    let mut by_store = std::collections::HashMap::with_capacity(rows.len());
+    for row in rows {
+        let mut earnings = Earnings {
+            earned_poisha: row.earned_poisha,
+            paid_out_poisha: row.paid_out_poisha,
+            pending_poisha: row.pending_poisha,
+            charges_total_poisha: row.charges_total_poisha,
+            available_poisha: 0,
+        };
+        earnings.available_poisha = available_balance(&earnings);
+        by_store.insert(row.store_id, earnings);
+    }
+    Ok(by_store)
+}
+
+/// One `seller_charges` row as the admin payout detail shows
+/// it (admin payouts remake): the deduction, what it paid
+/// for, and where. The label is resolved in Rust from the
+/// joined reference — `seller_charges.ref_id` has no foreign
+/// key and its target may have been deleted, so a missing
+/// join is a rendered fallback ("record deleted"), never a
+/// dropped money row.
+#[derive(Debug, Serialize)]
+pub struct SellerChargeView {
+    pub id: Uuid,
+    pub kind: String,
+    pub amount_poisha: i64,
+    pub ref_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    /// What the charge paid for, e.g. "Promotion — <product>"
+    /// or "Subscription — pro plan".
+    pub label: String,
+    /// Window / store context for the charge, when known.
+    pub secondary: Option<String>,
+}
+
+/// The most recent charges against ONE SELLER (charges are
+/// keyed by user, never by store — the earnings aggregate
+/// subtracts the owner's charges across all their stores, so
+/// the detail shows the same scope). At most `limit` rows,
+/// newest first. The joins are LEFT and kind-gated:
+/// `ref_id` means a promotion id for `promotion` rows and a
+/// `store_subscriptions` row id for `subscription` rows, and
+/// joining the wrong table would invent labels.
+pub async fn list_recent_seller_charges(
+    pool: &PgPool,
+    seller_user_id: Uuid,
+    limit: i64,
+) -> Result<Vec<SellerChargeView>, ApiError> {
+    #[derive(FromRow)]
+    struct ChargeRow {
+        id: Uuid,
+        kind: String,
+        amount_poisha: i64,
+        ref_id: Option<Uuid>,
+        created_at: DateTime<Utc>,
+        product_title: Option<String>,
+        promotion_days: Option<i32>,
+        promotion_store_name: Option<String>,
+        subscription_plan: Option<String>,
+        subscription_store_name: Option<String>,
+    }
+
+    let rows: Vec<ChargeRow> = sqlx::query_as(
+        "SELECT sc.id, sc.kind, sc.amount_poisha, sc.ref_id, sc.created_at, \
+         p.title AS product_title, pr.days AS promotion_days, \
+         ps.name AS promotion_store_name, \
+         ss.plan AS subscription_plan, sstore.name AS subscription_store_name \
+         FROM seller_charges sc \
+         LEFT JOIN promotions pr ON pr.id = sc.ref_id AND sc.kind = 'promotion' \
+         LEFT JOIN products p ON p.id = pr.product_id \
+         LEFT JOIN stores ps ON ps.id = pr.store_id \
+         LEFT JOIN store_subscriptions ss ON ss.id = sc.ref_id AND sc.kind = 'subscription' \
+         LEFT JOIN stores sstore ON sstore.id = ss.store_id \
+         WHERE sc.seller_user_id = $1 \
+         ORDER BY sc.created_at DESC, sc.id DESC LIMIT $2",
+    )
+    .bind(seller_user_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::internal("list seller charges", e))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let (label, secondary) = match row.kind.as_str() {
+                "promotion" => match (&row.ref_id, &row.product_title) {
+                    (None, _) => ("Promotion charge — no reference recorded".to_string(), None),
+                    (Some(_), None) => ("Promotion charge — record deleted".to_string(), None),
+                    (Some(_), Some(title)) => (
+                        format!("Promotion — {title}"),
+                        match (row.promotion_days, &row.promotion_store_name) {
+                            (Some(days), Some(store)) => {
+                                Some(format!("{days} days · {store}"))
+                            }
+                            (None, Some(store)) => Some(store.clone()),
+                            _ => None,
+                        },
+                    ),
+                },
+                "subscription" => match (&row.ref_id, &row.subscription_plan) {
+                    (None, _) => {
+                        ("Subscription charge — no reference recorded".to_string(), None)
+                    }
+                    (Some(_), None) => {
+                        ("Subscription charge — record deleted".to_string(), None)
+                    }
+                    (Some(_), Some(plan)) => (
+                        // The subscription row is the store's
+                        // CURRENT one (renewals share it), so
+                        // the plan shown is the current plan —
+                        // the charge-time plan is not recorded
+                        // and is never guessed.
+                        format!("Subscription — {plan} plan"),
+                        row.subscription_store_name.clone(),
+                    ),
+                },
+                other => (format!("{other} charge"), None),
+            };
+            SellerChargeView {
+                id: row.id,
+                kind: row.kind,
+                amount_poisha: row.amount_poisha,
+                ref_id: row.ref_id,
+                created_at: row.created_at,
+                label,
+                secondary,
+            }
+        })
+        .collect())
 }
 
 /// THE available-balance read for a seller: resolve the
@@ -403,11 +602,22 @@ pub async fn get_payout_account(
     pool: &PgPool,
     store: &Store,
 ) -> Result<Option<PayoutAccount>, ApiError> {
+    get_payout_account_for_store(pool, store.id).await
+}
+
+/// [`get_payout_account`] keyed by store id directly (admin
+/// payouts remake: the payout detail compares the payout's
+/// account snapshot against the store's CURRENT account,
+/// and the detail handler holds a store id, not a `Store`).
+pub async fn get_payout_account_for_store(
+    pool: &PgPool,
+    store_id: Uuid,
+) -> Result<Option<PayoutAccount>, ApiError> {
     sqlx::query_as(
         "SELECT id, store_id, method, account_name, account_number, created_at, updated_at \
          FROM payout_accounts WHERE store_id = $1",
     )
-    .bind(store.id)
+    .bind(store_id)
     .fetch_optional(pool)
     .await
     .map_err(|e| ApiError::internal("load payout account", e))
@@ -596,11 +806,10 @@ async fn request_payout_once(
     // `request_payout`) is the backstop for any path that
     // ever reaches the insert without this lock.
     if let Some(key) = idempotency_key {
-        let existing: Option<Payout> = sqlx::query_as(
-            "SELECT id, store_id, amount_poisha, method, account_name, account_number, \
-             status, note, created_at, processed_at, idempotency_key \
-             FROM payouts WHERE store_id = $1 AND idempotency_key = $2",
-        )
+        let existing: Option<Payout> = sqlx::query_as(&format!(
+            "SELECT {PAYOUT_COLUMNS} \
+             FROM payouts WHERE store_id = $1 AND idempotency_key = $2"
+        ))
         .bind(store.id)
         .bind(key)
         .fetch_optional(&mut *tx)
@@ -641,13 +850,12 @@ async fn request_payout_once(
     )
     .map_err(ApiError::bad_request)?;
 
-    let payout: Payout = match sqlx::query_as(
+    let payout: Payout = match sqlx::query_as(&format!(
         "INSERT INTO payouts \
          (store_id, amount_poisha, method, account_name, account_number, idempotency_key) \
          VALUES ($1, $2, $3, $4, $5, $6) \
-         RETURNING id, store_id, amount_poisha, method, account_name, account_number, \
-                   status, note, created_at, processed_at, idempotency_key",
-    )
+         RETURNING {PAYOUT_COLUMNS}"
+    ))
     .bind(store.id)
     .bind(amount_poisha)
     .bind(&account.method)
@@ -709,12 +917,11 @@ pub async fn list_payouts_for_store(
         .await
         .map_err(|e| ApiError::internal("count payouts", e))?;
 
-    let items: Vec<Payout> = sqlx::query_as(
-        "SELECT id, store_id, amount_poisha, method, account_name, account_number, \
-         status, note, created_at, processed_at, idempotency_key \
+    let items: Vec<Payout> = sqlx::query_as(&format!(
+        "SELECT {PAYOUT_COLUMNS} \
          FROM payouts WHERE store_id = $1 \
-         ORDER BY created_at DESC LIMIT $2 OFFSET $3",
-    )
+         ORDER BY created_at DESC LIMIT $2 OFFSET $3"
+    ))
     .bind(store.id)
     .bind(limit)
     .bind(offset)

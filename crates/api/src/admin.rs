@@ -56,11 +56,13 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use domain::{
-    can_transition_payout, parse_setting_i64, validate_advance_bps, validate_advance_threshold,
-    validate_commission_bps, validate_plan_free_product_cap, validate_promotion_price_per_day,
-    validate_subscription_price, ADVANCE_PERCENT_BPS_KEY, ADVANCE_THRESHOLD_KEY, COMMISSION_BPS_KEY,
-    KYC_PAYOUT_GATE_KEY, MIN_PAYOUT_KEY, MIN_PAYOUT_POISHA, PLAN_BUSINESS, PLAN_FREE_PRODUCT_CAP_KEY,
-    PLAN_PRO, PROMOTION_PRICE_PER_DAY_KEY, SUBSCRIPTION_PRICE_BUSINESS_KEY,
+    can_transition_payout, is_valid_payout_status, mask_phone, parse_setting_i64,
+    search_like_pattern, to_local_phone, validate_advance_bps, validate_advance_threshold,
+    validate_commission_bps, validate_payout_list_sort, validate_payout_rejection_reason,
+    validate_payment_reference, validate_plan_free_product_cap, validate_promotion_price_per_day,
+    validate_subscription_price, PayoutSort, ADVANCE_PERCENT_BPS_KEY, ADVANCE_THRESHOLD_KEY,
+    COMMISSION_BPS_KEY, KYC_PAYOUT_GATE_KEY, MIN_PAYOUT_KEY, MIN_PAYOUT_POISHA, PLAN_BUSINESS,
+    PLAN_FREE_PRODUCT_CAP_KEY, PLAN_PRO, PROMOTION_PRICE_PER_DAY_KEY, SUBSCRIPTION_PRICE_BUSINESS_KEY,
     SUBSCRIPTION_PRICE_PRO_KEY,
 };
 use serde::{Deserialize, Serialize};
@@ -86,7 +88,8 @@ const MAX_MIN_PAYOUT_POISHA: i64 = 10_000_000;
 /// The payout column list shared by the transition UPDATE's
 /// RETURNING clause (matches the `Payout` view in `payouts`).
 const PAYOUT_COLUMNS: &str = "id, store_id, amount_poisha, method, account_name, \
-    account_number, status, note, created_at, processed_at, idempotency_key";
+    account_number, status, note, created_at, processed_at, approved_at, paid_at, \
+    rejected_at, payment_reference, idempotency_key";
 
 // ---------------------------------------------------------------------------
 // The admin guard + settings readers
@@ -559,159 +562,653 @@ pub async fn list_orders(
 // Payouts: queue + processing
 // ---------------------------------------------------------------------------
 
-/// A payout as the admin sees it: the seller's payout view plus
-/// which store it belongs to and the owner's phone.
-#[derive(Debug, Serialize, FromRow)]
+/// A payout as the admin sees it in the queue: the seller's
+/// payout view plus which store it belongs to and the context
+/// a decision needs. Phone and account number are MASKED at
+/// this level (the Wave 28 list canon) — the full values live
+/// only in the single-payout detail ([`AdminPayoutDetail`]),
+/// which is where money is actually sent from.
+#[derive(Debug, Serialize)]
 pub struct AdminPayout {
     pub id: Uuid,
     pub store_id: Uuid,
     pub store_name: String,
-    pub owner_phone: String,
+    /// The store owner's phone, masked via
+    /// `domain::mask_phone`.
+    pub owner_phone_masked: String,
     pub amount_poisha: i64,
     pub method: String,
     pub account_name: String,
-    pub account_number: String,
+    /// The destination account number, masked to its last
+    /// four characters (for bkash/nagad the number IS a
+    /// phone number). Full value: the detail view only.
+    pub account_number_masked: String,
     pub status: String,
     pub note: Option<String>,
     pub created_at: DateTime<Utc>,
     pub processed_at: Option<DateTime<Utc>>,
+    /// Per-stage decision stamps (migration 0072); `None`
+    /// for a stage the payout has not reached — and, for
+    /// payouts decided before the columns existed, when the
+    /// backfill could not know (never fabricated).
+    pub approved_at: Option<DateTime<Utc>>,
+    pub paid_at: Option<DateTime<Utc>>,
+    pub rejected_at: Option<DateTime<Utc>>,
+    /// The acting admins' user ids for each stage; the
+    /// detail view's audit history names them by masked
+    /// phone.
+    pub approved_by_user_id: Option<Uuid>,
+    pub paid_by_user_id: Option<Uuid>,
+    pub rejected_by_user_id: Option<Uuid>,
+    /// The payment reference recorded at mark-paid (the
+    /// seller's reconciliation proof — not a secret, so the
+    /// queue shows it for paid rows).
+    pub payment_reference: Option<String>,
     /// The client's `Idempotency-Key` when the request carried
     /// one (Wave 44) — an admin handling a "charged twice?"
     /// support question can see at a glance whether the two
     /// rows a seller is worried about share a key (a recognised
     /// retry) or not.
     pub idempotency_key: Option<String>,
+    /// The store's current lifecycle status (`active` /
+    /// `suspended`): a suspended store's payouts are frozen
+    /// (see [`transition_payout`]), and the queue badges them.
+    pub store_status: String,
+    /// The store's current verification tier
+    /// (`unverified` / `basic` / `verified`).
+    pub store_verified_tier: String,
+    /// The store's UNCLAMPED available balance right now
+    /// (earned − paid out − pending − charges), for rows
+    /// still in flight (`requested` / `approved`); `None`
+    /// for terminal rows, where coverage no longer decides
+    /// anything. Negative means the store's commitments
+    /// exceed its earnings — the hole the approve/mark-paid
+    /// re-check refuses to deepen.
+    pub coverage_unclamped_poisha: Option<i64>,
+    /// `coverage_unclamped_poisha >= 0`, for in-flight rows;
+    /// `None` for terminal rows. A snapshot for triage —
+    /// the transition re-checks inside its transaction and
+    /// remains the authority.
+    pub covered: Option<bool>,
+    /// Another in-flight payout exists for the same store
+    /// and the SAME amount (a possible keyless double
+    /// submit — the one duplicate shape the idempotency key
+    /// cannot rule out). A warning to look before approving,
+    /// never proof: two equal legitimate requests exist.
+    pub possible_duplicate: bool,
 }
 
-/// A page of admin payouts plus the total count.
+/// One status slice of the whole payout queue (admin payouts
+/// remake): the same triple the overview's `pending_payouts`
+/// block reports for `requested` — count, total amount, and
+/// the age of the oldest row in the slice, always since the
+/// row was FILED (`created_at`), so the surfaces can never
+/// disagree about what the number means.
+#[derive(Debug, Serialize)]
+pub struct PayoutStatusBucket {
+    pub count: i64,
+    pub amount_poisha: i64,
+    pub oldest_age_secs: Option<i64>,
+}
+
+/// Per-status totals over the WHOLE queue — never the
+/// filtered page — in the admin payout list response. The
+/// `paid` / `rejected` slices are lifetime totals; the
+/// `requested` slice is identical to the overview's
+/// `pending_payouts` by construction of the same query
+/// shape (and pinned equal by test).
+#[derive(Debug, Serialize)]
+pub struct PayoutStatusSummary {
+    pub requested: PayoutStatusBucket,
+    pub approved: PayoutStatusBucket,
+    pub paid: PayoutStatusBucket,
+    pub rejected: PayoutStatusBucket,
+}
+
+/// A page of admin payouts plus the total count and the
+/// whole-queue status summary.
 #[derive(Debug, Serialize)]
 pub struct AdminPayoutList {
     pub items: Vec<AdminPayout>,
     pub total: i64,
     pub page: i64,
     pub limit: i64,
+    pub summary: PayoutStatusSummary,
 }
 
-/// The payout processing queue, newest first, optionally filtered
-/// by lifecycle status.
+/// The raw queue row, before masking and coverage are
+/// applied. Carries the full phone / account number (the
+/// detail view needs them) and the store fields the list
+/// mapping does not surface.
+#[derive(Debug, FromRow)]
+struct AdminPayoutRow {
+    id: Uuid,
+    store_id: Uuid,
+    store_name: String,
+    store_slug: String,
+    store_status: String,
+    store_verified_tier: String,
+    owner_user_id: Uuid,
+    owner_phone: String,
+    amount_poisha: i64,
+    method: String,
+    account_name: String,
+    account_number: String,
+    status: String,
+    note: Option<String>,
+    created_at: DateTime<Utc>,
+    processed_at: Option<DateTime<Utc>>,
+    approved_at: Option<DateTime<Utc>>,
+    paid_at: Option<DateTime<Utc>>,
+    rejected_at: Option<DateTime<Utc>>,
+    approved_by_user_id: Option<Uuid>,
+    paid_by_user_id: Option<Uuid>,
+    rejected_by_user_id: Option<Uuid>,
+    payment_reference: Option<String>,
+    idempotency_key: Option<String>,
+    possible_duplicate: bool,
+}
+
+/// The queue projection shared by the list, the detail and
+/// the detail's store history: one SELECT so the three can
+/// never drift apart. `$1` is the caller's WHERE tail; the
+/// projection itself is constant.
+const ADMIN_PAYOUT_PROJECTION: &str = "p.id, p.store_id, s.name AS store_name, \
+    s.slug AS store_slug, s.status AS store_status, \
+    s.verified_tier AS store_verified_tier, s.owner_user_id, \
+    u.phone AS owner_phone, p.amount_poisha, p.method, p.account_name, \
+    p.account_number, p.status, p.note, p.created_at, p.processed_at, \
+    p.approved_at, p.paid_at, p.rejected_at, p.approved_by_user_id, \
+    p.paid_by_user_id, p.rejected_by_user_id, p.payment_reference, \
+    p.idempotency_key, \
+    EXISTS (SELECT 1 FROM payouts d \
+             WHERE d.store_id = p.store_id AND d.id <> p.id \
+               AND d.amount_poisha = p.amount_poisha \
+               AND d.status IN ('requested', 'approved')) AS possible_duplicate \
+    FROM payouts p \
+    JOIN stores s ON s.id = p.store_id \
+    JOIN users u ON u.id = s.owner_user_id";
+
+/// Mask an account number to its last four characters —
+/// enough to recognise a destination, never enough to send
+/// to it.
+fn mask_account_number(number: &str) -> String {
+    let chars: Vec<char> = number.chars().collect();
+    if chars.len() > 4 {
+        let tail: String = chars[chars.len() - 4..].iter().collect();
+        format!("••••{tail}")
+    } else {
+        "••••".to_string()
+    }
+}
+
+/// Map raw rows to queue views, attaching the per-store
+/// coverage snapshot to in-flight rows in ONE batched
+/// earnings read (never a query per row).
+async fn payout_views(
+    pool: &PgPool,
+    rows: Vec<AdminPayoutRow>,
+) -> Result<Vec<AdminPayout>, ApiError> {
+    let in_flight_stores: Vec<Uuid> = rows
+        .iter()
+        .filter(|row| row.status == "requested" || row.status == "approved")
+        .map(|row| row.store_id)
+        .collect();
+    let earnings_by_store = if in_flight_stores.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        crate::payouts::seller_earnings_for_stores(pool, &in_flight_stores).await?
+    };
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let (coverage_unclamped_poisha, covered) =
+                match earnings_by_store.get(&row.store_id) {
+                    Some(earnings)
+                        if row.status == "requested" || row.status == "approved" =>
+                    {
+                        let unclamped = earnings.earned_poisha
+                            - earnings.paid_out_poisha
+                            - earnings.pending_poisha
+                            - earnings.charges_total_poisha;
+                        (Some(unclamped), Some(unclamped >= 0))
+                    }
+                    _ => (None, None),
+                };
+            AdminPayout {
+                id: row.id,
+                store_id: row.store_id,
+                store_name: row.store_name,
+                owner_phone_masked: mask_phone(&row.owner_phone),
+                amount_poisha: row.amount_poisha,
+                method: row.method,
+                account_name: row.account_name,
+                account_number_masked: mask_account_number(&row.account_number),
+                status: row.status,
+                note: row.note,
+                created_at: row.created_at,
+                processed_at: row.processed_at,
+                approved_at: row.approved_at,
+                paid_at: row.paid_at,
+                rejected_at: row.rejected_at,
+                approved_by_user_id: row.approved_by_user_id,
+                paid_by_user_id: row.paid_by_user_id,
+                rejected_by_user_id: row.rejected_by_user_id,
+                payment_reference: row.payment_reference,
+                idempotency_key: row.idempotency_key,
+                store_status: row.store_status,
+                store_verified_tier: row.store_verified_tier,
+                coverage_unclamped_poisha,
+                covered,
+                possible_duplicate: row.possible_duplicate,
+            }
+        })
+        .collect())
+}
+
+/// The queue's ORDER BY fragment for a validated sort —
+/// a fixed string per variant (user input never reaches
+/// the SQL text). Every order is TOTAL (the `id` tail
+/// breaks timestamp ties) so pages can neither repeat nor
+/// skip a row.
+fn payout_order_by(sort: PayoutSort) -> &'static str {
+    match sort {
+        PayoutSort::Newest => "ORDER BY p.created_at DESC, p.id DESC",
+        PayoutSort::Oldest => "ORDER BY p.created_at ASC, p.id ASC",
+        PayoutSort::AmountDesc => {
+            "ORDER BY p.amount_poisha DESC, p.created_at DESC, p.id DESC"
+        }
+        PayoutSort::AmountAsc => {
+            "ORDER BY p.amount_poisha ASC, p.created_at DESC, p.id DESC"
+        }
+    }
+}
+
+/// The whole-queue per-status summary (see
+/// [`PayoutStatusSummary`]): one FILTER scan over `payouts`,
+/// in the gift-cards/analytics aggregate style. Deliberately
+/// unfiltered — the summary describes the queue, not the
+/// page.
+async fn payout_status_summary(pool: &PgPool) -> Result<PayoutStatusSummary, ApiError> {
+    #[derive(FromRow)]
+    struct PayoutSummaryRow {
+        requested_count: i64,
+        requested_amount_poisha: i64,
+        requested_oldest_age_secs: Option<i64>,
+        approved_count: i64,
+        approved_amount_poisha: i64,
+        approved_oldest_age_secs: Option<i64>,
+        paid_count: i64,
+        paid_amount_poisha: i64,
+        paid_oldest_age_secs: Option<i64>,
+        rejected_count: i64,
+        rejected_amount_poisha: i64,
+        rejected_oldest_age_secs: Option<i64>,
+    }
+
+    let row: PayoutSummaryRow = sqlx::query_as(
+        "SELECT \
+           (COUNT(*) FILTER (WHERE status = 'requested'))::bigint AS requested_count, \
+           COALESCE(SUM(amount_poisha) FILTER (WHERE status = 'requested'), 0)::bigint \
+             AS requested_amount_poisha, \
+           EXTRACT(EPOCH FROM (now() - MIN(created_at) \
+             FILTER (WHERE status = 'requested')))::bigint AS requested_oldest_age_secs, \
+           (COUNT(*) FILTER (WHERE status = 'approved'))::bigint AS approved_count, \
+           COALESCE(SUM(amount_poisha) FILTER (WHERE status = 'approved'), 0)::bigint \
+             AS approved_amount_poisha, \
+           EXTRACT(EPOCH FROM (now() - MIN(created_at) \
+             FILTER (WHERE status = 'approved')))::bigint AS approved_oldest_age_secs, \
+           (COUNT(*) FILTER (WHERE status = 'paid'))::bigint AS paid_count, \
+           COALESCE(SUM(amount_poisha) FILTER (WHERE status = 'paid'), 0)::bigint \
+             AS paid_amount_poisha, \
+           EXTRACT(EPOCH FROM (now() - MIN(created_at) \
+             FILTER (WHERE status = 'paid')))::bigint AS paid_oldest_age_secs, \
+           (COUNT(*) FILTER (WHERE status = 'rejected'))::bigint AS rejected_count, \
+           COALESCE(SUM(amount_poisha) FILTER (WHERE status = 'rejected'), 0)::bigint \
+             AS rejected_amount_poisha, \
+           EXTRACT(EPOCH FROM (now() - MIN(created_at) \
+             FILTER (WHERE status = 'rejected')))::bigint AS rejected_oldest_age_secs \
+         FROM payouts",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::internal("payout status summary", e))?;
+
+    Ok(PayoutStatusSummary {
+        requested: PayoutStatusBucket {
+            count: row.requested_count,
+            amount_poisha: row.requested_amount_poisha,
+            oldest_age_secs: row.requested_oldest_age_secs,
+        },
+        approved: PayoutStatusBucket {
+            count: row.approved_count,
+            amount_poisha: row.approved_amount_poisha,
+            oldest_age_secs: row.approved_oldest_age_secs,
+        },
+        paid: PayoutStatusBucket {
+            count: row.paid_count,
+            amount_poisha: row.paid_amount_poisha,
+            oldest_age_secs: row.paid_oldest_age_secs,
+        },
+        rejected: PayoutStatusBucket {
+            count: row.rejected_count,
+            amount_poisha: row.rejected_amount_poisha,
+            oldest_age_secs: row.rejected_oldest_age_secs,
+        },
+    })
+}
+
+/// The payout processing queue (admin payouts remake):
+/// filterable by lifecycle status and a search term,
+/// sortable, and carrying the whole-queue status summary.
+///
+/// - `status`: one of the four lifecycle values; an unknown
+///   value is a 400, never a silently empty queue (an admin
+///   filtering by a typo must not conclude there is nothing
+///   to pay).
+/// - `q`: matches the store name, the owner's phone and the
+///   destination account number (substring, LIKE-escaped via
+///   the domain helper), a phone in local form (the stored
+///   canonical form contains it as a substring), and the
+///   idempotency key EXACTLY or by prefix (case-sensitive —
+///   key equality in this system is byte-for-byte, so the
+///   search is too).
+/// - `sort`: validated by the domain; the ORDER BY fragment
+///   is a fixed string per variant.
 pub async fn list_payouts(
     pool: &PgPool,
     status: Option<&str>,
+    q: Option<&str>,
+    sort: Option<&str>,
     page: Option<i64>,
     limit: Option<i64>,
 ) -> Result<AdminPayoutList, ApiError> {
     let (page, limit) = clamp_pagination(page, limit);
     let offset = (page - 1) * limit;
     let status = status.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(status) = status {
+        if !is_valid_payout_status(status) {
+            return Err(ApiError::bad_request(
+                "status must be one of: requested, approved, paid, rejected",
+            ));
+        }
+    }
+    let sort = validate_payout_list_sort(sort).map_err(ApiError::bad_request)?;
 
+    let q = q.map(str::trim).filter(|s| !s.is_empty());
+    let contains_pattern = q.map(search_like_pattern);
+    let local_pattern = q
+        .and_then(to_local_phone)
+        .map(|local| search_like_pattern(&local));
+    let raw_q = q.map(str::to_owned);
+
+    let summary = payout_status_summary(pool).await?;
+
+    // The COUNT carries the same joins and predicates as the
+    // page query — the two must never diverge.
     let total: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM payouts WHERE ($1::text IS NULL OR status = $1)",
+        "SELECT COUNT(*) FROM payouts p \
+         JOIN stores s ON s.id = p.store_id \
+         JOIN users u ON u.id = s.owner_user_id \
+         WHERE ($1::text IS NULL OR p.status = $1) \
+           AND ($2::text IS NULL OR s.name ILIKE $2 OR u.phone ILIKE $2 \
+                OR p.account_number ILIKE $2 \
+                OR ($3::text IS NOT NULL \
+                    AND (u.phone ILIKE $3 OR p.account_number ILIKE $3)) \
+                OR ($4::text IS NOT NULL \
+                    AND (p.idempotency_key = $4 \
+                         OR starts_with(p.idempotency_key, $4))))",
     )
     .bind(status)
+    .bind(&contains_pattern)
+    .bind(&local_pattern)
+    .bind(&raw_q)
     .fetch_one(pool)
     .await
     .map_err(|e| ApiError::internal("count admin payouts", e))?;
 
-    let items: Vec<AdminPayout> = sqlx::query_as(
-        "SELECT p.id, p.store_id, s.name AS store_name, u.phone AS owner_phone, \
-         p.amount_poisha, p.method, p.account_name, p.account_number, \
-         p.status, p.note, p.created_at, p.processed_at, p.idempotency_key \
-         FROM payouts p \
-         JOIN stores s ON s.id = p.store_id \
-         JOIN users u ON u.id = s.owner_user_id \
+    let rows: Vec<AdminPayoutRow> = sqlx::query_as(&format!(
+        "SELECT {ADMIN_PAYOUT_PROJECTION} \
          WHERE ($1::text IS NULL OR p.status = $1) \
-         ORDER BY p.created_at DESC LIMIT $2 OFFSET $3",
-    )
+           AND ($2::text IS NULL OR s.name ILIKE $2 OR u.phone ILIKE $2 \
+                OR p.account_number ILIKE $2 \
+                OR ($3::text IS NOT NULL \
+                    AND (u.phone ILIKE $3 OR p.account_number ILIKE $3)) \
+                OR ($4::text IS NOT NULL \
+                    AND (p.idempotency_key = $4 \
+                         OR starts_with(p.idempotency_key, $4)))) \
+         {} LIMIT $5 OFFSET $6",
+        payout_order_by(sort)
+    ))
     .bind(status)
+    .bind(&contains_pattern)
+    .bind(&local_pattern)
+    .bind(&raw_q)
     .bind(limit)
     .bind(offset)
     .fetch_all(pool)
     .await
     .map_err(|e| ApiError::internal("list admin payouts", e))?;
 
+    let items = payout_views(pool, rows).await?;
+
     Ok(AdminPayoutList {
         items,
         total,
         page,
         limit,
+        summary,
     })
+}
+
+/// The Bangla label of a payout status, for error prose —
+/// the same words the web's `payoutStatusLabel` shows.
+fn payout_status_label_bn(status: &str) -> &str {
+    match status {
+        "requested" => "অনুরোধ করা হয়েছে",
+        "approved" => "অনুমোদিত",
+        "paid" => "পরিশোধিত",
+        "rejected" => "প্রত্যাখ্যাত",
+        _ => status,
+    }
 }
 
 /// THE payout processing function: approve, reject and mark-paid
 /// are three thin handlers over this one service. The domain
 /// transition table decides legality (an illegal move is a 409);
-/// a legal move stamps `processed_at`, and a supplied note (the
-/// rejection reason) replaces the stored note. Wave 28: the
-/// whole move — status read, update, and the audit row
-/// (`payout.approve` / `payout.reject` / `payout.mark_paid`) —
-/// runs in ONE transaction, so the audit log and the payout
-/// can never disagree.
+/// a legal move stamps `processed_at` AND its per-stage stamp +
+/// actor (migration 0072). Wave 28: the whole move — status
+/// read, update, and the audit row (`payout.approve` /
+/// `payout.reject` / `payout.mark_paid`) — runs in ONE
+/// transaction, so the audit log and the payout can never
+/// disagree.
+///
+/// Admin payouts remake — the decision gates, in the order
+/// they fire (the precedence is deliberate and pinned by
+/// test):
+///
+/// 1. INPUT, before any database work (400): a rejection
+///    requires a reason ([`validate_payout_rejection_reason`])
+///    and mark-paid requires a payment reference
+///    ([`validate_payment_reference`]).
+/// 2. EXISTENCE (404): the payout's store is resolved by a
+///    plain read before any lock is taken.
+/// 3. LOCKS, in the platform's one order — store row first,
+///    then the payout row — the same order payout creation,
+///    promotions and subscriptions already use, so no two
+///    money paths can deadlock against each other.
+/// 4. LEGALITY (409): `can_transition_payout`.
+/// 5. SUSPENSION (409): a suspended store's payouts are
+///    frozen for approve and mark-paid. Reject is exempt —
+///    it releases the seller's hold, and freezing it would
+///    trap the amount with no exit.
+/// 6. KYC (400, approve only): when the platform's KYC
+///    payout gate is on, a store that is unverified NOW
+///    cannot be approved — the creation-time gate alone let
+///    a payout requested before the gate (or before a tier
+///    loss) sail through. Same error class as creation's.
+/// 7. COVERAGE (409): the Wave 39 re-check, extended from
+///    approve to mark-paid. Earnings can drop after approval
+///    (a delivered order is returned, a charge lands) and
+///    `paid` is final — the last moment to catch an
+///    uncovered payout is before the send is recorded. The
+///    check uses the UNCLAMPED balance, and the refusal
+///    carries the full earnings picture as structured
+///    details, computed inside this transaction.
 pub async fn transition_payout(
-    pool: &PgPool,
+    state: &AppState,
     admin_id: Uuid,
     payout_id: Uuid,
     target_status: &str,
     note: Option<&str>,
+    payment_reference: Option<&str>,
 ) -> Result<Payout, ApiError> {
+    // Gate 1 — pure input, validated before the transaction
+    // opens (the verification-reject precedent: a malformed
+    // decision is a 400 whatever the payout's state).
+    let rejection_reason: Option<String> = if target_status == "rejected" {
+        Some(
+            validate_payout_rejection_reason(note.unwrap_or(""))
+                .map_err(ApiError::bad_request)?,
+        )
+    } else {
+        None
+    };
+    let payment_reference: Option<String> = if target_status == "paid" {
+        Some(
+            validate_payment_reference(payment_reference.unwrap_or(""))
+                .map_err(ApiError::bad_request)?,
+        )
+    } else {
+        None
+    };
+
+    let pool = state.require_pool()?;
     let mut tx = pool
         .begin()
         .await
         .map_err(|e| ApiError::internal("begin payout transition", e))?;
-    let current: Option<String> =
-        sqlx::query_scalar("SELECT status FROM payouts WHERE id = $1 FOR UPDATE")
+
+    // Gate 2 — existence, before locks.
+    let store_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT store_id FROM payouts WHERE id = $1")
             .bind(payout_id)
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| ApiError::internal("load payout for transition", e))?;
-    let current = current.ok_or_else(|| ApiError::not_found("payout not found"))?;
+    let store_id = store_id.ok_or_else(|| ApiError::not_found("payout not found"))?;
+
+    // Gate 3 — the locks, store first. The store row carries
+    // the two facts the freeze and KYC gates read; reading
+    // them under the lock serialises against `set_store_status`
+    // and verification decisions taken concurrently.
+    let (store_status, verified_tier): (String, String) = sqlx::query_as(
+        "SELECT status, verified_tier FROM stores WHERE id = $1 FOR UPDATE",
+    )
+    .bind(store_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| ApiError::internal("lock store for payout transition", e))?;
+    let (current, amount_poisha): (String, i64) =
+        sqlx::query_as("SELECT status, amount_poisha FROM payouts WHERE id = $1 FOR UPDATE")
+            .bind(payout_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| ApiError::internal("lock payout for transition", e))?;
+
+    // Gate 4 — legality.
     if !can_transition_payout(&current, target_status) {
         return Err(ApiError::conflict(format!(
-            "cannot move a payout from '{current}' to '{target_status}'"
+            "এই পে-আউটটি এখন {} ('{current}') অবস্থায় আছে — '{target_status}' করা যাবে না। \
+             অন্য কোনো অ্যাডমিন হয়তো ইতিমধ্যে এটি প্রসেস করেছেন — তালিকা রিফ্রেশ করে \
+             আবার দেখুন (this payout is now '{current}' — it cannot be moved to \
+             '{target_status}'; another admin may have already processed it — refresh \
+             the list and check again)",
+            payout_status_label_bn(&current)
         )));
     }
 
-    // Wave 39 (security audit CR-10, the approve-time half of its
-    // prescription): approving re-checks the payout against the
-    // store's CURRENT earnings, inside this transaction. Earnings
-    // can drop after a request was created (a delivered order is
-    // returned, a charge lands), leaving total pending payouts
-    // above what the seller actually has. Approving into that
-    // hole is refused with a 409; the admin can reject the
-    // request, or wait until earnings cover it again. The check
-    // uses the UNCLAMPED balance — `Earnings.available_poisha`
-    // is clamped at zero for display, which would hide exactly
-    // the hole this check exists to catch. (The payout's own
-    // amount is already inside the requested total the earnings
-    // aggregate subtracts, so a non-negative unclamped balance
-    // is exactly "this payout is still covered".)
-    if target_status == "approved" {
-        let store_id: Uuid =
-            sqlx::query_scalar("SELECT store_id FROM payouts WHERE id = $1")
-                .bind(payout_id)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|e| ApiError::internal("load payout store for balance re-check", e))?;
+    // Gate 5 — the suspension freeze.
+    if (target_status == "approved" || target_status == "paid") && store_status == "suspended" {
+        return Err(ApiError::conflict(
+            "স্টোরটি সাসপেন্ডেড আছে — সাসপেন্ডেড থাকা অবস্থায় এই পে-আউট প্রসেস করা \
+             যাবে না। আগে স্টোরটি সক্রিয় করুন (this store is suspended — its payouts \
+             are frozen while suspended; reactivate the store first)",
+        ));
+    }
+
+    // Gate 6 — the KYC gate, re-checked at approval. The
+    // settings read goes through the pool, outside this
+    // transaction (settings are platform-global, exactly as
+    // at creation; a flip racing this approval is a policy
+    // change mid-flight, not a money race).
+    if target_status == "approved"
+        && effective_kyc_payout_gate(state).await
+        && verified_tier == "unverified"
+    {
+        return Err(ApiError::bad_request(
+            "স্টোরটি যাচাইকৃত নয় — KYC গেট চালু থাকায় এই পে-আউট অনুমোদন করা যাবে না \
+             (cannot approve this payout: payouts require a verified store while the \
+             KYC payout gate is on — the seller must complete store verification first)",
+        ));
+    }
+
+    // Gate 7 — coverage (Wave 39, extended to mark-paid).
+    if target_status == "approved" || target_status == "paid" {
         let earnings = crate::payouts::seller_earnings_on(&mut *tx, store_id).await?;
         let unclamped_available = earnings.earned_poisha
             - earnings.paid_out_poisha
             - earnings.pending_poisha
             - earnings.charges_total_poisha;
         if unclamped_available < 0 {
-            return Err(ApiError::conflict(
+            let message = if target_status == "approved" {
                 "পে-আউট অনুমোদন করা যাচ্ছে না — স্টোরের বর্তমান ব্যালেন্স এই পে-আউটের \
-                 জন্য যথেষ্ট নয় (cannot approve: the store's current available balance \
-                 no longer covers its pending payouts)",
-            ));
+                 জন্য যথেষ্ট নয় — হয় অনুরোধটি প্রত্যাখ্যান করুন, নয়তো ব্যালেন্স আবার \
+                 যথেষ্ট হওয়া পর্যন্ত অপেক্ষা করুন (cannot approve: the store's current \
+                 available balance no longer covers its pending payouts — reject the \
+                 request, or wait until the balance covers it again)"
+            } else {
+                "পে-আউট পরিশোধিত চিহ্নিত করা যাচ্ছে না — স্টোরের বর্তমান ব্যালেন্স এই \
+                 পে-আউটের জন্য যথেষ্ট নয় — হয় অনুরোধটি প্রত্যাখ্যান করুন, নয়তো \
+                 ব্যালেন্স আবার যথেষ্ট হওয়া পর্যন্ত অপেক্ষা করুন (cannot mark paid: \
+                 the store's current available balance no longer covers this payout — \
+                 reject the request, or wait until the balance covers it again)"
+            };
+            return Err(ApiError::conflict(message).with_details(serde_json::json!({
+                "kind": "payout_coverage",
+                "payout_id": payout_id,
+                "store_id": store_id,
+                "amount_poisha": amount_poisha,
+                "earned_poisha": earnings.earned_poisha,
+                "paid_out_poisha": earnings.paid_out_poisha,
+                "pending_poisha": earnings.pending_poisha,
+                "charges_total_poisha": earnings.charges_total_poisha,
+                "available_unclamped_poisha": unclamped_available,
+                "shortfall_poisha": -unclamped_available,
+            })));
         }
     }
 
     let payout: Payout = sqlx::query_as(&format!(
         "UPDATE payouts SET status = $2, processed_at = now(), \
-         note = COALESCE($3, note) WHERE id = $1 RETURNING {PAYOUT_COLUMNS}"
+         note = COALESCE($3, note), \
+         approved_at = CASE WHEN $2 = 'approved' THEN now() ELSE approved_at END, \
+         approved_by_user_id = CASE WHEN $2 = 'approved' THEN $4 \
+                                    ELSE approved_by_user_id END, \
+         paid_at = CASE WHEN $2 = 'paid' THEN now() ELSE paid_at END, \
+         paid_by_user_id = CASE WHEN $2 = 'paid' THEN $4 ELSE paid_by_user_id END, \
+         rejected_at = CASE WHEN $2 = 'rejected' THEN now() ELSE rejected_at END, \
+         rejected_by_user_id = CASE WHEN $2 = 'rejected' THEN $4 \
+                                    ELSE rejected_by_user_id END, \
+         payment_reference = COALESCE($5, payment_reference) \
+         WHERE id = $1 RETURNING {PAYOUT_COLUMNS}"
     ))
     .bind(payout_id)
     .bind(target_status)
-    .bind(note)
+    .bind(rejection_reason.as_deref())
+    .bind(admin_id)
+    .bind(payment_reference.as_deref())
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| ApiError::internal("transition payout", e))?;
@@ -723,8 +1220,11 @@ pub async fn transition_payout(
         _ => "payout.transition",
     };
     let mut detail = serde_json::json!({ "from": current, "to": target_status });
-    if let Some(note) = note {
-        detail["note"] = serde_json::Value::String(note.to_string());
+    if let Some(reason) = &rejection_reason {
+        detail["note"] = serde_json::Value::String(reason.clone());
+    }
+    if let Some(reference) = &payment_reference {
+        detail["payment_reference"] = serde_json::Value::String(reference.clone());
     }
     record_admin_action(
         &mut *tx,
@@ -735,12 +1235,27 @@ pub async fn transition_payout(
         Some(detail),
     )
     .await?;
-    // Wave 29: a payout that reaches `paid` also queues the
-    // seller's payout_paid SMS in the same transaction (the
-    // outbox rule — see the `notices` module).
-    if target_status == "paid" {
-        crate::notices::enqueue_payout_paid_notice(&mut tx, payout.store_id, payout.amount_poisha)
-            .await?;
+    // Wave 29 + remake: every decision queues the seller's
+    // notice in the same transaction (the outbox rule — see
+    // the `notices` module): approval announces the approval
+    // (never a send), rejection carries the reason, payment
+    // carries the recorded reference.
+    let notice_kind = match target_status {
+        "approved" => Some(domain::NOTIFICATION_PAYOUT_APPROVED),
+        "rejected" => Some(domain::NOTIFICATION_PAYOUT_REJECTED),
+        "paid" => Some(domain::NOTIFICATION_PAYOUT_PAID),
+        _ => None,
+    };
+    if let Some(kind) = notice_kind {
+        crate::notices::enqueue_payout_notice(
+            &mut tx,
+            payout.store_id,
+            payout.amount_poisha,
+            kind,
+            rejection_reason.as_deref(),
+            payment_reference.as_deref(),
+        )
+        .await?;
     }
     tx.commit()
         .await
@@ -748,9 +1263,252 @@ pub async fn transition_payout(
     Ok(payout)
 }
 
-// ---------------------------------------------------------------------------
-// Users: list + admin flag
-// ---------------------------------------------------------------------------
+/// The store block of the payout detail: the facts about
+/// the store a decision depends on that the flattened queue
+/// row does not carry (the name and id are already there).
+#[derive(Debug, Serialize)]
+pub struct PayoutStoreSummary {
+    pub slug: String,
+    pub status: String,
+    pub verified_tier: String,
+}
+
+/// Money still at risk from returns, for the payout detail
+/// (admin payouts remake): the two exposures are different
+/// money and are never summed together.
+#[derive(Debug, Serialize)]
+pub struct PayoutReturnsExposure {
+    /// Returns asked for or approved but not yet received.
+    pub in_flight_count: i64,
+    /// The seller-payout value of the still-delivered
+    /// sub-orders those returns target: it sits inside
+    /// `earned_poisha` today and leaves it the moment a
+    /// return is received — the approve/mark-paid coverage
+    /// hole, made visible before it lands.
+    pub at_risk_payout_poisha: i64,
+    /// Returns already received whose buyer refund is still
+    /// pending. That money is already OUT of earnings; it
+    /// is platform cash owed to buyers, shown for context.
+    pub received_refund_pending_count: i64,
+    pub received_refund_pending_poisha: i64,
+}
+
+/// One payout in full, for the admin who must decide on it
+/// (admin payouts remake): the queue row (flattened) plus
+/// the full destination (the ONLY admin payout response
+/// that carries it), the earnings behind the amount, the
+/// returns exposure, the seller's recent charges, the
+/// verification state, the store's current account beside
+/// the payout's snapshot, the store's other payouts, and
+/// this payout's audit history.
+///
+/// The detail is an ADVISORY snapshot assembled from
+/// sequential reads; the transition's in-transaction
+/// re-checks remain the authority for every decision.
+#[derive(Debug, Serialize)]
+pub struct AdminPayoutDetail {
+    #[serde(flatten)]
+    pub payout: AdminPayout,
+    /// The store owner's full phone — detail only.
+    pub owner_phone: String,
+    /// The destination account number in full — detail
+    /// only; this is the number money is sent to (always
+    /// the payout's request-time SNAPSHOT, never the
+    /// store's current account).
+    pub account_number: String,
+    pub store: PayoutStoreSummary,
+    /// The store's earnings, the one canonical aggregate.
+    pub earnings: crate::payouts::Earnings,
+    /// earned − paid out − pending − charges, unclamped.
+    pub unclamped_available_poisha: i64,
+    /// `unclamped_available_poisha >= 0` — the store's
+    /// total position covers its commitments. (Whether
+    /// THIS payout is covered is that same fact while it
+    /// sits in `requested` / `approved`: its amount is
+    /// inside the subtracted totals.)
+    pub covered: bool,
+    pub returns_exposure: PayoutReturnsExposure,
+    /// The seller's most recent charges (all their stores —
+    /// the scope the earnings aggregate subtracts).
+    pub charges_recent: Vec<crate::payouts::SellerChargeView>,
+    /// Copied from `earnings.charges_total_poisha` — never
+    /// a second aggregate, so the block cannot disagree
+    /// with the earnings above it.
+    pub charges_total_poisha: i64,
+    pub charges_count: i64,
+    /// The store's verification state, masked by
+    /// construction; a store that never applied reads
+    /// status `none`.
+    pub verification: crate::verification::SellerVerificationView,
+    /// The store's CURRENT payout account, beside the
+    /// snapshot this payout carries.
+    pub current_account: Option<crate::payouts::PayoutAccount>,
+    /// The current account's (method, name, number) differ
+    /// from this payout's snapshot — including "no current
+    /// account at all". A warning to re-confirm with the
+    /// seller, NEVER a signal to pay the current account:
+    /// payouts always go to their snapshot.
+    pub account_diverged: bool,
+    /// The store's other payouts, newest first, at most
+    /// ten (the subject payout is excluded; it is the
+    /// flattened row above).
+    pub store_payout_history: Vec<AdminPayout>,
+    /// Every audit entry recorded against this payout,
+    /// newest first, at most twenty.
+    pub audit_entries: Vec<crate::audit::AdminAuditEntry>,
+    /// The ids of the other in-flight payouts behind
+    /// `possible_duplicate`, for one-click comparison.
+    pub duplicate_candidate_ids: Vec<Uuid>,
+}
+
+/// Assemble the payout detail (see [`AdminPayoutDetail`]).
+/// The payout row is read first and alone: an unknown id is
+/// a 404 before any sub-query runs.
+pub async fn get_payout_detail(
+    pool: &PgPool,
+    payout_id: Uuid,
+) -> Result<AdminPayoutDetail, ApiError> {
+    let row: Option<AdminPayoutRow> = sqlx::query_as(&format!(
+        "SELECT {ADMIN_PAYOUT_PROJECTION} WHERE p.id = $1"
+    ))
+    .bind(payout_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ApiError::internal("load admin payout detail", e))?;
+    let row = row.ok_or_else(|| ApiError::not_found("payout not found"))?;
+
+    let store_id = row.store_id;
+    let owner_user_id = row.owner_user_id;
+    let store_slug = row.store_slug.clone();
+    let store_status = row.store_status.clone();
+    let verified_tier = row.store_verified_tier.clone();
+    let owner_phone = row.owner_phone.clone();
+    let account_number = row.account_number.clone();
+    let snapshot = (
+        row.method.clone(),
+        row.account_name.clone(),
+        row.account_number.clone(),
+    );
+
+    let earnings = crate::payouts::seller_earnings(pool, store_id).await?;
+    let unclamped_available_poisha = earnings.earned_poisha
+        - earnings.paid_out_poisha
+        - earnings.pending_poisha
+        - earnings.charges_total_poisha;
+
+    #[derive(FromRow)]
+    struct ReturnsExposureRow {
+        in_flight_count: i64,
+        at_risk_payout_poisha: i64,
+        received_refund_pending_count: i64,
+        received_refund_pending_poisha: i64,
+    }
+    let exposure: ReturnsExposureRow = sqlx::query_as(
+        "SELECT \
+           (COUNT(*) FILTER (WHERE rr.status IN ('requested', 'approved')))::bigint \
+             AS in_flight_count, \
+           COALESCE(SUM(so.seller_payout_poisha) FILTER \
+             (WHERE rr.status IN ('requested', 'approved') \
+                AND so.status = 'delivered'), 0)::bigint AS at_risk_payout_poisha, \
+           (COUNT(*) FILTER (WHERE rr.refund_status = 'pending'))::bigint \
+             AS received_refund_pending_count, \
+           COALESCE(SUM(rr.refund_poisha) FILTER \
+             (WHERE rr.refund_status = 'pending'), 0)::bigint \
+             AS received_refund_pending_poisha \
+         FROM return_requests rr \
+         JOIN sub_orders so ON so.id = rr.sub_order_id \
+         WHERE rr.store_id = $1",
+    )
+    .bind(store_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::internal("load payout returns exposure", e))?;
+
+    let charges_recent =
+        crate::payouts::list_recent_seller_charges(pool, owner_user_id, 10).await?;
+    let charges_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM seller_charges WHERE seller_user_id = $1")
+            .bind(owner_user_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| ApiError::internal("count seller charges", e))?;
+
+    let verification =
+        crate::verification::admin_verification_summary(pool, store_id, &verified_tier).await?;
+
+    let current_account =
+        crate::payouts::get_payout_account_for_store(pool, store_id).await?;
+    let account_diverged = match &current_account {
+        None => true,
+        Some(account) => {
+            account.method != snapshot.0
+                || account.account_name != snapshot.1
+                || account.account_number != snapshot.2
+        }
+    };
+
+    let history_rows: Vec<AdminPayoutRow> = sqlx::query_as(&format!(
+        "SELECT {ADMIN_PAYOUT_PROJECTION} \
+         WHERE p.store_id = $1 AND p.id <> $2 \
+         ORDER BY p.created_at DESC, p.id DESC LIMIT 10"
+    ))
+    .bind(store_id)
+    .bind(payout_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::internal("list store payout history", e))?;
+    let store_payout_history = payout_views(pool, history_rows).await?;
+
+    let audit_entries =
+        crate::audit::list_audit_for_target(pool, "payout", &payout_id.to_string(), 20).await?;
+
+    let duplicate_candidate_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM payouts \
+         WHERE store_id = $1 AND id <> $2 AND amount_poisha = $3 \
+           AND status IN ('requested', 'approved') \
+         ORDER BY created_at DESC LIMIT 5",
+    )
+    .bind(store_id)
+    .bind(payout_id)
+    .bind(row.amount_poisha)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::internal("load payout duplicate candidates", e))?;
+
+    let mut views = payout_views(pool, vec![row]).await?;
+    let payout = views.pop().ok_or_else(|| {
+        ApiError::internal_any("assemble payout detail", "payout view missing")
+    })?;
+
+    Ok(AdminPayoutDetail {
+        payout,
+        owner_phone,
+        account_number,
+        store: PayoutStoreSummary {
+            slug: store_slug,
+            status: store_status,
+            verified_tier: verified_tier.clone(),
+        },
+        unclamped_available_poisha,
+        covered: unclamped_available_poisha >= 0,
+        returns_exposure: PayoutReturnsExposure {
+            in_flight_count: exposure.in_flight_count,
+            at_risk_payout_poisha: exposure.at_risk_payout_poisha,
+            received_refund_pending_count: exposure.received_refund_pending_count,
+            received_refund_pending_poisha: exposure.received_refund_pending_poisha,
+        },
+        charges_recent,
+        charges_total_poisha: earnings.charges_total_poisha,
+        charges_count,
+        verification,
+        current_account,
+        account_diverged,
+        store_payout_history,
+        audit_entries,
+        duplicate_candidate_ids,
+        earnings,
+    })
+}
 
 /// A user as the admin sees them: the public user fields plus how
 /// many stores they own.
@@ -1168,6 +1926,11 @@ pub struct AdminOrdersQuery {
 #[derive(Deserialize)]
 pub struct AdminPayoutsQuery {
     pub status: Option<String>,
+    /// Search: store name / owner phone / account number
+    /// substring, or an idempotency key (exact or prefix).
+    pub q: Option<String>,
+    /// newest | oldest | amount_desc | amount_asc.
+    pub sort: Option<String>,
     pub page: Option<i64>,
     pub limit: Option<i64>,
 }
@@ -1186,7 +1949,21 @@ pub struct SetStoreStatusInput {
 
 #[derive(Deserialize)]
 pub struct RejectPayoutInput {
+    /// The rejection reason. REQUIRED by the transition
+    /// (a missing body, a missing field, or a blank reason
+    /// are all the same 400) — the field stays `Option` here
+    /// so an absent body reaches the service's validation
+    /// instead of dying in the extractor.
     pub note: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct MarkPayoutPaidInput {
+    /// The payment reference proving the send (bKash/Nagad
+    /// transaction id or bank reference). REQUIRED by the
+    /// transition; `Option` here for the same reason as the
+    /// reject note.
+    pub payment_reference: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1294,8 +2071,26 @@ pub async fn list_payouts_handler(
     require_admin(&state, &user).await?;
     let pool = state.require_pool()?;
     Ok(Json(
-        list_payouts(pool, query.status.as_deref(), query.page, query.limit).await?,
+        list_payouts(
+            pool,
+            query.status.as_deref(),
+            query.q.as_deref(),
+            query.sort.as_deref(),
+            query.page,
+            query.limit,
+        )
+        .await?,
     ))
+}
+
+pub async fn get_payout_detail_handler(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<AdminPayoutDetail>, ApiError> {
+    require_admin(&state, &user).await?;
+    let pool = state.require_pool()?;
+    Ok(Json(get_payout_detail(pool, id).await?))
 }
 
 pub async fn approve_payout_handler(
@@ -1304,9 +2099,8 @@ pub async fn approve_payout_handler(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Payout>, ApiError> {
     let admin = require_admin(&state, &user).await?;
-    let pool = state.require_pool()?;
     Ok(Json(
-        transition_payout(pool, admin.id, id, "approved", None).await?,
+        transition_payout(&state, admin.id, id, "approved", None, None).await?,
     ))
 }
 
@@ -1317,10 +2111,9 @@ pub async fn reject_payout_handler(
     body: Option<Json<RejectPayoutInput>>,
 ) -> Result<Json<Payout>, ApiError> {
     let admin = require_admin(&state, &user).await?;
-    let pool = state.require_pool()?;
     let note = body.and_then(|Json(input)| input.note);
     Ok(Json(
-        transition_payout(pool, admin.id, id, "rejected", note.as_deref()).await?,
+        transition_payout(&state, admin.id, id, "rejected", note.as_deref(), None).await?,
     ))
 }
 
@@ -1328,11 +2121,12 @@ pub async fn mark_payout_paid_handler(
     State(state): State<AppState>,
     user: AuthUser,
     Path(id): Path<Uuid>,
+    body: Option<Json<MarkPayoutPaidInput>>,
 ) -> Result<Json<Payout>, ApiError> {
     let admin = require_admin(&state, &user).await?;
-    let pool = state.require_pool()?;
+    let reference = body.and_then(|Json(input)| input.payment_reference);
     Ok(Json(
-        transition_payout(pool, admin.id, id, "paid", None).await?,
+        transition_payout(&state, admin.id, id, "paid", None, reference.as_deref()).await?,
     ))
 }
 

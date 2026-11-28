@@ -928,11 +928,15 @@ impl AppState {
 
 /// One error type for the whole API: an HTTP status + a message, rendered
 /// as `{"error": "..."}`. Service functions return this; handlers never
-/// build ad-hoc error responses.
+/// build ad-hoc error responses. An error MAY carry structured
+/// `details` (admin payouts remake): a JSON object rendered as a
+/// sibling `"details"` key, present only when set — every error
+/// without details keeps the exact pre-remake body.
 #[derive(Debug)]
 pub struct ApiError {
     pub status: StatusCode,
     pub message: String,
+    pub details: Option<serde_json::Value>,
 }
 
 impl ApiError {
@@ -940,7 +944,18 @@ impl ApiError {
         ApiError {
             status,
             message: message.into(),
+            details: None,
         }
+    }
+
+    /// Attach structured details to this error (see the type
+    /// docs): the client reads them to render more than the
+    /// prose message — e.g. the payout coverage block on a
+    /// 409 whose numbers were computed inside the refused
+    /// transaction.
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
+        self
     }
 
     pub fn bad_request(message: impl Into<String>) -> Self {
@@ -989,8 +1004,11 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = Json(serde_json::json!({ "error": self.message }));
-        (self.status, body).into_response()
+        let mut body = serde_json::json!({ "error": self.message });
+        if let Some(details) = self.details {
+            body["details"] = details;
+        }
+        (self.status, Json(body)).into_response()
     }
 }
 
@@ -2062,6 +2080,10 @@ pub fn build_app(state: AppState) -> Router {
         )
         .route("/v1/admin/orders", get(admin::list_orders_handler))
         .route("/v1/admin/payouts", get(admin::list_payouts_handler))
+        .route(
+            "/v1/admin/payouts/:id",
+            get(admin::get_payout_detail_handler),
+        )
         .route(
             "/v1/admin/payouts/:id/approve",
             post(admin::approve_payout_handler),

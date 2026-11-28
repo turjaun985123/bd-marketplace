@@ -795,3 +795,51 @@ a.queue-row:focus-visible, .kpi-tile--link:focus-visible { outline: 2px solid va
   }
   .admin-section, .kpi-tile, .queue-row { break-inside: avoid; }
 }
+
+/* Dialog (admin payouts remake) — the platform's one modal:
+   a fixed backdrop + token-styled panel. The entrance is a
+   fade only, and reduced-motion users get none. */
+.dialog-backdrop { position: fixed; inset: 0; z-index: 80; background: rgba(0, 0, 0, 0.5); display: flex; align-items: center; justify-content: center; padding: var(--space-3); animation: dialog-fade 120ms ease-out; }
+.dialog-panel { background: var(--surface-raised); color: var(--text); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow-lg); width: 100%; max-width: 520px; max-height: calc(100dvh - 2 * var(--space-3)); overflow-y: auto; padding: var(--space-4); }
+.dialog-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-3); }
+.dialog-title { margin: 0; }
+.dialog-close { min-width: 44px; min-height: 44px; font-size: 1.25rem; line-height: 1; background: none; border: none; color: var(--text-muted); cursor: pointer; }
+.dialog-body { margin-top: var(--space-2); }
+.dialog-error { border: 1px solid var(--danger-700); border-radius: var(--radius); background: var(--danger-50); padding: var(--space-2) var(--space-3); }
+.dialog-foot { display: flex; justify-content: flex-end; gap: var(--space-2); margin-top: var(--space-3); flex-wrap: wrap; }
+@keyframes dialog-fade { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .dialog-backdrop { animation: none; } }
+@media (max-width: 560px) {
+  .dialog-backdrop { padding: 0; align-items: stretch; }
+  .dialog-panel { max-width: none; max-height: none; border-radius: 0; }
+  .dialog-foot .btn { flex: 1; }
+}
+
+/* Admin payouts remake — the decision queue: stacked cards
+   at every width (a table's horizontal scroll hides the
+   actions at phone widths, away from the store they belong
+   to), the expanded detail, and the printable payment
+   instruction. */
+.payout-controls { display: flex; gap: var(--space-2); flex-wrap: wrap; align-items: flex-end; margin-bottom: var(--space-3); }
+.payout-controls label { display: grid; gap: var(--space-1); font-size: var(--text-sm); font-weight: 600; }
+.payout-card { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); padding: var(--space-3); }
+.payout-card-head { display: flex; align-items: flex-start; gap: var(--space-3); flex-wrap: wrap; }
+.payout-amount { font-size: 1.35rem; font-weight: 700; line-height: 1.2; }
+.payout-card-meta { color: var(--text-muted); font-size: var(--text-sm); }
+.payout-card-actions { display: flex; gap: var(--space-2); flex-wrap: wrap; margin-left: auto; }
+.payout-detail { border-top: 1px solid var(--border); margin-top: var(--space-3); padding-top: var(--space-3); }
+.payout-account-number { font-size: 1.15rem; font-weight: 700; letter-spacing: 0.04em; overflow-wrap: anywhere; }
+.payout-long-value { overflow-wrap: anywhere; }
+.payout-warning { border: 1px solid var(--danger-700); border-radius: var(--radius); background: var(--danger-50); padding: var(--space-2) var(--space-3); }
+.payout-stale { border: 1px solid var(--danger-700); border-radius: var(--radius); background: var(--danger-50); padding: var(--space-2) var(--space-3); margin-bottom: var(--space-3); display: flex; gap: var(--space-3); align-items: center; flex-wrap: wrap; }
+.char-count { color: var(--text-muted); font-size: var(--text-sm); text-align: right; }
+/* The printable payment instruction: when it renders, it
+   replaces the page content (the page's print view), so
+   what prints is the instruction and nothing else. */
+.payout-instruction { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); padding: var(--space-4); max-width: 640px; }
+.payout-instruction h2 { margin-top: 0; }
+.payout-instruction .sign-line { border-bottom: 1px solid var(--text); min-height: 2.2em; margin-bottom: 12px; }
+@media print {
+  .payout-instruction { border: none; max-width: none; }
+  .payout-instruction .payout-account-number { font-size: 1.6rem; }
+}

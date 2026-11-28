@@ -8,8 +8,11 @@
 //! listed here so the vocabulary lives in exactly one place):
 //!
 //! - `payout.approve`, `payout.reject`, `payout.mark_paid` —
-//!   target `payout`, detail `{from, to}` (plus `note` when the
-//!   admin supplied one, e.g. a rejection reason).
+//!   target `payout`, detail `{from, to}` (plus `note` on a
+//!   rejection — the reason, required since the admin
+//!   payouts remake — and `payment_reference` on a
+//!   mark-paid: non-secret proof-of-payment context. Account
+//!   numbers and phones are NEVER written here).
 //! - `store.suspend`, `store.reactivate` — target `store`,
 //!   detail `{status}`.
 //! - `settings.update` — target `platform_settings`, detail
@@ -182,6 +185,49 @@ pub async fn list_audit_log(
         page,
         limit,
     })
+}
+
+/// The audit history of ONE target (admin payouts remake:
+/// the payout detail shows every recorded decision on that
+/// payout). Newest first, at most `limit` entries. The
+/// masking and detail parsing are the shared read path's —
+/// this reader exists so no other module re-implements them.
+pub async fn list_audit_for_target(
+    pool: &PgPool,
+    target_type: &str,
+    target_id: &str,
+    limit: i64,
+) -> Result<Vec<AdminAuditEntry>, ApiError> {
+    let rows: Vec<AuditRow> = sqlx::query_as(
+        "SELECT a.id, a.admin_user_id, u.phone AS admin_phone, a.action, \
+         a.target_type, a.target_id, a.detail::text AS detail, a.created_at \
+         FROM admin_audit_log a \
+         JOIN users u ON u.id = a.admin_user_id \
+         WHERE a.target_type = $1 AND a.target_id = $2 \
+         ORDER BY a.created_at DESC, a.id DESC LIMIT $3",
+    )
+    .bind(target_type)
+    .bind(target_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::internal("list admin audit log for target", e))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| AdminAuditEntry {
+            id: row.id,
+            admin_user_id: row.admin_user_id,
+            admin_phone_masked: mask_phone(&row.admin_phone),
+            action: row.action,
+            target_type: row.target_type,
+            target_id: row.target_id,
+            detail: row
+                .detail
+                .and_then(|text| serde_json::from_str(&text).ok()),
+            created_at: row.created_at,
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------

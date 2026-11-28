@@ -14,7 +14,14 @@
  */
 
 import Link from "next/link";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 
 // ---------------------------------------------------------------------------
 // Button
@@ -341,5 +348,187 @@ export function Countdown({
         </span>
       ))}
     </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Dialog
+// ---------------------------------------------------------------------------
+
+export interface DialogProps {
+  open: boolean;
+  onClose: () => void;
+  title: string;
+  /** `danger` paints the confirm action as destructive. */
+  variant?: "default" | "danger";
+  children: ReactNode;
+  /** Renders the footer with a cancel + confirm button. */
+  onConfirm?: () => void;
+  confirmLabel?: string;
+  confirmDisabled?: boolean;
+  cancelLabel?: string;
+  /** A mutation is in flight: close paths are blocked and
+   * the confirm button shows its loading state. */
+  busy?: boolean;
+  /** An error to show INSIDE the dialog (role="alert") —
+   * a failed money action must keep its context on screen,
+   * never be replaced by a toast elsewhere. */
+  error?: string | null;
+  /** CSS selector for the element to focus on open.
+   * Defaults: the cancel button for `danger`, the first
+   * field otherwise — a money confirm is NEVER auto-focused. */
+  initialFocus?: string;
+}
+
+const FOCUSABLE_SELECTOR =
+  'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/**
+ * The one modal dialog (admin payouts remake — the first
+ * on the platform; `window.prompt`/`window.confirm` are
+ * retired for money actions). A plain fixed-position panel:
+ * no portal, no dependency, no native `<dialog>` (its
+ * top-layer and form-method behaviours vary across the
+ * WebViews this platform ships to). Escape and backdrop
+ * clicks close it, focus is trapped inside and restored to
+ * the opener on close, and the body scroll locks while it
+ * is open. While `busy`, every close path is disabled.
+ */
+export function Dialog({
+  open,
+  onClose,
+  title,
+  variant = "default",
+  children,
+  onConfirm,
+  confirmLabel = "নিশ্চিত করুন — Confirm",
+  confirmDisabled = false,
+  cancelLabel = "বাতিল — Cancel",
+  busy = false,
+  error = null,
+  initialFocus,
+}: DialogProps) {
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  const cancelWrapRef = useRef<HTMLSpanElement | null>(null);
+  const titleId = useId();
+  const openerRef = useRef<Element | null>(null);
+
+  const requestClose = useCallback(() => {
+    if (!busy) onClose();
+  }, [busy, onClose]);
+
+  useEffect(() => {
+    if (!open) return;
+    openerRef.current = document.activeElement;
+    const panel = panelRef.current;
+    if (panel) {
+      let target: HTMLElement | null = null;
+      if (initialFocus) {
+        target = panel.querySelector<HTMLElement>(initialFocus);
+      }
+      if (!target && variant === "danger") {
+        target =
+          cancelWrapRef.current?.querySelector<HTMLElement>("button") ?? null;
+      }
+      if (!target) {
+        target = panel.querySelector<HTMLElement>("input, textarea, select");
+      }
+      if (!target) {
+        target =
+          cancelWrapRef.current?.querySelector<HTMLElement>("button") ?? panel;
+      }
+      target.focus();
+    }
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        requestClose();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const current = panelRef.current;
+      if (!current) return;
+      const focusables = Array.from(
+        current.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)
+      ).filter((el) => el.offsetParent !== null || el === document.activeElement);
+      if (focusables.length === 0) return;
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      document.body.style.overflow = previousOverflow;
+      const opener = openerRef.current;
+      if (opener instanceof HTMLElement) opener.focus();
+    };
+  }, [open, initialFocus, variant, requestClose]);
+
+  if (!open) return null;
+
+  return (
+    <div
+      className="dialog-backdrop"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) requestClose();
+      }}
+    >
+      <div
+        ref={panelRef}
+        className="dialog-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
+      >
+        <div className="dialog-head">
+          <h3 id={titleId} className="dialog-title">
+            {title}
+          </h3>
+          <button
+            type="button"
+            className="dialog-close"
+            onClick={requestClose}
+            disabled={busy}
+            aria-label="বন্ধ করুন — Close"
+          >
+            ×
+          </button>
+        </div>
+        <div className="dialog-body">{children}</div>
+        {error ? (
+          <p className="dialog-error" role="alert">
+            {error}
+          </p>
+        ) : null}
+        {onConfirm ? (
+          <div className="dialog-foot">
+            <span ref={cancelWrapRef}>
+              <Button onClick={requestClose} disabled={busy}>
+                {cancelLabel}
+              </Button>
+            </span>
+            <Button
+              variant={variant === "danger" ? "danger" : "primary"}
+              onClick={onConfirm}
+              loading={busy}
+              disabled={confirmDisabled}
+            >
+              {confirmLabel}
+            </Button>
+          </div>
+        ) : null}
+      </div>
+    </div>
   );
 }

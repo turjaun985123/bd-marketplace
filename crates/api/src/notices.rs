@@ -29,6 +29,13 @@
 //!   courier-reported or seller-entered return).
 //! - `payout_paid` — `admin::transition_payout` on the move
 //!   to `paid`, to the seller.
+//! - `payout_approved` / `payout_rejected` (admin payouts
+//!   remake) — the same transition function on the moves to
+//!   `approved` / `rejected`, to the seller. All three
+//!   payout kinds share the one funnel
+//!   ([`enqueue_payout_notice`]); a rejected notice carries
+//!   the admin's reason, a paid notice the recorded payment
+//!   reference.
 //! - `return_update` — `returns::decide_return_request`
 //!   (approved / rejected) and `returns::mark_return_received`
 //!   (received), to the buyer.
@@ -375,14 +382,28 @@ pub async fn enqueue_store_flash_sale_notices(
     Ok(queued)
 }
 
-/// Queue the `payout_paid` notice for a store's owner: the
-/// recipient is the seller at their ACCOUNT phone (a payout
-/// belongs to the account, unlike an order event, which
-/// belongs to the delivery details).
-pub async fn enqueue_payout_paid_notice(
+/// Queue one payout-decision notice for a store's owner:
+/// the recipient is the seller at their ACCOUNT phone (a
+/// payout belongs to the account, unlike an order event,
+/// which belongs to the delivery details). One funnel for
+/// all three payout kinds (`payout_approved`,
+/// `payout_rejected`, `payout_paid`) — the caller in
+/// `admin::transition_payout` maps the target status to the
+/// kind, so each decision is announced exactly once, inside
+/// the transition's own transaction.
+///
+/// `note` (the rejection reason) and `payment_reference`
+/// (the recorded proof of the send) enter the payload ONLY
+/// when present: the paid payload for a reference-less call
+/// stays byte-identical to the pre-remake
+/// `{"amount_poisha": N}` shape.
+pub async fn enqueue_payout_notice(
     conn: &mut PgConnection,
     store_id: Uuid,
     amount_poisha: i64,
+    kind: &str,
+    note: Option<&str>,
+    payment_reference: Option<&str>,
 ) -> Result<(), ApiError> {
     let (owner_user_id, phone): (Uuid, String) = sqlx::query_as(
         "SELECT s.owner_user_id, u.phone FROM stores s \
@@ -392,15 +413,15 @@ pub async fn enqueue_payout_paid_notice(
     .fetch_one(&mut *conn)
     .await
     .map_err(|e| ApiError::internal("load payout notice recipient", e))?;
-    let payload = json!({ "amount_poisha": amount_poisha });
-    notify::enqueue(
-        &mut *conn,
-        owner_user_id,
-        &phone,
-        domain::NOTIFICATION_PAYOUT_PAID,
-        &payload,
-    )
-    .await
-    .map_err(|e| ApiError::internal("enqueue payout notification", e))?;
+    let mut payload = json!({ "amount_poisha": amount_poisha });
+    if let Some(note) = note {
+        payload["note"] = serde_json::Value::String(note.to_string());
+    }
+    if let Some(reference) = payment_reference {
+        payload["payment_reference"] = serde_json::Value::String(reference.to_string());
+    }
+    notify::enqueue(&mut *conn, owner_user_id, &phone, kind, &payload)
+        .await
+        .map_err(|e| ApiError::internal("enqueue payout notification", e))?;
     Ok(())
 }

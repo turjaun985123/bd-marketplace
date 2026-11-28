@@ -83,8 +83,8 @@ export default function AdminShell({
 
   return (
     <main>
-      <h1>অ্যাডমিন প্যানেল</h1>
-      <p>
+      <h1 className="no-print">অ্যাডমিন প্যানেল</h1>
+      <p className="no-print">
         <Link href="/admin">ওভারভিউ</Link>
         {" · "}
         <Link href="/admin/analytics">অ্যানালিটিক্স</Link>
