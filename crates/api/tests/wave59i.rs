@@ -181,6 +181,20 @@ async fn wave59i_caps_collisions_and_field_rules() {
     assert_eq!(status, StatusCode::OK, "page list: {body}");
     assert_eq!(body.as_array().expect("pages").len(), 25);
 
+    // Free one slot first: at the cap, a create is
+    // refused by the cap rule before its slug is ever
+    // examined, so the collision rule below needs room.
+    let first_id = body[24]["id"].as_str().expect("page id").to_string();
+    let (status, _) = call(
+        &app,
+        Method::DELETE,
+        &format!("/v1/seller/store/pages/{first_id}"),
+        None,
+        Some(&seller),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "delete frees a slot");
+
     // 2. Slug collisions: page-0 again inside this
     // store is a 409; in another store it is fine.
     let (status, _) = call(
