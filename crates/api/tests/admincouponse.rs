@@ -306,11 +306,11 @@ async fn admincoupons_terms_edit_gates() {
     .await
     .expect("terms audit row");
     assert!(
-        detail_text.contains("\"discount_value\":10"),
+        detail_text.contains("\"discount_value\": 10"),
         "audit keeps the BEFORE terms: {detail_text}"
     );
     assert!(
-        detail_text.contains("\"discount_value\":20"),
+        detail_text.contains("\"discount_value\": 20"),
         "audit keeps the AFTER terms: {detail_text}"
     );
 
