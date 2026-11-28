@@ -13727,6 +13727,7 @@ mod tests {
             note: String::new(),
             payment_reference: String::new(),
             verification_tier: String::new(),
+            coupon_code: String::new(),
         };
         // The short order id (first 8 chars) is what prints.
         let placed = render_body(NOTIFICATION_ORDER_PLACED, &vars);
