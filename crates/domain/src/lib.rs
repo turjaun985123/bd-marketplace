@@ -12304,7 +12304,7 @@ mod tests {
     }
 
     #[test]
-    fn csv_escape_quotes_only_when_needed() {
+    fn csv_escape_field_quotes_only_when_needed() {
         assert_eq!(csv_escape_field("plain"), "plain");
         assert_eq!(csv_escape_field("a,b"), "\"a,b\"");
         assert_eq!(csv_escape_field("say \"hi\""), "\"say \"\"hi\"\"\"");

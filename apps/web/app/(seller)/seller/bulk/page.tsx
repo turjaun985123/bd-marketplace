@@ -291,7 +291,7 @@ export default function SellerBulkPage() {
     setError(null);
     try {
       const body: Parameters<typeof bulkEditProducts>[1] = {
-        product_ids: [...selected],
+        product_ids: Array.from(selected),
       };
       if (priceMode === "set") {
         const poisha = parseTakaToPoisha(priceTaka);
