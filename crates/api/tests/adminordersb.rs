@@ -290,7 +290,7 @@ async fn adminorders_filters_and_summary_match_metrics() {
 
     // The summary and the overview metrics agree — the
     // cross-surface pin.
-    let (status, metrics) = call(&app, Method::GET, "/v1/admin/overview", None, Some(&admin)).await;
+    let (status, metrics) = call(&app, Method::GET, "/v1/admin/metrics", None, Some(&admin)).await;
     assert_eq!(status, StatusCode::OK, "overview: {metrics}");
     assert_eq!(metrics["orders_today"]["count"], summary["orders_today"]);
     assert_eq!(metrics["orders_today"]["gmv_poisha"], summary["gmv_today_poisha"]);
