@@ -281,12 +281,31 @@ pub struct GiftCardStats {
     pub depleted_cards: i64,
     /// Sum of every card's initial value.
     pub initial_total_poisha: i64,
-    /// Sum of current balances — the outstanding liability.
+    /// Balances on cards a holder can still spend (not
+    /// disabled, not expired, balance above zero) — the live
+    /// stored-value liability. Before the overview remake
+    /// this summed EVERY balance, counting value frozen on
+    /// disabled cards and value stranded on expired cards as
+    /// live liability; those two buckets are reported
+    /// separately below so the figures reconcile.
     pub outstanding_poisha: i64,
+    /// Balances frozen on admin-disabled cards: unspendable
+    /// until re-enabled, so excluded from the live liability.
+    pub frozen_disabled_poisha: i64,
+    /// Balances stranded on expired (not disabled) cards:
+    /// unspendable by expiry, so excluded from the live
+    /// liability.
+    pub expired_unredeemed_poisha: i64,
     /// Gross redeemed value (ledger redeem rows), all time.
     pub redeemed_total_poisha: i64,
     /// Gross restored value (cancel + return restores).
     pub restored_total_poisha: i64,
+    /// Net of admin balance adjustments (ledger
+    /// `admin_adjust` deltas, signed): the one flow that
+    /// moves balances without an issue/redeem/restore, so
+    /// the reconciliation initial − redeemed + restored +
+    /// adjusted = total balances holds.
+    pub adjusted_net_poisha: i64,
 }
 
 /// The card-row half of [`GiftCardStats`].
@@ -299,6 +318,8 @@ struct CardAggregates {
     depleted_cards: i64,
     initial_total_poisha: i64,
     outstanding_poisha: i64,
+    frozen_disabled_poisha: i64,
+    expired_unredeemed_poisha: i64,
 }
 
 /// The ledger half of [`GiftCardStats`].
@@ -306,6 +327,7 @@ struct CardAggregates {
 struct LedgerAggregates {
     redeemed_total_poisha: i64,
     restored_total_poisha: i64,
+    adjusted_net_poisha: i64,
 }
 
 /// Compute the stats over one store's cards, or the whole
@@ -329,7 +351,15 @@ pub async fn gift_card_stats(
              AND (gc.expires_at IS NULL OR gc.expires_at > now()) \
              AND gc.balance_poisha = 0)::bigint AS depleted_cards, \
          COALESCE(SUM(gc.initial_amount_poisha), 0)::bigint AS initial_total_poisha, \
-         COALESCE(SUM(gc.balance_poisha), 0)::bigint AS outstanding_poisha \
+         COALESCE(SUM(gc.balance_poisha) FILTER (WHERE gc.disabled_at IS NULL \
+             AND (gc.expires_at IS NULL OR gc.expires_at > now()) \
+             AND gc.balance_poisha > 0), 0)::bigint AS outstanding_poisha, \
+         COALESCE(SUM(gc.balance_poisha) FILTER \
+             (WHERE gc.disabled_at IS NOT NULL), 0)::bigint \
+             AS frozen_disabled_poisha, \
+         COALESCE(SUM(gc.balance_poisha) FILTER (WHERE gc.disabled_at IS NULL \
+             AND gc.expires_at IS NOT NULL AND gc.expires_at <= now()), 0)::bigint \
+             AS expired_unredeemed_poisha \
          FROM gift_cards gc WHERE ($1::uuid IS NULL OR gc.store_id = $1)",
     )
     .bind(store_id)
@@ -341,7 +371,10 @@ pub async fn gift_card_stats(
              AS redeemed_total_poisha, \
          COALESCE(SUM(l.delta_poisha) FILTER \
              (WHERE l.kind IN ('cancel_restore', 'return_restore')), 0)::bigint \
-             AS restored_total_poisha \
+             AS restored_total_poisha, \
+         COALESCE(SUM(l.delta_poisha) FILTER \
+             (WHERE l.kind = 'admin_adjust'), 0)::bigint \
+             AS adjusted_net_poisha \
          FROM gift_card_ledger l JOIN gift_cards gc ON gc.id = l.gift_card_id \
          WHERE ($1::uuid IS NULL OR gc.store_id = $1)",
     )
@@ -357,8 +390,11 @@ pub async fn gift_card_stats(
         depleted_cards: cards.depleted_cards,
         initial_total_poisha: cards.initial_total_poisha,
         outstanding_poisha: cards.outstanding_poisha,
+        frozen_disabled_poisha: cards.frozen_disabled_poisha,
+        expired_unredeemed_poisha: cards.expired_unredeemed_poisha,
         redeemed_total_poisha: ledger.redeemed_total_poisha,
         restored_total_poisha: ledger.restored_total_poisha,
+        adjusted_net_poisha: ledger.adjusted_net_poisha,
     })
 }
 

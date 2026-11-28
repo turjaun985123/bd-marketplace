@@ -2991,7 +2991,7 @@ request.
 only, behind the one `require_admin`; API keys stay
 locked out by the Wave 37 admin route exclusion)
 returns one point-in-time snapshot, computed per
-request by three aggregate queries
+request by a set of aggregate queries
 (`metrics::get_admin_metrics`):
 
 - `orders_today` — parent orders created on the
@@ -3026,6 +3026,88 @@ request by three aggregate queries
 
 The admin overview page shows the snapshot as its
 সিস্টেম অবস্থা — System status card.
+
+**Admin overview remake.** The overview page was
+rebuilt after a ~100-agent analysis of the surface,
+and two long-standing definition bugs were fixed at
+the source:
+
+- The overview's GMV now uses the canonical Wave 27
+  formula (goods − discount + delivery over
+  non-cancelled sub-orders) — it previously summed
+  goods only, so the overview and the metrics
+  snapshot printed two different figures both
+  labelled "GMV". The field is renamed
+  `gmv_goods_poisha` → `gmv_poisha` in
+  `GET /v1/admin/overview`.
+- The overview's `commission_earned_poisha` now sums
+  the commission snapshot over DELIVERED sub-orders
+  only (the seller-earnings definition) — it
+  previously counted placed/confirmed/shipped/
+  returned sub-orders as earned.
+- Gift-card `outstanding_poisha` (shared by the
+  seller stats endpoint and the metrics snapshot)
+  now counts only balances on spendable cards
+  (active: not disabled, not expired, balance > 0).
+  Two new fields carry the rest —
+  `frozen_disabled_poisha` (balances on disabled
+  cards) and `expired_unredeemed_poisha` (balances
+  stranded on expired cards) — and
+  `adjusted_net_poisha` totals the ledger's
+  `admin_adjust` deltas, so the books reconcile:
+  initial − redeemed + restored + adjusted = the sum
+  of all current balances. Gift cards are
+  seller-funded; the outstanding figure is the
+  sellers' aggregate liability, not cash the
+  platform holds.
+- The metrics snapshot gained operator blocks, all
+  reusing existing definitions: `orders_yesterday`
+  (today's two definitions one Dhaka day back, for
+  deltas), `sub_orders_by_status` and
+  `orders_by_payment_status` (sparse groupings;
+  `advance_pending` is a payment status, never an
+  order status), `advance_pending` (advances still
+  owed: count, outstanding, blocked order value,
+  >24h / >72h counts, oldest age), `advance_unfulfilled`
+  (advances required but never collected — the
+  degraded Wave 17 population, a different set),
+  `refunds_pending` (received returns whose refund
+  is not marked done), `verifications_pending`
+  (KYC applications awaiting review, with the oldest
+  age), `stock_alerts` (active products out of / low
+  on the variant-aware effective stock),
+  `growth_today`, `stores_suspended`,
+  `active_promotions`, `live_flash_sale`, an
+  `oldest_age_secs` on `pending_payouts`, and age
+  fields on `notification_backlog` (oldest pending
+  age, oldest sending-claim age by the Wave 48
+  `claimed_at` stamp, stale-claim count by the
+  notify crate's own threshold, sends in the last
+  24h, last-send age).
+- The page itself is now an operator home: KPI tiles
+  with yesterday deltas, a "needs attention" queue
+  whose rows deep-link to the page that clears them,
+  the sub-order pipeline with canonical Bangla status
+  labels, a 7-day orders chart and top stores from
+  the Wave 27 analytics, geography bars, compact
+  platform blocks, the latest search analytics and
+  merchandising events, and the head of the audit
+  log. Every section has its own loading skeleton,
+  empty state, and error state with retry — a failed
+  section no longer vanishes silently.
+
+Honest limits of the remake: there is deliberately
+no "failed notifications in the last 24h" (the
+outbox records no failure timestamp, so it cannot
+be computed); stock-alert counts are shown unlinked
+because no admin inventory page exists yet; queue
+deep links target whole pages, not pre-filtered
+views, because no admin page reads filter query
+parameters yet; and the parent-order status remains
+write-mostly (it only ever becomes `placed` or
+`cancelled` in practice) — the pipeline therefore
+leads with sub-order statuses, which are the real
+fulfilment axis.
 
 **Worker cycle line.** Each worker cycle now ends
 with ONE summary line — notifications
@@ -4245,13 +4327,17 @@ snapshot it was placed with, and a payout request keeps the
 rules it was validated under.
 
 **Overview metric definitions:** counts are plain table counts.
-GMV (`gmv_goods_poisha`) is the sum of `goods_subtotal_poisha`
-over sub-orders whose status is NOT `cancelled`, and
-`commission_earned_poisha` is the same filter over
-`commission_poisha` — a cancelled sub-order never moved money,
-so it counts towards neither. `payouts_pending` covers payouts
-still `requested`; `payments_pending_count` covers online
-payments still `pending` settlement.
+GMV (`gmv_poisha`, renamed from `gmv_goods_poisha` by the
+overview remake) is the canonical Wave 27 formula — the sum of
+`goods_subtotal_poisha − discount_poisha + delivery_charge_poisha`
+over sub-orders whose status is NOT `cancelled` — and
+`commission_earned_poisha` is the sum of the `commission_poisha`
+snapshot over sub-orders whose status IS `delivered` (the
+seller-earnings definition; a cancelled sub-order never moved
+money, and an undelivered one has not earned yet).
+`payouts_pending` covers payouts still `requested`;
+`payments_pending_count` covers online payments still `pending`
+settlement.
 
 Auth rules that matter: only a SHA-256 hash of an OTP is ever stored;
 ownership is checked on every seller mutation (403 for non-owners);

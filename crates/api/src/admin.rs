@@ -285,17 +285,27 @@ pub async fn effective_plan_free_product_cap(state: &AppState) -> i64 {
 // Overview
 // ---------------------------------------------------------------------------
 
-/// The platform at a glance. Money definitions (README, Wave 10):
-/// GMV and commission sum over sub-orders that were not cancelled
-/// (a cancelled sub-order never moved money); everything is a
+/// The platform at a glance. Money definitions are the
+/// platform-canonical ones (Wave 27, restated in the domain
+/// crate and the README): GMV is goods minus discount plus
+/// delivery over sub-orders that were not cancelled (a
+/// cancelled sub-order never moved money), and commission is
+/// EARNED only when a sub-order is delivered — the snapshot
+/// `commission_poisha` summed over delivered sub-orders,
+/// exactly the seller-earnings definition. Everything is a
 /// bigint aggregate, cast where Postgres would return numeric.
+///
+/// The GMV field was renamed in the overview remake
+/// (`gmv_goods_poisha` → `gmv_poisha`): the old name carried a
+/// pre-Wave-27 goods-only sum that disagreed with every other
+/// GMV on the platform while sharing its label.
 #[derive(Debug, Serialize)]
 pub struct AdminOverview {
     pub users: i64,
     pub stores: i64,
     pub products: i64,
     pub orders: i64,
-    pub gmv_goods_poisha: i64,
+    pub gmv_poisha: i64,
     pub commission_earned_poisha: i64,
     pub payouts_pending: PendingPayouts,
     pub payments_pending_count: i64,
@@ -314,7 +324,7 @@ struct OverviewRow {
     stores: i64,
     products: i64,
     orders: i64,
-    gmv_goods_poisha: i64,
+    gmv_poisha: i64,
     commission_earned_poisha: i64,
     payouts_pending_count: i64,
     payouts_pending_amount_poisha: i64,
@@ -329,10 +339,11 @@ pub async fn get_overview(pool: &PgPool) -> Result<AdminOverview, ApiError> {
            (SELECT COUNT(*) FROM stores) AS stores, \
            (SELECT COUNT(*) FROM products) AS products, \
            (SELECT COUNT(*) FROM orders) AS orders, \
-           (SELECT COALESCE(SUM(goods_subtotal_poisha), 0)::bigint \
-              FROM sub_orders WHERE status <> 'cancelled') AS gmv_goods_poisha, \
+           (SELECT COALESCE(SUM(goods_subtotal_poisha - discount_poisha \
+              + delivery_charge_poisha), 0)::bigint \
+              FROM sub_orders WHERE status <> 'cancelled') AS gmv_poisha, \
            (SELECT COALESCE(SUM(commission_poisha), 0)::bigint \
-              FROM sub_orders WHERE status <> 'cancelled') AS commission_earned_poisha, \
+              FROM sub_orders WHERE status = 'delivered') AS commission_earned_poisha, \
            (SELECT COUNT(*) FROM payouts WHERE status = 'requested') \
               AS payouts_pending_count, \
            (SELECT COALESCE(SUM(amount_poisha), 0)::bigint \
@@ -349,7 +360,7 @@ pub async fn get_overview(pool: &PgPool) -> Result<AdminOverview, ApiError> {
         stores: row.stores,
         products: row.products,
         orders: row.orders,
-        gmv_goods_poisha: row.gmv_goods_poisha,
+        gmv_poisha: row.gmv_poisha,
         commission_earned_poisha: row.commission_earned_poisha,
         payouts_pending: PendingPayouts {
             count: row.payouts_pending_count,

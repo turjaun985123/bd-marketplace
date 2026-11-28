@@ -630,6 +630,33 @@ export function paymentStatusLabel(paymentStatus: string): string {
   }
 }
 
+/**
+ * Bangla label for a SUB-ORDER fulfilment status (display
+ * only). The wording is the shared order timeline's step
+ * vocabulary (components/OrderTimeline STEP_LABELS) — the
+ * one canonical set; seller surfaces keep their own short
+ * forms, but new surfaces use this helper instead of
+ * growing another local map.
+ */
+export function orderStatusLabel(status: string): string {
+  switch (status) {
+    case "placed":
+      return "অর্ডার দেওয়া হয়েছে";
+    case "confirmed":
+      return "বিক্রেতা নিশ্চিত করেছেন";
+    case "shipped":
+      return "পাঠানো হয়েছে";
+    case "delivered":
+      return "ডেলিভারি হয়েছে";
+    case "returned":
+      return "ফেরত গেছে";
+    case "cancelled":
+      return "বাতিল হয়েছে";
+    default:
+      return status;
+  }
+}
+
 export interface Order {
   id: string;
   buyer_user_id: string;
@@ -906,10 +933,21 @@ export interface GiftCardStats {
   expired_cards: number;
   depleted_cards: number;
   initial_total_poisha: number;
-  /** Current balances summed — the outstanding liability. */
+  /**
+   * Balances on cards a holder can still spend (not
+   * disabled, not expired, balance above zero) — the live
+   * stored-value liability. Frozen and stranded balances
+   * are the two fields below, NOT part of this figure.
+   */
   outstanding_poisha: number;
+  /** Balances frozen on admin-disabled cards. */
+  frozen_disabled_poisha: number;
+  /** Balances stranded on expired (not disabled) cards. */
+  expired_unredeemed_poisha: number;
   redeemed_total_poisha: number;
   restored_total_poisha: number;
+  /** Net admin balance adjustments (signed, overview remake). */
+  adjusted_net_poisha: number;
 }
 
 /** Issue input (Wave 60). `count` > 1 bulk-issues identical cards. */
@@ -4032,14 +4070,20 @@ export function revokeApiKey(token: string, id: string): Promise<ApiKeyView> {
 // answers 403 for everyone else (the pages also gate on /v1/auth/me).
 // ---------------------------------------------------------------------------
 
-/** Platform metrics (GET /v1/admin/overview). GMV and commission
- * exclude cancelled sub-orders — they never moved money. */
+/**
+ * Platform metrics (GET /v1/admin/overview). GMV is the
+ * canonical Wave 27 figure — goods − discount + delivery
+ * over non-cancelled sub-orders; commission is earned on
+ * DELIVERED sub-orders only (the seller-earnings
+ * definition). The field was `gmv_goods_poisha` (a
+ * pre-Wave-27 goods-only sum) until the overview remake.
+ */
 export interface AdminOverview {
   users: number;
   stores: number;
   products: number;
   orders: number;
-  gmv_goods_poisha: number;
+  gmv_poisha: number;
   commission_earned_poisha: number;
   payouts_pending: { count: number; amount_poisha: number };
   payments_pending_count: number;
@@ -5608,13 +5652,30 @@ export interface AdminMetrics {
   orders_today: { count: number; gmv_poisha: number };
   /** Parent-order counts per status (placed/confirmed/delivered/cancelled). */
   orders_by_status: Record<string, number>;
-  pending_payouts: { count: number; amount_poisha: number };
+  pending_payouts: {
+    count: number;
+    amount_poisha: number;
+    /** Age of the oldest undecided request; null when empty. */
+    oldest_age_secs: number | null;
+  };
   open_returns: number;
   notification_backlog: {
     pending: number;
     sending: number;
     sent: number;
     failed: number;
+    /** Age of the oldest unclaimed row; null when none pending. */
+    oldest_pending_age_secs: number | null;
+    /** Age of the oldest live sending claim; null when none. */
+    oldest_sending_claim_age_secs: number | null;
+    /** Sending rows whose claim is stale (or never stamped). */
+    stale_sending_count: number;
+    /** Sending rows with no claim stamp at all. */
+    sending_unstamped_count: number;
+    /** Rows sent in the last 24 hours. */
+    sent_last_24h: number;
+    /** Seconds since the last successful send; null if never. */
+    last_sent_age_secs: number | null;
   };
   stale_shipments: number;
   users_total: number;
@@ -5656,8 +5717,42 @@ export interface AdminMetrics {
     buyers_with_addresses: number;
     defaults_count: number;
   };
-  /** Gift cards platform-wide (Wave 60) — the stored-value liability. */
+  /**
+   * Gift cards platform-wide (Wave 60). The outstanding
+   * figure is the sellers' aggregate liability on
+   * spendable cards — gift cards are seller-funded.
+   */
   gift_cards: GiftCardStats;
+  /** orders_today's definitions one Dhaka day earlier (remake). */
+  orders_yesterday: { count: number; gmv_poisha: number };
+  /** Sub-order counts per fulfilment status (sparse map). */
+  sub_orders_by_status: Record<string, number>;
+  /** Parent orders per payment_status (sparse map). */
+  orders_by_payment_status: Record<string, number>;
+  /** Advances still owed by buyers (remake). */
+  advance_pending: {
+    count: number;
+    outstanding_poisha: number;
+    blocked_total_poisha: number;
+    over_24h: number;
+    over_72h: number;
+    oldest_age_secs: number | null;
+  };
+  /** Advances required but never collected — degraded checkouts. */
+  advance_unfulfilled: { count: number; required_poisha: number };
+  /** Received returns whose refund is not marked done. */
+  refunds_pending: { count: number; amount_poisha: number };
+  /** KYC applications awaiting review + oldest age. */
+  verifications_pending: { count: number; oldest_age_secs: number | null };
+  /** Active products out of / low on effective stock. */
+  stock_alerts: { out_of_stock: number; low_stock: number };
+  /** New users and stores created today (Dhaka). */
+  growth_today: { new_users: number; new_stores: number };
+  stores_suspended: number;
+  /** Promotions live right now. */
+  active_promotions: number;
+  /** The flash sale live right now, when one is. */
+  live_flash_sale: { id: string; title: string; ends_at: string } | null;
 }
 
 /** GET /v1/admin/metrics — admin only (the API answers 403 otherwise). */

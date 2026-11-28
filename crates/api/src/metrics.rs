@@ -5,11 +5,11 @@
 //! Wave 37 route exclusions refuse key authentication on
 //! the whole admin prefix before scope checks run).
 //!
-//! Every block is ONE aggregate query — three queries
-//! total, no per-row loops, nothing cached: the numbers
-//! are recomputed from the ledger tables on each request,
-//! exactly like the Wave 27 analytics they reuse
-//! definitions from. The blocks:
+//! Every block is an aggregate query — no per-row loops,
+//! nothing cached: the numbers are recomputed from the
+//! ledger tables on each request, exactly like the
+//! Wave 27 analytics they reuse definitions from. The
+//! blocks:
 //!
 //! - `orders_today`: parent orders created on the current
 //!   Asia/Dhaka day (the Wave 27 day-boundary convention:
@@ -62,10 +62,66 @@
 //!   status plus the issued / outstanding / redeemed /
 //!   restored totals — the stored-value liability at a
 //!   glance.
+//!
+//! The overview remake added the operator blocks below.
+//! Every one reuses an existing definition; none invents
+//! a new money meaning:
+//!
+//! - `orders_yesterday`: `orders_today`'s two definitions
+//!   shifted one Dhaka day back, so the page can show a
+//!   today-vs-yesterday delta without a second endpoint.
+//! - `sub_orders_by_status` / `orders_by_payment_status`:
+//!   the fulfilment pipeline grouped by the sub-order
+//!   status vocabulary, and parent orders grouped by
+//!   `payment_status` — the axis `advance_pending` actually
+//!   lives on (it is a payment status, never an order
+//!   status). Sparse maps like `orders_by_status`: only
+//!   values present in the data appear.
+//! - `advance_pending`: orders whose advance is still
+//!   owed (`payment_status = 'advance_pending'`, parent
+//!   not cancelled) — how many, how much is still owed,
+//!   how much order value is blocked behind them, and how
+//!   many have waited over 24h / 72h. No reaper touches
+//!   this state; the queue only moves when the buyer pays
+//!   or an admin intervenes, so its age is the signal.
+//! - `advance_unfulfilled`: the degraded population (the
+//!   Wave 17 / CR-15 policy): an advance was required but
+//!   the order proceeded on `pay_on_delivery` terms
+//!   without it. A DIFFERENT set from `advance_pending` —
+//!   these orders are already moving; the platform simply
+//!   never collected the protection.
+//! - `refunds_pending`: returns received whose refund the
+//!   admin has not marked done (`status = 'received'`,
+//!   `refund_status = 'pending'`) — the money half of the
+//!   returns queue, invisible in `open_returns` because a
+//!   received request is terminal for the request itself.
+//! - `verifications_pending`: seller KYC applications
+//!   awaiting review (`store_verifications.status =
+//!   'pending'`) with the oldest application's age. NOT
+//!   stores whose tier is `unverified` — that tier also
+//!   covers stores that never applied.
+//! - `stock_alerts`: active products whose EFFECTIVE
+//!   stock (the variant-aware expression shared with the
+//!   inventory overview) is zero, or at/under the low
+//!   threshold — catalogue holes a buyer would hit.
+//! - `growth_today` / `stores_suspended` /
+//!   `active_promotions` / `live_flash_sale`: the day's
+//!   new users and stores (Dhaka day), suspended stores,
+//!   promotions live right now (the domain's
+//!   `promotion_is_active` rule in SQL form), and the
+//!   flash sale currently live, if any.
+//! - Notification ages on `notification_backlog`: how old
+//!   the oldest pending row and the oldest `sending`
+//!   claim are, how many claims are stale by the notify
+//!   crate's own threshold, and the last successful send.
+//!   There is deliberately NO "failed in the last 24h":
+//!   the outbox records no failure timestamp, so that
+//!   figure cannot be computed honestly.
 
 use std::collections::BTreeMap;
 
 use axum::{extract::State, Json};
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
@@ -92,11 +148,101 @@ pub struct OrdersToday {
 }
 
 /// Payout requests awaiting an admin decision (status
-/// `requested`): how many, and how much poisha they total.
+/// `requested`): how many, how much poisha they total, and
+/// the age of the oldest undecided request (the queue is
+/// the admin's to work; nothing auto-expires it).
 #[derive(Debug, Serialize)]
 pub struct PendingPayouts {
     pub count: i64,
     pub amount_poisha: i64,
+    /// Seconds since the oldest `requested` payout was
+    /// filed; `None` when the queue is empty.
+    pub oldest_age_secs: Option<i64>,
+}
+
+/// Orders whose advance payment is still owed (overview
+/// remake): the buyer has not paid the required advance,
+/// so the order cannot be booked with a courier and its
+/// stock stays locked. Ages are the operator's signal —
+/// nothing reaps this state automatically.
+#[derive(Debug, Serialize)]
+pub struct AdvancePending {
+    pub count: i64,
+    /// Advance still owed: SUM(required − paid).
+    pub outstanding_poisha: i64,
+    /// Full order value blocked behind the unpaid
+    /// advances: SUM(grand_total_poisha).
+    pub blocked_total_poisha: i64,
+    /// Waiting longer than 24 hours.
+    pub over_24h: i64,
+    /// Waiting longer than 72 hours.
+    pub over_72h: i64,
+    /// Seconds since the oldest such order was placed;
+    /// `None` when there are none.
+    pub oldest_age_secs: Option<i64>,
+}
+
+/// Orders that proceeded WITHOUT a required advance
+/// (overview remake): the degraded population of the
+/// Wave 17 advance policy — an advance was required but
+/// no gateway could take it, so the order went ahead on
+/// pay-on-delivery terms. Distinct from
+/// [`AdvancePending`]: these orders are already moving.
+#[derive(Debug, Serialize)]
+pub struct AdvanceUnfulfilled {
+    pub count: i64,
+    /// The advance that was required and never collected:
+    /// SUM(required − paid).
+    pub required_poisha: i64,
+}
+
+/// Returns received whose refund is still pending an
+/// admin mark-done (overview remake): `status =
+/// 'received'` and `refund_status = 'pending'` on
+/// `return_requests`.
+#[derive(Debug, Serialize)]
+pub struct RefundsPending {
+    pub count: i64,
+    /// SUM of the receipt-time refund snapshots.
+    pub amount_poisha: i64,
+}
+
+/// Seller verification (KYC) applications awaiting review
+/// (overview remake), with the oldest application's age.
+#[derive(Debug, Serialize)]
+pub struct VerificationsPending {
+    pub count: i64,
+    /// Seconds since the oldest pending application was
+    /// submitted; `None` when the queue is empty.
+    pub oldest_age_secs: Option<i64>,
+}
+
+/// Active products at or below their low-stock line
+/// (overview remake), by the variant-aware effective
+/// stock the inventory overview uses.
+#[derive(Debug, Serialize)]
+pub struct StockAlerts {
+    pub out_of_stock: i64,
+    pub low_stock: i64,
+}
+
+/// New users and stores created on the current Dhaka day
+/// (overview remake).
+#[derive(Debug, Serialize)]
+pub struct GrowthToday {
+    pub new_users: i64,
+    pub new_stores: i64,
+}
+
+/// The flash sale live at the instant of the call, when
+/// one is (overview remake): active flag set and `now`
+/// inside its window — the same liveness the price
+/// resolution uses.
+#[derive(Debug, Serialize, FromRow)]
+pub struct LiveFlashSale {
+    pub id: Uuid,
+    pub title: String,
+    pub ends_at: DateTime<Utc>,
 }
 
 /// The notification outbox counted per status. All four
@@ -108,6 +254,28 @@ pub struct NotificationBacklog {
     pub sending: i64,
     pub sent: i64,
     pub failed: i64,
+    /// Age in seconds of the oldest row still waiting to
+    /// be claimed; `None` when nothing is pending.
+    pub oldest_pending_age_secs: Option<i64>,
+    /// Age in seconds of the oldest live `sending` claim
+    /// (by `claimed_at`, the Wave 48 stamp); `None` when
+    /// nothing is claimed. Unstamped legacy claims carry
+    /// no `claimed_at` and cannot age — they are counted
+    /// separately below instead of being aged by a
+    /// fabricated stamp.
+    pub oldest_sending_claim_age_secs: Option<i64>,
+    /// `sending` rows whose claim is stale by the notify
+    /// crate's own threshold (or never stamped): claimed
+    /// work no live worker is finishing.
+    pub stale_sending_count: i64,
+    /// `sending` rows with no claim stamp at all.
+    pub sending_unstamped_count: i64,
+    /// Rows sent in the last 24 hours — the outbox's
+    /// proof of life.
+    pub sent_last_24h: i64,
+    /// Seconds since the most recent successful send;
+    /// `None` when nothing has ever been sent.
+    pub last_sent_age_secs: Option<i64>,
 }
 
 /// The media library's footprint (Wave 51): how many
@@ -171,9 +339,45 @@ pub struct AdminMetrics {
     /// derived status, issued / outstanding / redeemed /
     /// restored totals (see
     /// [`crate::gift_cards::GiftCardStats`]). The
-    /// outstanding figure is the platform's live
-    /// stored-value liability.
+    /// outstanding figure is the SELLERS' aggregate live
+    /// liability on spendable cards: gift cards are
+    /// seller-funded (issuance is promotional; redemption
+    /// is netted from the issuing store's payout), so the
+    /// platform itself holds no gift-card cash.
     pub gift_cards: crate::gift_cards::GiftCardStats,
+    /// Overview remake: `orders_today`'s definitions one
+    /// Dhaka day earlier — the delta baseline.
+    pub orders_yesterday: OrdersToday,
+    /// Overview remake: sub-order counts grouped by the
+    /// fulfilment status vocabulary. Sparse like
+    /// `orders_by_status`.
+    pub sub_orders_by_status: BTreeMap<String, i64>,
+    /// Overview remake: parent orders grouped by
+    /// `payment_status` (the axis advances live on).
+    /// Sparse like `orders_by_status`.
+    pub orders_by_payment_status: BTreeMap<String, i64>,
+    /// Overview remake: advances still owed by buyers.
+    pub advance_pending: AdvancePending,
+    /// Overview remake: advances required but never
+    /// collected (degraded checkouts).
+    pub advance_unfulfilled: AdvanceUnfulfilled,
+    /// Overview remake: received returns awaiting a
+    /// refund mark-done.
+    pub refunds_pending: RefundsPending,
+    /// Overview remake: KYC applications awaiting review.
+    pub verifications_pending: VerificationsPending,
+    /// Overview remake: low / out-of-stock active
+    /// products by effective stock.
+    pub stock_alerts: StockAlerts,
+    /// Overview remake: today's new users and stores.
+    pub growth_today: GrowthToday,
+    /// Overview remake: stores currently suspended.
+    pub stores_suspended: i64,
+    /// Overview remake: promotions live right now.
+    pub active_promotions: i64,
+    /// Overview remake: the flash sale live right now,
+    /// when one is.
+    pub live_flash_sale: Option<LiveFlashSale>,
 }
 
 /// One district's order count (Wave 55). Districts are the
@@ -244,7 +448,35 @@ pub async fn get_admin_metrics(pool: &PgPool) -> Result<AdminMetrics, ApiError> 
         media_stored_images: i64,
         media_external_images: i64,
         media_stored_bytes: i64,
+        orders_yesterday: i64,
+        orders_yesterday_gmv_poisha: i64,
+        pending_payouts_oldest_age_secs: Option<i64>,
+        advance_pending_count: i64,
+        advance_pending_outstanding_poisha: i64,
+        advance_pending_blocked_total_poisha: i64,
+        advance_pending_over_24h: i64,
+        advance_pending_over_72h: i64,
+        advance_pending_oldest_age_secs: Option<i64>,
+        advance_unfulfilled_count: i64,
+        advance_unfulfilled_required_poisha: i64,
+        refunds_pending_count: i64,
+        refunds_pending_amount_poisha: i64,
+        verifications_pending_count: i64,
+        verifications_oldest_age_secs: Option<i64>,
+        stock_out_of_stock: i64,
+        stock_low_stock: i64,
+        new_users_today: i64,
+        new_stores_today: i64,
+        stores_suspended: i64,
+        active_promotions: i64,
     }
+
+    // The variant-aware effective-stock expression is
+    // interpolated from the products module's canonical
+    // text (compile-time constant over the `p` alias, never
+    // user input) so the stock alerts can never drift from
+    // the inventory overview's definition.
+    let effective_stock = crate::products::EFFECTIVE_STOCK_SQL;
 
     let scalars: ScalarRow = sqlx::query_as(&format!(
         "SELECT \
@@ -282,7 +514,98 @@ pub async fn get_admin_metrics(pool: &PgPool) -> Result<AdminMetrics, ApiError> 
            (SELECT COUNT(*) FROM product_images \
              WHERE external_url IS NOT NULL) AS media_external_images, \
            (SELECT COALESCE(SUM(size_bytes), 0)::bigint FROM product_images) \
-             AS media_stored_bytes"
+             AS media_stored_bytes, \
+           (SELECT COUNT(*) FROM orders \
+             WHERE (created_at AT TIME ZONE 'Asia/Dhaka')::date \
+                 = (now() AT TIME ZONE 'Asia/Dhaka')::date - 1) \
+             AS orders_yesterday, \
+           (SELECT COALESCE(SUM(goods_subtotal_poisha - discount_poisha \
+                                + delivery_charge_poisha), 0)::bigint \
+              FROM sub_orders \
+             WHERE status <> 'cancelled' \
+               AND (created_at AT TIME ZONE 'Asia/Dhaka')::date \
+                 = (now() AT TIME ZONE 'Asia/Dhaka')::date - 1) \
+             AS orders_yesterday_gmv_poisha, \
+           (SELECT EXTRACT(EPOCH FROM (now() - MIN(created_at)))::bigint \
+              FROM payouts WHERE status = 'requested') \
+             AS pending_payouts_oldest_age_secs, \
+           (SELECT COUNT(*) FROM orders \
+             WHERE payment_status = 'advance_pending' \
+               AND status <> 'cancelled') \
+             AS advance_pending_count, \
+           (SELECT COALESCE(SUM(advance_required_poisha \
+                                - advance_paid_poisha), 0)::bigint \
+              FROM orders \
+             WHERE payment_status = 'advance_pending' \
+               AND status <> 'cancelled') \
+             AS advance_pending_outstanding_poisha, \
+           (SELECT COALESCE(SUM(grand_total_poisha), 0)::bigint \
+              FROM orders \
+             WHERE payment_status = 'advance_pending' \
+               AND status <> 'cancelled') \
+             AS advance_pending_blocked_total_poisha, \
+           (SELECT COUNT(*) FROM orders \
+             WHERE payment_status = 'advance_pending' \
+               AND status <> 'cancelled' \
+               AND created_at < now() - interval '24 hours') \
+             AS advance_pending_over_24h, \
+           (SELECT COUNT(*) FROM orders \
+             WHERE payment_status = 'advance_pending' \
+               AND status <> 'cancelled' \
+               AND created_at < now() - interval '72 hours') \
+             AS advance_pending_over_72h, \
+           (SELECT EXTRACT(EPOCH FROM (now() - MIN(created_at)))::bigint \
+              FROM orders \
+             WHERE payment_status = 'advance_pending' \
+               AND status <> 'cancelled') \
+             AS advance_pending_oldest_age_secs, \
+           (SELECT COUNT(*) FROM orders \
+             WHERE payment_status = 'pay_on_delivery' \
+               AND advance_required_poisha > advance_paid_poisha \
+               AND status <> 'cancelled') \
+             AS advance_unfulfilled_count, \
+           (SELECT COALESCE(SUM(advance_required_poisha \
+                                - advance_paid_poisha), 0)::bigint \
+              FROM orders \
+             WHERE payment_status = 'pay_on_delivery' \
+               AND advance_required_poisha > advance_paid_poisha \
+               AND status <> 'cancelled') \
+             AS advance_unfulfilled_required_poisha, \
+           (SELECT COUNT(*) FROM return_requests \
+             WHERE status = 'received' AND refund_status = 'pending') \
+             AS refunds_pending_count, \
+           (SELECT COALESCE(SUM(refund_poisha), 0)::bigint \
+              FROM return_requests \
+             WHERE status = 'received' AND refund_status = 'pending') \
+             AS refunds_pending_amount_poisha, \
+           (SELECT COUNT(*) FROM store_verifications \
+             WHERE status = 'pending') \
+             AS verifications_pending_count, \
+           (SELECT EXTRACT(EPOCH FROM (now() - MIN(submitted_at)))::bigint \
+              FROM store_verifications WHERE status = 'pending') \
+             AS verifications_oldest_age_secs, \
+           (SELECT COUNT(*) FROM products p \
+             WHERE p.status = 'active' AND {effective_stock} <= 0) \
+             AS stock_out_of_stock, \
+           (SELECT COUNT(*) FROM products p \
+             WHERE p.status = 'active' \
+               AND {effective_stock} BETWEEN 1 \
+                   AND COALESCE(p.low_stock_threshold, 5)) \
+             AS stock_low_stock, \
+           (SELECT COUNT(*) FROM users \
+             WHERE (created_at AT TIME ZONE 'Asia/Dhaka')::date \
+                 = (now() AT TIME ZONE 'Asia/Dhaka')::date) \
+             AS new_users_today, \
+           (SELECT COUNT(*) FROM stores \
+             WHERE (created_at AT TIME ZONE 'Asia/Dhaka')::date \
+                 = (now() AT TIME ZONE 'Asia/Dhaka')::date) \
+             AS new_stores_today, \
+           (SELECT COUNT(*) FROM stores WHERE status = 'suspended') \
+             AS stores_suspended, \
+           (SELECT COUNT(*) FROM promotions \
+             WHERE status = 'active' \
+               AND starts_at <= now() AND ends_at > now()) \
+             AS active_promotions"
     ))
     .bind(STALE_SHIPMENT_MINUTES)
     .fetch_one(pool)
@@ -312,6 +635,12 @@ pub async fn get_admin_metrics(pool: &PgPool) -> Result<AdminMetrics, ApiError> 
         sending: 0,
         sent: 0,
         failed: 0,
+        oldest_pending_age_secs: None,
+        oldest_sending_claim_age_secs: None,
+        stale_sending_count: 0,
+        sending_unstamped_count: 0,
+        sent_last_24h: 0,
+        last_sent_age_secs: None,
     };
     for row in notification_rows {
         match row.status.as_str() {
@@ -326,6 +655,80 @@ pub async fn get_admin_metrics(pool: &PgPool) -> Result<AdminMetrics, ApiError> 
         }
     }
 
+    // The outbox's age detail (overview remake): one
+    // aggregate over the same table. The stale threshold
+    // is the notify crate's own constant, bound — never
+    // re-stated here — so this snapshot cannot drift from
+    // the reaper's definition. MIN/MAX ignore NULL stamps
+    // by design: an unstamped claim cannot be aged, so it
+    // is counted (sending_unstamped_count) instead.
+    #[derive(FromRow)]
+    struct NotificationDetail {
+        oldest_pending_age_secs: Option<i64>,
+        oldest_sending_claim_age_secs: Option<i64>,
+        stale_sending_count: i64,
+        sending_unstamped_count: i64,
+        sent_last_24h: i64,
+        last_sent_age_secs: Option<i64>,
+    }
+    let notification_detail: NotificationDetail = sqlx::query_as(
+        "SELECT \
+           EXTRACT(EPOCH FROM (now() - MIN(created_at) \
+             FILTER (WHERE status = 'pending')))::bigint \
+             AS oldest_pending_age_secs, \
+           EXTRACT(EPOCH FROM (now() - MIN(claimed_at) \
+             FILTER (WHERE status = 'sending')))::bigint \
+             AS oldest_sending_claim_age_secs, \
+           COUNT(*) FILTER (WHERE status = 'sending' \
+             AND (claimed_at IS NULL \
+                  OR claimed_at < now() - make_interval(mins => $1::int)))::bigint \
+             AS stale_sending_count, \
+           COUNT(*) FILTER (WHERE status = 'sending' \
+             AND claimed_at IS NULL)::bigint \
+             AS sending_unstamped_count, \
+           COUNT(*) FILTER (WHERE status = 'sent' \
+             AND sent_at >= now() - interval '24 hours')::bigint \
+             AS sent_last_24h, \
+           EXTRACT(EPOCH FROM (now() - MAX(sent_at)))::bigint \
+             AS last_sent_age_secs \
+         FROM notifications",
+    )
+    .bind(notify::DEFAULT_SENDING_STALE_MINUTES)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::internal("admin metrics notification detail", e))?;
+    notification_backlog.oldest_pending_age_secs = notification_detail.oldest_pending_age_secs;
+    notification_backlog.oldest_sending_claim_age_secs =
+        notification_detail.oldest_sending_claim_age_secs;
+    notification_backlog.stale_sending_count = notification_detail.stale_sending_count;
+    notification_backlog.sending_unstamped_count = notification_detail.sending_unstamped_count;
+    notification_backlog.sent_last_24h = notification_detail.sent_last_24h;
+    notification_backlog.last_sent_age_secs = notification_detail.last_sent_age_secs;
+
+    let sub_order_rows: Vec<StatusCount> = sqlx::query_as(
+        "SELECT status, COUNT(*) AS count FROM sub_orders \
+         GROUP BY status ORDER BY status",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::internal("admin metrics sub-orders by status", e))?;
+    let sub_orders_by_status: BTreeMap<String, i64> = sub_order_rows
+        .into_iter()
+        .map(|row| (row.status, row.count))
+        .collect();
+
+    let payment_rows: Vec<StatusCount> = sqlx::query_as(
+        "SELECT payment_status AS status, COUNT(*) AS count FROM orders \
+         GROUP BY payment_status ORDER BY payment_status",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::internal("admin metrics orders by payment status", e))?;
+    let orders_by_payment_status: BTreeMap<String, i64> = payment_rows
+        .into_iter()
+        .map(|row| (row.status, row.count))
+        .collect();
+
     Ok(AdminMetrics {
         orders_today: OrdersToday {
             count: scalars.orders_today,
@@ -335,6 +738,7 @@ pub async fn get_admin_metrics(pool: &PgPool) -> Result<AdminMetrics, ApiError> 
         pending_payouts: PendingPayouts {
             count: scalars.pending_payouts_count,
             amount_poisha: scalars.pending_payouts_amount_poisha,
+            oldest_age_secs: scalars.pending_payouts_oldest_age_secs,
         },
         open_returns: scalars.open_returns,
         notification_backlog,
@@ -388,6 +792,50 @@ pub async fn get_admin_metrics(pool: &PgPool) -> Result<AdminMetrics, ApiError> 
         .await
         .map_err(|e| ApiError::internal("address book stats", e))?,
         gift_cards: crate::gift_cards::platform_gift_card_stats(pool).await?,
+        orders_yesterday: OrdersToday {
+            count: scalars.orders_yesterday,
+            gmv_poisha: scalars.orders_yesterday_gmv_poisha,
+        },
+        sub_orders_by_status,
+        orders_by_payment_status,
+        advance_pending: AdvancePending {
+            count: scalars.advance_pending_count,
+            outstanding_poisha: scalars.advance_pending_outstanding_poisha,
+            blocked_total_poisha: scalars.advance_pending_blocked_total_poisha,
+            over_24h: scalars.advance_pending_over_24h,
+            over_72h: scalars.advance_pending_over_72h,
+            oldest_age_secs: scalars.advance_pending_oldest_age_secs,
+        },
+        advance_unfulfilled: AdvanceUnfulfilled {
+            count: scalars.advance_unfulfilled_count,
+            required_poisha: scalars.advance_unfulfilled_required_poisha,
+        },
+        refunds_pending: RefundsPending {
+            count: scalars.refunds_pending_count,
+            amount_poisha: scalars.refunds_pending_amount_poisha,
+        },
+        verifications_pending: VerificationsPending {
+            count: scalars.verifications_pending_count,
+            oldest_age_secs: scalars.verifications_oldest_age_secs,
+        },
+        stock_alerts: StockAlerts {
+            out_of_stock: scalars.stock_out_of_stock,
+            low_stock: scalars.stock_low_stock,
+        },
+        growth_today: GrowthToday {
+            new_users: scalars.new_users_today,
+            new_stores: scalars.new_stores_today,
+        },
+        stores_suspended: scalars.stores_suspended,
+        active_promotions: scalars.active_promotions,
+        live_flash_sale: sqlx::query_as(
+            "SELECT id, title, ends_at FROM flash_sales \
+             WHERE is_active AND starts_at <= now() AND ends_at > now() \
+             ORDER BY ends_at ASC LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| ApiError::internal("admin metrics live flash sale", e))?,
     })
 }
 

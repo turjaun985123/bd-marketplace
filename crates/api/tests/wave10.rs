@@ -303,8 +303,12 @@ async fn wave10_admin_panel_flow() {
     assert_eq!(overview["stores"], 1);
     assert_eq!(overview["products"], 1);
     assert_eq!(overview["orders"], 1);
-    assert_eq!(overview["gmv_goods_poisha"], 200_000);
-    assert_eq!(overview["commission_earned_poisha"], 16_000);
+    // Overview remake: GMV is the canonical Wave-27 figure —
+    // goods 200_000 − discount 0 + inside-Dhaka delivery 6_000 —
+    // and commission is earned only on DELIVERED sub-orders, so
+    // the placed order's 16_000 snapshot is not yet earned.
+    assert_eq!(overview["gmv_poisha"], 206_000);
+    assert_eq!(overview["commission_earned_poisha"], 0);
     assert_eq!(overview["payouts_pending"]["count"], 0);
     assert_eq!(overview["payouts_pending"]["amount_poisha"], 0);
     assert_eq!(overview["payments_pending_count"], 0);

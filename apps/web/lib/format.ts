@@ -70,3 +70,71 @@ export function formatDateTime(iso: string | null | undefined): string {
     minute: "2-digit",
   });
 }
+
+/**
+ * A count with lakh-style grouping (the same grouping
+ * formatBdt uses for taka), so big dashboard numbers stay
+ * readable: 1234567 → "12,34,567".
+ */
+export function formatCount(n: number): string {
+  return n.toLocaleString("en-IN");
+}
+
+/**
+ * A byte count in the largest unit that keeps the value
+ * at or above 1 (B / KB / MB / GB), one decimal place
+ * past bytes. Added for the admin overview's media block:
+ * the page used to print raw KB unconditionally, which
+ * turns unreadable at real catalogue scale.
+ */
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "—";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return unit === 0
+    ? `${Math.round(value)} ${units[unit]}`
+    : `${value.toFixed(1)} ${units[unit]}`;
+}
+
+/**
+ * An age in seconds as a short Bangla duration — the
+ * largest whole unit (দিন / ঘণ্টা / মিনিট), "১ মিনিটের কম"
+ * under a minute. For queue ages on ops surfaces, where
+ * "how long has this waited" is the whole point.
+ */
+export function formatAgeSeconds(secs: number | null | undefined): string {
+  if (secs === null || secs === undefined || !Number.isFinite(secs)) {
+    return "—";
+  }
+  const s = Math.max(0, Math.floor(secs));
+  if (s < 60) return "১ মিনিটের কম";
+  const minutes = Math.floor(s / 60);
+  if (minutes < 60) return `${minutes} মিনিট`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} ঘণ্টা`;
+  const days = Math.floor(hours / 24);
+  return `${days} দিন`;
+}
+
+/**
+ * A timestamp pinned to Asia/Dhaka, for ops surfaces: the
+ * platform's day boundaries are Dhaka days, so an admin
+ * abroad should still read Dhaka wall-clock here.
+ */
+export function formatDhakaDateTime(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "—";
+  return date.toLocaleString("en-GB", {
+    timeZone: "Asia/Dhaka",
+    day: "numeric",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
