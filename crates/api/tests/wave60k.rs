@@ -168,7 +168,7 @@ async fn wave60_settings_default_validity_and_expiry_reminder_sweep() {
     let seller = login(&app, "01766666661").await;
     create_store(&app, &seller, "wave60k-store").await;
     let seller_id: String = sqlx::query_scalar(
-        "SELECT id::text FROM users WHERE phone = '01766666661'",
+        "SELECT id::text FROM users WHERE phone = '+8801766666661'",
     )
     .fetch_one(&pool)
     .await
