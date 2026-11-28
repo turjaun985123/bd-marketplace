@@ -265,8 +265,8 @@ async fn wave56_product_category_linking() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "detail: {detail}");
-    assert_eq!(detail["product"]["category_id"], fashion_id);
-    assert_eq!(path_slugs(&detail["product"]), vec!["fashion"]);
+    assert_eq!(detail["category_id"], fashion_id);
+    assert_eq!(path_slugs(&detail), vec!["fashion"]);
     let (status, list) = call(
         &app,
         Method::GET,

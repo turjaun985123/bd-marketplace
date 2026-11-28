@@ -272,8 +272,8 @@ async fn wave56_taxonomy_change_semantics() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "product after rename: {after}");
-    assert_eq!(after["product"]["category"], "W56I Original");
-    assert_eq!(after["product"]["category_id"], node_id, "the link survives");
+    assert_eq!(after["category"], "W56I Original");
+    assert_eq!(after["category_id"], node_id, "the link survives");
 
     // ...but RESOLUTION uses current names: a new product
     // labelled with the OLD name no longer links, and one

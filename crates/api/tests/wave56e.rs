@@ -433,9 +433,9 @@ async fn wave56_import_export_merge_and_specialties() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "product after merge: {after}");
-    assert_eq!(after["product"]["category_id"], others_id);
+    assert_eq!(after["category_id"], others_id);
     assert_eq!(
-        after["product"]["category"], "Others",
+        after["category"], "Others",
         "the synced label re-syncs to the target"
     );
 
