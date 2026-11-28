@@ -1218,21 +1218,39 @@ pub struct ProductInput {
 /// Validate product input. Pure and shared by the create and update
 /// service functions so the rules can never drift apart. Returns a
 /// human-readable error message on failure.
-pub fn validate_product_input(input: &ProductInput) -> Result<(), String> {
+/// Every problem with a product input, as (field, message)
+/// pairs in the canonical check order — the accumulating
+/// form of [`validate_product_input`] (Wave 57: the bulk
+/// importer reports ALL of a row's field errors at once
+/// instead of making the seller fix them one at a time).
+pub fn product_input_errors(input: &ProductInput) -> Vec<(&'static str, String)> {
+    let mut errors: Vec<(&'static str, String)> = Vec::new();
     if input.title.trim().is_empty() {
-        return Err("title must not be empty".to_string());
+        errors.push(("title", "title must not be empty".to_string()));
     }
     if input.price_poisha < 0 {
-        return Err("price_poisha must be >= 0".to_string());
+        errors.push(("price_poisha", "price_poisha must be >= 0".to_string()));
     }
     if input.stock < 0 {
-        return Err("stock must be >= 0".to_string());
+        errors.push(("stock", "stock must be >= 0".to_string()));
     }
     if !is_valid_product_status(&input.status) {
-        return Err("status must be one of: draft, active, archived".to_string());
+        errors.push((
+            "status",
+            "status must be one of: draft, active, archived".to_string(),
+        ));
     }
-    validate_weight_grams(input.weight_grams)?;
-    Ok(())
+    if let Err(message) = validate_weight_grams(input.weight_grams) {
+        errors.push(("weight_grams", message));
+    }
+    errors
+}
+
+pub fn validate_product_input(input: &ProductInput) -> Result<(), String> {
+    match product_input_errors(input).into_iter().next() {
+        None => Ok(()),
+        Some((_, message)) => Err(message),
+    }
 }
 
 /// Maximum length of a review body, in characters.
@@ -6683,6 +6701,15 @@ pub fn parse_csv(input: &str) -> Result<Vec<Vec<String>>, String> {
                     if row_started || !row.is_empty() {
                         row.push(std::mem::take(&mut field));
                         rows.push(std::mem::take(&mut row));
+                    } else if chars.peek().is_some() {
+                        // A genuinely empty line mid-file:
+                        // emit its one-field row so callers'
+                        // line numbers stay sheet-true (the
+                        // bulk parser skips it as blank). A
+                        // trailing newline at end-of-file has
+                        // nothing after it and emits no
+                        // phantom row.
+                        rows.push(vec![String::new()]);
                     }
                     row_started = false;
                 }
@@ -7108,8 +7135,8 @@ pub fn parse_bulk_product_csv(text: &str) -> Result<BulkCsvParse, String> {
 
         // The shared product validator — the same gate the
         // single-create form passes — judges the mapped
-        // row as a whole; its message is attributed to the
-        // field its wording names.
+        // row as a whole, in its accumulating form: every
+        // failing field is reported, not just the first.
         let candidate = ProductInput {
             title: title.clone(),
             price_poisha,
@@ -7117,18 +7144,7 @@ pub fn parse_bulk_product_csv(text: &str) -> Result<BulkCsvParse, String> {
             status: status.clone(),
             weight_grams,
         };
-        if let Err(message) = validate_product_input(&candidate) {
-            let field = if message.starts_with("title") {
-                "title"
-            } else if message.starts_with("price") {
-                "price_poisha"
-            } else if message.starts_with("stock") {
-                "stock"
-            } else if message.starts_with("status") {
-                "status"
-            } else {
-                "weight_grams"
-            };
+        for (field, message) in product_input_errors(&candidate) {
             errors.push(bulk_field_error(field, message));
         }
         // The import-only price rule (the Facebook import's
@@ -12568,8 +12584,8 @@ mod tests {
     #[test]
     fn bulk_row_rejects_negative_compare_and_huge_stock() {
         let parsed = parse_bulk_product_csv(&bulk_sheet(&[
-            "NEG-1,Neg Compare,,,100,-5,,,,draft,,,",
-            "HUGE-1,Huge Stock,,,100,,9999999999999,,,draft,,,",
+            "NEG-1,Neg Compare,,,100,-5,,,draft,,,",
+            "HUGE-1,Huge Stock,,,100,,9999999999999,,draft,,,",
             "W-1,Bad Weight,,,100,,,0,draft,,,",
         ]))
         .expect("parse");
