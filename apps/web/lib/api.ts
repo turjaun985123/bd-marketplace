@@ -3419,7 +3419,7 @@ export function storeStatusLabel(status: string): string {
 
 /** Bangla label for a payout status (Wave 9). */
 export function payoutStatusLabel(status: string): string {
-  switch (status) {  switch (status) {
+  switch (status) {
     case "requested":
       return "অনুরোধ করা হয়েছে";
     case "approved":
