@@ -1912,6 +1912,111 @@ pub fn validate_fulfillment_sla_hours(hours: i64) -> bool {
     (1..=720).contains(&hours)
 }
 
+/// The `platform_settings` key for the admin shipments
+/// queue's aged threshold for the `created` status: how
+/// long a booked shipment may wait for pickup before the
+/// oversight queue flags it aged (admin shipments remake).
+/// The seven `shipment_aged_*` keys cover exactly the
+/// non-terminal unified statuses — `delivered`, `returned`
+/// and `cancelled` are the poller's terminal set and get
+/// no threshold. Resolution is two-layer (a stored setting
+/// gated by [`validate_fulfillment_sla_hours`], then the
+/// built-in default), following the delivery-day ranges'
+/// precedent: a runtime platform decision, not a
+/// deployment parameter, so there is no env layer.
+pub const SHIPMENT_AGED_CREATED_HOURS_KEY: &str = "shipment_aged_created_hours";
+
+/// The aged-threshold settings key for `picked_up`. See
+/// [`SHIPMENT_AGED_CREATED_HOURS_KEY`].
+pub const SHIPMENT_AGED_PICKED_UP_HOURS_KEY: &str = "shipment_aged_picked_up_hours";
+
+/// The aged-threshold settings key for `in_transit`. See
+/// [`SHIPMENT_AGED_CREATED_HOURS_KEY`].
+pub const SHIPMENT_AGED_IN_TRANSIT_HOURS_KEY: &str = "shipment_aged_in_transit_hours";
+
+/// The aged-threshold settings key for `out_for_delivery`.
+/// See [`SHIPMENT_AGED_CREATED_HOURS_KEY`].
+pub const SHIPMENT_AGED_OUT_FOR_DELIVERY_HOURS_KEY: &str =
+    "shipment_aged_out_for_delivery_hours";
+
+/// The aged-threshold settings key for `partial_delivered`.
+/// See [`SHIPMENT_AGED_CREATED_HOURS_KEY`].
+pub const SHIPMENT_AGED_PARTIAL_DELIVERED_HOURS_KEY: &str =
+    "shipment_aged_partial_delivered_hours";
+
+/// The aged-threshold settings key for `return_in_transit`.
+/// See [`SHIPMENT_AGED_CREATED_HOURS_KEY`].
+pub const SHIPMENT_AGED_RETURN_IN_TRANSIT_HOURS_KEY: &str =
+    "shipment_aged_return_in_transit_hours";
+
+/// The aged-threshold settings key for `unknown`. See
+/// [`SHIPMENT_AGED_CREATED_HOURS_KEY`].
+pub const SHIPMENT_AGED_UNKNOWN_HOURS_KEY: &str = "shipment_aged_unknown_hours";
+
+/// Built-in aged threshold for `created`, in hours: a
+/// booked parcel should be picked up within a day (the
+/// fulfillment ship-SLA analogue).
+pub const DEFAULT_SHIPMENT_AGED_CREATED_HOURS: i64 = 24;
+
+/// Built-in aged threshold for `picked_up`, in hours: a
+/// collected parcel should reach a hub within two days.
+pub const DEFAULT_SHIPMENT_AGED_PICKED_UP_HOURS: i64 = 48;
+
+/// Built-in aged threshold for `in_transit`, in hours:
+/// three days (the platform's outside-Dhaka promise tops
+/// out at five).
+pub const DEFAULT_SHIPMENT_AGED_IN_TRANSIT_HOURS: i64 = 72;
+
+/// Built-in aged threshold for `out_for_delivery`, in
+/// hours: out-for-delivery is a same-day state.
+pub const DEFAULT_SHIPMENT_AGED_OUT_FOR_DELIVERY_HOURS: i64 = 24;
+
+/// Built-in aged threshold for `partial_delivered`, in
+/// hours: the completion-or-return decision should land
+/// within two days.
+pub const DEFAULT_SHIPMENT_AGED_PARTIAL_DELIVERED_HOURS: i64 = 48;
+
+/// Built-in aged threshold for `return_in_transit`, in
+/// hours: the same transit bound as the forward leg.
+pub const DEFAULT_SHIPMENT_AGED_RETURN_IN_TRANSIT_HOURS: i64 = 72;
+
+/// Built-in aged threshold for `unknown`, in hours: an
+/// unmapped courier status is a data problem, surfaced
+/// after a day.
+pub const DEFAULT_SHIPMENT_AGED_UNKNOWN_HOURS: i64 = 24;
+
+/// The settings key holding the aged threshold for
+/// `status`, or `None` for a terminal (or unknown) status
+/// — terminal shipments are never aged.
+pub fn shipment_aged_setting_key(status: &str) -> Option<&'static str> {
+    match status {
+        "created" => Some(SHIPMENT_AGED_CREATED_HOURS_KEY),
+        "picked_up" => Some(SHIPMENT_AGED_PICKED_UP_HOURS_KEY),
+        "in_transit" => Some(SHIPMENT_AGED_IN_TRANSIT_HOURS_KEY),
+        "out_for_delivery" => Some(SHIPMENT_AGED_OUT_FOR_DELIVERY_HOURS_KEY),
+        "partial_delivered" => Some(SHIPMENT_AGED_PARTIAL_DELIVERED_HOURS_KEY),
+        "return_in_transit" => Some(SHIPMENT_AGED_RETURN_IN_TRANSIT_HOURS_KEY),
+        "unknown" => Some(SHIPMENT_AGED_UNKNOWN_HOURS_KEY),
+        _ => None,
+    }
+}
+
+/// The built-in aged threshold in hours for `status`, or
+/// `None` exactly where [`shipment_aged_setting_key`] is
+/// `None` — the two maps never disagree.
+pub fn default_shipment_aged_hours(status: &str) -> Option<i64> {
+    match status {
+        "created" => Some(DEFAULT_SHIPMENT_AGED_CREATED_HOURS),
+        "picked_up" => Some(DEFAULT_SHIPMENT_AGED_PICKED_UP_HOURS),
+        "in_transit" => Some(DEFAULT_SHIPMENT_AGED_IN_TRANSIT_HOURS),
+        "out_for_delivery" => Some(DEFAULT_SHIPMENT_AGED_OUT_FOR_DELIVERY_HOURS),
+        "partial_delivered" => Some(DEFAULT_SHIPMENT_AGED_PARTIAL_DELIVERED_HOURS),
+        "return_in_transit" => Some(DEFAULT_SHIPMENT_AGED_RETURN_IN_TRANSIT_HOURS),
+        "unknown" => Some(DEFAULT_SHIPMENT_AGED_UNKNOWN_HOURS),
+        _ => None,
+    }
+}
+
 /// The `platform_settings` key for the commission rate override
 /// (Wave 10). When a row with this key holds a valid value, it
 /// beats the startup `COMMISSION_RATE_BPS` at checkout.
@@ -3542,6 +3647,37 @@ pub fn validate_admin_product_list_sort(
         Some(_) => Err(
             "sort must be one of: newest, oldest, price_asc, price_desc, sold_desc, rating_desc",
         ),
+    }
+}
+
+/// The admin shipment queue's sort orders (admin shipments
+/// remake). `Newest` is the default archive order;
+/// `StaleFirst` is the poller's own order (oldest
+/// `updated_at` first) for working the unrefreshed queue
+/// top-down; `CodDesc` surfaces the largest courier
+/// collections first. The API layer maps each variant to
+/// a fixed ORDER BY fragment — user input never reaches
+/// the SQL text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShipmentSort {
+    Newest,
+    Oldest,
+    StaleFirst,
+    CodDesc,
+}
+
+/// Validate an admin shipment-list `sort` parameter
+/// (admin shipments remake): absent means
+/// [`ShipmentSort::Newest`]; an unknown value is an error
+/// naming the allowed set, in the style of
+/// [`validate_order_list_sort`].
+pub fn validate_shipment_list_sort(sort: Option<&str>) -> Result<ShipmentSort, &'static str> {
+    match sort {
+        None | Some("newest") => Ok(ShipmentSort::Newest),
+        Some("oldest") => Ok(ShipmentSort::Oldest),
+        Some("stale_first") => Ok(ShipmentSort::StaleFirst),
+        Some("cod_desc") => Ok(ShipmentSort::CodDesc),
+        Some(_) => Err("sort must be one of: newest, oldest, stale_first, cod_desc"),
     }
 }
 
@@ -11409,6 +11545,60 @@ mod tests {
             Err("sort must be one of: newest, oldest, amount_desc, amount_asc")
         );
         assert!(validate_order_list_sort(Some("cheapest")).is_err());
+    }
+
+    #[test]
+    fn shipment_list_sort_validation() {
+        assert_eq!(validate_shipment_list_sort(None), Ok(ShipmentSort::Newest));
+        assert_eq!(
+            validate_shipment_list_sort(Some("newest")),
+            Ok(ShipmentSort::Newest)
+        );
+        assert_eq!(
+            validate_shipment_list_sort(Some("oldest")),
+            Ok(ShipmentSort::Oldest)
+        );
+        assert_eq!(
+            validate_shipment_list_sort(Some("stale_first")),
+            Ok(ShipmentSort::StaleFirst)
+        );
+        assert_eq!(
+            validate_shipment_list_sort(Some("cod_desc")),
+            Ok(ShipmentSort::CodDesc)
+        );
+        assert_eq!(
+            validate_shipment_list_sort(Some("")),
+            Err("sort must be one of: newest, oldest, stale_first, cod_desc")
+        );
+        assert!(validate_shipment_list_sort(Some("Newest")).is_err());
+    }
+
+    #[test]
+    fn shipment_aged_threshold_maps() {
+        // The seven non-terminal statuses each carry a key
+        // and a default; the two maps never disagree, and
+        // terminal statuses have neither.
+        for status in [
+            "created",
+            "picked_up",
+            "in_transit",
+            "out_for_delivery",
+            "partial_delivered",
+            "return_in_transit",
+            "unknown",
+        ] {
+            let key = shipment_aged_setting_key(status).expect("aged key");
+            assert!(key.starts_with("shipment_aged_"), "key shape: {key}");
+            let hours = default_shipment_aged_hours(status).expect("aged default");
+            assert!(validate_fulfillment_sla_hours(hours), "default in range");
+        }
+        assert_eq!(default_shipment_aged_hours("created"), Some(24));
+        assert_eq!(default_shipment_aged_hours("in_transit"), Some(72));
+        assert_eq!(default_shipment_aged_hours("out_for_delivery"), Some(24));
+        for terminal in ["delivered", "returned", "cancelled", "bogus", ""] {
+            assert_eq!(shipment_aged_setting_key(terminal), None);
+            assert_eq!(default_shipment_aged_hours(terminal), None);
+        }
     }
 
     #[test]

@@ -443,6 +443,13 @@ export interface Shipment {
   manual_tracking_id: string | null;
   created_at: string;
   updated_at: string;
+  /**
+   * Admin shipments remake: when a courier poll was last
+   * ATTEMPTED (advances, unchanged answers and failures
+   * alike); null when no poll has been recorded — manual
+   * shipments are never polled.
+   */
+  last_polled_at: string | null;
 }
 
 /** Availability of one courier (GET /v1/couriers, Wave 6). */
@@ -4912,6 +4919,302 @@ export function restoreAdminProduct(
     method: "POST",
     token,
     body: { note },
+  });
+}
+
+/** Admin shipment queue sorts (admin shipments remake). */
+export type AdminShipmentSort = "newest" | "oldest" | "stale_first" | "cod_desc";
+
+/**
+ * Display name for a shipment's courier: the manual
+ * courier's canonical name when the row carries one,
+ * else the API courier's brand name (the API stores
+ * lowercase keys and has no display names of its own).
+ */
+export function courierDisplayName(
+  courier: string,
+  manualCourierName?: string | null
+): string {
+  if (manualCourierName) return manualCourierName;
+  switch (courier) {
+    case "steadfast":
+      return "Steadfast";
+    case "pathao":
+      return "Pathao";
+    case "redx":
+      return "RedX";
+    case "ecourier":
+      return "eCourier";
+    case "paperfly":
+      return "Paperfly";
+    case "manual":
+      return "ম্যানুয়াল কুরিয়ার";
+    default:
+      return courier;
+  }
+}
+
+/**
+ * One row of the admin shipment queue. The recipient's
+ * phone is MASKED here by design; the address and the
+ * buyer's account phone never appear in the list.
+ */
+export interface AdminShipment {
+  id: string;
+  sub_order_id: string;
+  order_id: string;
+  store_id: string;
+  store_name: string;
+  store_slug: string;
+  courier: string;
+  manual_courier_name: string | null;
+  consignment_id: string;
+  tracking_code: string | null;
+  manual_tracking_id: string | null;
+  status: string;
+  sub_order_status: string;
+  cod_amount_poisha: number;
+  delivery_name: string;
+  delivery_phone_masked: string;
+  delivery_zone: string;
+  delivery_district: string | null;
+  created_at: string;
+  updated_at: string;
+  last_polled_at: string | null;
+  status_since: string;
+  status_age_secs: number;
+  aged: boolean;
+  poll_overdue: boolean;
+  unrefreshed: boolean;
+  has_return_request: boolean;
+}
+
+export interface AdminShipmentStatusCounts {
+  created: number;
+  picked_up: number;
+  in_transit: number;
+  out_for_delivery: number;
+  delivered: number;
+  partial_delivered: number;
+  return_in_transit: number;
+  returned: number;
+  cancelled: number;
+  unknown: number;
+}
+
+export interface AdminShipmentAdvanceStranded {
+  shipments: number;
+  orders: number;
+  advance_paid_poisha: number;
+}
+
+export interface AdminShipmentCourierRollup {
+  courier: string;
+  display_name: string | null;
+  available: boolean;
+  mode: string | null;
+  reason: string | null;
+  is_default: boolean;
+  total: number;
+  created: number;
+  in_flight: number;
+  delivered: number;
+  partial_delivered: number;
+  return_in_transit: number;
+  returned: number;
+  cancelled: number;
+  unknown: number;
+  non_terminal: number;
+  cod_delivered_held_poisha: number;
+  cod_in_flight_expected_poisha: number;
+  dev_shipment_count: number;
+  oldest_non_terminal_at: string | null;
+}
+
+export interface ShipmentAgedThresholds {
+  created: number;
+  picked_up: number;
+  in_transit: number;
+  out_for_delivery: number;
+  partial_delivered: number;
+  return_in_transit: number;
+  unknown: number;
+}
+
+/**
+ * The whole-queue summary riding the list response —
+ * never shaped by the active filters. COD figures are
+ * the stored booking snapshots; "delivered held" is an
+ * unreconciled upper bound (no remittance ledger
+ * exists), not money the platform has received.
+ */
+export interface AdminShipmentSummary {
+  total: number;
+  non_terminal: number;
+  by_status: AdminShipmentStatusCounts;
+  unrefreshed: number;
+  poll_overdue: number;
+  status_aged: number;
+  cod_delivered_held_poisha: number;
+  cod_delivered_over_7d_poisha: number;
+  cod_delivered_over_30d_poisha: number;
+  cod_in_flight_expected_poisha: number;
+  cod_created_poisha: number;
+  cod_partial_poisha: number;
+  cod_unknown_poisha: number;
+  advance_stranded: AdminShipmentAdvanceStranded;
+  couriers_dev_mode: boolean;
+  couriers: AdminShipmentCourierRollup[];
+  aged_thresholds: ShipmentAgedThresholds;
+}
+
+export interface AdminShipmentList {
+  items: AdminShipment[];
+  total: number;
+  page: number;
+  limit: number;
+  summary: AdminShipmentSummary;
+}
+
+export interface AdminShipmentItem {
+  title_snapshot: string;
+  variant_name: string | null;
+  quantity: number;
+  unit_price_poisha: number;
+}
+
+export interface AdminShipmentEvent {
+  id: string;
+  status: string;
+  raw_status: string | null;
+  source: string;
+  at: string;
+}
+
+export interface AdminShipmentReturnRef {
+  id: string;
+  status: string;
+  refund_status: string;
+  refund_poisha: number | null;
+}
+
+/**
+ * The admin shipment detail: the full delivery block is
+ * present (a stuck delivery cannot be worked without
+ * it); the buyer's ACCOUNT phone stays masked even here.
+ */
+export interface AdminShipmentDetail {
+  id: string;
+  sub_order_id: string;
+  order_id: string;
+  store_id: string;
+  store_name: string;
+  store_slug: string;
+  courier: string;
+  manual_courier_name: string | null;
+  consignment_id: string;
+  tracking_code: string | null;
+  manual_tracking_id: string | null;
+  status: string;
+  note: string | null;
+  sub_order_status: string;
+  cod_amount_poisha: number;
+  goods_subtotal_poisha: number;
+  discount_poisha: number;
+  delivery_charge_poisha: number;
+  order_status: string;
+  payment_method: string;
+  payment_status: string;
+  advance_required_poisha: number;
+  advance_paid_poisha: number;
+  grand_total_poisha: number;
+  delivery_name: string;
+  delivery_phone: string;
+  delivery_address: string;
+  delivery_zone: string;
+  delivery_district: string | null;
+  order_note: string | null;
+  buyer_phone_masked: string;
+  created_at: string;
+  updated_at: string;
+  last_polled_at: string | null;
+  status_since: string;
+  status_age_secs: number;
+  aged: boolean;
+  poll_overdue: boolean;
+  unrefreshed: boolean;
+  items: AdminShipmentItem[];
+  events: AdminShipmentEvent[];
+  timeline: TimelineEvent[];
+  steps: TimelineStep[];
+  return_request: AdminShipmentReturnRef | null;
+  advance_stranded: boolean;
+  audit_entries: AdminAuditEntry[];
+}
+
+export interface AdminShipmentRefresh {
+  shipment: Shipment;
+  /** "advanced" | "unchanged" — the shared core's outcome. */
+  outcome: string;
+}
+
+/**
+ * GET /v1/admin/shipments — the cross-courier oversight
+ * queue: status / courier / store / work-queue filters,
+ * phone-disciplined search, sort, pagination, and the
+ * whole-queue summary (stuck counts, COD exposure,
+ * per-courier rollup).
+ */
+export function listAdminShipments(
+  token: string,
+  params?: {
+    q?: string;
+    status?: string;
+    courier?: string;
+    store_id?: string;
+    queue?: string;
+    sort?: AdminShipmentSort;
+    page?: number;
+    limit?: number;
+  }
+): Promise<AdminShipmentList> {
+  const search = new URLSearchParams();
+  if (params?.q) search.set("q", params.q);
+  if (params?.status) search.set("status", params.status);
+  if (params?.courier) search.set("courier", params.courier);
+  if (params?.store_id) search.set("store_id", params.store_id);
+  if (params?.queue) search.set("queue", params.queue);
+  if (params?.sort) search.set("sort", params.sort);
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/admin/shipments${qs ? `?${qs}` : ""}`, { token });
+}
+
+/** GET /v1/admin/shipments/{id} — one shipment's oversight detail. */
+export function getAdminShipmentDetail(
+  token: string,
+  shipmentId: string
+): Promise<AdminShipmentDetail> {
+  return call(`/v1/admin/shipments/${encodeURIComponent(shipmentId)}`, {
+    token,
+  });
+}
+
+/**
+ * POST /v1/admin/shipments/{id}/refresh — poll the
+ * courier once for this parcel, through the SAME shared
+ * core the worker poller runs. An advance is audited.
+ * A manual shipment answers an honest "unchanged";
+ * courier errors surface as errors, never as success.
+ */
+export function refreshAdminShipment(
+  token: string,
+  shipmentId: string
+): Promise<AdminShipmentRefresh> {
+  return call(`/v1/admin/shipments/${encodeURIComponent(shipmentId)}/refresh`, {
+    method: "POST",
+    token,
   });
 }
 

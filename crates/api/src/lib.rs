@@ -2100,6 +2100,15 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/admin/products/:id/restore",
             post(admin::restore_product_handler),
         )
+        .route("/v1/admin/shipments", get(admin::list_shipments_handler))
+        .route(
+            "/v1/admin/shipments/:id",
+            get(admin::get_shipment_detail_handler),
+        )
+        .route(
+            "/v1/admin/shipments/:id/refresh",
+            post(admin::refresh_shipment_handler),
+        )
         .route("/v1/admin/payouts", get(admin::list_payouts_handler))
         .route(
             "/v1/admin/payouts/:id",

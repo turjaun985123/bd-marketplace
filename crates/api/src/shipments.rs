@@ -116,6 +116,15 @@ pub struct Shipment {
     pub manual_tracking_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// When a courier poll was last ATTEMPTED for this
+    /// shipment (admin shipments remake, migration 0079):
+    /// stamped on advances, unchanged answers and failed
+    /// attempts alike; `None` when no poll has been
+    /// recorded — manual shipments are never polled, and
+    /// rows predating the stamp were never backfilled, so
+    /// `None` honestly means "no poll recorded", never
+    /// "polled at some unknown time".
+    pub last_polled_at: Option<DateTime<Utc>>,
 }
 
 /// The shipment on a sub-order, embedded in the order views.
@@ -157,7 +166,7 @@ pub struct CourierAvailability {
 
 const SHIPMENT_COLUMNS: &str = "id, sub_order_id, courier, consignment_id, tracking_code, \
     status, cod_amount_poisha, note, manual_courier_name, manual_tracking_id, \
-    created_at, updated_at";
+    created_at, updated_at, last_polled_at";
 
 // ---------------------------------------------------------------------------
 // Loaders (shared by booking, refresh and the order views)
@@ -1022,6 +1031,46 @@ pub async fn refresh_shipment_by_id(
     state: &AppState,
     shipment_id: Uuid,
 ) -> Result<(Shipment, RefreshOutcome), ApiError> {
+    refresh_shipment_by_id_audited(state, shipment_id, None).await
+}
+
+/// Stamp `last_polled_at` for one shipment (migration
+/// 0079), best-effort: the stamp is observability, never
+/// the point of the poll, so its failure is swallowed
+/// rather than masking the poll's real outcome — a
+/// courier error must surface as the courier error, and
+/// an unchanged answer must stay an unchanged answer.
+async fn stamp_last_polled(pool: &PgPool, shipment_id: Uuid) {
+    let _ = sqlx::query("UPDATE shipments SET last_polled_at = now() WHERE id = $1")
+        .bind(shipment_id)
+        .execute(pool)
+        .await;
+}
+
+/// The audited twin of [`refresh_shipment_by_id`] — the
+/// SAME core, never a second implementation.
+/// `audit_admin` is `Some` only for the admin endpoint's
+/// call: when the refresh ADVANCES the shipment, the
+/// admin's action is recorded in the refresh's own
+/// transaction (`shipment.refresh`, see the audit
+/// module) — the one fact `shipment_events` cannot
+/// preserve, since its `source = 'refresh'` rows are
+/// identical whoever asked. `Unchanged` refreshes and
+/// courier errors write no audit row (the platform's
+/// no-op rule), and the worker and participant paths go
+/// through [`refresh_shipment_by_id`] and stay
+/// unaudited.
+///
+/// Every adapter attempt also stamps `last_polled_at`
+/// (migration 0079): an advance inside its transaction,
+/// an unchanged answer or a failed attempt as a
+/// best-effort standalone update. Manual shipments are
+/// never stamped — no adapter attempt happens for them.
+pub async fn refresh_shipment_by_id_audited(
+    state: &AppState,
+    shipment_id: Uuid,
+    audit_admin: Option<Uuid>,
+) -> Result<(Shipment, RefreshOutcome), ApiError> {
     let pool = state.require_pool()?;
     let shipment = load_shipment(pool, shipment_id).await?;
 
@@ -1041,17 +1090,36 @@ pub async fn refresh_shipment_by_id(
         return Ok((shipment, RefreshOutcome::Unchanged));
     }
 
-    let adapter =
-        courier_adapter_for(&shipment.courier, &state.couriers_config).map_err(courier_error_to_api)?;
-    let update = adapter
-        .track(&shipment.consignment_id)
-        .await
-        .map_err(courier_error_to_api)?;
+    // A factory failure (credentials revoked, unknown
+    // courier) is still a poll ATTEMPT: stamp it before
+    // returning the error, so the shipment stops looking
+    // "never polled" — and so the poller's rotation (see
+    // `refresh_stale_shipments`) gives it its full
+    // staleness window before asking again.
+    let adapter = match courier_adapter_for(&shipment.courier, &state.couriers_config) {
+        Ok(adapter) => adapter,
+        Err(error) => {
+            stamp_last_polled(pool, shipment_id).await;
+            return Err(courier_error_to_api(error));
+        }
+    };
+    let update = match adapter.track(&shipment.consignment_id).await {
+        Ok(update) => update,
+        Err(error) => {
+            stamp_last_polled(pool, shipment_id).await;
+            return Err(courier_error_to_api(error));
+        }
+    };
 
     if update.status == shipment.status
         || update.status == "unknown"
         || !can_transition_shipment(&shipment.status, &update.status)
     {
+        // The courier was asked and answered: stamp the
+        // attempt. `updated_at` deliberately does NOT
+        // move — it means "status last changed", and the
+        // metrics stale count is defined on it.
+        stamp_last_polled(pool, shipment_id).await;
         return Ok((shipment, RefreshOutcome::Unchanged));
     }
 
@@ -1060,7 +1128,10 @@ pub async fn refresh_shipment_by_id(
         .await
         .map_err(|e| ApiError::internal("begin refresh transaction", e))?;
 
-    sqlx::query("UPDATE shipments SET status = $2, updated_at = now() WHERE id = $1")
+    sqlx::query(
+        "UPDATE shipments SET status = $2, updated_at = now(), last_polled_at = now() \
+         WHERE id = $1",
+    )
         .bind(shipment_id)
         .bind(&update.status)
         .execute(&mut *tx)
@@ -1088,6 +1159,29 @@ pub async fn refresh_shipment_by_id(
         &update.status,
     )
     .await?;
+
+    // An admin-forced advance is a consequential admin
+    // action: record it in THIS transaction (the audit
+    // module's same-transaction rule), so the log can
+    // never claim an advance that rolled back, and never
+    // misses one that committed.
+    if let Some(admin_id) = audit_admin {
+        crate::audit::record_admin_action(
+            &mut *tx,
+            admin_id,
+            "shipment.refresh",
+            "shipment",
+            Some(&shipment_id.to_string()),
+            Some(serde_json::json!({
+                "from": shipment.status,
+                "to": update.status,
+                "raw_status": update.raw_status,
+                "courier": shipment.courier,
+                "sub_order_id": shipment.sub_order_id.to_string(),
+            })),
+        )
+        .await?;
+    }
 
     tx.commit()
         .await
@@ -1173,17 +1267,26 @@ pub struct PollReport {
 /// Refresh every stale API-courier shipment (Wave 30). A
 /// shipment is a candidate when its courier is not `manual`
 /// (manual shipments have no API to poll), its status is not
-/// terminal ([`POLL_TERMINAL_STATUSES`]), and its `updated_at`
-/// is older than `stale_minutes` ago; candidates are taken
-/// oldest-first, at most `limit` of them. Each candidate goes
-/// through [`refresh_shipment_by_id`] — the same service
-/// function the refresh endpoint calls — so a polled status
-/// lands with the same event, sub-order sync and notification
-/// as a manual refresh. A shipment that errors (courier down,
+/// terminal ([`POLL_TERMINAL_STATUSES`]), and it was last
+/// POLLED more than `stale_minutes` ago; candidates are
+/// taken oldest-polled-first, at most `limit` of them.
+/// "Last polled" is `COALESCE(last_polled_at, updated_at)`:
+/// since the admin shipments remake (migration 0079) every
+/// refresh attempt — advanced, unchanged or failed — stamps
+/// `last_polled_at`, so a shipment the courier just answered
+/// about (however the poll ended) waits its full staleness
+/// window before the batch reaches it again, and the batch
+/// ROTATES through the stale population instead of
+/// re-asking the same oldest rows every cycle while rows
+/// past the batch limit starved. Rows never polled since
+/// the stamp existed fall back to `updated_at` — exactly
+/// the pre-stamp rule. Each candidate goes through
+/// [`refresh_shipment_by_id`] — the same service function
+/// the refresh endpoint calls — so a polled status lands
+/// with the same event, sub-order sync and notification as
+/// a manual refresh. A shipment that errors (courier down,
 /// credentials revoked, row raced away) is counted `failed`
-/// and logged; it never stops the batch, and because a failed
-/// refresh writes nothing its `updated_at` stays stale, so
-/// the next run retries it.
+/// and logged; it never stops the batch.
 pub async fn refresh_stale_shipments(
     state: &AppState,
     stale_minutes: i64,
@@ -1194,8 +1297,8 @@ pub async fn refresh_stale_shipments(
         "SELECT id FROM shipments \
          WHERE courier <> 'manual' \
            AND status NOT IN ('delivered', 'returned', 'cancelled') \
-           AND updated_at < now() - make_interval(mins => $1::int) \
-         ORDER BY updated_at ASC \
+           AND COALESCE(last_polled_at, updated_at) < now() - make_interval(mins => $1::int) \
+         ORDER BY COALESCE(last_polled_at, updated_at) ASC \
          LIMIT $2",
     )
     .bind(stale_minutes)

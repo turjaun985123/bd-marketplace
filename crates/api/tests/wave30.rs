@@ -277,10 +277,15 @@ async fn sub_order_status(pool: &PgPool, sub_order_id: &str) -> String {
 }
 
 /// Age one shipment's `updated_at` by the given interval, so
-/// the staleness threshold sees it as old.
+/// the staleness threshold sees it as old. Since the admin
+/// shipments remake the poller selects on
+/// `COALESCE(last_polled_at, updated_at)`, so the poll stamp
+/// is aged by the same interval — one intent ("this
+/// shipment is old"), both clocks.
 async fn backdate_shipment(pool: &PgPool, shipment_id: &str, interval: &str) {
     let sql = format!(
-        "UPDATE shipments SET updated_at = now() - interval '{interval}' WHERE id = $1::uuid"
+        "UPDATE shipments SET updated_at = now() - interval '{interval}', \
+         last_polled_at = now() - interval '{interval}' WHERE id = $1::uuid"
     );
     sqlx::query(&sql)
         .bind(shipment_id)

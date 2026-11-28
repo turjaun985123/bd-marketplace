@@ -42,6 +42,14 @@
 //!   hiding a question on their own product is routine
 //!   moderation, not a platform action.
 //! - `return.refund_done` — target `return_request`, no detail.
+//! - `shipment.refresh` — target `shipment`, detail
+//!   `{from, to, raw_status, courier, sub_order_id}`
+//!   (admin shipments remake): written ONLY when an
+//!   admin-triggered refresh ADVANCES the shipment,
+//!   inside the refresh's own transaction. Unchanged
+//!   refreshes, worker polls and participant refreshes
+//!   are never audited — the `refresh` event row is
+//!   their record.
 //! - `category.create` (detail `{slug}`), `category.update`
 //!   (detail `{changed_keys}` — key NAMES only, the settings
 //!   pattern), `category.delete` (detail `{slug}`),

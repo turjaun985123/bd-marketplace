@@ -110,14 +110,16 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use domain::{
-    bn_to_en_digits, can_transition_payout, is_valid_payout_status, mask_phone,
-    normalize_bd_phone, parse_setting_i64, search_like_pattern, to_local_phone,
+    bn_to_en_digits, can_transition_payout, default_shipment_aged_hours,
+    is_valid_payout_status, mask_phone, normalize_bd_phone, parse_setting_i64,
+    search_like_pattern, shipment_aged_setting_key, to_local_phone,
     validate_admin_product_list_sort, validate_advance_bps, validate_advance_threshold,
-    validate_commission_bps, validate_order_list_sort, validate_payout_list_sort,
-    validate_payout_rejection_reason, validate_payment_reference, validate_plan_free_product_cap,
-    validate_product_restore_note, validate_product_takedown_reason,
-    validate_promotion_price_per_day, validate_store_list_sort, validate_subscription_price,
-    validate_suspension_note, OrderSort, PayoutSort, ProductSort, StoreSort,
+    validate_commission_bps, validate_fulfillment_sla_hours, validate_order_list_sort,
+    validate_payout_list_sort, validate_payout_rejection_reason, validate_payment_reference,
+    validate_plan_free_product_cap, validate_product_restore_note,
+    validate_product_takedown_reason, validate_promotion_price_per_day,
+    validate_shipment_list_sort, validate_store_list_sort, validate_subscription_price,
+    validate_suspension_note, OrderSort, PayoutSort, ProductSort, ShipmentSort, StoreSort,
     ADVANCE_PERCENT_BPS_KEY, ADVANCE_THRESHOLD_KEY, COMMISSION_BPS_KEY, KYC_PAYOUT_GATE_KEY,
     MIN_PAYOUT_KEY, MIN_PAYOUT_POISHA, NOTIFICATION_PRODUCT_RESTORED,
     NOTIFICATION_PRODUCT_TAKEN_DOWN, NOTIFICATION_STORE_REACTIVATED, NOTIFICATION_STORE_SUSPENDED,
@@ -128,10 +130,17 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
-use crate::audit::record_admin_action;
+use crate::audit::{list_audit_for_target, record_admin_action, AdminAuditEntry};
 use crate::auth::{load_user, AuthUser, User};
+use crate::metrics::STALE_SHIPMENT_MINUTES;
 use crate::orders::{load_order, Order};
 use crate::payouts::{Earnings, Payout};
+use crate::shipments::{
+    courier_availability, manual_courier_availability, refresh_shipment_by_id_audited,
+    CourierAvailability, RefreshOutcome, Shipment, POLL_TERMINAL_STATUSES,
+};
+use crate::timeline::{sub_order_steps, sub_order_timeline, TimelineEvent, TimelineStep};
+use courier::CouriersConfig;
 use crate::products::{
     clamp_pagination, get_product_by_id, with_stock_status, Product, EFFECTIVE_STOCK_SQL,
     PRODUCT_COLUMNS, PRODUCT_RATING_JOIN,
@@ -3952,4 +3961,1351 @@ pub async fn update_settings_handler(
 ) -> Result<Json<AdminSettings>, ApiError> {
     let admin = require_admin(&state, &user).await?;
     Ok(Json(update_settings(&state, admin.id, input).await?))
+}
+
+// ---------------------------------------------------------------------------
+// Admin shipments (admin shipments remake)
+// ---------------------------------------------------------------------------
+//
+// The cross-store, cross-courier oversight queue the
+// overview's Needs-attention block links to. Shipments
+// were seller-facing only before this remake: no admin
+// list, no admin detail, and a dead `/admin/shipments`
+// link on the overview since its own remake.
+//
+// Two different "stuck" facts are kept apart throughout,
+// because they have different owners:
+//
+// - UNREFRESHED / POLL OVERDUE are platform facts. A
+//   shipment is unrefreshed when its status has not
+//   changed in [`STALE_SHIPMENT_MINUTES`] — the exact
+//   population `/v1/admin/metrics` reports as
+//   `stale_shipments`, pinned equal in tests. It is
+//   poll-overdue when no courier poll has been ATTEMPTED
+//   in that window (`last_polled_at`, migration 0079):
+//   a courier legitimately reporting the same status for
+//   a day is unrefreshed but not poll-overdue; a dead
+//   worker is both.
+// - STATUS AGED is a courier/seller fact: the shipment
+//   has sat in one non-terminal status longer than that
+//   status's threshold (platform settings
+//   `shipment_aged_<status>_hours`, domain defaults
+//   otherwise). Manual shipments age too — a seller who
+//   never types the next status is exactly this queue.
+//
+// Money shown here is the STORED `cod_amount_poisha`
+// snapshot from booking — the courier's collection
+// figure — never recomputed. "Delivered COD held" is an
+// upper bound, not a ledger: no remittance tracking
+// exists anywhere in the platform, so nothing here
+// claims a courier has or has not settled.
+
+/// The non-terminal unified statuses in canonical order —
+/// the order the aged thresholds bind in. The domain aged
+/// maps key off exactly these seven; the terminal three
+/// (`delivered`, `returned`, `cancelled`) never age.
+const SHIPMENT_NON_TERMINAL: [&str; 7] = [
+    "created",
+    "picked_up",
+    "in_transit",
+    "out_for_delivery",
+    "partial_delivered",
+    "return_in_transit",
+    "unknown",
+];
+
+/// The effective per-status aged thresholds, echoed on
+/// the list response so the page can say which bar each
+/// flag was measured against.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ShipmentAgedThresholds {
+    pub created: i64,
+    pub picked_up: i64,
+    pub in_transit: i64,
+    pub out_for_delivery: i64,
+    pub partial_delivered: i64,
+    pub return_in_transit: i64,
+    pub unknown: i64,
+}
+
+impl ShipmentAgedThresholds {
+    /// The threshold for one status, or `None` for a
+    /// terminal (or unknown) status.
+    fn hours_for(&self, status: &str) -> Option<i64> {
+        match status {
+            "created" => Some(self.created),
+            "picked_up" => Some(self.picked_up),
+            "in_transit" => Some(self.in_transit),
+            "out_for_delivery" => Some(self.out_for_delivery),
+            "partial_delivered" => Some(self.partial_delivered),
+            "return_in_transit" => Some(self.return_in_transit),
+            "unknown" => Some(self.unknown),
+            _ => None,
+        }
+    }
+
+    /// The seven thresholds in [`SHIPMENT_NON_TERMINAL`]
+    /// order, for binding into the aged-queue predicates.
+    fn ordered(&self) -> [i64; 7] {
+        [
+            self.created,
+            self.picked_up,
+            self.in_transit,
+            self.out_for_delivery,
+            self.partial_delivered,
+            self.return_in_transit,
+            self.unknown,
+        ]
+    }
+}
+
+/// Resolve one status's aged threshold: the stored
+/// setting when it holds a valid value (gated by the
+/// fulfillment-SLA rule, 1..=720), else the domain
+/// default. Two layers — a stored setting and the
+/// constant; deliberately no env layer (the
+/// delivery-estimates precedent).
+async fn resolve_shipment_aged_hours(pool: &PgPool, status: &str) -> i64 {
+    let key = shipment_aged_setting_key(status).expect("non-terminal status has an aged key");
+    let default =
+        default_shipment_aged_hours(status).expect("non-terminal status has an aged default");
+    match platform_setting_i64(pool, key).await {
+        Some(value) if validate_fulfillment_sla_hours(value) => value,
+        _ => default,
+    }
+}
+
+/// The whole effective threshold set (see
+/// [`resolve_shipment_aged_hours`]).
+pub async fn effective_shipment_aged_thresholds(pool: &PgPool) -> ShipmentAgedThresholds {
+    ShipmentAgedThresholds {
+        created: resolve_shipment_aged_hours(pool, "created").await,
+        picked_up: resolve_shipment_aged_hours(pool, "picked_up").await,
+        in_transit: resolve_shipment_aged_hours(pool, "in_transit").await,
+        out_for_delivery: resolve_shipment_aged_hours(pool, "out_for_delivery").await,
+        partial_delivered: resolve_shipment_aged_hours(pool, "partial_delivered").await,
+        return_in_transit: resolve_shipment_aged_hours(pool, "return_in_transit").await,
+        unknown: resolve_shipment_aged_hours(pool, "unknown").await,
+    }
+}
+
+/// Is a shipment in `status`, last changed at `since`,
+/// aged at `now` under `thresholds`? Terminal statuses
+/// are never aged. Shared by the list rows and the
+/// detail so the two never disagree.
+fn shipment_is_aged(status: &str, since: DateTime<Utc>, thresholds: &ShipmentAgedThresholds, now: DateTime<Utc>) -> bool {
+    if POLL_TERMINAL_STATUSES.contains(&status) {
+        return false;
+    }
+    match thresholds.hours_for(status) {
+        Some(hours) => since < now - chrono::Duration::hours(hours),
+        None => false,
+    }
+}
+
+/// Is a non-manual, non-terminal shipment unrefreshed at
+/// `now` — the metrics `stale_shipments` predicate,
+/// restated per row.
+fn shipment_is_unrefreshed(
+    courier: &str,
+    status: &str,
+    updated_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> bool {
+    courier != "manual"
+        && !POLL_TERMINAL_STATUSES.contains(&status)
+        && updated_at < now - chrono::Duration::minutes(STALE_SHIPMENT_MINUTES)
+}
+
+/// Is a non-manual, non-terminal shipment poll-overdue at
+/// `now`: no adapter attempt recorded within the stale
+/// window. A never-polled shipment's clock starts at its
+/// booking (`created_at`) — the poller's debt starts
+/// there too.
+fn shipment_is_poll_overdue(
+    courier: &str,
+    status: &str,
+    last_polled_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> bool {
+    courier != "manual"
+        && !POLL_TERMINAL_STATUSES.contains(&status)
+        && last_polled_at.unwrap_or(created_at)
+            < now - chrono::Duration::minutes(STALE_SHIPMENT_MINUTES)
+}
+
+/// Private row for the admin shipment list: carries the
+/// recipient's raw delivery phone, which must never be
+/// serialised — the public view is built by
+/// [`AdminShipmentRowRow::into_view`], which masks it
+/// (the orders remake's row pattern).
+#[derive(FromRow)]
+struct AdminShipmentRowRow {
+    id: Uuid,
+    sub_order_id: Uuid,
+    order_id: Uuid,
+    store_id: Uuid,
+    store_name: String,
+    store_slug: String,
+    courier: String,
+    manual_courier_name: Option<String>,
+    consignment_id: String,
+    tracking_code: Option<String>,
+    manual_tracking_id: Option<String>,
+    status: String,
+    sub_order_status: String,
+    cod_amount_poisha: i64,
+    delivery_name: String,
+    delivery_phone: String,
+    delivery_zone: String,
+    delivery_district: Option<String>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    last_polled_at: Option<DateTime<Utc>>,
+    status_since: DateTime<Utc>,
+    has_return_request: bool,
+}
+
+/// One row of the admin shipment queue. Recipient PII is
+/// minimised for a scanning surface: the delivery NAME
+/// (triage recognition, as on the orders queue) and a
+/// MASKED phone; the address, the order note and the
+/// buyer's account phone never appear here — the detail
+/// carries the full delivery block.
+#[derive(Debug, Serialize)]
+pub struct AdminShipment {
+    pub id: Uuid,
+    pub sub_order_id: Uuid,
+    pub order_id: Uuid,
+    pub store_id: Uuid,
+    pub store_name: String,
+    pub store_slug: String,
+    pub courier: String,
+    pub manual_courier_name: Option<String>,
+    pub consignment_id: String,
+    pub tracking_code: Option<String>,
+    pub manual_tracking_id: Option<String>,
+    pub status: String,
+    pub sub_order_status: String,
+    pub cod_amount_poisha: i64,
+    pub delivery_name: String,
+    pub delivery_phone_masked: String,
+    pub delivery_zone: String,
+    pub delivery_district: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub last_polled_at: Option<DateTime<Utc>>,
+    /// When the shipment entered its CURRENT status (the
+    /// newest event in that status; the booking time when
+    /// no such event exists).
+    pub status_since: DateTime<Utc>,
+    pub status_age_secs: i64,
+    /// In one non-terminal status past its threshold.
+    pub aged: bool,
+    /// No poll attempted within the stale window.
+    pub poll_overdue: bool,
+    /// No status change within the stale window — the
+    /// metrics `stale_shipments` population.
+    pub unrefreshed: bool,
+    pub has_return_request: bool,
+}
+
+impl AdminShipmentRowRow {
+    fn into_view(self, thresholds: &ShipmentAgedThresholds, now: DateTime<Utc>) -> AdminShipment {
+        let aged = shipment_is_aged(&self.status, self.status_since, thresholds, now);
+        let unrefreshed =
+            shipment_is_unrefreshed(&self.courier, &self.status, self.updated_at, now);
+        let poll_overdue = shipment_is_poll_overdue(
+            &self.courier,
+            &self.status,
+            self.last_polled_at,
+            self.created_at,
+            now,
+        );
+        AdminShipment {
+            delivery_phone_masked: mask_phone(&self.delivery_phone),
+            status_age_secs: (now - self.status_since).num_seconds().max(0),
+            aged,
+            poll_overdue,
+            unrefreshed,
+            id: self.id,
+            sub_order_id: self.sub_order_id,
+            order_id: self.order_id,
+            store_id: self.store_id,
+            store_name: self.store_name,
+            store_slug: self.store_slug,
+            courier: self.courier,
+            manual_courier_name: self.manual_courier_name,
+            consignment_id: self.consignment_id,
+            tracking_code: self.tracking_code,
+            manual_tracking_id: self.manual_tracking_id,
+            status: self.status,
+            sub_order_status: self.sub_order_status,
+            cod_amount_poisha: self.cod_amount_poisha,
+            delivery_name: self.delivery_name,
+            delivery_zone: self.delivery_zone,
+            delivery_district: self.delivery_district,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            last_polled_at: self.last_polled_at,
+            status_since: self.status_since,
+            has_return_request: self.has_return_request,
+        }
+    }
+}
+
+/// Per-status counts over the WHOLE queue (the summary is
+/// never filter-shaped).
+#[derive(Debug, Serialize)]
+pub struct AdminShipmentStatusCounts {
+    pub created: i64,
+    pub picked_up: i64,
+    pub in_transit: i64,
+    pub out_for_delivery: i64,
+    pub delivered: i64,
+    pub partial_delivered: i64,
+    pub return_in_transit: i64,
+    pub returned: i64,
+    pub cancelled: i64,
+    pub unknown: i64,
+}
+
+/// Shipments whose parcel came back (courier RTO) on an
+/// order where the buyer had already paid money in —
+/// an advance or a full prepayment — with NO return
+/// request on file: the population with no refund path
+/// anywhere in the platform today (surfaced read-only;
+/// creating the obligation is a returns/payments
+/// decision). `advance_paid_poisha` sums DISTINCT
+/// orders — one order's advance is counted once however
+/// many of its parcels came back.
+#[derive(Debug, Serialize)]
+pub struct AdminShipmentAdvanceStranded {
+    pub shipments: i64,
+    pub orders: i64,
+    pub advance_paid_poisha: i64,
+}
+
+/// One courier's slice of the platform: shipment counts
+/// by status class (the classes partition the unified
+/// status set, so they sum to `total`), its COD figures
+/// and its oldest live parcel. Built by merging the SQL
+/// rollup onto the availability list, so a courier with
+/// zero shipments still appears — a missing courier is
+/// itself a health fact.
+#[derive(Debug, Serialize)]
+pub struct AdminShipmentCourierRollup {
+    /// The shipments-table courier value: an API courier
+    /// key, or `manual` for the manual-counter rows.
+    pub courier: String,
+    /// The manual courier's canonical display name;
+    /// `None` for API couriers (the web maps brand names
+    /// for the keys).
+    pub display_name: Option<String>,
+    pub available: bool,
+    /// `live` / `dev` / `manual`, as the availability
+    /// service reports it.
+    pub mode: Option<String>,
+    pub reason: Option<String>,
+    pub is_default: bool,
+    pub total: i64,
+    pub created: i64,
+    pub in_flight: i64,
+    pub delivered: i64,
+    pub partial_delivered: i64,
+    pub return_in_transit: i64,
+    pub returned: i64,
+    pub cancelled: i64,
+    pub unknown: i64,
+    pub non_terminal: i64,
+    pub cod_delivered_held_poisha: i64,
+    pub cod_in_flight_expected_poisha: i64,
+    /// Rows carrying a DEV-simulator consignment id —
+    /// row-level evidence of simulated bookings, whatever
+    /// the current config says.
+    pub dev_shipment_count: i64,
+    pub oldest_non_terminal_at: Option<DateTime<Utc>>,
+}
+
+/// The whole-queue summary riding the list response.
+#[derive(Debug, Serialize)]
+pub struct AdminShipmentSummary {
+    pub total: i64,
+    pub non_terminal: i64,
+    pub by_status: AdminShipmentStatusCounts,
+    /// The metrics `stale_shipments` population, by
+    /// construction (pinned equal in tests).
+    pub unrefreshed: i64,
+    pub poll_overdue: i64,
+    pub status_aged: i64,
+    /// Stored COD on `delivered` shipments: cash the
+    /// couriers are presumed to hold, UNRECONCILED — an
+    /// upper bound, not a ledger (no remittance tracking
+    /// exists).
+    pub cod_delivered_held_poisha: i64,
+    /// Of the held figure, the part delivered more than
+    /// 7 / 30 days ago (ageing measured on `updated_at`,
+    /// the moment delivery was recorded).
+    pub cod_delivered_over_7d_poisha: i64,
+    pub cod_delivered_over_30d_poisha: i64,
+    /// Stored COD on parcels in a courier's hands
+    /// (picked up / in transit / out for delivery): what
+    /// they are expected to collect.
+    pub cod_in_flight_expected_poisha: i64,
+    /// Stored COD on booked-but-uncollected parcels.
+    pub cod_created_poisha: i64,
+    /// Stored COD on partially delivered parcels: an
+    /// UPPER BOUND (the platform records no
+    /// collected-so-far amount).
+    pub cod_partial_poisha: i64,
+    /// Stored COD on `unknown` shipments: money attached
+    /// to parcels whose state the platform cannot
+    /// classify — a blind spot, shown rather than hidden.
+    pub cod_unknown_poisha: i64,
+    pub advance_stranded: AdminShipmentAdvanceStranded,
+    /// True when the DEV courier simulator is the active
+    /// mode: API-courier bookings and polls are simulated
+    /// (manual bookings are real in every mode).
+    pub couriers_dev_mode: bool,
+    pub couriers: Vec<AdminShipmentCourierRollup>,
+    pub aged_thresholds: ShipmentAgedThresholds,
+}
+
+/// The list envelope: `total` is the FILTERED count;
+/// `summary` describes the whole queue.
+#[derive(Debug, Serialize)]
+pub struct AdminShipmentList {
+    pub items: Vec<AdminShipment>,
+    pub total: i64,
+    pub page: i64,
+    pub limit: i64,
+    pub summary: AdminShipmentSummary,
+}
+
+/// The summary's main aggregate: one FILTER pass over the
+/// whole shipments table (see [`shipment_summary`]).
+#[derive(FromRow)]
+struct ShipmentSummaryRow {
+    total: i64,
+    st_created: i64,
+    st_picked_up: i64,
+    st_in_transit: i64,
+    st_out_for_delivery: i64,
+    st_delivered: i64,
+    st_partial_delivered: i64,
+    st_return_in_transit: i64,
+    st_returned: i64,
+    st_cancelled: i64,
+    st_unknown: i64,
+    non_terminal: i64,
+    unrefreshed: i64,
+    poll_overdue: i64,
+    status_aged: i64,
+    cod_delivered_held: i64,
+    cod_delivered_over_7d: i64,
+    cod_delivered_over_30d: i64,
+    cod_in_flight: i64,
+    cod_created: i64,
+    cod_partial: i64,
+    cod_unknown: i64,
+}
+
+/// The stranded-advance aggregate (one row of three
+/// subqueries; see [`AdminShipmentAdvanceStranded`]).
+#[derive(FromRow)]
+struct ShipmentStrandedRow {
+    shipments: i64,
+    orders: i64,
+    advance_paid_poisha: i64,
+}
+
+/// One `(courier, manual_courier_name)` group of the
+/// per-courier rollup.
+#[derive(FromRow)]
+struct ShipmentCourierGroupRow {
+    courier: String,
+    manual_courier_name: Option<String>,
+    total: i64,
+    cls_created: i64,
+    cls_in_flight: i64,
+    cls_delivered: i64,
+    cls_partial: i64,
+    cls_return_in_transit: i64,
+    cls_returned: i64,
+    cls_cancelled: i64,
+    cls_unknown: i64,
+    non_terminal: i64,
+    cod_delivered_held: i64,
+    cod_in_flight: i64,
+    dev_count: i64,
+    oldest_non_terminal_at: Option<DateTime<Utc>>,
+}
+
+fn empty_shipment_rollup(
+    courier: String,
+    display_name: Option<String>,
+    availability: Option<&CourierAvailability>,
+) -> AdminShipmentCourierRollup {
+    AdminShipmentCourierRollup {
+        courier,
+        display_name,
+        available: availability.is_some_and(|entry| entry.available),
+        mode: availability.and_then(|entry| entry.mode.clone()),
+        reason: availability.and_then(|entry| entry.reason.clone()),
+        is_default: availability.is_some_and(|entry| entry.is_default),
+        total: 0,
+        created: 0,
+        in_flight: 0,
+        delivered: 0,
+        partial_delivered: 0,
+        return_in_transit: 0,
+        returned: 0,
+        cancelled: 0,
+        unknown: 0,
+        non_terminal: 0,
+        cod_delivered_held_poisha: 0,
+        cod_in_flight_expected_poisha: 0,
+        dev_shipment_count: 0,
+        oldest_non_terminal_at: None,
+    }
+}
+
+fn fill_shipment_rollup(entry: &mut AdminShipmentCourierRollup, row: &ShipmentCourierGroupRow) {
+    entry.total = row.total;
+    entry.created = row.cls_created;
+    entry.in_flight = row.cls_in_flight;
+    entry.delivered = row.cls_delivered;
+    entry.partial_delivered = row.cls_partial;
+    entry.return_in_transit = row.cls_return_in_transit;
+    entry.returned = row.cls_returned;
+    entry.cancelled = row.cls_cancelled;
+    entry.unknown = row.cls_unknown;
+    entry.non_terminal = row.non_terminal;
+    entry.cod_delivered_held_poisha = row.cod_delivered_held;
+    entry.cod_in_flight_expected_poisha = row.cod_in_flight;
+    entry.dev_shipment_count = row.dev_count;
+    entry.oldest_non_terminal_at = row.oldest_non_terminal_at;
+}
+
+/// The whole-queue shipment summary. Takes only the pool
+/// for DATA — `config` and `thresholds` are platform
+/// configuration, never list filters, so the summary
+/// structurally cannot become filter-shaped (the
+/// payouts/orders canon).
+async fn shipment_summary(
+    pool: &PgPool,
+    config: &CouriersConfig,
+    thresholds: &ShipmentAgedThresholds,
+) -> Result<AdminShipmentSummary, ApiError> {
+    let t = thresholds.ordered();
+    let row: ShipmentSummaryRow = sqlx::query_as(
+        "SELECT COUNT(*) AS total, \
+           COUNT(*) FILTER (WHERE status = 'created') AS st_created, \
+           COUNT(*) FILTER (WHERE status = 'picked_up') AS st_picked_up, \
+           COUNT(*) FILTER (WHERE status = 'in_transit') AS st_in_transit, \
+           COUNT(*) FILTER (WHERE status = 'out_for_delivery') AS st_out_for_delivery, \
+           COUNT(*) FILTER (WHERE status = 'delivered') AS st_delivered, \
+           COUNT(*) FILTER (WHERE status = 'partial_delivered') AS st_partial_delivered, \
+           COUNT(*) FILTER (WHERE status = 'return_in_transit') AS st_return_in_transit, \
+           COUNT(*) FILTER (WHERE status = 'returned') AS st_returned, \
+           COUNT(*) FILTER (WHERE status = 'cancelled') AS st_cancelled, \
+           COUNT(*) FILTER (WHERE status = 'unknown') AS st_unknown, \
+           COUNT(*) FILTER (WHERE status NOT IN ('delivered', 'returned', 'cancelled')) \
+             AS non_terminal, \
+           COUNT(*) FILTER (WHERE courier <> 'manual' \
+             AND status NOT IN ('delivered', 'returned', 'cancelled') \
+             AND updated_at < now() - make_interval(mins => $1::int)) AS unrefreshed, \
+           COUNT(*) FILTER (WHERE courier <> 'manual' \
+             AND status NOT IN ('delivered', 'returned', 'cancelled') \
+             AND COALESCE(last_polled_at, created_at) \
+               < now() - make_interval(mins => $1::int)) AS poll_overdue, \
+           COUNT(*) FILTER (WHERE status NOT IN ('delivered', 'returned', 'cancelled') \
+             AND updated_at < now() - (CASE status \
+               WHEN 'created' THEN make_interval(hours => $2::int) \
+               WHEN 'picked_up' THEN make_interval(hours => $3::int) \
+               WHEN 'in_transit' THEN make_interval(hours => $4::int) \
+               WHEN 'out_for_delivery' THEN make_interval(hours => $5::int) \
+               WHEN 'partial_delivered' THEN make_interval(hours => $6::int) \
+               WHEN 'return_in_transit' THEN make_interval(hours => $7::int) \
+               WHEN 'unknown' THEN make_interval(hours => $8::int) END)) AS status_aged, \
+           COALESCE(SUM(cod_amount_poisha) FILTER (WHERE status = 'delivered'), 0)::bigint \
+             AS cod_delivered_held, \
+           COALESCE(SUM(cod_amount_poisha) FILTER (WHERE status = 'delivered' \
+             AND updated_at < now() - interval '7 days'), 0)::bigint \
+             AS cod_delivered_over_7d, \
+           COALESCE(SUM(cod_amount_poisha) FILTER (WHERE status = 'delivered' \
+             AND updated_at < now() - interval '30 days'), 0)::bigint \
+             AS cod_delivered_over_30d, \
+           COALESCE(SUM(cod_amount_poisha) FILTER \
+             (WHERE status IN ('picked_up', 'in_transit', 'out_for_delivery')), 0)::bigint \
+             AS cod_in_flight, \
+           COALESCE(SUM(cod_amount_poisha) FILTER (WHERE status = 'created'), 0)::bigint \
+             AS cod_created, \
+           COALESCE(SUM(cod_amount_poisha) FILTER (WHERE status = 'partial_delivered'), 0)::bigint \
+             AS cod_partial, \
+           COALESCE(SUM(cod_amount_poisha) FILTER (WHERE status = 'unknown'), 0)::bigint \
+             AS cod_unknown \
+         FROM shipments",
+    )
+    .bind(STALE_SHIPMENT_MINUTES)
+    .bind(t[0])
+    .bind(t[1])
+    .bind(t[2])
+    .bind(t[3])
+    .bind(t[4])
+    .bind(t[5])
+    .bind(t[6])
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::internal("summarise admin shipments", e))?;
+
+    let stranded: ShipmentStrandedRow = sqlx::query_as(
+        "SELECT \
+           (SELECT COUNT(*) FROM shipments sh \
+              JOIN sub_orders so ON so.id = sh.sub_order_id \
+              JOIN orders o ON o.id = so.order_id \
+            WHERE sh.status = 'returned' AND o.advance_paid_poisha > 0 \
+              AND NOT EXISTS (SELECT 1 FROM return_requests rr \
+                              WHERE rr.sub_order_id = so.id)) AS shipments, \
+           (SELECT COUNT(*) FROM orders o \
+            WHERE o.advance_paid_poisha > 0 AND EXISTS \
+              (SELECT 1 FROM shipments sh \
+                 JOIN sub_orders so ON so.id = sh.sub_order_id \
+               WHERE so.order_id = o.id AND sh.status = 'returned' \
+                 AND NOT EXISTS (SELECT 1 FROM return_requests rr \
+                                 WHERE rr.sub_order_id = so.id))) AS orders, \
+           (SELECT COALESCE(SUM(o.advance_paid_poisha), 0)::bigint FROM orders o \
+            WHERE o.advance_paid_poisha > 0 AND EXISTS \
+              (SELECT 1 FROM shipments sh \
+                 JOIN sub_orders so ON so.id = sh.sub_order_id \
+               WHERE so.order_id = o.id AND sh.status = 'returned' \
+                 AND NOT EXISTS (SELECT 1 FROM return_requests rr \
+                                 WHERE rr.sub_order_id = so.id))) AS advance_paid_poisha",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::internal("summarise stranded advances", e))?;
+
+    let groups: Vec<ShipmentCourierGroupRow> = sqlx::query_as(
+        "SELECT courier, manual_courier_name, \
+           COUNT(*) AS total, \
+           COUNT(*) FILTER (WHERE status = 'created') AS cls_created, \
+           COUNT(*) FILTER (WHERE status IN ('picked_up', 'in_transit', 'out_for_delivery')) \
+             AS cls_in_flight, \
+           COUNT(*) FILTER (WHERE status = 'delivered') AS cls_delivered, \
+           COUNT(*) FILTER (WHERE status = 'partial_delivered') AS cls_partial, \
+           COUNT(*) FILTER (WHERE status = 'return_in_transit') AS cls_return_in_transit, \
+           COUNT(*) FILTER (WHERE status = 'returned') AS cls_returned, \
+           COUNT(*) FILTER (WHERE status = 'cancelled') AS cls_cancelled, \
+           COUNT(*) FILTER (WHERE status = 'unknown') AS cls_unknown, \
+           COUNT(*) FILTER (WHERE status NOT IN ('delivered', 'returned', 'cancelled')) \
+             AS non_terminal, \
+           COALESCE(SUM(cod_amount_poisha) FILTER (WHERE status = 'delivered'), 0)::bigint \
+             AS cod_delivered_held, \
+           COALESCE(SUM(cod_amount_poisha) FILTER \
+             (WHERE status IN ('picked_up', 'in_transit', 'out_for_delivery')), 0)::bigint \
+             AS cod_in_flight, \
+           COUNT(*) FILTER (WHERE consignment_id LIKE 'DEV-%') AS dev_count, \
+           MIN(created_at) FILTER (WHERE status NOT IN ('delivered', 'returned', 'cancelled')) \
+             AS oldest_non_terminal_at \
+         FROM shipments GROUP BY courier, manual_courier_name",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::internal("roll up admin shipments by courier", e))?;
+
+    // Merge the SQL groups onto the availability list:
+    // every configured courier appears, zero-volume ones
+    // included; a group with no availability entry (a
+    // manual row without a recorded name, say) is appended
+    // rather than dropped, so counts never vanish.
+    let mut couriers: Vec<AdminShipmentCourierRollup> = Vec::new();
+    for entry in courier_availability(config) {
+        couriers.push(empty_shipment_rollup(
+            entry.courier.clone(),
+            entry.display_name.clone(),
+            Some(&entry),
+        ));
+    }
+    for entry in manual_courier_availability() {
+        couriers.push(empty_shipment_rollup(
+            "manual".to_string(),
+            entry.display_name.clone(),
+            Some(&entry),
+        ));
+    }
+    for group in &groups {
+        let position = if group.courier == "manual" {
+            couriers.iter().position(|entry| {
+                entry.courier == "manual" && entry.display_name == group.manual_courier_name
+            })
+        } else {
+            couriers
+                .iter()
+                .position(|entry| entry.courier == group.courier)
+        };
+        match position {
+            Some(index) => fill_shipment_rollup(&mut couriers[index], group),
+            None => {
+                let mut entry = empty_shipment_rollup(
+                    group.courier.clone(),
+                    group.manual_courier_name.clone(),
+                    None,
+                );
+                fill_shipment_rollup(&mut entry, group);
+                couriers.push(entry);
+            }
+        }
+    }
+
+    Ok(AdminShipmentSummary {
+        total: row.total,
+        non_terminal: row.non_terminal,
+        by_status: AdminShipmentStatusCounts {
+            created: row.st_created,
+            picked_up: row.st_picked_up,
+            in_transit: row.st_in_transit,
+            out_for_delivery: row.st_out_for_delivery,
+            delivered: row.st_delivered,
+            partial_delivered: row.st_partial_delivered,
+            return_in_transit: row.st_return_in_transit,
+            returned: row.st_returned,
+            cancelled: row.st_cancelled,
+            unknown: row.st_unknown,
+        },
+        unrefreshed: row.unrefreshed,
+        poll_overdue: row.poll_overdue,
+        status_aged: row.status_aged,
+        cod_delivered_held_poisha: row.cod_delivered_held,
+        cod_delivered_over_7d_poisha: row.cod_delivered_over_7d,
+        cod_delivered_over_30d_poisha: row.cod_delivered_over_30d,
+        cod_in_flight_expected_poisha: row.cod_in_flight,
+        cod_created_poisha: row.cod_created,
+        cod_partial_poisha: row.cod_partial,
+        cod_unknown_poisha: row.cod_unknown,
+        advance_stranded: AdminShipmentAdvanceStranded {
+            shipments: stranded.shipments,
+            orders: stranded.orders,
+            advance_paid_poisha: stranded.advance_paid_poisha,
+        },
+        couriers_dev_mode: config.dev_mode,
+        couriers,
+        aged_thresholds: *thresholds,
+    })
+}
+
+/// The filter predicates shared by the count and the page
+/// query (they must never drift — the stores remake's
+/// count/items lesson). Parameters, in order: status,
+/// courier, store_id, queue, stale minutes, the seven
+/// aged thresholds in [`SHIPMENT_NON_TERMINAL`] order,
+/// canonical phone, raw search text, id prefix pattern,
+/// text pattern.
+const ADMIN_SHIPMENT_FILTERS: &str = "($1::text IS NULL OR sh.status = $1) \
+    AND ($2::text IS NULL OR sh.courier = $2) \
+    AND ($3::uuid IS NULL OR so.store_id = $3) \
+    AND ($4::text IS NULL \
+          OR ($4 = 'unrefreshed' AND sh.courier <> 'manual' \
+              AND sh.status NOT IN ('delivered', 'returned', 'cancelled') \
+              AND sh.updated_at < now() - make_interval(mins => $5::int)) \
+          OR ($4 = 'poll_overdue' AND sh.courier <> 'manual' \
+              AND sh.status NOT IN ('delivered', 'returned', 'cancelled') \
+              AND COALESCE(sh.last_polled_at, sh.created_at) \
+                < now() - make_interval(mins => $5::int)) \
+          OR ($4 = 'status_aged' \
+              AND sh.status NOT IN ('delivered', 'returned', 'cancelled') \
+              AND sh.updated_at < now() - (CASE sh.status \
+                    WHEN 'created' THEN make_interval(hours => $6::int) \
+                    WHEN 'picked_up' THEN make_interval(hours => $7::int) \
+                    WHEN 'in_transit' THEN make_interval(hours => $8::int) \
+                    WHEN 'out_for_delivery' THEN make_interval(hours => $9::int) \
+                    WHEN 'partial_delivered' THEN make_interval(hours => $10::int) \
+                    WHEN 'return_in_transit' THEN make_interval(hours => $11::int) \
+                    WHEN 'unknown' THEN make_interval(hours => $12::int) END))) \
+    AND ($14::text IS NULL OR o.delivery_phone = $13 OR u.phone = $13 \
+          OR o.delivery_phone = $14 \
+          OR sh.id::text LIKE $15 OR so.id::text LIKE $15 OR o.id::text LIKE $15 \
+          OR sh.consignment_id ILIKE $16 OR sh.tracking_code ILIKE $16 \
+          OR sh.manual_tracking_id ILIKE $16 \
+          OR o.delivery_name ILIKE $16 OR st.name ILIKE $16 OR st.slug ILIKE $16 \
+          OR sh.manual_courier_name ILIKE $16)";
+
+fn shipment_order_by(sort: ShipmentSort) -> &'static str {
+    match sort {
+        ShipmentSort::Newest => "ORDER BY sh.created_at DESC, sh.id DESC",
+        ShipmentSort::Oldest => "ORDER BY sh.created_at ASC, sh.id ASC",
+        ShipmentSort::StaleFirst => "ORDER BY sh.updated_at ASC, sh.id ASC",
+        ShipmentSort::CodDesc => {
+            "ORDER BY sh.cod_amount_poisha DESC, sh.created_at DESC, sh.id DESC"
+        }
+    }
+}
+
+/// List shipments for the admin oversight queue (admin
+/// shipments remake): a purpose-built masked row (see
+/// [`AdminShipment`]) assembled set-wise, plus the
+/// whole-queue summary.
+///
+/// Filters, all validated fail-closed (an unknown value
+/// is a 400, never a silently empty page): `status` (the
+/// ten unified statuses), `courier` (the five API keys
+/// or `manual`), `store_id`, and `queue` — `unrefreshed`
+/// (the metrics stale population), `poll_overdue` (no
+/// poll attempted in the stale window) or `status_aged`
+/// (in one status past its threshold); a chosen queue
+/// defaults the sort to stale-first. `q` searches,
+/// following the platform's phone discipline: a BD phone
+/// in any typed form (Bengali digits transliterated
+/// first) matches the delivery phone or the buyer's
+/// account phone EXACTLY — phones are never
+/// substring-searched; a shipment / sub-order / order id
+/// prefix (4+ hex/dash characters) matches by prefix;
+/// any other text matches the courier references
+/// (consignment, tracking code, manual receipt number —
+/// operational strings printed on labels, substring-safe
+/// unlike phones), the delivery name, the store's
+/// name/slug or the manual courier's name, all
+/// LIKE-escaped substrings.
+#[allow(clippy::too_many_arguments)]
+pub async fn list_shipments(
+    pool: &PgPool,
+    config: &CouriersConfig,
+    q: Option<&str>,
+    status: Option<&str>,
+    courier: Option<&str>,
+    store_id: Option<Uuid>,
+    queue: Option<&str>,
+    sort: Option<&str>,
+    page: Option<i64>,
+    limit: Option<i64>,
+) -> Result<AdminShipmentList, ApiError> {
+    let (page, limit) = clamp_pagination(page, limit);
+    let offset = (page - 1) * limit;
+    let status: Option<&str> = match status.map(str::trim) {
+        None | Some("") => None,
+        Some(s @ ("created" | "picked_up" | "in_transit" | "out_for_delivery" | "delivered"
+        | "partial_delivered" | "return_in_transit" | "returned" | "cancelled" | "unknown")) => {
+            Some(s)
+        }
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "status must be one of: created, picked_up, in_transit, out_for_delivery, \
+                 delivered, partial_delivered, return_in_transit, returned, cancelled, unknown",
+            ))
+        }
+    };
+    let courier: Option<&str> = match courier.map(str::trim) {
+        None | Some("") => None,
+        Some(s @ ("steadfast" | "pathao" | "redx" | "ecourier" | "paperfly" | "manual")) => {
+            Some(s)
+        }
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "courier must be one of: steadfast, pathao, redx, ecourier, paperfly, manual",
+            ))
+        }
+    };
+    let queue: Option<&str> = match queue.map(str::trim) {
+        None | Some("") => None,
+        Some(s @ ("unrefreshed" | "poll_overdue" | "status_aged")) => Some(s),
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "queue must be one of: unrefreshed, poll_overdue, status_aged",
+            ))
+        }
+    };
+    // A chosen queue is a work list: default to the
+    // poller's own order (stalest first) unless the
+    // caller picked a sort explicitly.
+    let sort = match (queue.is_some(), sort) {
+        (true, None) => ShipmentSort::StaleFirst,
+        _ => validate_shipment_list_sort(sort).map_err(ApiError::bad_request)?,
+    };
+
+    let q_trim: Option<String> = q
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(bn_to_en_digits);
+    let phone_exact: Option<String> = q_trim.as_deref().and_then(normalize_bd_phone);
+    let id_prefix: Option<String> = q_trim.as_deref().and_then(|text| {
+        let lowered = text.to_lowercase();
+        if lowered.len() >= 4 && lowered.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+            // Hex digits and dashes carry no LIKE wildcards,
+            // so the prefix pattern needs no escaping.
+            Some(format!("{lowered}%"))
+        } else {
+            None
+        }
+    });
+    let text_pattern: Option<String> = q_trim.as_deref().map(search_like_pattern);
+
+    let thresholds = effective_shipment_aged_thresholds(pool).await;
+    let t = thresholds.ordered();
+
+    let total: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM shipments sh \
+         JOIN sub_orders so ON so.id = sh.sub_order_id \
+         JOIN orders o ON o.id = so.order_id \
+         JOIN stores st ON st.id = so.store_id \
+         JOIN users u ON u.id = o.buyer_user_id \
+         WHERE {ADMIN_SHIPMENT_FILTERS}"
+    ))
+    .bind(status)
+    .bind(courier)
+    .bind(store_id)
+    .bind(queue)
+    .bind(STALE_SHIPMENT_MINUTES)
+    .bind(t[0])
+    .bind(t[1])
+    .bind(t[2])
+    .bind(t[3])
+    .bind(t[4])
+    .bind(t[5])
+    .bind(t[6])
+    .bind(&phone_exact)
+    .bind(&q_trim)
+    .bind(&id_prefix)
+    .bind(&text_pattern)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::internal("count admin shipments", e))?;
+
+    let rows: Vec<AdminShipmentRowRow> = sqlx::query_as(&format!(
+        "SELECT sh.id, sh.sub_order_id, so.order_id, so.store_id, \
+           st.name AS store_name, st.slug AS store_slug, \
+           sh.courier, sh.manual_courier_name, sh.consignment_id, \
+           sh.tracking_code, sh.manual_tracking_id, sh.status, \
+           so.status AS sub_order_status, sh.cod_amount_poisha, \
+           o.delivery_name, o.delivery_phone, o.delivery_zone, \
+           o.delivery_district, sh.created_at, sh.updated_at, \
+           sh.last_polled_at, \
+           COALESCE((SELECT MAX(e.created_at) FROM shipment_events e \
+                     WHERE e.shipment_id = sh.id AND e.status = sh.status), \
+                    sh.created_at) AS status_since, \
+           EXISTS (SELECT 1 FROM return_requests rr \
+                   WHERE rr.sub_order_id = so.id) AS has_return_request \
+         FROM shipments sh \
+         JOIN sub_orders so ON so.id = sh.sub_order_id \
+         JOIN orders o ON o.id = so.order_id \
+         JOIN stores st ON st.id = so.store_id \
+         JOIN users u ON u.id = o.buyer_user_id \
+         WHERE {ADMIN_SHIPMENT_FILTERS} \
+         {} LIMIT $17 OFFSET $18",
+        shipment_order_by(sort)
+    ))
+    .bind(status)
+    .bind(courier)
+    .bind(store_id)
+    .bind(queue)
+    .bind(STALE_SHIPMENT_MINUTES)
+    .bind(t[0])
+    .bind(t[1])
+    .bind(t[2])
+    .bind(t[3])
+    .bind(t[4])
+    .bind(t[5])
+    .bind(t[6])
+    .bind(&phone_exact)
+    .bind(&q_trim)
+    .bind(&id_prefix)
+    .bind(&text_pattern)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::internal("list admin shipments", e))?;
+
+    let now = Utc::now();
+    let items: Vec<AdminShipment> = rows
+        .into_iter()
+        .map(|row| row.into_view(&thresholds, now))
+        .collect();
+    let summary = shipment_summary(pool, config, &thresholds).await?;
+    Ok(AdminShipmentList {
+        items,
+        total,
+        page,
+        limit,
+        summary,
+    })
+}
+
+/// One purchased line on the detail's sub-order.
+#[derive(Debug, Serialize, FromRow)]
+pub struct AdminShipmentItem {
+    pub title_snapshot: String,
+    pub variant_name: Option<String>,
+    pub quantity: i32,
+    pub unit_price_poisha: i64,
+}
+
+/// One raw `shipment_events` row on the detail. Unlike
+/// the folded timeline, this keeps `source` (who moved
+/// it: the booking, a poll, the seller's manual entry)
+/// and the courier's verbatim `raw_status` — the two
+/// facts a courier escalation turns on.
+#[derive(Debug, Serialize, FromRow)]
+pub struct AdminShipmentEvent {
+    pub id: Uuid,
+    pub status: String,
+    pub raw_status: Option<String>,
+    pub source: String,
+    pub at: DateTime<Utc>,
+}
+
+/// The return request filed against this sub-order, if
+/// any — a cross-reference only. Refund handling belongs
+/// to the returns surface; this block exists so the two
+/// different things both called "returned" (a courier
+/// RTO and a buyer return) are never conflated here.
+#[derive(Debug, Serialize, FromRow)]
+pub struct AdminShipmentReturnRef {
+    pub id: Uuid,
+    pub status: String,
+    pub refund_status: String,
+    pub refund_poisha: Option<i64>,
+}
+
+/// Private header row for the detail: carries the raw
+/// phones; the view masks the buyer's account phone at
+/// construction and never serialises this struct.
+#[derive(FromRow)]
+struct AdminShipmentDetailRow {
+    id: Uuid,
+    sub_order_id: Uuid,
+    order_id: Uuid,
+    store_id: Uuid,
+    store_name: String,
+    store_slug: String,
+    courier: String,
+    manual_courier_name: Option<String>,
+    consignment_id: String,
+    tracking_code: Option<String>,
+    manual_tracking_id: Option<String>,
+    status: String,
+    note: Option<String>,
+    sub_order_status: String,
+    sub_order_created_at: DateTime<Utc>,
+    cod_amount_poisha: i64,
+    goods_subtotal_poisha: i64,
+    discount_poisha: i64,
+    delivery_charge_poisha: i64,
+    order_status: String,
+    payment_method: String,
+    payment_status: String,
+    advance_required_poisha: i64,
+    advance_paid_poisha: i64,
+    grand_total_poisha: i64,
+    delivery_name: String,
+    delivery_phone: String,
+    delivery_address: String,
+    delivery_zone: String,
+    delivery_district: Option<String>,
+    order_note: Option<String>,
+    buyer_phone: String,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    last_polled_at: Option<DateTime<Utc>>,
+    status_since: DateTime<Utc>,
+}
+
+/// The admin shipment detail. The full delivery block
+/// (name, phone, address) is present — a stuck or failed
+/// delivery cannot be worked with the courier without
+/// it, and the seller and the courier already hold all
+/// three (booking copies them into the courier request).
+/// The buyer's ACCOUNT phone stays masked even here: it
+/// is an identity credential, not a delivery fact. The
+/// read is not reason-gated or audited — delivery data is
+/// ephemeral operational data (the orders detail's
+/// rationale), not a national credential like the NID,
+/// whose reveal IS gated.
+#[derive(Debug, Serialize)]
+pub struct AdminShipmentDetail {
+    pub id: Uuid,
+    pub sub_order_id: Uuid,
+    pub order_id: Uuid,
+    pub store_id: Uuid,
+    pub store_name: String,
+    pub store_slug: String,
+    pub courier: String,
+    pub manual_courier_name: Option<String>,
+    pub consignment_id: String,
+    pub tracking_code: Option<String>,
+    pub manual_tracking_id: Option<String>,
+    pub status: String,
+    pub note: Option<String>,
+    pub sub_order_status: String,
+    pub cod_amount_poisha: i64,
+    pub goods_subtotal_poisha: i64,
+    pub discount_poisha: i64,
+    pub delivery_charge_poisha: i64,
+    pub order_status: String,
+    pub payment_method: String,
+    pub payment_status: String,
+    pub advance_required_poisha: i64,
+    pub advance_paid_poisha: i64,
+    pub grand_total_poisha: i64,
+    pub delivery_name: String,
+    pub delivery_phone: String,
+    pub delivery_address: String,
+    pub delivery_zone: String,
+    pub delivery_district: Option<String>,
+    pub order_note: Option<String>,
+    pub buyer_phone_masked: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub last_polled_at: Option<DateTime<Utc>>,
+    pub status_since: DateTime<Utc>,
+    pub status_age_secs: i64,
+    pub aged: bool,
+    pub poll_overdue: bool,
+    pub unrefreshed: bool,
+    pub items: Vec<AdminShipmentItem>,
+    pub events: Vec<AdminShipmentEvent>,
+    /// The shared W55 timeline + steps for the
+    /// sub-order — no surface assembles its own history.
+    pub timeline: Vec<TimelineEvent>,
+    pub steps: Vec<TimelineStep>,
+    pub return_request: Option<AdminShipmentReturnRef>,
+    /// This parcel came back on an order with money
+    /// already paid in and no return request exists —
+    /// the no-refund-path population (see the summary).
+    pub advance_stranded: bool,
+    pub audit_entries: Vec<AdminAuditEntry>,
+}
+
+/// One shipment's full oversight detail (admin shipments
+/// remake). 404 for an unknown id.
+pub async fn get_admin_shipment_detail(
+    pool: &PgPool,
+    shipment_id: Uuid,
+) -> Result<AdminShipmentDetail, ApiError> {
+    let row: Option<AdminShipmentDetailRow> = sqlx::query_as(
+        "SELECT sh.id, sh.sub_order_id, so.order_id, so.store_id, \
+           st.name AS store_name, st.slug AS store_slug, \
+           sh.courier, sh.manual_courier_name, sh.consignment_id, \
+           sh.tracking_code, sh.manual_tracking_id, sh.status, sh.note, \
+           so.status AS sub_order_status, so.created_at AS sub_order_created_at, \
+           sh.cod_amount_poisha, so.goods_subtotal_poisha, so.discount_poisha, \
+           so.delivery_charge_poisha, \
+           o.status AS order_status, o.payment_method, o.payment_status, \
+           o.advance_required_poisha, o.advance_paid_poisha, o.grand_total_poisha, \
+           o.delivery_name, o.delivery_phone, o.delivery_address, o.delivery_zone, \
+           o.delivery_district, o.order_note, u.phone AS buyer_phone, \
+           sh.created_at, sh.updated_at, sh.last_polled_at, \
+           COALESCE((SELECT MAX(e.created_at) FROM shipment_events e \
+                     WHERE e.shipment_id = sh.id AND e.status = sh.status), \
+                    sh.created_at) AS status_since \
+         FROM shipments sh \
+         JOIN sub_orders so ON so.id = sh.sub_order_id \
+         JOIN orders o ON o.id = so.order_id \
+         JOIN stores st ON st.id = so.store_id \
+         JOIN users u ON u.id = o.buyer_user_id \
+         WHERE sh.id = $1",
+    )
+    .bind(shipment_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ApiError::internal("load admin shipment detail", e))?;
+    let row = row.ok_or_else(|| ApiError::not_found("shipment not found"))?;
+
+    let items: Vec<AdminShipmentItem> = sqlx::query_as(
+        "SELECT title_snapshot, variant_name, quantity, unit_price_poisha \
+         FROM order_items WHERE sub_order_id = $1 ORDER BY id",
+    )
+    .bind(row.sub_order_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::internal("load admin shipment items", e))?;
+
+    let events: Vec<AdminShipmentEvent> = sqlx::query_as(
+        "SELECT id, status, raw_status, source, created_at AS at \
+         FROM shipment_events WHERE shipment_id = $1 \
+         ORDER BY created_at ASC, id ASC",
+    )
+    .bind(shipment_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::internal("load admin shipment events", e))?;
+
+    let return_request: Option<AdminShipmentReturnRef> = sqlx::query_as(
+        "SELECT id, status, refund_status, refund_poisha \
+         FROM return_requests WHERE sub_order_id = $1",
+    )
+    .bind(row.sub_order_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ApiError::internal("load admin shipment return reference", e))?;
+
+    let timeline = sub_order_timeline(
+        pool,
+        row.sub_order_id,
+        &row.sub_order_status,
+        row.sub_order_created_at,
+    )
+    .await?;
+    let steps = sub_order_steps(&row.sub_order_status, Some(&row.status));
+    let audit_entries = list_audit_for_target(pool, "shipment", &shipment_id.to_string(), 20)
+        .await?;
+
+    let thresholds = effective_shipment_aged_thresholds(pool).await;
+    let now = Utc::now();
+    let advance_stranded =
+        row.status == "returned" && row.advance_paid_poisha > 0 && return_request.is_none();
+    Ok(AdminShipmentDetail {
+        buyer_phone_masked: mask_phone(&row.buyer_phone),
+        status_age_secs: (now - row.status_since).num_seconds().max(0),
+        aged: shipment_is_aged(&row.status, row.status_since, &thresholds, now),
+        poll_overdue: shipment_is_poll_overdue(
+            &row.courier,
+            &row.status,
+            row.last_polled_at,
+            row.created_at,
+            now,
+        ),
+        unrefreshed: shipment_is_unrefreshed(&row.courier, &row.status, row.updated_at, now),
+        advance_stranded,
+        id: row.id,
+        sub_order_id: row.sub_order_id,
+        order_id: row.order_id,
+        store_id: row.store_id,
+        store_name: row.store_name,
+        store_slug: row.store_slug,
+        courier: row.courier,
+        manual_courier_name: row.manual_courier_name,
+        consignment_id: row.consignment_id,
+        tracking_code: row.tracking_code,
+        manual_tracking_id: row.manual_tracking_id,
+        status: row.status,
+        note: row.note,
+        sub_order_status: row.sub_order_status,
+        cod_amount_poisha: row.cod_amount_poisha,
+        goods_subtotal_poisha: row.goods_subtotal_poisha,
+        discount_poisha: row.discount_poisha,
+        delivery_charge_poisha: row.delivery_charge_poisha,
+        order_status: row.order_status,
+        payment_method: row.payment_method,
+        payment_status: row.payment_status,
+        advance_required_poisha: row.advance_required_poisha,
+        advance_paid_poisha: row.advance_paid_poisha,
+        grand_total_poisha: row.grand_total_poisha,
+        delivery_name: row.delivery_name,
+        delivery_phone: row.delivery_phone,
+        delivery_address: row.delivery_address,
+        delivery_zone: row.delivery_zone,
+        delivery_district: row.delivery_district,
+        order_note: row.order_note,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        last_polled_at: row.last_polled_at,
+        status_since: row.status_since,
+        items,
+        events,
+        timeline,
+        steps,
+        return_request,
+        audit_entries,
+    })
+}
+
+/// The admin refresh response: the shipment as the
+/// shared core left it, plus the outcome as a stable
+/// wire string (`advanced` / `unchanged`).
+#[derive(Debug, Serialize)]
+pub struct AdminShipmentRefresh {
+    pub shipment: Shipment,
+    pub outcome: String,
+}
+
+/// Refresh ONE shipment as an admin (admin shipments
+/// remake): delegates to the shared refresh core — the
+/// same function the participant endpoint and the worker
+/// poller run — with the admin's id threaded through so
+/// an advance is audited in the refresh transaction.
+/// There is deliberately no bulk variant: one click, one
+/// parcel, one courier call. A manual shipment returns
+/// an honest `unchanged` (nothing exists to poll);
+/// courier errors (not configured, gateway failure)
+/// propagate as errors, never folded into `unchanged`.
+pub async fn refresh_admin_shipment(
+    state: &AppState,
+    admin_id: Uuid,
+    shipment_id: Uuid,
+) -> Result<AdminShipmentRefresh, ApiError> {
+    let (shipment, outcome) =
+        refresh_shipment_by_id_audited(state, shipment_id, Some(admin_id)).await?;
+    Ok(AdminShipmentRefresh {
+        shipment,
+        outcome: match outcome {
+            RefreshOutcome::Advanced => "advanced".to_string(),
+            RefreshOutcome::Unchanged => "unchanged".to_string(),
+        },
+    })
+}
+
+#[derive(Deserialize)]
+pub struct AdminShipmentsQuery {
+    /// Search: courier references (substring), delivery
+    /// name / store (substring), phone (exact), or an id
+    /// prefix — see [`list_shipments`].
+    pub q: Option<String>,
+    /// Unified-status filter; an unknown value is a 400.
+    pub status: Option<String>,
+    /// Courier filter: an API key or `manual`; an
+    /// unknown value is a 400.
+    pub courier: Option<String>,
+    /// Restrict to one store's shipments.
+    pub store_id: Option<Uuid>,
+    /// Work-queue filter: `unrefreshed` | `poll_overdue`
+    /// | `status_aged`; an unknown value is a 400.
+    pub queue: Option<String>,
+    /// newest | oldest | stale_first | cod_desc.
+    pub sort: Option<String>,
+    pub page: Option<i64>,
+    pub limit: Option<i64>,
+}
+
+pub async fn list_shipments_handler(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(query): Query<AdminShipmentsQuery>,
+) -> Result<Json<AdminShipmentList>, ApiError> {
+    require_admin(&state, &user).await?;
+    let pool = state.require_pool()?;
+    Ok(Json(
+        list_shipments(
+            pool,
+            &state.couriers_config,
+            query.q.as_deref(),
+            query.status.as_deref(),
+            query.courier.as_deref(),
+            query.store_id,
+            query.queue.as_deref(),
+            query.sort.as_deref(),
+            query.page,
+            query.limit,
+        )
+        .await?,
+    ))
+}
+
+pub async fn get_shipment_detail_handler(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<AdminShipmentDetail>, ApiError> {
+    require_admin(&state, &user).await?;
+    let pool = state.require_pool()?;
+    Ok(Json(get_admin_shipment_detail(pool, id).await?))
+}
+
+pub async fn refresh_shipment_handler(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<AdminShipmentRefresh>, ApiError> {
+    let admin = require_admin(&state, &user).await?;
+    Ok(Json(refresh_admin_shipment(&state, admin.id, id).await?))
 }

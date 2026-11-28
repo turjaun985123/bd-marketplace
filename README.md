@@ -4775,6 +4775,120 @@ detail, and a per-product takedown power:
   is NOT changed here — this remake seals the
   platform-removal case only.
 
+**Admin shipments remake (2026-11-28, the seventh surface
+of the admin remake program; 20 analysis agents):** the
+shipments surface did not exist for admins at all — no
+`/admin/shipments` page, no admin shipments API — while
+the remade overview's Needs-attention queue linked to
+`/admin/shipments` (a dead link since the overview
+remake; it now carries `?queue=unrefreshed`). The remake
+builds the cross-store, cross-courier oversight queue,
+the detail, and one action:
+
+- **Two stuck queues, kept apart.** UNREFRESHED = no
+  status change in 15 minutes — by construction the
+  exact population `/v1/admin/metrics` reports as
+  `stale_shipments` (pinned equal in tests). POLL
+  OVERDUE = no poll ATTEMPTED in 15 minutes, which
+  `updated_at` could never express (unchanged and failed
+  polls write nothing), so migration 0079 adds
+  `shipments.last_polled_at`, stamped by the ONE refresh
+  service on every adapter attempt: an advance inside
+  its transaction, an unchanged answer or a failed
+  attempt as a best-effort standalone update (a failed
+  stamp never masks the poll's real outcome). Manual
+  shipments are never stamped — no attempt happens.
+  STATUS AGED = in one non-terminal status past its
+  threshold (`created` 24h, `picked_up` 48h, `in_transit`
+  72h, `out_for_delivery` 24h, `partial_delivered` 48h,
+  `return_in_transit` 72h, `unknown` 24h), overridable
+  via the `shipment_aged_<status>_hours` platform
+  settings (DB row gated 1..=720, then the domain
+  default; no env layer — the delivery-estimates
+  precedent). Aged-queue membership is computed on
+  `updated_at`; the displayed per-row age is exact,
+  from the newest event in the current status — a manual
+  shipment whose receipt number was edited after its
+  last status change can surface in the aged queue
+  slightly late, never with a wrong displayed age.
+  Editing the thresholds in the settings UI is a named
+  follow-up for the settings remake (the fulfillment
+  SLA pair is in the same state). Migration 0080 adds
+  the queue's indexes.
+- **The poller rotates now.** `refresh_stale_shipments`
+  selects on `COALESCE(last_polled_at, updated_at)`:
+  before the stamp, the same oldest ≤50 shipments were
+  re-asked every cycle and rows past the batch limit
+  could starve indefinitely. A just-polled shipment now
+  waits its full staleness window however the poll
+  ended. Pre-stamp rows fall back to `updated_at` —
+  exactly the old rule.
+- **The one action: single-parcel refresh.**
+  `POST /v1/admin/shipments/{id}/refresh` delegates to
+  the shared refresh core (the same function the
+  participant endpoint and the worker run) with the
+  admin's id threaded through; when the refresh
+  ADVANCES the shipment, `shipment.refresh` is recorded
+  in the refresh's own transaction (detail `{from, to,
+  raw_status, courier, sub_order_id}`). Unchanged
+  refreshes and courier errors write no audit row;
+  errors propagate as errors (503 not configured, 502
+  gateway), never folded into "unchanged". A manual
+  shipment answers an honest `unchanged`. There is no
+  bulk refresh and no status editing — transitions
+  belong to courier polling and seller/buyer flows.
+  Known inherited limit, not worsened: two CONCURRENT
+  refreshes of one shipment can both apply the same
+  transition (the shared core takes no row lock — the
+  security audit's HI-49 pattern); admin clicks are
+  human-rate and downstream syncs are the guard, and
+  the fix belongs in the shared core, not this surface.
+- **PII, following the orders precedent.** The list row
+  carries the delivery name and a MASKED phone (triage),
+  zone and district; never the address, the order note
+  or the buyer's account phone. The detail carries the
+  full delivery block — a stuck delivery cannot be
+  worked with the courier without it, and the seller
+  and courier already hold all three — while the
+  buyer's ACCOUNT phone stays masked even there. The
+  detail read is not reason-gated or audited: delivery
+  data is ephemeral operational data, not a national
+  credential like the verifications NID.
+- **COD is shown as what it is.** Every figure is the
+  stored `cod_amount_poisha` snapshot from booking,
+  never recomputed. "Delivered COD held" is labelled an
+  UNRECONCILED UPPER BOUND: no remittance/settlement
+  tracking exists anywhere in the platform (the
+  worker's `cod_reconciliation` job is still planned),
+  so nothing here claims a courier has settled, and the
+  figure grows monotonically until such a ledger
+  exists. Partially delivered COD is shown separately
+  (its stored figure is also an upper bound — no
+  collected-so-far amount is recorded), and `unknown`
+  shipments carry their COD as a named blind spot. The
+  per-courier rollup merges the SQL groups onto the
+  availability list, so zero-volume couriers appear;
+  DEV-simulator bookings are flagged per row
+  (`DEV-` consignments) and by the summary's
+  `couriers_dev_mode`, because availability ranks
+  credentials above dev mode while the adapter factory
+  checks dev mode first.
+- **Advance-paid RTO: surfaced, not solved.** A buyer
+  who paid a COD advance (or prepaid in full) whose
+  parcel returns by courier RTO has NO refund path
+  anywhere: the sub-order is `returned`, so a buyer
+  return request (which requires `delivered`) is
+  unreachable, and the cancel paths refuse
+  advance-paid orders and point at "the admin returns
+  flow", which cannot accept an RTO sub-order either.
+  The summary's `advance_stranded` block and a per-row
+  detail flag expose the population (returned shipments
+  on orders with `advance_paid_poisha > 0` and no
+  return request; the poisha sums distinct orders).
+  Creating the refund obligation is a returns/payments
+  decision — this surface invents neither an amount
+  beyond the recorded advance nor an action.
+
 **Settings override precedence:** a row in `platform_settings`
 (migration 0013) beats the startup value, which beats the
 built-in default — for commission: setting > `COMMISSION_RATE_BPS`

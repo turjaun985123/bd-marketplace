@@ -460,7 +460,7 @@ function AttentionQueue({ metrics }: { metrics: AdminMetrics }) {
       label: "আটকে থাকা শিপমেন্ট — Shipments not moving",
       count: metrics.stale_shipments,
       tone: "accent",
-      href: "/admin/shipments",
+      href: "/admin/shipments?queue=unrefreshed",
       meta: "১৫ মিনিটের বেশি হালনাগাদ হয়নি (ম্যানুয়াল ছাড়া)",
     });
   }

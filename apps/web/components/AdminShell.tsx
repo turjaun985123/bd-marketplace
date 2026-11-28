@@ -99,6 +99,8 @@ export default function AdminShell({
         {" · "}
         <Link href="/admin/orders">অর্ডার</Link>
         {" · "}
+        <Link href="/admin/shipments">শিপমেন্ট</Link>
+        {" · "}
         <Link href="/admin/payouts">পে-আউট</Link>
         {" · "}
         <Link href="/admin/coupons">কুপন</Link>
