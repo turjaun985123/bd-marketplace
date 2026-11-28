@@ -697,7 +697,7 @@ pub async fn create_category(
         input.parent_id.map(|id| id.to_string()).as_deref(),
     )
     .map_err(ApiError::bad_request)?;
-    ensure_slug_free(&mut *tx, &slug, None).await?;
+    ensure_slug_free(&mut tx, &slug, None).await?;
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO categories (slug, parent_id, name_en, name_bn, icon_key, \
          sort_order, is_active, is_featured) \
@@ -827,7 +827,7 @@ pub async fn update_category(
     }
 
     if slug != existing.slug {
-        ensure_slug_free(&mut *tx, &slug, Some(id)).await?;
+        ensure_slug_free(&mut tx, &slug, Some(id)).await?;
     }
     sqlx::query(
         "UPDATE categories SET slug = $2, name_en = $3, name_bn = $4, parent_id = $5, \

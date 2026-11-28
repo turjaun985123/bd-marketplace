@@ -377,6 +377,13 @@ pub(crate) fn clamp_pagination(page: Option<i64>, limit: Option<i64>) -> (i64, i
 /// sorts are pure, and the price sorts price by the
 /// EFFECTIVE price (the merch module's SQL flash twin),
 /// so the list orders by the price its own cards show.
+///
+/// Wave 56: `category_ids` (the taxonomy subtree filter)
+/// is the eighth parameter — the list's filters are one
+/// flat, greppable signature by design (the payments
+/// module's wide-service precedent), so the lint is
+/// allowed here rather than hiding them in a struct.
+#[allow(clippy::too_many_arguments)]
 pub async fn list_products(
     pool: &PgPool,
     q: Option<&str>,

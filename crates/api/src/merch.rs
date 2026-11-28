@@ -2188,12 +2188,12 @@ pub async fn home_feed_handler(
 /// not a display choice.
 pub const CATEGORIES_LIST_LIMIT: i64 = 200;
 
-/// The public category list payload (Wave 53) lived here
-/// until Wave 56: `GET /v1/categories` is now served by
-/// `categories::list_categories_handler`, which returns
-/// this same aggregate in its `categories` field (from
-/// [`load_categories`], byte-identical) plus the taxonomy
-/// tree as an additive `tree` field.
+// The public category list payload (Wave 53) lived here
+// until Wave 56: `GET /v1/categories` is now served by
+// `categories::list_categories_handler`, which returns
+// this same aggregate in its `categories` field (from
+// `load_categories`, byte-identical) plus the taxonomy
+// tree as an additive `tree` field.
 
 /// The admin preview query: `at` is an RFC 3339 timestamp.
 #[derive(Deserialize)]
