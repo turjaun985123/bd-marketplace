@@ -11437,9 +11437,17 @@ mod tests {
         ];
         assert_eq!(resolve_category_link("phones", &rows).as_deref(), Some("a"));
         assert_eq!(resolve_category_link("PHONES", &rows).as_deref(), Some("a"));
-        // And the name still resolves when no slug claims
-        // the label first.
-        assert_eq!(resolve_category_link("Gadgets", &rows).as_deref(), Some("a"));
+        // The priority is symmetric: "Gadgets" is a's NAME
+        // but b's SLUG, so the slug claim wins again and
+        // the label resolves to b.
+        assert_eq!(resolve_category_link("Gadgets", &rows).as_deref(), Some("b"));
+        // And a name still resolves when no slug claims
+        // the label at all.
+        let name_only = vec![cat("c", None, "shoes", "Footwear", 10)];
+        assert_eq!(
+            resolve_category_link("Footwear", &name_only).as_deref(),
+            Some("c")
+        );
     }
 
     #[test]
