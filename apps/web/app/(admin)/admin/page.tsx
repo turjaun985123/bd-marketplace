@@ -427,7 +427,7 @@ function AttentionQueue({ metrics }: { metrics: AdminMetrics }) {
       label: "অগ্রিম পেমেন্ট বাকি — Advances unpaid",
       count: ap.count,
       tone: ap.over_24h > 0 ? "danger" : "accent",
-      href: "/admin/orders",
+      href: "/admin/orders?advance_state=pending",
       meta: (
         <>
           বাকি <PriceTag amountPoisha={ap.outstanding_poisha} /> · আটকে থাকা
@@ -445,7 +445,7 @@ function AttentionQueue({ metrics }: { metrics: AdminMetrics }) {
       label: "অগ্রিম ছাড়াই এগিয়ে গেছে — Advances not collected",
       count: metrics.advance_unfulfilled.count,
       tone: "muted",
-      href: "/admin/orders",
+      href: "/admin/orders?advance_state=unfulfilled",
       meta: (
         <>
           গেটওয়ে না পেয়ে অগ্রিম ছাড়া চলমান · নেওয়ার কথা ছিল{" "}

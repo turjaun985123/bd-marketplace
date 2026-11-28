@@ -4566,6 +4566,89 @@ surface both leaking and blind:
   carry no note and possibly no stamp — the UI says so
   instead of inventing either.
 
+**Admin orders remake (2026-11-28, the fifth surface of
+the admin remake program; 96 analysis agents):** the
+orders surface was a read-only endpoint with no page —
+`GET /v1/admin/orders` returned the buyer's FULL order
+view per row (full delivery name, phone, address and
+note, every sub-order's items, timeline and steps),
+assembled by running the shared order loader once per
+row (~350 queries for a 25-row page), and the web client
+for it had no caller. The remake keeps the surface
+strictly observational — order and sub-order transitions
+belong to the buyer/seller flows, refunds to the returns
+surface, and no admin order-mutating power is added:
+
+- **Privacy fix:** the list is now a purpose-built triage
+  row (`AdminOrderRow`): snapshot money under the buyer
+  view's field names, per-store sub-order chips (store,
+  pipeline status, goods), and the delivery phone MASKED
+  (`delivery_phone_masked`); the address, note and items
+  are absent from the list entirely. New `GET
+  /v1/admin/orders/{id}` returns the buyer's own view
+  (the full delivery block lives there only — the
+  payouts detail precedent) plus `buyer_phone_masked`
+  (the account phone, masked even in the detail) and
+  `cod_amount_due_poisha` on the receipt's own formula
+  (grand − advance paid, COD only). The read is not
+  reason-gated: a delivery phone is operational data the
+  seller already sees, not a national credential like
+  the verification NID (whose reveal stays gated).
+- **Set-based reads:** one page query, one grouped
+  sub-order query for the page's ids, one count and the
+  summary — the per-row loader loop is gone from this
+  path (the buyer loader itself is untouched). Migration
+  0077 indexes the queue's walks (`created_at, id` and
+  `payment_status, created_at, id`); the orders table
+  previously had no secondary index on these paths.
+- **Queue filters, all fail-closed 400s:** parent
+  `status` (placed/cancelled — the parent status is
+  write-once), `payment_status` (the seven-value
+  vocabulary), `sub_status` (orders having a sub-order
+  in that pipeline status), `store_id`, and
+  `advance_state` — `pending` / `unfulfilled`, the
+  overview metrics' two advance populations, so the
+  overview's Needs-attention rows now deep-link into the
+  exact queue they count. Sorts are domain-validated
+  (`newest`/`oldest`/`amount_desc`/`amount_asc`).
+  Search follows the phone discipline: a BD phone in any
+  typed form (Bengali digits transliterated) matches the
+  delivery or account phone EXACTLY — phones are never
+  substring-searched; an order-id prefix matches by
+  prefix; other text matches the delivery name or a
+  store name/slug, LIKE-escaped.
+- **Whole-queue `summary`:** counts by parent and
+  payment status, the advance-pending count + outstanding
+  and the CR-15 unfulfilled count + amount, and today's
+  order count + GMV — all on the overview metrics' own
+  populations and formulas, pinned against the metrics
+  by test (`adminordersb`), so the queue header and the
+  overview cannot disagree. Note the deliberate
+  asymmetry, inherited from the metrics: the
+  per-payment-status counts include cancelled orders;
+  the advance blocks exclude them.
+- **Web:** new `/admin/orders` page to the remake
+  standard (summary chips, status/payment/pipeline/
+  advance filter chips, debounced search, sorts,
+  pagination, expandable detail with the money
+  breakdown, per-sub-order timelines via the shared
+  `OrderTimeline`, shipment lines, return links, and
+  per-store invoices fetched through the ADMIN invoice
+  endpoint — the print page's buyer/seller invoice
+  calls 403 for admins); an অর্ডার entry in the admin
+  nav; the overview's two advance rows deep-link with
+  `?advance_state=`.
+- **Honest limits:** deliberately no date-range or
+  buyer filters (no caller needs them yet), no CSV
+  export (an orders export is a full-PII bulk channel;
+  the payouts remake cut its CSV on the same reasoning),
+  no audit-history block on the detail (no admin action
+  targets orders, so it would always be empty), and no
+  stale-advance sweeping — stale `advance_pending`
+  orders are never expired by the worker; this queue is
+  their only visibility, and acting on them stays with
+  the buyer/seller flows.
+
 **Settings override precedence:** a row in `platform_settings`
 (migration 0013) beats the startup value, which beats the
 built-in default — for commission: setting > `COMMISSION_RATE_BPS`

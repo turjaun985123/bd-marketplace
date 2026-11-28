@@ -3473,6 +3473,35 @@ pub fn validate_store_list_sort(sort: Option<&str>) -> Result<StoreSort, &'stati
     }
 }
 
+/// The admin order queue's sort orders (admin orders
+/// remake). `Newest` is the pre-remake behaviour and the
+/// default; `Oldest` serves the work queues (the advance
+/// queue above all — the longest-waiting buyer first); the
+/// amount orders serve triage by order value. The API layer
+/// maps each variant to a fixed ORDER BY fragment — user
+/// input never reaches the SQL text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderSort {
+    Newest,
+    Oldest,
+    AmountDesc,
+    AmountAsc,
+}
+
+/// Validate an admin order-list `sort` parameter (admin
+/// orders remake): absent means [`OrderSort::Newest`]; an
+/// unknown value is an error naming the allowed set, in
+/// the style of [`validate_store_list_sort`].
+pub fn validate_order_list_sort(sort: Option<&str>) -> Result<OrderSort, &'static str> {
+    match sort {
+        None | Some("newest") => Ok(OrderSort::Newest),
+        Some("oldest") => Ok(OrderSort::Oldest),
+        Some("amount_desc") => Ok(OrderSort::AmountDesc),
+        Some("amount_asc") => Ok(OrderSort::AmountAsc),
+        Some(_) => Err("sort must be one of: newest, oldest, amount_desc, amount_asc"),
+    }
+}
+
 /// May this user cast a helpful vote on a review (Wave 54
 /// extension)? Everyone except the review's AUTHOR: a
 /// vote is other buyers certifying the review helped
@@ -11187,6 +11216,32 @@ mod tests {
         );
         assert!(validate_payout_list_sort(Some("largest")).is_err());
         assert!(validate_payout_list_sort(Some("AmountDesc")).is_err());
+    }
+
+    #[test]
+    fn order_list_sort_validation() {
+        assert_eq!(validate_order_list_sort(None), Ok(OrderSort::Newest));
+        assert_eq!(
+            validate_order_list_sort(Some("newest")),
+            Ok(OrderSort::Newest)
+        );
+        assert_eq!(
+            validate_order_list_sort(Some("oldest")),
+            Ok(OrderSort::Oldest)
+        );
+        assert_eq!(
+            validate_order_list_sort(Some("amount_desc")),
+            Ok(OrderSort::AmountDesc)
+        );
+        assert_eq!(
+            validate_order_list_sort(Some("amount_asc")),
+            Ok(OrderSort::AmountAsc)
+        );
+        assert_eq!(
+            validate_order_list_sort(Some("")),
+            Err("sort must be one of: newest, oldest, amount_desc, amount_asc")
+        );
+        assert!(validate_order_list_sort(Some("cheapest")).is_err());
     }
 
     #[test]

@@ -35,6 +35,22 @@
 //! decisions on a suspended store are frozen (see
 //! `transition_payout`), and that is all.
 //!
+//! Admin orders remake: the orders surface is READ-ONLY
+//! oversight — no admin power over an order's lifecycle
+//! exists or is added here (transitions belong to the
+//! buyer/seller flows; refunds to the returns surface).
+//! The queue list is a purpose-built row (masked delivery
+//! phone, sub-order chips, snapshot money) assembled
+//! set-wise; the pre-remake list returned the buyer's full
+//! order view per row through the shared loader, leaking
+//! full delivery PII into a list and costing a query per
+//! order part. The detail returns the buyer's own view
+//! (full delivery block — the payouts detail precedent)
+//! plus the masked account phone and the receipt's COD
+//! due. The list summary restates the overview metrics'
+//! advance populations and today figures so the two
+//! surfaces agree.
+//!
 //! Settings: rows in `platform_settings` override startup values
 //! at read time — `commission_bps` beats the startup
 //! `COMMISSION_RATE_BPS`, and `min_payout_poisha` beats the domain
@@ -72,12 +88,13 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use domain::{
-    can_transition_payout, is_valid_payout_status, mask_phone, parse_setting_i64,
-    search_like_pattern, to_local_phone, validate_advance_bps, validate_advance_threshold,
-    validate_commission_bps, validate_payout_list_sort, validate_payout_rejection_reason,
+    bn_to_en_digits, can_transition_payout, is_valid_payout_status, mask_phone,
+    normalize_bd_phone, parse_setting_i64, search_like_pattern, to_local_phone,
+    validate_advance_bps, validate_advance_threshold, validate_commission_bps,
+    validate_order_list_sort, validate_payout_list_sort, validate_payout_rejection_reason,
     validate_payment_reference, validate_plan_free_product_cap, validate_promotion_price_per_day,
-    validate_store_list_sort, validate_subscription_price, validate_suspension_note, PayoutSort,
-    StoreSort, ADVANCE_PERCENT_BPS_KEY, ADVANCE_THRESHOLD_KEY, COMMISSION_BPS_KEY,
+    validate_store_list_sort, validate_subscription_price, validate_suspension_note, OrderSort,
+    PayoutSort, StoreSort, ADVANCE_PERCENT_BPS_KEY, ADVANCE_THRESHOLD_KEY, COMMISSION_BPS_KEY,
     KYC_PAYOUT_GATE_KEY, MIN_PAYOUT_KEY, MIN_PAYOUT_POISHA, NOTIFICATION_STORE_REACTIVATED,
     NOTIFICATION_STORE_SUSPENDED, PLAN_BUSINESS, PLAN_FREE_PRODUCT_CAP_KEY, PLAN_PRO,
     PROMOTION_PRICE_PER_DAY_KEY, SUBSCRIPTION_PRICE_BUSINESS_KEY, SUBSCRIPTION_PRICE_PRO_KEY,
@@ -88,7 +105,7 @@ use uuid::Uuid;
 
 use crate::audit::record_admin_action;
 use crate::auth::{load_user, AuthUser, User};
-use crate::orders::{load_order, OrderList};
+use crate::orders::{load_order, Order};
 use crate::payouts::{Earnings, Payout};
 use crate::products::clamp_pagination;
 use crate::stores::Store;
@@ -957,50 +974,565 @@ pub async fn set_store_status(
 }
 
 // ---------------------------------------------------------------------------
-// Orders: list (read-only oversight)
+// Orders: oversight queue + detail (read-only)
 // ---------------------------------------------------------------------------
 
-/// List every order on the platform, newest first, optionally
-/// filtered by the order-level status. Rows are built by the ONE
-/// shared order loader, so the admin sees exactly what buyers see.
+/// One sub-order as the admin queue shows it (admin orders
+/// remake): which store, which pipeline status, how much
+/// goods money. Items, timelines and shipment detail stay
+/// in the detail view — a queue row is for triage.
+#[derive(Debug, Serialize)]
+pub struct AdminOrderSubOrder {
+    pub id: Uuid,
+    pub store_id: Uuid,
+    pub store_slug: String,
+    pub store_name: String,
+    pub status: String,
+    pub goods_subtotal_poisha: i64,
+}
+
+#[derive(Debug, FromRow)]
+struct AdminOrderSubOrderRow {
+    id: Uuid,
+    order_id: Uuid,
+    store_id: Uuid,
+    store_slug: String,
+    store_name: String,
+    status: String,
+    goods_subtotal_poisha: i64,
+}
+
+/// One order in the admin queue (admin orders remake). The
+/// pre-remake list returned the buyer's full [`Order`] view
+/// per row — full delivery name, phone, address and note,
+/// plus every sub-order's items, timeline and steps —
+/// assembled by running the shared order loader once per
+/// row (a page of 25 cost roughly 350 queries). The queue
+/// row carries only what triage needs, with the delivery
+/// phone MASKED (the Wave 28 list canon): the full delivery
+/// block lives in [`AdminOrderDetail`] only. Money fields
+/// are the stored checkout snapshots, under the same names
+/// the buyer view uses.
+#[derive(Debug, Serialize)]
+pub struct AdminOrderRow {
+    pub id: Uuid,
+    /// Parent status: `placed` or `cancelled` (the parent
+    /// status is write-once; the pipeline lives on the
+    /// sub-orders below).
+    pub status: String,
+    pub payment_method: String,
+    pub payment_status: String,
+    pub advance_required_poisha: i64,
+    pub advance_paid_poisha: i64,
+    /// The CR-15 degradation flag, derived exactly as the
+    /// overview's `advance_unfulfilled` block defines it:
+    /// an advance was required, none could be collected,
+    /// and the order proceeded as plain COD.
+    pub advance_unfulfilled: bool,
+    pub delivery_name: String,
+    /// The delivery phone, masked via `domain::mask_phone`.
+    pub delivery_phone_masked: String,
+    pub delivery_zone: String,
+    pub delivery_district: Option<String>,
+    pub goods_total_poisha: i64,
+    pub discount_total_poisha: i64,
+    pub loyalty_discount_poisha: i64,
+    pub gift_card_discount_poisha: i64,
+    pub delivery_total_poisha: i64,
+    pub grand_total_poisha: i64,
+    pub created_at: DateTime<Utc>,
+    pub sub_orders: Vec<AdminOrderSubOrder>,
+}
+
+#[derive(Debug, FromRow)]
+struct AdminOrderRowRow {
+    id: Uuid,
+    status: String,
+    payment_method: String,
+    payment_status: String,
+    advance_required_poisha: i64,
+    advance_paid_poisha: i64,
+    delivery_name: String,
+    delivery_phone: String,
+    delivery_zone: String,
+    delivery_district: Option<String>,
+    goods_total_poisha: i64,
+    discount_total_poisha: i64,
+    loyalty_discount_poisha: i64,
+    gift_card_discount_poisha: i64,
+    delivery_total_poisha: i64,
+    grand_total_poisha: i64,
+    created_at: DateTime<Utc>,
+}
+
+impl AdminOrderRowRow {
+    fn into_view(self, sub_orders: Vec<AdminOrderSubOrder>) -> AdminOrderRow {
+        AdminOrderRow {
+            advance_unfulfilled: self.payment_status == "pay_on_delivery"
+                && self.advance_required_poisha > self.advance_paid_poisha
+                && self.status != "cancelled",
+            delivery_phone_masked: mask_phone(&self.delivery_phone),
+            id: self.id,
+            status: self.status,
+            payment_method: self.payment_method,
+            payment_status: self.payment_status,
+            advance_required_poisha: self.advance_required_poisha,
+            advance_paid_poisha: self.advance_paid_poisha,
+            delivery_name: self.delivery_name,
+            delivery_zone: self.delivery_zone,
+            delivery_district: self.delivery_district,
+            goods_total_poisha: self.goods_total_poisha,
+            discount_total_poisha: self.discount_total_poisha,
+            loyalty_discount_poisha: self.loyalty_discount_poisha,
+            gift_card_discount_poisha: self.gift_card_discount_poisha,
+            delivery_total_poisha: self.delivery_total_poisha,
+            grand_total_poisha: self.grand_total_poisha,
+            created_at: self.created_at,
+            sub_orders,
+        }
+    }
+}
+
+/// Whole-queue order counts for the admin list header
+/// (admin orders remake), deliberately UNFILTERED — the
+/// summary describes the platform, not the page (the
+/// payout/store summary rule). The advance blocks and the
+/// today figures use the overview metrics' own populations
+/// and formulas (see `metrics::get_admin_metrics`), so the
+/// queue header and the overview can never disagree: the
+/// advance-pending population excludes cancelled orders,
+/// the per-payment-status counts do not (exactly the
+/// metrics `orders_by_payment_status` semantics).
+#[derive(Debug, Serialize)]
+pub struct AdminOrderSummary {
+    pub total: i64,
+    pub placed: i64,
+    pub cancelled: i64,
+    pub payment_pending: i64,
+    pub payment_paid: i64,
+    pub payment_failed: i64,
+    pub payment_refunded: i64,
+    pub payment_pay_on_delivery: i64,
+    pub payment_advance_pending: i64,
+    pub payment_advance_paid: i64,
+    /// `payment_status = 'advance_pending'` and not
+    /// cancelled — the metrics `advance_pending` block.
+    pub advance_pending_count: i64,
+    /// Advance money still to collect over that
+    /// population: `advance_required - advance_paid`.
+    pub advance_outstanding_poisha: i64,
+    /// The CR-15 degraded population (plain-COD payment
+    /// status, an advance required but uncollected, not
+    /// cancelled) — the metrics `advance_unfulfilled`
+    /// block.
+    pub advance_unfulfilled_count: i64,
+    /// The uncollected advance over that population.
+    pub advance_unfulfilled_poisha: i64,
+    /// Orders placed on the current Asia/Dhaka calendar
+    /// day, all statuses — the metrics `orders_today`
+    /// count.
+    pub orders_today: i64,
+    /// Today's GMV — the metrics `orders_today` formula:
+    /// goods − discount + delivery over today's
+    /// non-cancelled sub-orders.
+    pub gmv_today_poisha: i64,
+}
+
+/// A page of admin orders plus the total count and the
+/// whole-queue summary.
+#[derive(Debug, Serialize)]
+pub struct AdminOrderList {
+    pub items: Vec<AdminOrderRow>,
+    pub total: i64,
+    pub page: i64,
+    pub limit: i64,
+    pub summary: AdminOrderSummary,
+}
+
+/// The whole-queue summary (admin orders remake): one
+/// FILTER-count pass over `orders` plus the one sub-order
+/// aggregate for today's GMV — the metrics definitions,
+/// restated once here so the two surfaces agree by
+/// construction and by test.
+async fn order_summary(pool: &PgPool) -> Result<AdminOrderSummary, ApiError> {
+    #[derive(FromRow)]
+    struct OrderSummaryRow {
+        total: i64,
+        placed: i64,
+        cancelled: i64,
+        payment_pending: i64,
+        payment_paid: i64,
+        payment_failed: i64,
+        payment_refunded: i64,
+        payment_pay_on_delivery: i64,
+        payment_advance_pending: i64,
+        payment_advance_paid: i64,
+        advance_pending_count: i64,
+        advance_outstanding_poisha: i64,
+        advance_unfulfilled_count: i64,
+        advance_unfulfilled_poisha: i64,
+        orders_today: i64,
+    }
+    let row: OrderSummaryRow = sqlx::query_as(
+        "SELECT COUNT(*)::bigint AS total, \
+           (COUNT(*) FILTER (WHERE status = 'placed'))::bigint AS placed, \
+           (COUNT(*) FILTER (WHERE status = 'cancelled'))::bigint AS cancelled, \
+           (COUNT(*) FILTER (WHERE payment_status = 'pending'))::bigint \
+             AS payment_pending, \
+           (COUNT(*) FILTER (WHERE payment_status = 'paid'))::bigint \
+             AS payment_paid, \
+           (COUNT(*) FILTER (WHERE payment_status = 'failed'))::bigint \
+             AS payment_failed, \
+           (COUNT(*) FILTER (WHERE payment_status = 'refunded'))::bigint \
+             AS payment_refunded, \
+           (COUNT(*) FILTER (WHERE payment_status = 'pay_on_delivery'))::bigint \
+             AS payment_pay_on_delivery, \
+           (COUNT(*) FILTER (WHERE payment_status = 'advance_pending'))::bigint \
+             AS payment_advance_pending, \
+           (COUNT(*) FILTER (WHERE payment_status = 'advance_paid'))::bigint \
+             AS payment_advance_paid, \
+           (COUNT(*) FILTER (WHERE payment_status = 'advance_pending' \
+             AND status <> 'cancelled'))::bigint AS advance_pending_count, \
+           COALESCE(SUM(advance_required_poisha - advance_paid_poisha) FILTER \
+             (WHERE payment_status = 'advance_pending' \
+             AND status <> 'cancelled'), 0)::bigint \
+             AS advance_outstanding_poisha, \
+           (COUNT(*) FILTER (WHERE payment_status = 'pay_on_delivery' \
+             AND advance_required_poisha > advance_paid_poisha \
+             AND status <> 'cancelled'))::bigint AS advance_unfulfilled_count, \
+           COALESCE(SUM(advance_required_poisha - advance_paid_poisha) FILTER \
+             (WHERE payment_status = 'pay_on_delivery' \
+             AND advance_required_poisha > advance_paid_poisha \
+             AND status <> 'cancelled'), 0)::bigint \
+             AS advance_unfulfilled_poisha, \
+           (COUNT(*) FILTER (WHERE (created_at AT TIME ZONE 'Asia/Dhaka')::date \
+             = (now() AT TIME ZONE 'Asia/Dhaka')::date))::bigint AS orders_today \
+         FROM orders",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::internal("admin order summary", e))?;
+
+    let gmv_today_poisha: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(goods_subtotal_poisha - discount_poisha \
+           + delivery_charge_poisha), 0)::bigint \
+         FROM sub_orders \
+         WHERE (created_at AT TIME ZONE 'Asia/Dhaka')::date \
+             = (now() AT TIME ZONE 'Asia/Dhaka')::date \
+           AND status <> 'cancelled'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::internal("admin order summary gmv", e))?;
+
+    Ok(AdminOrderSummary {
+        total: row.total,
+        placed: row.placed,
+        cancelled: row.cancelled,
+        payment_pending: row.payment_pending,
+        payment_paid: row.payment_paid,
+        payment_failed: row.payment_failed,
+        payment_refunded: row.payment_refunded,
+        payment_pay_on_delivery: row.payment_pay_on_delivery,
+        payment_advance_pending: row.payment_advance_pending,
+        payment_advance_paid: row.payment_advance_paid,
+        advance_pending_count: row.advance_pending_count,
+        advance_outstanding_poisha: row.advance_outstanding_poisha,
+        advance_unfulfilled_count: row.advance_unfulfilled_count,
+        advance_unfulfilled_poisha: row.advance_unfulfilled_poisha,
+        orders_today: row.orders_today,
+        gmv_today_poisha,
+    })
+}
+
+/// The ORDER BY fragment for an order-list sort — a fixed
+/// string per variant (user input never reaches the SQL
+/// text), every arm ending in the `id` tiebreaker the
+/// deterministic-order rule requires.
+fn order_order_by(sort: OrderSort) -> &'static str {
+    match sort {
+        OrderSort::Newest => "ORDER BY o.created_at DESC, o.id DESC",
+        OrderSort::Oldest => "ORDER BY o.created_at ASC, o.id ASC",
+        OrderSort::AmountDesc => "ORDER BY o.grand_total_poisha DESC, o.id DESC",
+        OrderSort::AmountAsc => "ORDER BY o.grand_total_poisha ASC, o.id DESC",
+    }
+}
+
+/// The filter predicates shared by the count and the page
+/// query (they must never drift — the stores remake's
+/// count/items lesson). Parameters, in order: status,
+/// payment_status, sub_status, store_id, advance_state,
+/// phone (canonical), raw phone text, id prefix pattern,
+/// text pattern.
+const ADMIN_ORDER_FILTERS: &str = "($1::text IS NULL OR o.status = $1) \
+    AND ($2::text IS NULL OR o.payment_status = $2) \
+    AND ($3::text IS NULL OR EXISTS (SELECT 1 FROM sub_orders sx \
+          WHERE sx.order_id = o.id AND sx.status = $3)) \
+    AND ($4::uuid IS NULL OR EXISTS (SELECT 1 FROM sub_orders sy \
+          WHERE sy.order_id = o.id AND sy.store_id = $4)) \
+    AND ($5::text IS NULL \
+          OR ($5 = 'pending' AND o.payment_status = 'advance_pending' \
+              AND o.status <> 'cancelled') \
+          OR ($5 = 'unfulfilled' AND o.payment_status = 'pay_on_delivery' \
+              AND o.advance_required_poisha > o.advance_paid_poisha \
+              AND o.status <> 'cancelled')) \
+    AND ($7::text IS NULL OR o.delivery_phone = $6 OR u.phone = $6 \
+          OR o.delivery_phone = $7 \
+          OR o.id::text LIKE $8 \
+          OR o.delivery_name ILIKE $9 \
+          OR EXISTS (SELECT 1 FROM sub_orders sz \
+              JOIN stores st ON st.id = sz.store_id \
+              WHERE sz.order_id = o.id \
+                AND (st.name ILIKE $9 OR st.slug ILIKE $9)))";
+
+/// List orders for the admin oversight queue (admin
+/// orders remake): a purpose-built row (see
+/// [`AdminOrderRow`]) assembled set-wise — one page query,
+/// one grouped sub-order query for the page's ids, one
+/// count and the summary; the pre-remake per-row
+/// `load_order` loop is gone from this path (the buyer
+/// loader itself is untouched).
+///
+/// Filters, all validated fail-closed (an unknown value
+/// is a 400, never a silently empty page): `status`
+/// (parent: placed/cancelled), `payment_status` (the
+/// seven-value vocabulary), `sub_status` (orders having
+/// at least one sub-order in that pipeline status),
+/// `store_id`, and `advance_state` — `pending` /
+/// `unfulfilled`, the overview metrics' two advance
+/// populations, for the attention queues the overview
+/// links here. `q` searches, following the platform's
+/// phone discipline: a BD phone in any typed form
+/// (Bengali digits transliterated first) matches the
+/// delivery phone or the buyer's account phone EXACTLY —
+/// phone numbers are never substring-searched; an
+/// order-id prefix (4+ hex/dash characters) matches by
+/// id prefix; any other text matches the delivery name
+/// or a store's name/slug as a LIKE-escaped substring.
+#[allow(clippy::too_many_arguments)]
 pub async fn list_orders(
     pool: &PgPool,
+    q: Option<&str>,
     status: Option<&str>,
+    payment_status: Option<&str>,
+    sub_status: Option<&str>,
+    store_id: Option<Uuid>,
+    advance_state: Option<&str>,
+    sort: Option<&str>,
     page: Option<i64>,
     limit: Option<i64>,
-) -> Result<OrderList, ApiError> {
+) -> Result<AdminOrderList, ApiError> {
     let (page, limit) = clamp_pagination(page, limit);
     let offset = (page - 1) * limit;
-    let status = status.map(str::trim).filter(|s| !s.is_empty());
+    let status: Option<&str> = match status.map(str::trim) {
+        None | Some("") => None,
+        Some("placed") => Some("placed"),
+        Some("cancelled") => Some("cancelled"),
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "status must be one of: placed, cancelled",
+            ))
+        }
+    };
+    let payment_status: Option<&str> = match payment_status.map(str::trim) {
+        None | Some("") => None,
+        Some(s @ ("pending" | "paid" | "failed" | "refunded" | "pay_on_delivery"
+        | "advance_pending" | "advance_paid")) => Some(s),
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "payment_status must be one of: pending, paid, failed, refunded, \
+                 pay_on_delivery, advance_pending, advance_paid",
+            ))
+        }
+    };
+    let sub_status: Option<&str> = match sub_status.map(str::trim) {
+        None | Some("") => None,
+        Some(s @ ("placed" | "confirmed" | "shipped" | "delivered" | "cancelled"
+        | "returned")) => Some(s),
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "sub_status must be one of: placed, confirmed, shipped, delivered, \
+                 cancelled, returned",
+            ))
+        }
+    };
+    let advance_state: Option<&str> = match advance_state.map(str::trim) {
+        None | Some("") => None,
+        Some("pending") => Some("pending"),
+        Some("unfulfilled") => Some("unfulfilled"),
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "advance_state must be one of: pending, unfulfilled",
+            ))
+        }
+    };
+    let sort = validate_order_list_sort(sort).map_err(ApiError::bad_request)?;
 
-    let total: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM orders WHERE ($1::text IS NULL OR status = $1)",
-    )
+    let q_trim: Option<String> = q
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(bn_to_en_digits);
+    let phone_exact: Option<String> =
+        q_trim.as_deref().and_then(normalize_bd_phone);
+    let id_prefix: Option<String> = q_trim.as_deref().and_then(|text| {
+        let lowered = text.to_lowercase();
+        if lowered.len() >= 4
+            && lowered
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == '-')
+        {
+            // Hex digits and dashes carry no LIKE wildcards,
+            // so the prefix pattern needs no escaping.
+            Some(format!("{lowered}%"))
+        } else {
+            None
+        }
+    });
+    let text_pattern: Option<String> = q_trim.as_deref().map(search_like_pattern);
+
+    let total: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM orders o \
+         JOIN users u ON u.id = o.buyer_user_id \
+         WHERE {ADMIN_ORDER_FILTERS}"
+    ))
     .bind(status)
+    .bind(payment_status)
+    .bind(sub_status)
+    .bind(store_id)
+    .bind(advance_state)
+    .bind(&phone_exact)
+    .bind(&q_trim)
+    .bind(&id_prefix)
+    .bind(&text_pattern)
     .fetch_one(pool)
     .await
     .map_err(|e| ApiError::internal("count admin orders", e))?;
 
-    let ids: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM orders WHERE ($1::text IS NULL OR status = $1) \
-         ORDER BY created_at DESC LIMIT $2 OFFSET $3",
-    )
+    let rows: Vec<AdminOrderRowRow> = sqlx::query_as(&format!(
+        "SELECT o.id, o.status, o.payment_method, o.payment_status, \
+           o.advance_required_poisha, o.advance_paid_poisha, \
+           o.delivery_name, o.delivery_phone, o.delivery_zone, \
+           o.delivery_district, o.goods_total_poisha, \
+           o.discount_total_poisha, o.loyalty_discount_poisha, \
+           o.gift_card_discount_poisha, o.delivery_total_poisha, \
+           o.grand_total_poisha, o.created_at \
+         FROM orders o \
+         JOIN users u ON u.id = o.buyer_user_id \
+         WHERE {ADMIN_ORDER_FILTERS} \
+         {} LIMIT $10 OFFSET $11",
+        order_order_by(sort)
+    ))
     .bind(status)
+    .bind(payment_status)
+    .bind(sub_status)
+    .bind(store_id)
+    .bind(advance_state)
+    .bind(&phone_exact)
+    .bind(&q_trim)
+    .bind(&id_prefix)
+    .bind(&text_pattern)
     .bind(limit)
     .bind(offset)
     .fetch_all(pool)
     .await
     .map_err(|e| ApiError::internal("list admin orders", e))?;
 
-    let mut items = Vec::with_capacity(ids.len());
-    for id in ids {
-        items.push(load_order(pool, id).await?);
+    let ids: Vec<Uuid> = rows.iter().map(|row| row.id).collect();
+    let sub_rows: Vec<AdminOrderSubOrderRow> = sqlx::query_as(
+        "SELECT so.id, so.order_id, so.store_id, st.slug AS store_slug, \
+           st.name AS store_name, so.status, so.goods_subtotal_poisha \
+         FROM sub_orders so \
+         JOIN stores st ON st.id = so.store_id \
+         WHERE so.order_id = ANY($1) \
+         ORDER BY so.created_at, so.id",
+    )
+    .bind(&ids)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::internal("list admin order sub-orders", e))?;
+    let mut sub_by_order: std::collections::HashMap<Uuid, Vec<AdminOrderSubOrder>> =
+        std::collections::HashMap::new();
+    for sub in sub_rows {
+        sub_by_order.entry(sub.order_id).or_default().push(
+            AdminOrderSubOrder {
+                id: sub.id,
+                store_id: sub.store_id,
+                store_slug: sub.store_slug,
+                store_name: sub.store_name,
+                status: sub.status,
+                goods_subtotal_poisha: sub.goods_subtotal_poisha,
+            },
+        );
     }
-    Ok(OrderList {
-        items,
+
+    let summary = order_summary(pool).await?;
+
+    Ok(AdminOrderList {
+        items: rows
+            .into_iter()
+            .map(|row| {
+                let subs = sub_by_order.remove(&row.id).unwrap_or_default();
+                row.into_view(subs)
+            })
+            .collect(),
         total,
         page,
         limit,
+        summary,
+    })
+}
+
+/// One order in full, for the admin working a support
+/// case (admin orders remake): the buyer's own [`Order`]
+/// view — items, per-sub-order timelines and steps,
+/// shipment summaries, the full delivery block — plus the
+/// two admin-only extras below. The full delivery phone
+/// and address exist ONLY here, never in the queue list
+/// (the payouts detail precedent: the detail is where the
+/// work happens). The read is not reason-gated or
+/// separately audited: a delivery phone is operational
+/// data the seller already sees to ship the parcel, not a
+/// national credential like the verification NID (whose
+/// reveal IS gated — see `verification`).
+#[derive(Debug, Serialize)]
+pub struct AdminOrderDetail {
+    #[serde(flatten)]
+    pub order: Order,
+    /// The buyer's ACCOUNT phone, masked — it can differ
+    /// from the delivery phone on the order, and the
+    /// masked form is enough to confirm identity on a
+    /// support call without a second full number.
+    pub buyer_phone_masked: String,
+    /// Cash the courier still collects on delivery — the
+    /// receipt's own figure (`build_receipt`): the grand
+    /// total minus any settled advance, for COD orders;
+    /// zero for online-paid orders.
+    pub cod_amount_due_poisha: i64,
+}
+
+/// Read one order's admin detail. The shared loader runs
+/// first and 404s before any extra read (the payout/store
+/// detail order).
+pub async fn get_admin_order_detail(
+    pool: &PgPool,
+    order_id: Uuid,
+) -> Result<AdminOrderDetail, ApiError> {
+    let order = load_order(pool, order_id).await?;
+    let buyer_phone: String =
+        sqlx::query_scalar("SELECT phone FROM users WHERE id = $1")
+            .bind(order.buyer_user_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| ApiError::internal("load order buyer phone", e))?;
+    let cod_amount_due_poisha = if order.payment_method == "cod" {
+        order.grand_total_poisha - order.advance_paid_poisha
+    } else {
+        0
+    };
+    Ok(AdminOrderDetail {
+        buyer_phone_masked: mask_phone(&buyer_phone),
+        cod_amount_due_poisha,
+        order,
     })
 }
 
@@ -2373,7 +2905,26 @@ pub struct AdminStoresQuery {
 
 #[derive(Deserialize)]
 pub struct AdminOrdersQuery {
+    /// Search: delivery/account phone (exact, any typed
+    /// form), order-id prefix, delivery name, or store
+    /// name/slug substring (admin orders remake).
+    pub q: Option<String>,
+    /// Parent status filter: `placed` | `cancelled`; an
+    /// unknown value is a 400.
     pub status: Option<String>,
+    /// Payment-status filter (the seven-value
+    /// vocabulary); an unknown value is a 400.
+    pub payment_status: Option<String>,
+    /// Pipeline filter: orders having at least one
+    /// sub-order in this status.
+    pub sub_status: Option<String>,
+    /// Restrict to orders containing this store.
+    pub store_id: Option<Uuid>,
+    /// The overview's advance queues: `pending` |
+    /// `unfulfilled`.
+    pub advance_state: Option<String>,
+    /// newest | oldest | amount_desc | amount_asc.
+    pub sort: Option<String>,
     pub page: Option<i64>,
     pub limit: Option<i64>,
 }
@@ -2535,12 +3086,34 @@ pub async fn list_orders_handler(
     State(state): State<AppState>,
     user: AuthUser,
     Query(query): Query<AdminOrdersQuery>,
-) -> Result<Json<OrderList>, ApiError> {
+) -> Result<Json<AdminOrderList>, ApiError> {
     require_admin(&state, &user).await?;
     let pool = state.require_pool()?;
     Ok(Json(
-        list_orders(pool, query.status.as_deref(), query.page, query.limit).await?,
+        list_orders(
+            pool,
+            query.q.as_deref(),
+            query.status.as_deref(),
+            query.payment_status.as_deref(),
+            query.sub_status.as_deref(),
+            query.store_id,
+            query.advance_state.as_deref(),
+            query.sort.as_deref(),
+            query.page,
+            query.limit,
+        )
+        .await?,
     ))
+}
+
+pub async fn get_order_detail_handler(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<AdminOrderDetail>, ApiError> {
+    require_admin(&state, &user).await?;
+    let pool = state.require_pool()?;
+    Ok(Json(get_admin_order_detail(pool, id).await?))
 }
 
 pub async fn list_payouts_handler(

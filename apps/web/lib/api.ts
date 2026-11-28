@@ -4545,17 +4545,173 @@ export function setAdminStoreStatus(
   });
 }
 
-/** GET /v1/admin/orders — every order, optional status filter. */
+/** Sort orders for the admin order queue (admin orders remake). */
+export type AdminOrderSort =
+  | "newest"
+  | "oldest"
+  | "amount_desc"
+  | "amount_asc";
+
+/**
+ * One store's slice of an order in the admin queue: which
+ * store, which pipeline status, how much goods money.
+ */
+export interface AdminOrderSubOrder {
+  id: string;
+  store_id: string;
+  store_slug: string;
+  store_name: string;
+  status: string;
+  goods_subtotal_poisha: number;
+}
+
+/**
+ * An order in the admin list (admin orders remake): triage
+ * fields only, with the delivery phone MASKED — the
+ * pre-remake list carried the buyer's full order view (full
+ * delivery phone, address and note) on every row; the full
+ * delivery block now lives in the detail only
+ * (AdminOrderDetail). Money fields are the stored checkout
+ * snapshots under the buyer view's names.
+ */
+export interface AdminOrder {
+  id: string;
+  /** placed | cancelled — the write-once parent status. */
+  status: string;
+  payment_method: string;
+  payment_status: string;
+  advance_required_poisha: number;
+  advance_paid_poisha: number;
+  /**
+   * CR-15 degradation: an advance was required, none could
+   * be collected, and the order proceeded as plain COD.
+   */
+  advance_unfulfilled: boolean;
+  delivery_name: string;
+  /** The delivery phone, masked (e.g. 017****678). */
+  delivery_phone_masked: string;
+  delivery_zone: string;
+  delivery_district: string | null;
+  goods_total_poisha: number;
+  discount_total_poisha: number;
+  loyalty_discount_poisha: number;
+  gift_card_discount_poisha: number;
+  delivery_total_poisha: number;
+  grand_total_poisha: number;
+  created_at: string;
+  sub_orders: AdminOrderSubOrder[];
+}
+
+/**
+ * Whole-queue order summary for the list header —
+ * deliberately UNFILTERED (it describes the platform, not
+ * the page), with the advance populations and today
+ * figures on the overview metrics' own definitions.
+ */
+export interface AdminOrderSummary {
+  total: number;
+  placed: number;
+  cancelled: number;
+  payment_pending: number;
+  payment_paid: number;
+  payment_failed: number;
+  payment_refunded: number;
+  payment_pay_on_delivery: number;
+  payment_advance_pending: number;
+  payment_advance_paid: number;
+  /** advance_pending and not cancelled (metrics block). */
+  advance_pending_count: number;
+  /** Advance money still to collect over that population. */
+  advance_outstanding_poisha: number;
+  /** The CR-15 degraded population (metrics block). */
+  advance_unfulfilled_count: number;
+  advance_unfulfilled_poisha: number;
+  /** Orders placed on the current Asia/Dhaka day. */
+  orders_today: number;
+  /** Today's GMV: goods − discount + delivery, non-cancelled. */
+  gmv_today_poisha: number;
+}
+
+/** GET /v1/admin/orders response envelope. */
+export interface AdminOrderList {
+  items: AdminOrder[];
+  total: number;
+  page: number;
+  limit: number;
+  summary: AdminOrderSummary;
+}
+
+/**
+ * GET /v1/admin/orders/{id} — the buyer's full order view
+ * (items, timelines, the full delivery block) plus the
+ * admin extras.
+ */
+export interface AdminOrderDetail extends Order {
+  /** The buyer's account phone, masked. */
+  buyer_phone_masked: string;
+  /** Cash still due on delivery for COD orders (the receipt figure). */
+  cod_amount_due_poisha: number;
+}
+
+/**
+ * GET /v1/admin/orders — the oversight queue: search
+ * (phone exact / order-id prefix / name / store),
+ * status / payment-status / pipeline / store / advance
+ * filters, sort, pagination, whole-queue summary.
+ */
 export function listAdminOrders(
   token: string,
-  params?: { status?: string; page?: number; limit?: number }
-): Promise<OrderList> {
+  params?: {
+    q?: string;
+    status?: string;
+    payment_status?: string;
+    sub_status?: string;
+    store_id?: string;
+    advance_state?: string;
+    sort?: AdminOrderSort;
+    page?: number;
+    limit?: number;
+  }
+): Promise<AdminOrderList> {
   const search = new URLSearchParams();
+  if (params?.q) search.set("q", params.q);
   if (params?.status) search.set("status", params.status);
+  if (params?.payment_status)
+    search.set("payment_status", params.payment_status);
+  if (params?.sub_status) search.set("sub_status", params.sub_status);
+  if (params?.store_id) search.set("store_id", params.store_id);
+  if (params?.advance_state)
+    search.set("advance_state", params.advance_state);
+  if (params?.sort) search.set("sort", params.sort);
   if (params?.page) search.set("page", String(params.page));
   if (params?.limit) search.set("limit", String(params.limit));
   const qs = search.toString();
   return call(`/v1/admin/orders${qs ? `?${qs}` : ""}`, { token });
+}
+
+/** GET /v1/admin/orders/{id} — one order's admin detail. */
+export function getAdminOrder(
+  tok: string,
+  orderId: string
+): Promise<AdminOrderDetail> {
+  return call(`/v1/admin/orders/${encodeURIComponent(orderId)}`, {
+    token: tok,
+  });
+}
+
+/**
+ * GET /v1/admin/sub-orders/{id}/invoice — the per-seller
+ * legal invoice, admin read (the buyer/seller invoice
+ * calls 403 for admins, so the admin detail uses this).
+ */
+export function getAdminInvoice(
+  tok: string,
+  subOrderId: string
+): Promise<Invoice> {
+  return call(
+    `/v1/admin/sub-orders/${encodeURIComponent(subOrderId)}/invoice`,
+    { token: tok }
+  );
 }
 
 /**

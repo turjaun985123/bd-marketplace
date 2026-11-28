@@ -2083,6 +2083,10 @@ pub fn build_app(state: AppState) -> Router {
             get(follows::list_admin_store_followers_handler),
         )
         .route("/v1/admin/orders", get(admin::list_orders_handler))
+        .route(
+            "/v1/admin/orders/:id",
+            get(admin::get_order_detail_handler),
+        )
         .route("/v1/admin/payouts", get(admin::list_payouts_handler))
         .route(
             "/v1/admin/payouts/:id",

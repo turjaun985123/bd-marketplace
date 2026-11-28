@@ -843,3 +843,32 @@ a.queue-row:focus-visible, .kpi-tile--link:focus-visible { outline: 2px solid va
   .payout-instruction { border: none; max-width: none; }
   .payout-instruction .payout-account-number { font-size: 1.6rem; }
 }
+
+/* Admin orders remake — the oversight queue: whole-queue
+   summary chips, filter chip rows, and the expanded
+   detail (delivery / payment / money / per-store
+   timelines). Cards reuse the payouts remake's card
+   classes; only the orders-specific pieces live here.
+   Token colours only. */
+.summary-chips { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: var(--space-3); margin-bottom: var(--space-4); }
+.chip { border: 1px solid var(--border); border-radius: var(--radius); padding: var(--space-3); background: var(--surface); display: grid; gap: var(--space-1); }
+.chip-warning { border-color: var(--accent-500); }
+.chip-danger { border-color: var(--danger-700); }
+.chip-label { color: var(--text-muted); font-size: var(--text-sm); font-weight: 600; }
+.chip-value { font-size: 1.4rem; font-weight: 700; line-height: 1.2; }
+.chip-sub { color: var(--text-muted); font-size: var(--text-sm); display: flex; align-items: center; gap: var(--space-1); flex-wrap: wrap; }
+.chip-row { display: flex; gap: var(--space-2); flex-wrap: wrap; margin-bottom: var(--space-2); }
+.order-title-row { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
+.detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: var(--space-3) var(--space-4); }
+.detail-grid h4 { margin: var(--space-2) 0 var(--space-1); }
+.detail-grid h4:first-child { margin-top: 0; }
+.detail-wide { grid-column: 1 / -1; }
+.money-lines { list-style: none; padding: 0; margin: 0; }
+.money-lines li { display: flex; justify-content: space-between; align-items: center; gap: var(--space-3); padding: var(--space-1) 0; border-bottom: 1px solid var(--border); }
+.money-lines li:last-child { border-bottom: none; }
+.money-lines .money-total { font-weight: 700; }
+.item-lines { list-style: none; padding: 0; margin: var(--space-1) 0; }
+.item-lines li { padding: var(--space-1) 0; border-bottom: 1px solid var(--border); }
+.item-lines li:last-child { border-bottom: none; }
+.sub-detail { border-top: 1px solid var(--border); padding-top: var(--space-2); margin-top: var(--space-2); }
+.admin-error-text { color: var(--danger-700); font-size: var(--text-sm); }
