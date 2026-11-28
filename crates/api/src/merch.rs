@@ -947,7 +947,7 @@ pub async fn load_collection_products(
     limit: Option<i64>,
 ) -> Result<Vec<Product>, ApiError> {
     let visibility = if public_only {
-        "AND p.status = 'active' AND s.status = 'active'"
+        "AND p.status = 'active' AND s.status = 'active' AND p.admin_hidden_at IS NULL"
     } else {
         ""
     };
@@ -1905,7 +1905,7 @@ pub async fn load_categories(pool: &PgPool, limit: i64) -> Result<Vec<HomeCatego
          FROM ( \
              SELECT p.category AS category, COUNT(*)::bigint AS product_count \
              FROM products p JOIN stores s ON s.id = p.store_id \
-             WHERE p.status = 'active' AND s.status = 'active' \
+             WHERE p.status = 'active' AND s.status = 'active' AND p.admin_hidden_at IS NULL \
                AND p.category IS NOT NULL AND btrim(p.category) <> '' \
              GROUP BY p.category \
          ) cat \
@@ -1915,7 +1915,7 @@ pub async fn load_categories(pool: &PgPool, limit: i64) -> Result<Vec<HomeCatego
              JOIN stores s2 ON s2.id = p2.store_id \
              JOIN product_images pi ON pi.product_id = p2.id \
              WHERE p2.category = cat.category \
-               AND p2.status = 'active' AND s2.status = 'active' \
+               AND p2.status = 'active' AND s2.status = 'active' AND p2.admin_hidden_at IS NULL \
              ORDER BY (SELECT COALESCE(SUM(oi.quantity), 0)::bigint \
                        FROM order_items oi \
                        JOIN sub_orders so ON so.id = oi.sub_order_id \
@@ -2021,7 +2021,7 @@ pub async fn build_home_feed(pool: &PgPool, now: DateTime<Utc>) -> Result<HomeFe
         &format!(
             "SELECT {PRODUCT_COLUMNS} FROM products p JOIN stores s ON s.id = p.store_id \
              {PRODUCT_RATING_JOIN} \
-             WHERE p.status = 'active' AND s.status = 'active' \
+             WHERE p.status = 'active' AND s.status = 'active' AND p.admin_hidden_at IS NULL \
              ORDER BY p.created_at DESC LIMIT {HOME_RAIL_LIMIT}"
         ),
         now,
@@ -2032,7 +2032,7 @@ pub async fn build_home_feed(pool: &PgPool, now: DateTime<Utc>) -> Result<HomeFe
         &format!(
             "SELECT {PRODUCT_COLUMNS} FROM products p JOIN stores s ON s.id = p.store_id \
              {PRODUCT_RATING_JOIN} \
-             WHERE p.status = 'active' AND s.status = 'active' AND rv.rating_count > 0 \
+             WHERE p.status = 'active' AND s.status = 'active' AND p.admin_hidden_at IS NULL AND rv.rating_count > 0 \
              ORDER BY rv.rating_avg DESC NULLS LAST, rv.rating_count DESC, \
              p.created_at DESC LIMIT {HOME_RAIL_LIMIT}"
         ),
@@ -2044,7 +2044,7 @@ pub async fn build_home_feed(pool: &PgPool, now: DateTime<Utc>) -> Result<HomeFe
         &format!(
             "SELECT {PRODUCT_COLUMNS} FROM products p JOIN stores s ON s.id = p.store_id \
              {PRODUCT_RATING_JOIN} \
-             WHERE p.status = 'active' AND s.status = 'active' \
+             WHERE p.status = 'active' AND s.status = 'active' AND p.admin_hidden_at IS NULL \
              ORDER BY sold_count DESC, p.created_at DESC LIMIT {HOME_RAIL_LIMIT}"
         ),
         now,
@@ -2059,7 +2059,7 @@ pub async fn build_home_feed(pool: &PgPool, now: DateTime<Utc>) -> Result<HomeFe
         &format!(
             "SELECT {PRODUCT_COLUMNS} FROM products p JOIN stores s ON s.id = p.store_id \
              {PRODUCT_RATING_JOIN} \
-             WHERE p.status = 'active' AND s.status = 'active' \
+             WHERE p.status = 'active' AND s.status = 'active' AND p.admin_hidden_at IS NULL \
                AND EXISTS (SELECT 1 FROM promotions pr \
                            WHERE pr.product_id = p.id AND pr.status = 'active' \
                              AND pr.starts_at <= now() AND pr.ends_at > now()) \
@@ -2075,7 +2075,7 @@ pub async fn build_home_feed(pool: &PgPool, now: DateTime<Utc>) -> Result<HomeFe
         "SELECT s.id, s.slug, s.name, s.logo_url, s.banner_url, s.brand_color, \
                 s.verified_tier, COUNT(p.id)::bigint AS product_count \
          FROM stores s \
-         LEFT JOIN products p ON p.store_id = s.id AND p.status = 'active' \
+         LEFT JOIN products p ON p.store_id = s.id AND p.status = 'active' AND p.admin_hidden_at IS NULL \
          WHERE s.status = 'active' AND s.verified_tier <> 'unverified' \
          GROUP BY s.id \
          ORDER BY product_count DESC, s.created_at ASC LIMIT $1",
@@ -2136,7 +2136,7 @@ async fn load_home_flash_sale(
          JOIN products p ON p.id = fsi.product_id \
          JOIN stores s ON s.id = p.store_id \
          {PRODUCT_RATING_JOIN} \
-         WHERE fsi.flash_sale_id = $1 AND p.status = 'active' AND s.status = 'active' \
+         WHERE fsi.flash_sale_id = $1 AND p.status = 'active' AND s.status = 'active' AND p.admin_hidden_at IS NULL \
          ORDER BY (p.price_poisha - fsi.sale_price_poisha) DESC, p.created_at DESC \
          LIMIT $2"
     ))

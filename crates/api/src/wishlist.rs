@@ -24,6 +24,15 @@
 //!   current visibility: the list is the user's own record of
 //!   what they saved, and the product page itself enforces
 //!   visibility when they click through.
+//! - ONE exception (admin products remake): a product the
+//!   PLATFORM has taken down is filtered out of the list.
+//!   A seller withdrawing their own listing is the seller's
+//!   business and the saved row above stands; a platform
+//!   removal is the stronger act — the listing was removed
+//!   for cause, and the wishlist must not keep presenting
+//!   it with a live price and photo. The saved ROW is not
+//!   deleted: if an admin restores the product, it returns
+//!   to the list.
 
 use axum::{
     extract::{Path, State},
@@ -114,7 +123,8 @@ pub async fn list_wishlist(pool: &PgPool, user_id: Uuid) -> Result<WishlistList,
          JOIN products p ON p.id = w.product_id \
          JOIN stores s ON s.id = p.store_id \
          {PRODUCT_RATING_JOIN} \
-         WHERE w.user_id = $1 ORDER BY w.created_at DESC"
+         WHERE w.user_id = $1 AND p.admin_hidden_at IS NULL \
+         ORDER BY w.created_at DESC"
     ))
     .bind(user_id)
     .fetch_all(pool)

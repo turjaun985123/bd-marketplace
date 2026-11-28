@@ -51,6 +51,28 @@
 //! advance populations and today figures so the two
 //! surfaces agree.
 //!
+//! Admin products remake: the products surface is new —
+//! before it, an admin could not see the catalogue
+//! cross-store at all, and the only lever on a bad
+//! listing was suspending the seller's whole store. The
+//! queue is the shared product view (products are public
+//! data — nothing here needs masking) plus store context;
+//! the detail adds the gallery, ALL variants, a sales
+//! block and the product's audit history (real here,
+//! unlike orders: takedown actions DO target products).
+//! The one admin power is takedown/restore: a platform
+//! FLAG on the product row (migration 0078), orthogonal
+//! to the seller's own status, so restore returns the
+//! product to exactly its seller-chosen state. Takedown
+//! REQUIRES a reason and restore REQUIRES a note (the
+//! restore-note requirement consciously diverges from
+//! store reactivation: a takedown is a content
+//! determination, and the note is the only record of why
+//! another admin reversed it). Every public read path
+//! filters the flag; checkout refuses a taken-down line
+//! in its locked validation loop; the full blast-radius
+//! list is in the README's remake note.
+//!
 //! Settings: rows in `platform_settings` override startup values
 //! at read time — `commission_bps` beats the startup
 //! `COMMISSION_RATE_BPS`, and `min_payout_poisha` beats the domain
@@ -90,14 +112,17 @@ use chrono::{DateTime, Utc};
 use domain::{
     bn_to_en_digits, can_transition_payout, is_valid_payout_status, mask_phone,
     normalize_bd_phone, parse_setting_i64, search_like_pattern, to_local_phone,
-    validate_advance_bps, validate_advance_threshold, validate_commission_bps,
-    validate_order_list_sort, validate_payout_list_sort, validate_payout_rejection_reason,
-    validate_payment_reference, validate_plan_free_product_cap, validate_promotion_price_per_day,
-    validate_store_list_sort, validate_subscription_price, validate_suspension_note, OrderSort,
-    PayoutSort, StoreSort, ADVANCE_PERCENT_BPS_KEY, ADVANCE_THRESHOLD_KEY, COMMISSION_BPS_KEY,
-    KYC_PAYOUT_GATE_KEY, MIN_PAYOUT_KEY, MIN_PAYOUT_POISHA, NOTIFICATION_STORE_REACTIVATED,
-    NOTIFICATION_STORE_SUSPENDED, PLAN_BUSINESS, PLAN_FREE_PRODUCT_CAP_KEY, PLAN_PRO,
-    PROMOTION_PRICE_PER_DAY_KEY, SUBSCRIPTION_PRICE_BUSINESS_KEY, SUBSCRIPTION_PRICE_PRO_KEY,
+    validate_admin_product_list_sort, validate_advance_bps, validate_advance_threshold,
+    validate_commission_bps, validate_order_list_sort, validate_payout_list_sort,
+    validate_payout_rejection_reason, validate_payment_reference, validate_plan_free_product_cap,
+    validate_product_restore_note, validate_product_takedown_reason,
+    validate_promotion_price_per_day, validate_store_list_sort, validate_subscription_price,
+    validate_suspension_note, OrderSort, PayoutSort, ProductSort, StoreSort,
+    ADVANCE_PERCENT_BPS_KEY, ADVANCE_THRESHOLD_KEY, COMMISSION_BPS_KEY, KYC_PAYOUT_GATE_KEY,
+    MIN_PAYOUT_KEY, MIN_PAYOUT_POISHA, NOTIFICATION_PRODUCT_RESTORED,
+    NOTIFICATION_PRODUCT_TAKEN_DOWN, NOTIFICATION_STORE_REACTIVATED, NOTIFICATION_STORE_SUSPENDED,
+    PLAN_BUSINESS, PLAN_FREE_PRODUCT_CAP_KEY, PLAN_PRO, PROMOTION_PRICE_PER_DAY_KEY,
+    SUBSCRIPTION_PRICE_BUSINESS_KEY, SUBSCRIPTION_PRICE_PRO_KEY,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
@@ -107,8 +132,11 @@ use crate::audit::record_admin_action;
 use crate::auth::{load_user, AuthUser, User};
 use crate::orders::{load_order, Order};
 use crate::payouts::{Earnings, Payout};
-use crate::products::clamp_pagination;
-use crate::stores::Store;
+use crate::products::{
+    clamp_pagination, get_product_by_id, with_stock_status, Product, EFFECTIVE_STOCK_SQL,
+    PRODUCT_COLUMNS, PRODUCT_RATING_JOIN,
+};
+use crate::stores::{get_store_by_id, Store};
 use crate::{ApiError, AppState};
 
 /// The platform's public name, reported by the settings endpoint.
@@ -1537,6 +1565,596 @@ pub async fn get_admin_order_detail(
 }
 
 // ---------------------------------------------------------------------------
+// Products: cross-store queue + takedown/restore (admin products remake)
+// ---------------------------------------------------------------------------
+
+/// One product in the admin queue: the shared product
+/// view (the same materialisation every product surface
+/// uses — effective stock, rating, sold count, live flash
+/// price, and the takedown state on the row itself) plus
+/// the store it belongs to. Products are public data, so
+/// nothing here is masked; no seller phone is carried at
+/// all (the store detail is one click away for that).
+#[derive(Debug, Serialize)]
+pub struct AdminProduct {
+    #[serde(flatten)]
+    pub product: Product,
+    pub store_name: String,
+    pub store_status: String,
+}
+
+/// Whole-queue counts for the admin product list (admin
+/// products remake): by seller status, the taken-down
+/// worklist size, live-catalogue stock alerts and
+/// image-less listings, over ALL products — deliberately
+/// UNFILTERED, in the store summary's style: the summary
+/// describes the platform, not the page. `out_of_stock`
+/// counts only products a buyer could otherwise see
+/// (active and not taken down), matching the overview
+/// metrics' stock alerts.
+#[derive(Debug, Serialize)]
+pub struct AdminProductSummary {
+    pub total: i64,
+    pub draft: i64,
+    pub active: i64,
+    pub archived: i64,
+    pub taken_down: i64,
+    pub out_of_stock: i64,
+    pub no_image: i64,
+}
+
+/// A page of admin products plus the total count and the
+/// whole-queue summary.
+#[derive(Debug, Serialize)]
+pub struct AdminProductList {
+    pub items: Vec<AdminProduct>,
+    pub total: i64,
+    pub page: i64,
+    pub limit: i64,
+    pub summary: AdminProductSummary,
+}
+
+/// The whole-queue summary query (admin products
+/// remake), in the payout summary's FILTER-count style.
+async fn product_summary(pool: &PgPool) -> Result<AdminProductSummary, ApiError> {
+    #[derive(FromRow)]
+    struct ProductSummaryRow {
+        total: i64,
+        draft: i64,
+        active: i64,
+        archived: i64,
+        taken_down: i64,
+        out_of_stock: i64,
+        no_image: i64,
+    }
+    let row: ProductSummaryRow = sqlx::query_as(&format!(
+        "SELECT COUNT(*)::bigint AS total, \
+           (COUNT(*) FILTER (WHERE p.status = 'draft'))::bigint AS draft, \
+           (COUNT(*) FILTER (WHERE p.status = 'active'))::bigint AS active, \
+           (COUNT(*) FILTER (WHERE p.status = 'archived'))::bigint AS archived, \
+           (COUNT(*) FILTER (WHERE p.admin_hidden_at IS NOT NULL))::bigint \
+             AS taken_down, \
+           (COUNT(*) FILTER (WHERE p.status = 'active' \
+             AND p.admin_hidden_at IS NULL AND {EFFECTIVE_STOCK_SQL} <= 0))::bigint \
+             AS out_of_stock, \
+           (COUNT(*) FILTER (WHERE NOT EXISTS \
+             (SELECT 1 FROM product_images pi \
+              WHERE pi.product_id = p.id)))::bigint AS no_image \
+         FROM products p"
+    ))
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::internal("admin product summary", e))?;
+    Ok(AdminProductSummary {
+        total: row.total,
+        draft: row.draft,
+        active: row.active,
+        archived: row.archived,
+        taken_down: row.taken_down,
+        out_of_stock: row.out_of_stock,
+        no_image: row.no_image,
+    })
+}
+
+/// The filter predicates shared by the admin product
+/// list's COUNT and page queries (the orders remake's
+/// shared-filters rule: the total must count exactly the
+/// set the page draws from). Static fragments only — all
+/// values stay bound parameters. $1 = LIKE-escaped search
+/// pattern, $2 = seller status, $3 = store id,
+/// $4 = source, $5 = taken-down flag, $6 = stock state,
+/// $7 = has-images flag.
+const ADMIN_PRODUCT_FILTERS: &str = "($1::text IS NULL OR p.title ILIKE $1 \
+    OR p.title_bn ILIKE $1 OR s.name ILIKE $1 OR s.slug ILIKE $1) \
+    AND ($2::text IS NULL OR p.status = $2) \
+    AND ($3::uuid IS NULL OR p.store_id = $3) \
+    AND ($4::text IS NULL OR p.source = $4) \
+    AND ($5::boolean IS NULL OR (p.admin_hidden_at IS NOT NULL) = $5)";
+
+/// The stock-state half of the admin product filters,
+/// over the shared effective-stock expression (the
+/// variant-sum CASE — never the raw stored column, which
+/// is only a display sum once variants exist). $6 is the
+/// validated stock-state literal.
+fn admin_product_stock_filter() -> String {
+    format!(
+        "($6::text IS NULL \
+         OR ($6 = 'out_of_stock' AND {EFFECTIVE_STOCK_SQL} <= 0) \
+         OR ($6 = 'low' AND {EFFECTIVE_STOCK_SQL} \
+               BETWEEN 1 AND COALESCE(p.low_stock_threshold, 5)) \
+         OR ($6 = 'in_stock' AND {EFFECTIVE_STOCK_SQL} \
+               > COALESCE(p.low_stock_threshold, 5))) \
+         AND ($7::boolean IS NULL OR EXISTS \
+               (SELECT 1 FROM product_images pi \
+                WHERE pi.product_id = p.id) = $7)"
+    )
+}
+
+/// The ORDER BY fragment for a product-list sort — a
+/// fixed string per variant (user input never reaches
+/// the SQL text), every arm ending in the `id`
+/// tiebreaker the deterministic-order rule requires.
+/// Price sorts use the BASE price (the seller's listed
+/// price — what an admin judges a listing by); the live
+/// flash price rides on each row for display.
+fn product_order_by(sort: ProductSort) -> &'static str {
+    match sort {
+        ProductSort::Newest => "ORDER BY p.created_at DESC, p.id DESC",
+        ProductSort::Oldest => "ORDER BY p.created_at ASC, p.id ASC",
+        ProductSort::PriceAsc => "ORDER BY p.price_poisha ASC, p.id DESC",
+        ProductSort::PriceDesc => "ORDER BY p.price_poisha DESC, p.id DESC",
+        ProductSort::SoldDesc => "ORDER BY sold_count DESC, p.id DESC",
+        ProductSort::RatingDesc => {
+            "ORDER BY rating_avg DESC NULLS LAST, rating_count DESC, p.id DESC"
+        }
+    }
+}
+
+/// The Bangla label of a product status, for error
+/// prose — the same words the web's product status
+/// labels show.
+fn product_status_label_bn(status: &str) -> &str {
+    match status {
+        "draft" => "খসড়া",
+        "active" => "সক্রিয়",
+        "archived" => "আর্কাইভ",
+        _ => status,
+    }
+}
+
+/// List products for the admin queue (admin products
+/// remake): the cross-store catalogue admins never had.
+/// `q` matches title, Bangla title, store name or slug
+/// (LIKE-escaped via `domain::search_like_pattern`);
+/// `status`, `source`, `visibility` and `stock_state`
+/// filter exactly and are validated fail-closed (an
+/// unknown value is a 400 naming the allowed set, never
+/// a silently empty page); `has_images` takes `true` or
+/// `false`; `sort` is validated by the domain. The total
+/// and the items run the SAME joins and filters.
+#[allow(clippy::too_many_arguments)]
+pub async fn list_products(
+    pool: &PgPool,
+    q: Option<&str>,
+    status: Option<&str>,
+    store_id: Option<Uuid>,
+    source: Option<&str>,
+    visibility: Option<&str>,
+    stock_state: Option<&str>,
+    has_images: Option<&str>,
+    sort: Option<&str>,
+    page: Option<i64>,
+    limit: Option<i64>,
+) -> Result<AdminProductList, ApiError> {
+    let (page, limit) = clamp_pagination(page, limit);
+    let offset = (page - 1) * limit;
+    let pattern: Option<String> = q
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(search_like_pattern);
+    let status: Option<&str> = match status.map(str::trim) {
+        None | Some("") => None,
+        Some("draft") => Some("draft"),
+        Some("active") => Some("active"),
+        Some("archived") => Some("archived"),
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "status must be one of: draft, active, archived",
+            ))
+        }
+    };
+    let source: Option<&str> = match source.map(str::trim) {
+        None | Some("") => None,
+        Some("manual") => Some("manual"),
+        Some("facebook") => Some("facebook"),
+        Some("bulk") => Some("bulk"),
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "source must be one of: manual, facebook, bulk",
+            ))
+        }
+    };
+    let taken_down: Option<bool> = match visibility.map(str::trim) {
+        None | Some("") => None,
+        Some("visible") => Some(false),
+        Some("taken_down") => Some(true),
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "visibility must be one of: visible, taken_down",
+            ))
+        }
+    };
+    let stock_state: Option<&str> = match stock_state.map(str::trim) {
+        None | Some("") => None,
+        Some("in_stock") => Some("in_stock"),
+        Some("low") => Some("low"),
+        Some("out_of_stock") => Some("out_of_stock"),
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "stock_state must be one of: in_stock, low, out_of_stock",
+            ))
+        }
+    };
+    let has_images: Option<bool> = match has_images.map(str::trim) {
+        None | Some("") => None,
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "has_images must be one of: true, false",
+            ))
+        }
+    };
+    let sort = validate_admin_product_list_sort(sort).map_err(ApiError::bad_request)?;
+
+    let filters = format!("{ADMIN_PRODUCT_FILTERS} AND {}", admin_product_stock_filter());
+    let total: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM products p \
+         JOIN stores s ON s.id = p.store_id \
+         WHERE {filters}"
+    ))
+    .bind(&pattern)
+    .bind(status)
+    .bind(store_id)
+    .bind(source)
+    .bind(taken_down)
+    .bind(stock_state)
+    .bind(has_images)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::internal("count admin products", e))?;
+
+    let mut items: Vec<Product> = sqlx::query_as(&format!(
+        "SELECT {PRODUCT_COLUMNS} FROM products p \
+         JOIN stores s ON s.id = p.store_id {PRODUCT_RATING_JOIN} \
+         WHERE {filters} {} LIMIT $8 OFFSET $9",
+        product_order_by(sort)
+    ))
+    .bind(&pattern)
+    .bind(status)
+    .bind(store_id)
+    .bind(source)
+    .bind(taken_down)
+    .bind(stock_state)
+    .bind(has_images)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::internal("list admin products", e))?
+    .into_iter()
+    .map(with_stock_status)
+    .collect();
+    // Live flash prices attach like every product surface.
+    crate::merch::attach_flash_prices(pool, &mut items, Utc::now()).await?;
+
+    // Store context for the page's rows, in one query —
+    // the rows' own store ids are the only ones read.
+    let page_store_ids: Vec<Uuid> = items.iter().map(|item| item.store_id).collect();
+    let store_rows: Vec<(Uuid, String, String)> = sqlx::query_as(
+        "SELECT id, name, status FROM stores WHERE id = ANY($1)",
+    )
+    .bind(&page_store_ids)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::internal("load admin product stores", e))?;
+    let store_by_id: std::collections::HashMap<Uuid, (String, String)> = store_rows
+        .into_iter()
+        .map(|(id, name, status)| (id, (name, status)))
+        .collect();
+
+    let summary = product_summary(pool).await?;
+
+    Ok(AdminProductList {
+        items: items
+            .into_iter()
+            .map(|product| {
+                let (store_name, store_status) = store_by_id
+                    .get(&product.store_id)
+                    .cloned()
+                    .unwrap_or_default();
+                AdminProduct {
+                    product,
+                    store_name,
+                    store_status,
+                }
+            })
+            .collect(),
+        total,
+        page,
+        limit,
+        summary,
+    })
+}
+
+/// The store context on the admin product detail: the
+/// payout detail's slim-summary precedent (identity,
+/// status, tier) — the full store picture is the admin
+/// store detail's job, one link away.
+#[derive(Debug, Serialize)]
+pub struct AdminProductStoreSummary {
+    pub id: Uuid,
+    pub slug: String,
+    pub name: String,
+    pub status: String,
+    pub verified_tier: String,
+}
+
+/// The sales block on the admin product detail: what the
+/// ledger says this product has done. `goods_poisha` is
+/// the SUM of the order lines' stored totals over
+/// NON-CANCELLED sub-orders (the analytics top-products
+/// population): ordered goods value from the checkout
+/// snapshots — NOT earnings (commission, discounts and
+/// gift cards all move the seller's take away from this
+/// figure; the seller's balance is the earnings truth).
+/// Delivered units are the product view's own
+/// `sold_count`, the platform's one sold definition.
+#[derive(Debug, Serialize)]
+pub struct AdminProductSales {
+    pub goods_poisha: i64,
+    pub units_ordered: i64,
+}
+
+/// One product's admin detail: the queue row plus the
+/// gallery, ALL variants (inactive included — a
+/// deactivated variant is part of the listing being
+/// judged), the store summary, the sales block, and the
+/// product's audit history (takedowns and restores DO
+/// target products, so the history is real signal here,
+/// not the theatre the orders remake cut).
+#[derive(Debug, Serialize)]
+pub struct AdminProductDetail {
+    #[serde(flatten)]
+    pub item: AdminProduct,
+    pub store: AdminProductStoreSummary,
+    pub images: Vec<crate::product_images::GalleryImageView>,
+    pub variants: Vec<crate::variants::AdminVariantView>,
+    pub sales: AdminProductSales,
+    pub audit_history: Vec<crate::audit::AdminAuditEntry>,
+}
+
+/// Read one product's admin detail. The shared product
+/// loader runs first and 404s before any extra read
+/// (the payout/store detail order) — and it is the
+/// UNSHARED-visibility loader: admins see drafts,
+/// archived products and taken-down products alike.
+pub async fn get_admin_product_detail(
+    pool: &PgPool,
+    product_id: Uuid,
+) -> Result<AdminProductDetail, ApiError> {
+    let product = get_product_by_id(pool, product_id).await?;
+    let store = get_store_by_id(pool, product.store_id).await?;
+    let images = crate::product_images::load_product_gallery(pool, product_id).await?;
+    let variants = crate::variants::load_all_variants(pool, &product).await?;
+    let (goods_poisha, units_ordered): (i64, i64) = sqlx::query_as(
+        "SELECT COALESCE(SUM(oi.line_total_poisha), 0)::bigint, \
+         COALESCE(SUM(oi.quantity), 0)::bigint \
+         FROM order_items oi \
+         JOIN sub_orders so ON so.id = oi.sub_order_id \
+         WHERE oi.product_id = $1 AND so.status <> 'cancelled'",
+    )
+    .bind(product_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::internal("load admin product sales", e))?;
+    let audit_history =
+        crate::audit::list_audit_for_target(pool, "product", &product_id.to_string(), 20)
+            .await?;
+    Ok(AdminProductDetail {
+        item: AdminProduct {
+            store_name: store.name.clone(),
+            store_status: store.status.clone(),
+            product,
+        },
+        store: AdminProductStoreSummary {
+            id: store.id,
+            slug: store.slug,
+            name: store.name,
+            status: store.status,
+            verified_tier: store.verified_tier,
+        },
+        images,
+        variants,
+        sales: AdminProductSales {
+            goods_poisha,
+            units_ordered,
+        },
+        audit_history,
+    })
+}
+
+/// Take one product down, or restore a taken-down one
+/// (admin products remake). Returns the shared product
+/// view.
+///
+/// The gates, in the order they fire (the
+/// payouts/verifications/stores precedence):
+///
+/// 1. INPUT (400): the note — a takedown's REQUIRED
+///    reason ([`validate_product_takedown_reason`]) or a
+///    restore's REQUIRED note
+///    ([`validate_product_restore_note`]; restore is
+///    note-gated by deliberate divergence from store
+///    reactivation — see the module doc).
+/// 2. LOCKS: the product's store row, then the product
+///    row, `FOR UPDATE` inside the transition
+///    transaction (404 when the product is absent) — the
+///    store-first lock order every money path here uses.
+/// 3. NO-OP (409): taking down an already-taken-down
+///    product, or restoring one that stands, is refused,
+///    naming the current state. Nothing is written: no
+///    stamp bump, no audit row, no notice — and a second
+///    admin's restore can never silently erase a
+///    re-takedown that landed after their screen loaded,
+///    because the legality is re-read under the lock.
+/// 4. WRITE + AUDIT + NOTICE, one transaction: the flag
+///    columns (set on takedown; cleared on restore —
+///    restore never touches the seller's `status`), ONE
+///    audit row whose detail contractually carries the
+///    reason (on restore: the note PLUS the outgoing
+///    reason and hider, copied BEFORE the row is
+///    cleared, so clearing never destroys the only
+///    copy), and the `product_taken_down` /
+///    `product_restored` notice to the store owner,
+///    enqueued through the one funnel in `notices` with
+///    the reason copied into its payload at takedown
+///    time.
+///
+/// Takedown is allowed whatever the seller's status and
+/// whatever the store's status: a draft about to be
+/// published, and a suspended store's product that must
+/// stay down after the store is reactivated, are exactly
+/// the cases the flag exists for.
+pub async fn set_product_takedown(
+    pool: &PgPool,
+    admin_id: Uuid,
+    product_id: Uuid,
+    taken_down: bool,
+    note: Option<&str>,
+) -> Result<Product, ApiError> {
+    let note: String = if taken_down {
+        validate_product_takedown_reason(note.unwrap_or(""))
+            .map_err(ApiError::bad_request)?
+    } else {
+        validate_product_restore_note(note.unwrap_or("")).map_err(ApiError::bad_request)?
+    };
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| ApiError::internal("begin product takedown", e))?;
+    let store_id: Uuid = sqlx::query_scalar("SELECT store_id FROM products WHERE id = $1")
+        .bind(product_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ApiError::internal("load product store for takedown", e))?
+        .ok_or_else(|| ApiError::not_found("product not found"))?;
+    let store_name: String =
+        sqlx::query_scalar("SELECT name FROM stores WHERE id = $1 FOR UPDATE")
+            .bind(store_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| ApiError::internal("lock store for product takedown", e))?;
+    #[derive(FromRow)]
+    struct LockedProduct {
+        title: String,
+        status: String,
+        admin_hidden_at: Option<DateTime<Utc>>,
+        admin_hidden_reason: Option<String>,
+        admin_hidden_by_user_id: Option<Uuid>,
+    }
+    let current: LockedProduct = sqlx::query_as(
+        "SELECT title, status, admin_hidden_at, admin_hidden_reason, \
+         admin_hidden_by_user_id FROM products WHERE id = $1 FOR UPDATE",
+    )
+    .bind(product_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| ApiError::internal("lock product for takedown", e))?;
+    let is_hidden = current.admin_hidden_at.is_some();
+    if taken_down && is_hidden {
+        return Err(ApiError::conflict(
+            "পণ্যটি ইতিমধ্যে প্ল্যাটফর্ম থেকে সরিয়ে নেওয়া আছে — this product is already taken down",
+        ));
+    }
+    if !taken_down && !is_hidden {
+        return Err(ApiError::conflict(format!(
+            "পণ্যটি সরিয়ে নেওয়া হয়নি (বর্তমান অবস্থা: {}) — this product is not taken down",
+            product_status_label_bn(&current.status)
+        )));
+    }
+    if taken_down {
+        sqlx::query(
+            "UPDATE products SET admin_hidden_at = now(), \
+             admin_hidden_by_user_id = $2, admin_hidden_reason = $3, \
+             updated_at = now() WHERE id = $1",
+        )
+        .bind(product_id)
+        .bind(admin_id)
+        .bind(&note)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::internal("take product down", e))?;
+    } else {
+        sqlx::query(
+            "UPDATE products SET admin_hidden_at = NULL, \
+             admin_hidden_by_user_id = NULL, admin_hidden_reason = NULL, \
+             updated_at = now() WHERE id = $1",
+        )
+        .bind(product_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::internal("restore product", e))?;
+    }
+    let (action, notice_kind, detail) = if taken_down {
+        (
+            "product.takedown",
+            NOTIFICATION_PRODUCT_TAKEN_DOWN,
+            serde_json::json!({
+                "reason": note,
+                "store_id": store_id.to_string(),
+                "previous_status": current.status,
+            }),
+        )
+    } else {
+        (
+            "product.restore",
+            NOTIFICATION_PRODUCT_RESTORED,
+            serde_json::json!({
+                "note": note,
+                "previous_reason": current.admin_hidden_reason,
+                "previous_hidden_by": current
+                    .admin_hidden_by_user_id
+                    .map(|id| id.to_string()),
+            }),
+        )
+    };
+    record_admin_action(
+        &mut *tx,
+        admin_id,
+        action,
+        "product",
+        Some(&product_id.to_string()),
+        Some(detail),
+    )
+    .await?;
+    crate::notices::enqueue_product_status_notice(
+        &mut tx,
+        store_id,
+        &store_name,
+        product_id,
+        &current.title,
+        notice_kind,
+        taken_down.then_some(note.as_str()),
+    )
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::internal("commit product takedown", e))?;
+    get_product_by_id(pool, product_id).await
+}
+
+// ---------------------------------------------------------------------------
 // Payouts: queue + processing
 // ---------------------------------------------------------------------------
 
@@ -2942,6 +3560,54 @@ pub struct AdminPayoutsQuery {
 }
 
 #[derive(Deserialize)]
+pub struct AdminProductsQuery {
+    /// Search: product title / Bangla title, or store
+    /// name / slug substring (LIKE-escaped).
+    pub q: Option<String>,
+    /// Seller-status filter: `draft` | `active` |
+    /// `archived`; an unknown value is a 400.
+    pub status: Option<String>,
+    /// Restrict to one store's catalogue.
+    pub store_id: Option<Uuid>,
+    /// Origin filter: `manual` | `facebook` | `bulk`; an
+    /// unknown value is a 400.
+    pub source: Option<String>,
+    /// Platform-visibility filter: `visible` |
+    /// `taken_down`; an unknown value is a 400.
+    pub visibility: Option<String>,
+    /// Effective-stock filter: `in_stock` | `low` |
+    /// `out_of_stock`; an unknown value is a 400.
+    pub stock_state: Option<String>,
+    /// Image filter: `true` | `false`; an unknown value
+    /// is a 400.
+    pub has_images: Option<String>,
+    /// newest | oldest | price_asc | price_desc |
+    /// sold_desc | rating_desc.
+    pub sort: Option<String>,
+    pub page: Option<i64>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub struct TakedownProductInput {
+    /// The takedown reason. REQUIRED by the transition
+    /// (a missing body, a missing field, or a blank
+    /// reason are all the same 400) — the field stays
+    /// `Option` here so an absent body reaches the
+    /// service's validation instead of dying in the
+    /// extractor, the `RejectPayoutInput` pattern.
+    pub note: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct RestoreProductInput {
+    /// The restore note. REQUIRED by the transition, for
+    /// the same reason as the takedown reason — see
+    /// `set_product_takedown`.
+    pub note: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct AdminUsersQuery {
     pub q: Option<String>,
     pub page: Option<i64>,
@@ -3114,6 +3780,69 @@ pub async fn get_order_detail_handler(
     require_admin(&state, &user).await?;
     let pool = state.require_pool()?;
     Ok(Json(get_admin_order_detail(pool, id).await?))
+}
+
+pub async fn list_products_handler(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(query): Query<AdminProductsQuery>,
+) -> Result<Json<AdminProductList>, ApiError> {
+    require_admin(&state, &user).await?;
+    let pool = state.require_pool()?;
+    Ok(Json(
+        list_products(
+            pool,
+            query.q.as_deref(),
+            query.status.as_deref(),
+            query.store_id,
+            query.source.as_deref(),
+            query.visibility.as_deref(),
+            query.stock_state.as_deref(),
+            query.has_images.as_deref(),
+            query.sort.as_deref(),
+            query.page,
+            query.limit,
+        )
+        .await?,
+    ))
+}
+
+pub async fn get_product_detail_handler(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<AdminProductDetail>, ApiError> {
+    require_admin(&state, &user).await?;
+    let pool = state.require_pool()?;
+    Ok(Json(get_admin_product_detail(pool, id).await?))
+}
+
+pub async fn takedown_product_handler(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+    body: Option<Json<TakedownProductInput>>,
+) -> Result<Json<Product>, ApiError> {
+    let admin = require_admin(&state, &user).await?;
+    let pool = state.require_pool()?;
+    let note = body.and_then(|Json(input)| input.note);
+    Ok(Json(
+        set_product_takedown(pool, admin.id, id, true, note.as_deref()).await?,
+    ))
+}
+
+pub async fn restore_product_handler(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+    body: Option<Json<RestoreProductInput>>,
+) -> Result<Json<Product>, ApiError> {
+    let admin = require_admin(&state, &user).await?;
+    let pool = state.require_pool()?;
+    let note = body.and_then(|Json(input)| input.note);
+    Ok(Json(
+        set_product_takedown(pool, admin.id, id, false, note.as_deref()).await?,
+    ))
 }
 
 pub async fn list_payouts_handler(

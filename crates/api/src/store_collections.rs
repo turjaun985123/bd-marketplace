@@ -109,7 +109,7 @@ impl From<StoreCollectionRow> for StoreCollection {
 /// image in position order.
 fn collection_select(active_only: bool) -> String {
     let count_filter = if active_only {
-        " AND p.status = 'active'"
+        " AND p.status = 'active' AND p.admin_hidden_at IS NULL"
     } else {
         ""
     };
@@ -495,7 +495,7 @@ pub async fn public_collection(
     let total: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM store_collection_products cp \
          JOIN products p ON p.id = cp.product_id \
-         WHERE cp.collection_id = $1 AND p.status = 'active'",
+         WHERE cp.collection_id = $1 AND p.status = 'active' AND p.admin_hidden_at IS NULL",
     )
     .bind(collection.id)
     .fetch_one(pool)
@@ -505,7 +505,7 @@ pub async fn public_collection(
         "SELECT {PRODUCT_COLUMNS} FROM store_collection_products cp \
          JOIN products p ON p.id = cp.product_id \
          JOIN stores s ON s.id = p.store_id {PRODUCT_RATING_JOIN} \
-         WHERE cp.collection_id = $1 AND p.status = 'active' \
+         WHERE cp.collection_id = $1 AND p.status = 'active' AND p.admin_hidden_at IS NULL \
          ORDER BY cp.position ASC, p.id ASC LIMIT $2 OFFSET $3"
     ))
     .bind(collection.id)

@@ -126,6 +126,10 @@ struct ExistingBulkRow {
     source_ref: String,
     source: String,
     stock: i32,
+    /// Whether the platform has taken this product down
+    /// (admin products remake). A hidden row refuses the
+    /// import outright — see `apply_bulk_row`.
+    admin_hidden: bool,
 }
 
 /// Resolve one row's category against the taxonomy flats
@@ -212,7 +216,8 @@ pub async fn import_bulk_csv(
     // The store's existing sku claims, in one query.
     let skus: Vec<String> = parsed.rows.iter().map(|row| row.sku.clone()).collect();
     let existing: Vec<ExistingBulkRow> = sqlx::query_as(
-        "SELECT id, store_id, source_ref, source, stock FROM products \
+        "SELECT id, store_id, source_ref, source, stock, \
+         (admin_hidden_at IS NOT NULL) AS admin_hidden FROM products \
          WHERE store_id = $1 AND source_ref = ANY($2)",
     )
     .bind(store_id)
@@ -364,6 +369,33 @@ async fn apply_bulk_row(
             ..base
         }),
         Some(entry) => {
+            // Admin products remake: a product the
+            // PLATFORM has taken down refuses the row.
+            // The bulk update path writes title/price/
+            // stock/status directly in SQL, bypassing the
+            // single-product editor — without this guard
+            // the documented export → edit → re-import
+            // round-trip would silently rewrite a removed
+            // listing (and the demo seed, which imports
+            // through this same path, would too). The row
+            // errors in dry runs as well: "would_update"
+            // for a row the real run refuses would be a
+            // lie. Nothing is written, and the flag itself
+            // is never touched by an import.
+            if entry.admin_hidden {
+                return Ok(BulkRowOutcome {
+                    errors: vec![BulkFieldError {
+                        field: "sku".to_string(),
+                        message: format!(
+                            "product with sku '{}' has been removed by the platform and cannot be edited by import — \
+                             '{}' SKU-এর পণ্যটি প্ল্যাটফর্ম থেকে সরিয়ে নেওয়া হয়েছে; আমদানি দিয়ে সম্পাদনা করা যাবে না",
+                            row.sku, row.sku
+                        ),
+                    }],
+                    notes,
+                    ..base
+                });
+            }
             let product_id = entry.id;
             if dry_run {
                 return Ok(BulkRowOutcome {

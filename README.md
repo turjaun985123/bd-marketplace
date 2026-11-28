@@ -4649,6 +4649,132 @@ surface, and no admin order-mutating power is added:
   their only visibility, and acting on them stays with
   the buyer/seller flows.
 
+**Admin products remake (2026-11-28, the sixth surface of
+the admin remake program; 22 analysis agents):** the
+products surface did not exist — there was no
+`/admin/products` page and no admin products API, so an
+admin could not see the catalogue cross-store at all,
+and the only lever on a bad listing was suspending the
+seller's WHOLE store. The remake builds the queue, the
+detail, and a per-product takedown power:
+
+- **Model — a flag, not a status (migration 0078):**
+  `products.admin_hidden_at` (the flag itself),
+  `admin_hidden_by_user_id` and `admin_hidden_reason`
+  (CHECK 1..=500), plus a consistency CHECK coupling the
+  timestamp and the reason. A new status value was
+  rejected: it would corrupt the seller-owned lifecycle
+  (`draft`/`active`/`archived`) and restore could not
+  know the prior state. The flag is orthogonal, so
+  restore returns the product to EXACTLY its
+  seller-chosen state, and no seller write path (PATCH,
+  bulk edit, variant writes) can set or clear it.
+  Takedown is allowed on any status and on a suspended
+  store's product — deliberately, so it outlives a store
+  reactivation. No-op transitions are 409s.
+- **Reason + note discipline:** takedown REQUIRES a
+  reason (`domain::validate_product_takedown_reason`)
+  and restore REQUIRES a note
+  (`validate_product_restore_note`) — the restore-note
+  requirement consciously diverges from store
+  reactivation, which takes none: a takedown is a
+  content determination, and the restore note, stored
+  in the restore audit detail together with the
+  OUTGOING reason and hider (copied before the row is
+  cleared), is the only record of why the decision was
+  reversed. Both transitions run the remake canon:
+  validation → store-then-product row locks → legality
+  re-read under the lock → one transaction writes the
+  flag, ONE audit row (`product.takedown` /
+  `product.restore`, target `product`) and the seller
+  notice (`product_taken_down` / `product_restored`
+  kinds, the reason copied into the payload at takedown
+  time; the restored body claims only the lift, never
+  that the product is selling again).
+- **Blast radius — every public read path filters
+  `admin_hidden_at IS NULL`:** the shared list predicate
+  (with the owner exception, so the seller still manages
+  the listing and sees the reason on it), the strict
+  public-product gate (detail-adjacent reads: wishlist
+  add, recommendations bases, Q&A), the product detail
+  handler (insiders pass), faceted browse + facets +
+  suggestions, home rails / collections / flash block /
+  category tiles + cover images / featured-store counts,
+  the category tree counts + covers, store public stats,
+  follows (counts, newest picker, feed, suggestions),
+  recommendations candidates, storefront sections,
+  store collections, buy-again, the overview metrics'
+  live-catalogue counts, and the per-product review
+  list + rating summary (uniform 404) and store review
+  list + summary (excluded). The follower new-product
+  notice funnel also refuses a taken-down product, so a
+  publish-while-hidden can never ping followers.
+- **Cart / checkout decision — block, honestly:** cart
+  add refuses a taken-down product with a bilingual 400;
+  a product carted BEFORE its takedown is refused in
+  checkout's locked validation loop with a distinct
+  bilingual 400 naming the product (not the
+  seller-withdrawal wording — a different act with a
+  different remedy). The whole checkout aborts and the
+  cart survives, so a restore makes the same cart check
+  out. Reorder gains the domain skip reason
+  `product_taken_down`; the cart READ deliberately does
+  not re-validate (checkout is the validator, the
+  platform's standing split).
+- **Seller-side integrity:** the seller keeps editing,
+  restocking and exporting a taken-down product (their
+  records are not the platform's to hide); the seller
+  product list shows the takedown banner with the full
+  reason. Bulk import refuses a taken-down SKU per-row
+  and writes nothing — the export → edit → re-import
+  round-trip (and the demo seed, which imports through
+  the same path) cannot resurrect or rewrite a removed
+  listing. Creating a promotion for a taken-down product
+  is refused (its placement could never render).
+- **Queue + detail:** `GET /v1/admin/products`
+  (fail-closed filters: `status`, `store_id`, `source`,
+  `visibility`, `stock_state` over the effective-stock
+  CASE, `has_images`; LIKE-escaped search over title /
+  Bangla title / store; domain-validated sorts incl.
+  `sold_desc` / `rating_desc`; whole-queue summary) and
+  `GET /v1/admin/products/{id}` (shared product view +
+  store summary + full gallery + ALL variants incl.
+  inactive + a sales block — line-total goods over
+  non-cancelled sub-orders, labelled as ordered value,
+  NOT earnings — + the product's audit history, which is
+  real here because takedowns target products). New
+  `/admin/products` page to the remake standard, a পণ্য
+  nav entry, and the two notification kind labels.
+- **Honest limits:** there is NO product report/flag
+  signal anywhere in the platform (no report table, no
+  endpoint, no view events), so the queue is
+  inspection-based by design — no reports inbox is
+  fabricated. A running promotion is NOT paused by a
+  takedown and never refunded (the store-suspension
+  precedent for platform actions: suspension does not
+  pause subscription billing either); its placement
+  simply stops rendering — the fairness counter-argument
+  (prepaid placement burning while platform-hidden) is
+  recorded here as open policy, not silently decided.
+  Product IMAGES keep serving by URL: order history
+  thumbnails are live by design, the media handler has
+  no caller identity to gate on, and a gate would leak
+  anyway (external hotlinks, immutable caching) — when
+  the image itself is the violation, pair the takedown
+  with the media moderation surface's audited delete.
+  The takedown is per-row: the same listing re-created
+  as a new product (manually or under a new Facebook
+  post id) is a new row — repeat abuse is a store-level
+  decision, and the queue's store filter + the store
+  detail are the escalation path. Anonymous catalogue
+  reads are cached `public, max-age=30`, so a takedown
+  is effective within ~30 seconds, not instantly.
+  Granularity is whole-product only (no per-variant
+  takedown). The wider pre-existing finding that
+  draft/archived products' reviews are publicly readable
+  is NOT changed here — this remake seals the
+  platform-removal case only.
+
 **Settings override precedence:** a row in `platform_settings`
 (migration 0013) beats the startup value, which beats the
 built-in default — for commission: setting > `COMMISSION_RATE_BPS`

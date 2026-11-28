@@ -292,8 +292,9 @@ pub async fn add_cart_item(
 ) -> Result<CartView, ApiError> {
     let add_qty = validate_cart_quantity(quantity).map_err(ApiError::bad_request)?;
 
-    let statuses: Option<(String, String)> = sqlx::query_as(
-        "SELECT p.status, s.status FROM products p \
+    let statuses: Option<(String, String, bool)> = sqlx::query_as(
+        "SELECT p.status, s.status, (p.admin_hidden_at IS NOT NULL) \
+         FROM products p \
          JOIN stores s ON s.id = p.store_id WHERE p.id = $1",
     )
     .bind(product_id)
@@ -302,10 +303,24 @@ pub async fn add_cart_item(
     .map_err(|e| ApiError::internal("load product for cart", e))?;
     match statuses {
         None => return Err(ApiError::not_found("product not found")),
-        Some((product_status, store_status)) => {
+        Some((product_status, store_status, product_taken_down)) => {
             if product_status != "active" {
                 return Err(ApiError::bad_request(
                     "only active products can be added to the cart",
+                ));
+            }
+            // Admin products remake: a product the PLATFORM
+            // has taken down cannot enter a cart either. Its
+            // seller-chosen status may still read `active`
+            // (the takedown is an orthogonal flag), so the
+            // status check above cannot see it — the refusal
+            // belongs here, at the door, beside the
+            // suspended-store refusal, in the same bilingual
+            // style. The wording says removed-by-platform,
+            // never deleted: the listing can be restored.
+            if product_taken_down {
+                return Err(ApiError::bad_request(
+                    "পণ্যটি প্ল্যাটফর্ম থেকে সরিয়ে নেওয়া হয়েছে — this product has been removed by the platform and cannot be ordered right now",
                 ));
             }
             // Admin stores remake: a SUSPENDED store takes

@@ -241,6 +241,64 @@ pub async fn load_public_variants(
         .collect())
 }
 
+/// One variant as an ADMIN sees it (admin products
+/// remake): every variant of the product, active or not,
+/// because a deactivated variant is part of the listing
+/// an admin is judging. The final price is optional here
+/// — a variant whose composed price fails the domain
+/// rule is SHOWN with a null price rather than silently
+/// omitted (the public reader's rule would hide exactly
+/// the rows an admin needs to see).
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminVariantView {
+    pub id: Uuid,
+    pub name: String,
+    pub sku: Option<String>,
+    pub price_delta_poisha: i64,
+    pub final_price_poisha: Option<i64>,
+    pub stock: i32,
+    pub is_active: bool,
+    pub image_url: Option<String>,
+}
+
+/// ALL variants of one product, in picker order — the
+/// admin product detail's variant table (admin products
+/// remake). The seller's own all-variants reader
+/// (`list_variants_for_seller`) is ownership-gated, so
+/// admin reads get this pool reader instead of borrowing
+/// a seller path.
+pub async fn load_all_variants(
+    pool: &PgPool,
+    product: &Product,
+) -> Result<Vec<AdminVariantView>, ApiError> {
+    let rows: Vec<VariantRow> = sqlx::query_as(&format!(
+        "SELECT {VARIANT_COLUMNS} FROM product_variants \
+         WHERE product_id = $1 \
+         ORDER BY sort ASC, name ASC, created_at ASC"
+    ))
+    .bind(product.id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::internal("load all variants", e))?;
+    let image_urls = crate::product_images::image_urls_by_variant(pool, product.id).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| AdminVariantView {
+            final_price_poisha: variant_final_price(
+                product.price_poisha,
+                row.price_delta_poisha,
+            ),
+            image_url: image_urls.get(&row.id).cloned(),
+            id: row.id,
+            name: row.name,
+            sku: row.sku,
+            price_delta_poisha: row.price_delta_poisha,
+            stock: row.stock,
+            is_active: row.is_active,
+        })
+        .collect())
+}
+
 /// Whether the product currently has at least one ACTIVE
 /// variant — the switch that decides whether stock and
 /// prices live on the variants (cart add and checkout ask

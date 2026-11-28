@@ -220,6 +220,22 @@ pub async fn promote_product(
             "only an active product can be promoted",
         ));
     }
+    // Admin products remake: a product the PLATFORM has
+    // taken down cannot be sponsored either. Its status
+    // may still read `active` (the takedown is an
+    // orthogonal flag), and every placement surface
+    // filters it out — selling the seller a promotion
+    // whose placement can never render would take money
+    // for nothing. (A promotion already RUNNING when the
+    // takedown lands is a different case: it is neither
+    // paused nor cancelled — the store-suspension
+    // precedent for platform actions — and its placement
+    // simply stops rendering while the product is hidden.)
+    if product.admin_hidden_at.is_some() {
+        return Err(ApiError::bad_request(
+            "পণ্যটি প্ল্যাটফর্ম থেকে সরিয়ে নেওয়া হয়েছে — a product removed by the platform cannot be promoted",
+        ));
+    }
 
     // The seller's money lives in the payout store (their
     // earliest store) — the store the balance endpoint and

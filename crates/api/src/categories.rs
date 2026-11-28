@@ -247,7 +247,7 @@ async fn load_subtree_stats(pool: &PgPool) -> Result<SubtreeStats, ApiError> {
     let count_rows: Vec<(Uuid, i64)> = sqlx::query_as(
         "SELECT p.category_id, COUNT(*)::bigint FROM products p \
          JOIN stores s ON s.id = p.store_id \
-         WHERE p.status = 'active' AND s.status = 'active' \
+         WHERE p.status = 'active' AND s.status = 'active' AND p.admin_hidden_at IS NULL \
            AND p.category_id IS NOT NULL \
          GROUP BY p.category_id",
     )
@@ -275,7 +275,7 @@ async fn load_subtree_stats(pool: &PgPool) -> Result<SubtreeStats, ApiError> {
              JOIN stores s ON s.id = p.store_id \
              JOIN product_images pi ON pi.product_id = p.id \
              WHERE p.category_id = c.id \
-               AND p.status = 'active' AND s.status = 'active' \
+               AND p.status = 'active' AND s.status = 'active' AND p.admin_hidden_at IS NULL \
              ORDER BY ( \
                  SELECT COALESCE(SUM(oi.quantity), 0) FROM order_items oi \
                  JOIN sub_orders so ON so.id = oi.sub_order_id \
@@ -1436,7 +1436,8 @@ pub async fn store_category_specialties(
             .ok_or_else(|| ApiError::not_found("store not found"))?;
     let count_rows: Vec<(Uuid, i64)> = sqlx::query_as(
         "SELECT category_id, COUNT(*)::bigint FROM products \
-         WHERE store_id = $1 AND status = 'active' AND category_id IS NOT NULL \
+         WHERE store_id = $1 AND status = 'active' AND admin_hidden_at IS NULL \
+           AND category_id IS NOT NULL \
          GROUP BY category_id",
     )
     .bind(store_id)

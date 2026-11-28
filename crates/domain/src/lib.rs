@@ -3502,6 +3502,49 @@ pub fn validate_order_list_sort(sort: Option<&str>) -> Result<OrderSort, &'stati
     }
 }
 
+/// The admin product queue's sort orders (admin products
+/// remake). `Newest` is the default; `Oldest` surfaces
+/// the longest-standing listings; the price orders serve
+/// triage by listing value; `SoldDesc` and `RatingDesc`
+/// surface the catalogue's most consequential products
+/// first (a takedown there has the widest blast radius).
+/// The API layer maps each variant to a fixed ORDER BY
+/// fragment over the shared product projection's aliases
+/// — user input never reaches the SQL text. Named
+/// distinctly from the PUBLIC list's
+/// [`validate_product_list_sort`], whose vocabulary and
+/// semantics are a different surface's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductSort {
+    Newest,
+    Oldest,
+    PriceAsc,
+    PriceDesc,
+    SoldDesc,
+    RatingDesc,
+}
+
+/// Validate an admin product-list `sort` parameter
+/// (admin products remake): absent means
+/// [`ProductSort::Newest`]; an unknown value is an error
+/// naming the allowed set, in the style of
+/// [`validate_store_list_sort`].
+pub fn validate_admin_product_list_sort(
+    sort: Option<&str>,
+) -> Result<ProductSort, &'static str> {
+    match sort {
+        None | Some("newest") => Ok(ProductSort::Newest),
+        Some("oldest") => Ok(ProductSort::Oldest),
+        Some("price_asc") => Ok(ProductSort::PriceAsc),
+        Some("price_desc") => Ok(ProductSort::PriceDesc),
+        Some("sold_desc") => Ok(ProductSort::SoldDesc),
+        Some("rating_desc") => Ok(ProductSort::RatingDesc),
+        Some(_) => Err(
+            "sort must be one of: newest, oldest, price_asc, price_desc, sold_desc, rating_desc",
+        ),
+    }
+}
+
 /// May this user cast a helpful vote on a review (Wave 54
 /// extension)? Everyone except the review's AUTHOR: a
 /// vote is other buyers certifying the review helped
@@ -4159,6 +4202,57 @@ pub fn validate_suspension_note(raw: &str) -> Result<String, &'static str> {
     Ok(trimmed.to_string())
 }
 
+/// Maximum length of an admin's product takedown reason
+/// or restore note, in characters (admin products
+/// remake) — the same cap as the suspension note: one
+/// vocabulary of admin reasons.
+pub const MAX_TAKEDOWN_REASON_CHARS: usize = 500;
+
+/// Validate an admin's reason for taking a product down
+/// (admin products remake). The reason is REQUIRED: it
+/// is stored on the product row, written into the audit
+/// detail, shown to the seller on their product list,
+/// and quoted in the takedown notice — a seller whose
+/// listing is removed by the platform is owed the reason
+/// in every place the decision lands. Blank is an
+/// error; the value is trimmed and may be at most
+/// [`MAX_TAKEDOWN_REASON_CHARS`] characters, counted in
+/// Unicode characters. Mirrors
+/// [`validate_suspension_note`].
+pub fn validate_product_takedown_reason(raw: &str) -> Result<String, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("অপসারণের কারণ আবশ্যক (a takedown reason is required)");
+    }
+    if trimmed.chars().count() > MAX_TAKEDOWN_REASON_CHARS {
+        return Err("অপসারণের কারণ সর্বোচ্চ ৫০০ অক্ষরের হতে হবে (takedown reason must be at most 500 characters)");
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Validate an admin's note for restoring a taken-down
+/// product (admin products remake). Unlike store
+/// reactivation, which takes no note, a restore here is
+/// REQUIRED to carry one: a takedown is a content
+/// determination made for a stated reason, and an
+/// ungated restore would let any admin silently reverse
+/// another's decision — the note, stored in the restore
+/// audit detail alongside the original reason and the
+/// original taker, is the only place the disagreement
+/// is ever recorded once the product row is cleared.
+/// Same shape and cap as
+/// [`validate_product_takedown_reason`].
+pub fn validate_product_restore_note(raw: &str) -> Result<String, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("ফেরত দেওয়ার নোট আবশ্যক (a restore note is required)");
+    }
+    if trimmed.chars().count() > MAX_TAKEDOWN_REASON_CHARS {
+        return Err("ফেরত দেওয়ার নোট সর্বোচ্চ ৫০০ অক্ষরের হতে হবে (restore note must be at most 500 characters)");
+    }
+    Ok(trimmed.to_string())
+}
+
 /// The `platform_settings` key for the KYC payout gate
 /// (Wave 21). When the row holds `on`, a store must hold at
 /// least the `basic` verification tier before it can request
@@ -4480,6 +4574,25 @@ pub const NOTIFICATION_STORE_SUSPENDED: &str = "store_suspended";
 /// by an admin and can sell again. No note rides along —
 /// reactivation takes none.
 pub const NOTIFICATION_STORE_REACTIVATED: &str = "store_reactivated";
+/// Admin products remake: one product was taken down by
+/// an admin (the platform-level removal flag, migration
+/// 0078). The body says TEMPORARY (সাময়িকভাবে) and
+/// carries the admin's reason via
+/// [`NotificationVars::note`] (truncated for SMS — the
+/// full reason stands on the seller's product list). It
+/// must never imply the product was deleted: the row,
+/// its seller-chosen status, its images and its order
+/// history all survive, and an admin can restore it.
+pub const NOTIFICATION_PRODUCT_TAKEN_DOWN: &str = "product_taken_down";
+/// Admin products remake: a taken-down product was
+/// restored by an admin — the platform removal is
+/// lifted. The body claims only the lift, never that
+/// the product is selling: whether it sells again is
+/// the seller's own status choice (a product taken down
+/// while archived is restored to archived). The restore
+/// note itself does not ride along (it is recorded in
+/// the audit detail, not broadcast to the seller).
+pub const NOTIFICATION_PRODUCT_RESTORED: &str = "product_restored";
 pub const NOTIFICATION_RETURN_UPDATE: &str = "return_update";
 /// Wave 54: a store a user follows published a new product;
 /// the notice goes to each follower (see the API's
@@ -4726,6 +4839,35 @@ pub fn render_body(kind: &str, vars: &NotificationVars) -> String {
         NOTIFICATION_STORE_REACTIVATED => format!(
             "BD Marketplace: আপনার স্টোর {store} আবার চালু করা হয়েছে। এখন আবার বিক্রি করতে পারবেন।"
         ),
+        NOTIFICATION_PRODUCT_TAKEN_DOWN => {
+            // The reason is the actionable content, and it
+            // can run to 500 characters — the SMS carries
+            // a truncated reason and points at the
+            // seller's product list, where the full reason
+            // stands on the product (the
+            // store_suspended truncation rule). The
+            // wording says TEMPORARY and claims nothing
+            // stronger: nothing was deleted, the seller's
+            // own status choice is untouched, and an
+            // admin can restore the listing.
+            let product = vars.product_title.as_str();
+            let reason = if vars.note.is_empty() {
+                String::new()
+            } else {
+                let note: String = vars.note.chars().take(120).collect();
+                let ellipsis = if vars.note.chars().count() > 120 { "…" } else { "" };
+                format!(" কারণ: {note}{ellipsis}। বিস্তারিত আপনার পণ্যের তালিকায় দেখুন।")
+            };
+            format!(
+                "BD Marketplace: আপনার স্টোর {store}-এর পণ্য '{product}' প্ল্যাটফর্ম থেকে সাময়িকভাবে সরিয়ে নেওয়া হয়েছে।{reason}"
+            )
+        }
+        NOTIFICATION_PRODUCT_RESTORED => {
+            let product = vars.product_title.as_str();
+            format!(
+                "BD Marketplace: আপনার স্টোর {store}-এর পণ্য '{product}'-এর উপর থেকে প্ল্যাটফর্মের অপসারণ তুলে নেওয়া হয়েছে।"
+            )
+        }
         NOTIFICATION_RETURN_UPDATE => match vars.status.as_str() {
             "approved" => format!(
                 "BD Marketplace: আপনার রিটার্ন অনুমোদিত হয়েছে ({store}, অর্ডার #{short})। পণ্যটি ফেরত পাঠিয়ে দিন।"
@@ -6405,6 +6547,16 @@ pub enum ReorderSkipReason {
     /// `ProductUnavailable` so the buyer hears the true,
     /// fixable reason instead of "no longer sold".
     StoreSuspended,
+    /// The product itself was taken down by the platform
+    /// (admin products remake): the seller still sells
+    /// it and the store still trades, but the platform
+    /// removed this listing, so its lines cannot re-enter
+    /// a cart unless an admin restores it. Kept distinct
+    /// from `ProductUnavailable` (the seller's own
+    /// withdrawal) and from `StoreSuspended` (a
+    /// store-level stop) so the buyer hears the true
+    /// reason.
+    ProductTakenDown,
 }
 
 impl ReorderSkipReason {
@@ -6416,6 +6568,7 @@ impl ReorderSkipReason {
             ReorderSkipReason::OutOfStock => "out_of_stock",
             ReorderSkipReason::CartLimit => "cart_limit",
             ReorderSkipReason::StoreSuspended => "store_suspended",
+            ReorderSkipReason::ProductTakenDown => "product_taken_down",
         }
     }
 
@@ -6434,6 +6587,9 @@ impl ReorderSkipReason {
             }
             ReorderSkipReason::StoreSuspended => {
                 "স্টোরটি সাময়িকভাবে স্থগিত আছে — the store is temporarily suspended"
+            }
+            ReorderSkipReason::ProductTakenDown => {
+                "পণ্যটি প্ল্যাটফর্ম থেকে সরিয়ে নেওয়া হয়েছে — the product has been removed by the platform"
             }
         }
     }
@@ -6475,23 +6631,34 @@ pub enum ReorderVariantState {
 /// facts: the product's current status (`None` = the
 /// row is gone), the product's STORE's current status
 /// (`None` = the store row is gone; anything but
-/// `active` skips the line — admin stores remake), the
+/// `active` skips the line — admin stores remake),
+/// whether the platform has taken the product down
+/// (admin products remake — an orthogonal flag: the
+/// seller's status may still read `active`), the
 /// bought variant's state, the stock
 /// of the line's pool (variant stock for a variant
 /// line, product stock otherwise), the originally
 /// ordered quantity, and the room left in the cart
 /// line under [`MAX_CART_QUANTITY`] (0 when the line
 /// already sits at the cap). Checks run in report
-/// order: product, store, variant, stock, cart room — the
-/// FIRST failing one is the reported reason.
+/// order: takedown, product, store, variant, stock,
+/// cart room — the FIRST failing one is the reported
+/// reason. The takedown runs first because it is the
+/// most specific stop: a listing the platform removed
+/// is reported as removed even if the seller has since
+/// archived it too.
 pub fn reorder_decision(
     product_status: Option<&str>,
     store_status: Option<&str>,
+    product_taken_down: bool,
     variant_state: ReorderVariantState,
     stock: i64,
     requested: i64,
     cart_headroom: i64,
 ) -> ReorderDecision {
+    if product_taken_down {
+        return ReorderDecision::Skip(ReorderSkipReason::ProductTakenDown);
+    }
     if product_status != Some("active") {
         return ReorderDecision::Skip(ReorderSkipReason::ProductUnavailable);
     }
@@ -12695,6 +12862,120 @@ mod tests {
     }
 
     #[test]
+    fn takedown_reason_and_restore_note_are_required_trimmed_and_capped() {
+        assert_eq!(
+            validate_product_takedown_reason("  নকল পণ্য  ").unwrap(),
+            "নকল পণ্য"
+        );
+        assert!(validate_product_takedown_reason("").is_err());
+        assert!(validate_product_takedown_reason("   ").is_err());
+        assert!(validate_product_takedown_reason(&"x".repeat(MAX_TAKEDOWN_REASON_CHARS)).is_ok());
+        assert!(
+            validate_product_takedown_reason(&"x".repeat(MAX_TAKEDOWN_REASON_CHARS + 1)).is_err()
+        );
+        assert_eq!(
+            validate_product_restore_note("  বিক্রেতা প্রমাণ দিয়েছেন  ").unwrap(),
+            "বিক্রেতা প্রমাণ দিয়েছেন"
+        );
+        assert!(validate_product_restore_note("").is_err());
+        assert!(validate_product_restore_note("   ").is_err());
+        assert!(validate_product_restore_note(&"x".repeat(MAX_TAKEDOWN_REASON_CHARS)).is_ok());
+        assert!(
+            validate_product_restore_note(&"x".repeat(MAX_TAKEDOWN_REASON_CHARS + 1)).is_err()
+        );
+    }
+
+    #[test]
+    fn admin_product_list_sort_names_its_allowed_set() {
+        assert_eq!(validate_admin_product_list_sort(None).unwrap(), ProductSort::Newest);
+        assert_eq!(
+            validate_admin_product_list_sort(Some("newest")).unwrap(),
+            ProductSort::Newest
+        );
+        assert_eq!(
+            validate_admin_product_list_sort(Some("oldest")).unwrap(),
+            ProductSort::Oldest
+        );
+        assert_eq!(
+            validate_admin_product_list_sort(Some("price_asc")).unwrap(),
+            ProductSort::PriceAsc
+        );
+        assert_eq!(
+            validate_admin_product_list_sort(Some("price_desc")).unwrap(),
+            ProductSort::PriceDesc
+        );
+        assert_eq!(
+            validate_admin_product_list_sort(Some("sold_desc")).unwrap(),
+            ProductSort::SoldDesc
+        );
+        assert_eq!(
+            validate_admin_product_list_sort(Some("rating_desc")).unwrap(),
+            ProductSort::RatingDesc
+        );
+        assert_eq!(
+            validate_admin_product_list_sort(Some("")).unwrap_err(),
+            "sort must be one of: newest, oldest, price_asc, price_desc, sold_desc, rating_desc"
+        );
+        assert!(validate_admin_product_list_sort(Some("cheapest")).is_err());
+        assert!(validate_admin_product_list_sort(Some("PriceAsc")).is_err());
+    }
+
+    #[test]
+    fn product_takedown_notification_bodies_are_honest() {
+        let mut vars = NotificationVars {
+            store_name: "ঢাকা ফ্যাশন".to_string(),
+            product_title: "নকল ঘড়ি".to_string(),
+            note: "নকল পণ্য বিক্রির প্রমাণ মিলেছে".to_string(),
+            ..NotificationVars::default()
+        };
+        let taken_down = render_body(NOTIFICATION_PRODUCT_TAKEN_DOWN, &vars);
+        // Temporary, names the product, carries the
+        // reason — and never a word that implies the
+        // product was deleted.
+        assert!(taken_down.contains("সাময়িকভাবে সরিয়ে নেওয়া হয়েছে"), "{taken_down}");
+        assert!(taken_down.contains("নকল ঘড়ি"), "{taken_down}");
+        assert!(taken_down.contains("নকল পণ্য বিক্রির প্রমাণ মিলেছে"), "{taken_down}");
+        assert!(!taken_down.contains("মুছে ফেলা"), "{taken_down}");
+        assert!(!taken_down.contains("স্থায়ীভাবে"), "{taken_down}");
+
+        // A long reason truncates at 120 chars with an
+        // ellipsis and points at the product list.
+        vars.note = "x".repeat(200);
+        let truncated = render_body(NOTIFICATION_PRODUCT_TAKEN_DOWN, &vars);
+        assert!(truncated.contains("…"), "{truncated}");
+        assert!(truncated.contains("পণ্যের তালিকায়"), "{truncated}");
+
+        // The restore body claims only the lift — never
+        // that the product is selling again (its status
+        // is the seller's own choice).
+        let restored = render_body(NOTIFICATION_PRODUCT_RESTORED, &vars);
+        assert!(restored.contains("অপসারণ তুলে নেওয়া হয়েছে"), "{restored}");
+        assert!(restored.contains("নকল ঘড়ি"), "{restored}");
+        assert!(!restored.contains("বিক্রি করতে পারবেন"), "{restored}");
+    }
+
+    #[test]
+    fn reorder_decision_reports_a_platform_takedown_first() {
+        use ReorderVariantState::NotApplicable;
+        // Taken down beats every other fact — even a
+        // healthy active product in an active store, and
+        // even a simultaneously archived product (the
+        // takedown is the more specific stop).
+        assert_eq!(
+            reorder_decision(Some("active"), Some("active"), true, NotApplicable, 10, 1, 99),
+            ReorderDecision::Skip(ReorderSkipReason::ProductTakenDown)
+        );
+        assert_eq!(
+            reorder_decision(Some("archived"), Some("suspended"), true, NotApplicable, 10, 1, 99),
+            ReorderDecision::Skip(ReorderSkipReason::ProductTakenDown)
+        );
+        assert_eq!(
+            ReorderSkipReason::ProductTakenDown.as_str(),
+            "product_taken_down"
+        );
+    }
+
+    #[test]
     fn store_suspension_notification_bodies_are_honest() {
         let mut vars = NotificationVars {
             store_name: "ঢাকা ফ্যাশন".to_string(),
@@ -14162,42 +14443,42 @@ mod tests {
         // Happy path: full quantity when stock and cart
         // room both allow it.
         assert_eq!(
-            reorder_decision(Some("active"), Some("active"), NotApplicable, 10, 3, 99),
+            reorder_decision(Some("active"), Some("active"), false, NotApplicable, 10, 3, 99),
             ReorderDecision::Add { quantity: 3 }
         );
         // Partial stock clamps the add — never a skip
         // while anything can be added.
         assert_eq!(
-            reorder_decision(Some("active"), Some("active"), Active, 2, 5, 99),
+            reorder_decision(Some("active"), Some("active"), false, Active, 2, 5, 99),
             ReorderDecision::Add { quantity: 2 }
         );
         // Cart headroom clamps too.
         assert_eq!(
-            reorder_decision(Some("active"), Some("active"), NotApplicable, 10, 5, 1),
+            reorder_decision(Some("active"), Some("active"), false, NotApplicable, 10, 5, 1),
             ReorderDecision::Add { quantity: 1 }
         );
         // Product gone / draft / archived.
         for status in [None, Some("draft"), Some("archived")] {
             assert_eq!(
-                reorder_decision(status, Some("active"), NotApplicable, 10, 1, 99),
+                reorder_decision(status, Some("active"), false, NotApplicable, 10, 1, 99),
                 ReorderDecision::Skip(ReorderSkipReason::ProductUnavailable)
             );
         }
         // Variant problems beat the stock check.
         for state in [Inactive, Missing, ProductGainedVariants] {
             assert_eq!(
-                reorder_decision(Some("active"), Some("active"), state, 0, 1, 99),
+                reorder_decision(Some("active"), Some("active"), false, state, 0, 1, 99),
                 ReorderDecision::Skip(ReorderSkipReason::VariantUnavailable)
             );
         }
         // Empty pool.
         assert_eq!(
-            reorder_decision(Some("active"), Some("active"), NotApplicable, 0, 1, 99),
+            reorder_decision(Some("active"), Some("active"), false, NotApplicable, 0, 1, 99),
             ReorderDecision::Skip(ReorderSkipReason::OutOfStock)
         );
         // A cart line already at the cap.
         assert_eq!(
-            reorder_decision(Some("active"), Some("active"), NotApplicable, 10, 1, 0),
+            reorder_decision(Some("active"), Some("active"), false, NotApplicable, 10, 1, 0),
             ReorderDecision::Skip(ReorderSkipReason::CartLimit)
         );
         // Reason codes are the report vocabulary.
@@ -14207,11 +14488,11 @@ mod tests {
         // product itself is healthy (admin stores remake);
         // a gone store row reads the same way.
         assert_eq!(
-            reorder_decision(Some("active"), Some("suspended"), NotApplicable, 10, 1, 99),
+            reorder_decision(Some("active"), Some("suspended"), false, NotApplicable, 10, 1, 99),
             ReorderDecision::Skip(ReorderSkipReason::StoreSuspended)
         );
         assert_eq!(
-            reorder_decision(Some("active"), None, NotApplicable, 10, 1, 99),
+            reorder_decision(Some("active"), None, false, NotApplicable, 10, 1, 99),
             ReorderDecision::Skip(ReorderSkipReason::StoreSuspended)
         );
         assert_eq!(ReorderSkipReason::StoreSuspended.as_str(), "store_suspended");
@@ -14357,6 +14638,7 @@ mod tests {
             reorder_decision(
                 Some("active"),
                 Some("active"),
+                false,
                 ReorderVariantState::ProductGainedVariants,
                 10,
                 1,
@@ -14366,33 +14648,33 @@ mod tests {
         );
         // A full cart line refuses even a healthy product.
         assert_eq!(
-            reorder_decision(Some("active"), Some("active"), ReorderVariantState::NotApplicable, 10, 1, 0),
+            reorder_decision(Some("active"), Some("active"), false, ReorderVariantState::NotApplicable, 10, 1, 0),
             ReorderDecision::Skip(CartLimit)
         );
         // Partial stock clamps the add to what exists.
         assert_eq!(
-            reorder_decision(Some("active"), Some("active"), ReorderVariantState::NotApplicable, 2, 5, 99),
+            reorder_decision(Some("active"), Some("active"), false, ReorderVariantState::NotApplicable, 2, 5, 99),
             ReorderDecision::Add { quantity: 2 }
         );
         // Cart headroom clamps below stock when tighter.
         assert_eq!(
-            reorder_decision(Some("active"), Some("active"), ReorderVariantState::Active, 50, 5, 3),
+            reorder_decision(Some("active"), Some("active"), false, ReorderVariantState::Active, 50, 5, 3),
             ReorderDecision::Add { quantity: 3 }
         );
         // Draft products are as unbuyable as archived ones,
         // and a deleted product (no row) likewise.
         assert_eq!(
-            reorder_decision(Some("draft"), Some("active"), ReorderVariantState::NotApplicable, 5, 1, 99),
+            reorder_decision(Some("draft"), Some("active"), false, ReorderVariantState::NotApplicable, 5, 1, 99),
             ReorderDecision::Skip(ProductUnavailable)
         );
         assert_eq!(
-            reorder_decision(None, Some("active"), ReorderVariantState::NotApplicable, 5, 1, 99),
+            reorder_decision(None, Some("active"), false, ReorderVariantState::NotApplicable, 5, 1, 99),
             ReorderDecision::Skip(ProductUnavailable)
         );
         // A missing variant row (hard-removed since) skips
         // like a deactivated one.
         assert_eq!(
-            reorder_decision(Some("active"), Some("active"), ReorderVariantState::Missing, 5, 1, 99),
+            reorder_decision(Some("active"), Some("active"), false, ReorderVariantState::Missing, 5, 1, 99),
             ReorderDecision::Skip(VariantUnavailable)
         );
         // The wire codes + bilingual messages are stable.
@@ -14471,18 +14753,18 @@ mod tests {
         // Stock exactly equal to the request adds in full —
         // the clamp is a ceiling, not a haircut.
         assert_eq!(
-            reorder_decision(Some("active"), Some("active"), NotApplicable, 4, 4, 99),
+            reorder_decision(Some("active"), Some("active"), false, NotApplicable, 4, 4, 99),
             ReorderDecision::Add { quantity: 4 }
         );
         // Headroom exactly equal to the request adds in full.
         assert_eq!(
-            reorder_decision(Some("active"), Some("active"), NotApplicable, 10, 4, 4),
+            reorder_decision(Some("active"), Some("active"), false, NotApplicable, 10, 4, 4),
             ReorderDecision::Add { quantity: 4 }
         );
         // One unit of headroom with plenty of stock adds
         // exactly one.
         assert_eq!(
-            reorder_decision(Some("active"), Some("active"), NotApplicable, 10, 4, 1),
+            reorder_decision(Some("active"), Some("active"), false, NotApplicable, 10, 4, 1),
             ReorderDecision::Add { quantity: 1 }
         );
         // A zero-quantity request can only be a skip
@@ -14490,7 +14772,7 @@ mod tests {
         // rule must not Add{0}) — it lands on the
         // quantity<=0 guard, reported as the cart limit.
         assert_eq!(
-            reorder_decision(Some("active"), Some("active"), NotApplicable, 10, 0, 99),
+            reorder_decision(Some("active"), Some("active"), false, NotApplicable, 10, 0, 99),
             ReorderDecision::Skip(ReorderSkipReason::CartLimit)
         );
     }
@@ -14569,6 +14851,7 @@ mod tests {
             ReorderSkipReason::OutOfStock,
             ReorderSkipReason::CartLimit,
             ReorderSkipReason::StoreSuspended,
+            ReorderSkipReason::ProductTakenDown,
         ] {
             let message = reason.message();
             assert!(message.contains(" — "), "{reason:?} message: {message}");

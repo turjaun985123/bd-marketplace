@@ -122,6 +122,17 @@ export interface Product {
   /** in_stock | low | out_of_stock — computed by the API (Wave 23). */
   stock_status: string;
   status: string;
+  /**
+   * When the platform took this product down (admin products
+   * remake); null while the product stands. Orthogonal to the
+   * seller's `status`: restore clears it and returns the
+   * product to exactly its seller-chosen state. Only insider
+   * and admin reads ever carry a non-null value — every public
+   * surface filters taken-down products out entirely.
+   */
+  admin_hidden_at: string | null;
+  /** The admin's takedown reason; null while the product stands. */
+  admin_hidden_reason: string | null;
   /** Weight of one unit in grams (Wave 4 — drives delivery charges). */
   weight_grams: number;
   /** manual | facebook — where the product came from (Wave 12). */
@@ -3405,6 +3416,34 @@ export interface PayoutList {
   limit: number;
 }
 
+/** Bangla label for a product status (admin products remake). */
+export function productStatusLabel(status: string): string {
+  switch (status) {
+    case "draft":
+      return "খসড়া";
+    case "active":
+      return "সক্রিয়";
+    case "archived":
+      return "আর্কাইভ";
+    default:
+      return status;
+  }
+}
+
+/** Bilingual label for a product's origin (admin products remake). */
+export function productSourceLabel(source: string): string {
+  switch (source) {
+    case "manual":
+      return "ম্যানুয়াল — Manual";
+    case "facebook":
+      return "ফেসবুক — Facebook";
+    case "bulk":
+      return "বাল্ক — Bulk";
+    default:
+      return source;
+  }
+}
+
 /** Bangla label for a store status (admin stores remake). */
 export function storeStatusLabel(status: string): string {
   switch (status) {
@@ -4641,6 +4680,96 @@ export interface AdminOrderList {
   summary: AdminOrderSummary;
 }
 
+/** Sort orders the admin product queue accepts. */
+export type AdminProductSort =
+  | "newest"
+  | "oldest"
+  | "price_asc"
+  | "price_desc"
+  | "sold_desc"
+  | "rating_desc";
+
+/**
+ * One product in the admin queue (admin products remake):
+ * the shared product view plus the store it belongs to.
+ * Products are public data — nothing here is masked, and
+ * no seller phone is carried at all.
+ */
+export interface AdminProduct extends Product {
+  store_name: string;
+  /** active | suspended */
+  store_status: string;
+}
+
+/** Whole-queue product counts (never the filtered page). */
+export interface AdminProductSummary {
+  total: number;
+  draft: number;
+  active: number;
+  archived: number;
+  /** Products the platform has taken down (any status). */
+  taken_down: number;
+  /** Active, visible products with no effective stock. */
+  out_of_stock: number;
+  /** Products with no image at all. */
+  no_image: number;
+}
+
+/** GET /v1/admin/products response envelope. */
+export interface AdminProductList {
+  items: AdminProduct[];
+  total: number;
+  page: number;
+  limit: number;
+  summary: AdminProductSummary;
+}
+
+/** The store context on the admin product detail. */
+export interface AdminProductStoreSummary {
+  id: string;
+  slug: string;
+  name: string;
+  /** active | suspended */
+  status: string;
+  /** unverified | basic | verified */
+  verified_tier: string;
+}
+
+/** One variant on the admin product detail — ALL variants,
+ * inactive included (the buyer picker shows active only). */
+export interface AdminVariantView {
+  id: string;
+  name: string;
+  sku: string | null;
+  price_delta_poisha: number;
+  /** Null when the composed price fails the domain rule. */
+  final_price_poisha: number | null;
+  stock: number;
+  is_active: boolean;
+  image_url: string | null;
+}
+
+/**
+ * GET /v1/admin/products/{id} (admin products remake): the
+ * queue row plus the store summary, the full gallery, ALL
+ * variants, the sales block, and the product's audit
+ * history (takedowns/restores target products, so the
+ * history is real).
+ */
+export interface AdminProductDetail extends AdminProduct {
+  store: AdminProductStoreSummary;
+  images: GalleryImageView[];
+  variants: AdminVariantView[];
+  sales: {
+    /** SUM of line totals over non-cancelled sub-orders —
+     * ordered goods value from snapshots, NOT earnings. */
+    goods_poisha: number;
+    /** Units over the same non-cancelled population. */
+    units_ordered: number;
+  };
+  audit_history: AdminAuditEntry[];
+}
+
 /**
  * GET /v1/admin/orders/{id} — the buyer's full order view
  * (items, timelines, the full delivery block) plus the
@@ -4696,6 +4825,93 @@ export function getAdminOrder(
 ): Promise<AdminOrderDetail> {
   return call(`/v1/admin/orders/${encodeURIComponent(orderId)}`, {
     token: tok,
+  });
+}
+
+/**
+ * GET /v1/admin/products — the cross-store catalogue queue:
+ * search (title / store), status / store / source /
+ * visibility / stock / image filters, sort, pagination,
+ * whole-queue summary.
+ */
+export function listAdminProducts(
+  token: string,
+  params?: {
+    q?: string;
+    status?: string;
+    store_id?: string;
+    source?: string;
+    visibility?: string;
+    stock_state?: string;
+    has_images?: string;
+    sort?: AdminProductSort;
+    page?: number;
+    limit?: number;
+  }
+): Promise<AdminProductList> {
+  const search = new URLSearchParams();
+  if (params?.q) search.set("q", params.q);
+  if (params?.status) search.set("status", params.status);
+  if (params?.store_id) search.set("store_id", params.store_id);
+  if (params?.source) search.set("source", params.source);
+  if (params?.visibility) search.set("visibility", params.visibility);
+  if (params?.stock_state) search.set("stock_state", params.stock_state);
+  if (params?.has_images) search.set("has_images", params.has_images);
+  if (params?.sort) search.set("sort", params.sort);
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/admin/products${qs ? `?${qs}` : ""}`, { token });
+}
+
+/** GET /v1/admin/products/{id} — one product's decision detail. */
+export function getAdminProductDetail(
+  token: string,
+  productId: string
+): Promise<AdminProductDetail> {
+  return call(`/v1/admin/products/${encodeURIComponent(productId)}`, {
+    token,
+  });
+}
+
+/**
+ * POST /v1/admin/products/{id}/takedown — take a product
+ * down platform-wide. The reason is REQUIRED (the API
+ * answers 400 without one): it is stored on the product,
+ * written into the audit detail, shown to the seller on
+ * their product list and quoted in the notice. A product
+ * already taken down is a 409.
+ */
+export function takedownAdminProduct(
+  token: string,
+  productId: string,
+  note: string
+): Promise<Product> {
+  return call(`/v1/admin/products/${encodeURIComponent(productId)}/takedown`, {
+    method: "POST",
+    token,
+    body: { note },
+  });
+}
+
+/**
+ * POST /v1/admin/products/{id}/restore — lift a takedown.
+ * A note is REQUIRED here too (unlike store reactivation):
+ * it lands in the audit detail beside the original reason
+ * and the original taker. Restore never changes the
+ * seller's own status — the product returns to exactly
+ * the state the seller chose. A product that stands is a
+ * 409.
+ */
+export function restoreAdminProduct(
+  token: string,
+  productId: string,
+  note: string
+): Promise<Product> {
+  return call(`/v1/admin/products/${encodeURIComponent(productId)}/restore`, {
+    method: "POST",
+    token,
+    body: { note },
   });
 }
 

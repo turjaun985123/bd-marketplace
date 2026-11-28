@@ -668,6 +668,15 @@ struct LockedCartItem {
     /// to pick a variant, rather than drawing on the product
     /// stock the seller has since moved into variants.
     has_active_variants: bool,
+    /// Whether the platform has taken this product down
+    /// (admin products remake). Read under the same row
+    /// lock as the stock, so a takedown racing this
+    /// checkout is seen one way or the other — never
+    /// half-applied. A cart line added BEFORE the takedown
+    /// is refused here, at the one gate every order must
+    /// pass (the cart read deliberately does not
+    /// re-validate; checkout is the validator).
+    admin_hidden: bool,
 }
 
 /// A variant row locked for checkout (`FOR UPDATE` on the
@@ -920,6 +929,7 @@ pub async fn place_order(
          p.price_poisha AS unit_price_poisha, p.stock, p.status, \
          s.status AS store_status, ci.quantity, \
          p.weight_grams, \
+         (p.admin_hidden_at IS NOT NULL) AS admin_hidden, \
          EXISTS (SELECT 1 FROM product_variants pv \
                  WHERE pv.product_id = p.id AND pv.is_active) AS has_active_variants \
          FROM cart_items ci JOIN products p ON p.id = ci.product_id \
@@ -997,6 +1007,24 @@ pub async fn place_order(
         if item.store_status == "suspended" {
             return Err(ApiError::conflict(format!(
                 "the store selling '{}' is suspended and cannot take orders right now",
+                item.title
+            )));
+        }
+        // Admin products remake: a product the platform
+        // took down AFTER it entered the cart is refused
+        // here — checkout is the re-validator, and letting
+        // the order through would sell exactly the listing
+        // the takedown exists to stop (at its flash price,
+        // if one is live). The refusal is a 400 naming the
+        // product, with wording distinct from the
+        // seller-withdrawal branch below: a takedown is
+        // the platform's act with the platform's remedy
+        // (an admin restore), not the seller's. Like every
+        // refusal in this loop it aborts the WHOLE checkout
+        // and leaves the cart intact.
+        if item.admin_hidden {
+            return Err(ApiError::bad_request(format!(
+                "পণ্যটি প্ল্যাটফর্ম থেকে সরিয়ে নেওয়া হয়েছে — product '{}' has been removed by the platform and cannot be ordered",
                 item.title
             )));
         }
@@ -1778,7 +1806,8 @@ pub struct ReorderSkipped {
     pub title: String,
     /// The domain reason code (`product_unavailable`,
     /// `variant_unavailable`, `out_of_stock`,
-    /// `cart_limit`, `store_suspended`).
+    /// `cart_limit`, `store_suspended`,
+    /// `product_taken_down`).
     pub reason: String,
     /// The buyer-facing bilingual explanation.
     pub message: String,
@@ -1811,6 +1840,11 @@ struct ReorderLine {
     /// `None` when the product row is gone (its store is
     /// unreachable too, and the product check fires first).
     store_status: Option<String>,
+    /// Whether the platform has taken the product down
+    /// (admin products remake); false when the product
+    /// row is gone (the LEFT JOIN yields NULL, and the
+    /// product check reports that case).
+    product_taken_down: bool,
     product_stock: Option<i32>,
     variant_active: Option<bool>,
     variant_stock: Option<i32>,
@@ -1845,6 +1879,7 @@ pub async fn reorder_order(
     let lines: Vec<ReorderLine> = sqlx::query_as(
         "SELECT oi.product_id, oi.variant_id, oi.title_snapshot, oi.quantity, \
          p.status AS product_status, s.status AS store_status, \
+         (p.admin_hidden_at IS NOT NULL) AS product_taken_down, \
          p.stock AS product_stock, \
          v.is_active AS variant_active, v.stock AS variant_stock, \
          EXISTS (SELECT 1 FROM product_variants pv \
@@ -1908,6 +1943,7 @@ pub async fn reorder_order(
         let decision = reorder_decision(
             line.product_status.as_deref(),
             line.store_status.as_deref(),
+            line.product_taken_down,
             variant_state,
             stock,
             i64::from(line.quantity),
@@ -2073,6 +2109,7 @@ pub async fn buy_again_rail(pool: &PgPool, user: &AuthUser) -> Result<BuyAgainLi
          JOIN stores s ON s.id = p.store_id \
          WHERE o.buyer_user_id = $1 AND o.status <> 'cancelled' \
            AND so.status <> 'cancelled' AND p.status = 'active' \
+           AND p.admin_hidden_at IS NULL \
            AND s.status = 'active' \
            AND ((NOT EXISTS (SELECT 1 FROM product_variants pv3 \
                              WHERE pv3.product_id = p.id AND pv3.is_active) \

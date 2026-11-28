@@ -143,7 +143,7 @@ pub async fn related_products(
         "SELECT {PRODUCT_COLUMNS} FROM products p \
          JOIN stores s ON s.id = p.store_id \
          {PRODUCT_RATING_JOIN} \
-         WHERE p.id <> $1 AND p.status = 'active' AND s.status = 'active' \
+         WHERE p.id <> $1 AND p.status = 'active' AND s.status = 'active' AND p.admin_hidden_at IS NULL \
          ORDER BY (\
              CASE WHEN $2::text IS NOT NULL AND p.category IS NOT NULL \
                        AND lower(p.category) = lower($2) THEN 4 ELSE 0 END \
@@ -196,7 +196,7 @@ pub async fn also_bought_products(
          JOIN products p ON p.id = co.product_id \
          JOIN stores s ON s.id = p.store_id \
          {PRODUCT_RATING_JOIN} \
-         WHERE p.status = 'active' AND s.status = 'active' \
+         WHERE p.status = 'active' AND s.status = 'active' AND p.admin_hidden_at IS NULL \
          ORDER BY co.co_count DESC, \
          rv.rating_avg DESC NULLS LAST, rv.rating_count DESC, p.created_at DESC \
          LIMIT $2"
@@ -264,7 +264,7 @@ pub async fn recommendations_for_user(
             "SELECT {PRODUCT_COLUMNS} FROM products p \
              JOIN stores s ON s.id = p.store_id \
              {PRODUCT_RATING_JOIN} \
-             WHERE p.status = 'active' AND s.status = 'active' \
+             WHERE p.status = 'active' AND s.status = 'active' AND p.admin_hidden_at IS NULL \
              AND {NOT_BOUGHT_BY_CALLER} AND {NOT_WISHLISTED_BY_CALLER} \
              ORDER BY rv.rating_avg DESC NULLS LAST, rv.rating_count DESC, \
              p.created_at DESC \
@@ -312,7 +312,7 @@ pub async fn recommendations_for_user(
          JOIN stores s ON s.id = p.store_id \
          {PRODUCT_RATING_JOIN} \
          JOIN signals ON lower(p.category) = signals.category \
-         WHERE p.status = 'active' AND s.status = 'active' \
+         WHERE p.status = 'active' AND s.status = 'active' AND p.admin_hidden_at IS NULL \
          AND {NOT_BOUGHT_BY_CALLER} AND {NOT_WISHLISTED_BY_CALLER} \
          ORDER BY signals.last_at DESC, \
          rv.rating_avg DESC NULLS LAST, rv.rating_count DESC, p.created_at DESC \

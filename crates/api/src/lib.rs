@@ -2087,6 +2087,19 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/admin/orders/:id",
             get(admin::get_order_detail_handler),
         )
+        .route("/v1/admin/products", get(admin::list_products_handler))
+        .route(
+            "/v1/admin/products/:id",
+            get(admin::get_product_detail_handler),
+        )
+        .route(
+            "/v1/admin/products/:id/takedown",
+            post(admin::takedown_product_handler),
+        )
+        .route(
+            "/v1/admin/products/:id/restore",
+            post(admin::restore_product_handler),
+        )
         .route("/v1/admin/payouts", get(admin::list_payouts_handler))
         .route(
             "/v1/admin/payouts/:id",

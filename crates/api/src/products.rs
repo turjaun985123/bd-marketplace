@@ -124,6 +124,23 @@ pub struct Product {
     #[sqlx(default)]
     pub stock_status: String,
     pub status: String,
+    /// When the platform took this product down (admin
+    /// products remake, migration 0078); null while the
+    /// product stands. The takedown is a platform flag
+    /// ORTHOGONAL to the seller's `status`: restore
+    /// clears it and returns the product to exactly its
+    /// seller-chosen state, and no seller write path can
+    /// set or clear it. A real column, selected by
+    /// `PRODUCT_COLUMNS`. The acting admin is NOT carried
+    /// here — admin identity lives in the audit log only.
+    pub admin_hidden_at: Option<DateTime<Utc>>,
+    /// The admin's takedown reason (admin products
+    /// remake), stored on the row so the seller sees why
+    /// on their own product list; null while the product
+    /// stands. Only insider and admin reads can ever
+    /// receive a non-null value: every public surface
+    /// filters taken-down rows out before serialization.
+    pub admin_hidden_reason: Option<String>,
     /// Weight of one unit in grams (Wave 4 — drives delivery charges).
     pub weight_grams: i32,
     /// Where the product came from (Wave 12): `manual` for the
@@ -247,6 +264,7 @@ pub(crate) const PRODUCT_COLUMNS: &str = "p.id, p.store_id, s.slug AS store_slug
     EXISTS (SELECT 1 FROM product_variants pv \
             WHERE pv.product_id = p.id AND pv.is_active) AS has_variants, \
     p.low_stock_threshold, p.status, \
+    p.admin_hidden_at, p.admin_hidden_reason, \
     p.weight_grams, p.source, p.source_ref, rv.rating_avg, rv.rating_count, \
     p.created_at, p.updated_at, \
     EXISTS (SELECT 1 FROM promotions pr \
@@ -344,10 +362,15 @@ pub(crate) const PRODUCT_RATING_JOIN: &str = "LEFT JOIN LATERAL (\
 /// $3 = viewer user id (or NULL; owners additionally see own non-active).
 /// Wave 10: a SUSPENDED store's products are hidden from everyone
 /// except the store's owner (who still manages their catalogue).
+/// Admin products remake: a TAKEN-DOWN product follows the
+/// same rule — hidden from everyone except the store's
+/// owner, who still sees it in their catalogue (with its
+/// takedown reason on the row) so they can fix it.
 const PRODUCT_WHERE: &str = "($1::text IS NULL OR p.title ILIKE $1 OR p.title_bn ILIKE $1) \
     AND ($2::text IS NULL OR s.slug = $2) \
     AND (p.status = 'active' OR s.owner_user_id = $3) \
-    AND (s.status = 'active' OR s.owner_user_id = $3)";
+    AND (s.status = 'active' OR s.owner_user_id = $3) \
+    AND (p.admin_hidden_at IS NULL OR s.owner_user_id = $3)";
 
 /// One page of products plus the total match count.
 #[derive(Debug, Serialize)]
@@ -505,12 +528,14 @@ pub async fn get_product_by_id(pool: &PgPool, id: Uuid) -> Result<Product, ApiEr
 /// stricter rule the discovery surfaces use (Wave 15 search,
 /// Wave 24 wishlist / recommendations): the product must be
 /// `active` and its store must be `active`, with no owner
-/// exception. Anything else — missing, draft, archived, or a
-/// suspended store's product — is the same 404, so a caller
-/// cannot probe for hidden products through these endpoints.
+/// exception. Anything else — missing, draft, archived, a
+/// suspended store's product, or a product the platform has
+/// taken down (admin products remake) — is the same 404, so
+/// a caller cannot probe for hidden products through these
+/// endpoints.
 pub async fn get_public_product(pool: &PgPool, id: Uuid) -> Result<Product, ApiError> {
     let product = get_product_by_id(pool, id).await?;
-    if product.status != "active" {
+    if product.status != "active" || product.admin_hidden_at.is_some() {
         return Err(ApiError::not_found("product not found"));
     }
     let store = get_store_by_id(pool, product.store_id).await?;
@@ -1034,7 +1059,14 @@ pub async fn get_product(
             .is_some(),
         None => false,
     };
-    if !is_owner && (product.status != "active" || store.status == "suspended") {
+    // Admin products remake: a taken-down product joins
+    // the same gate — visible only to the store's team,
+    // who manage it; everyone else gets the same 404.
+    if !is_owner
+        && (product.status != "active"
+            || store.status == "suspended"
+            || product.admin_hidden_at.is_some())
+    {
         return Err(ApiError::not_found("product not found"));
     }
     // Wave 33: the detail view carries the ACTIVE variants

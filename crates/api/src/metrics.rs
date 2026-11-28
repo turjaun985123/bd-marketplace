@@ -506,7 +506,8 @@ pub async fn get_admin_metrics(pool: &PgPool) -> Result<AdminMetrics, ApiError> 
              AS stale_shipments, \
            (SELECT COUNT(*) FROM users) AS users_total, \
            (SELECT COUNT(*) FROM stores) AS stores_total, \
-           (SELECT COUNT(*) FROM products WHERE status = 'active') \
+           (SELECT COUNT(*) FROM products \
+             WHERE status = 'active' AND admin_hidden_at IS NULL) \
              AS products_active, \
            (SELECT COUNT(*) FROM product_images) AS media_images_total, \
            (SELECT COUNT(*) FROM product_images \
@@ -585,10 +586,11 @@ pub async fn get_admin_metrics(pool: &PgPool) -> Result<AdminMetrics, ApiError> 
               FROM store_verifications WHERE status = 'pending') \
              AS verifications_oldest_age_secs, \
            (SELECT COUNT(*) FROM products p \
-             WHERE p.status = 'active' AND {effective_stock} <= 0) \
+             WHERE p.status = 'active' AND p.admin_hidden_at IS NULL \
+               AND {effective_stock} <= 0) \
              AS stock_out_of_stock, \
            (SELECT COUNT(*) FROM products p \
-             WHERE p.status = 'active' \
+             WHERE p.status = 'active' AND p.admin_hidden_at IS NULL \
                AND {effective_stock} BETWEEN 1 \
                    AND COALESCE(p.low_stock_threshold, 5)) \
              AS stock_low_stock, \

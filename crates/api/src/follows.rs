@@ -243,7 +243,8 @@ pub async fn list_follows(pool: &PgPool, user: &AuthUser) -> Result<Vec<Followed
          (SELECT COUNT(*) FROM store_follows fc WHERE fc.store_id = s.id) \
             AS follower_count, \
          (SELECT COUNT(*) FROM products p \
-          WHERE p.store_id = s.id AND p.status = 'active') AS product_count \
+          WHERE p.store_id = s.id AND p.status = 'active' \
+            AND p.admin_hidden_at IS NULL) AS product_count \
          FROM store_follows f JOIN stores s ON s.id = f.store_id \
          WHERE f.user_id = $1 AND s.status = 'active' \
          ORDER BY f.created_at DESC, s.id ASC",
@@ -273,7 +274,8 @@ pub async fn list_follows(pool: &PgPool, user: &AuthUser) -> Result<Vec<Followed
          JOIN stores s ON s.id = p.store_id {PRODUCT_RATING_JOIN} \
          JOIN (SELECT id, ROW_NUMBER() OVER (\
              PARTITION BY store_id ORDER BY created_at DESC, id DESC) AS rn \
-             FROM products WHERE status = 'active' AND store_id = ANY($1)) picked \
+             FROM products WHERE status = 'active' AND admin_hidden_at IS NULL \
+               AND store_id = ANY($1)) picked \
            ON picked.id = p.id AND picked.rn <= $2 \
          ORDER BY p.store_id ASC, p.created_at DESC"
     ))
@@ -513,6 +515,7 @@ pub async fn follows_feed(pool: &PgPool, user: &AuthUser) -> Result<Vec<Product>
         "SELECT {PRODUCT_COLUMNS} FROM store_follows f \
          JOIN stores s ON s.id = f.store_id AND s.status = 'active' \
          JOIN products p ON p.store_id = s.id AND p.status = 'active' \
+           AND p.admin_hidden_at IS NULL \
          {PRODUCT_RATING_JOIN} \
          WHERE f.user_id = $1 \
          ORDER BY p.created_at DESC, p.id DESC LIMIT $2"
@@ -594,7 +597,8 @@ pub async fn suggested_stores(
           JOIN products p ON p.id = r.product_id WHERE p.store_id = s.id) \
             AS rating_count, \
          (SELECT COUNT(*) FROM products p \
-          WHERE p.store_id = s.id AND p.status = 'active') AS product_count \
+          WHERE p.store_id = s.id AND p.status = 'active' \
+            AND p.admin_hidden_at IS NULL) AS product_count \
          FROM stores s \
          WHERE s.status = 'active' AND s.owner_user_id <> $1 \
            AND NOT EXISTS (SELECT 1 FROM store_follows f \

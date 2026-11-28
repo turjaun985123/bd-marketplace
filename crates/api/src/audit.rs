@@ -16,6 +16,15 @@
 //! - `store.suspend`, `store.reactivate` — target `store`,
 //!   detail `{status}` (plus `note` on a suspension — the
 //!   reason, required since the admin stores remake).
+//! - `product.takedown` — target `product`, detail
+//!   `{reason, store_id, previous_status}` (admin products
+//!   remake: the reason is REQUIRED and is copied here
+//!   contractually, because restore clears it from the
+//!   product row — this detail is the surviving record),
+//!   `product.restore` — detail `{note,
+//!   previous_reason, previous_hidden_by}` (the restore
+//!   note is required too, and the outgoing takedown's
+//!   reason and actor are preserved alongside it).
 //! - `settings.update` — target `platform_settings`, detail
 //!   `{changed_keys}`: the NAMES of the settings the patch
 //!   changed, never their values.

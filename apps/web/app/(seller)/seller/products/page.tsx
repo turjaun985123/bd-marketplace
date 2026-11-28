@@ -222,6 +222,17 @@ export default function SellerProductsPage() {
                   flashPricePoisha={p.flash_price_poisha}
                   flashEndsAt={p.flash_ends_at}
                 />
+                {p.admin_hidden_at !== null && (
+                  <p role="alert">
+                    ⛔ এই পণ্যটি প্ল্যাটফর্ম থেকে সাময়িকভাবে সরিয়ে নেওয়া
+                    হয়েছে — ক্রেতারা এটি দেখতে বা কিনতে পারবেন না। কারণ:{" "}
+                    {p.admin_hidden_reason ?? "—"}। পণ্যটি সম্পাদনা করতে
+                    পারবেন, কিন্তু ফেরত শুধু প্ল্যাটফর্ম অ্যাডমিন দিতে
+                    পারবেন। (This product has been temporarily removed by
+                    the platform. You can still edit it; only a platform
+                    admin can restore it.)
+                  </p>
+                )}
                 {p.flash_price_poisha !== null && (
                   <p>
                     ⚡ এই পণ্যটি এখন ফ্ল্যাশ সেলে আছে —{" "}
@@ -249,7 +260,7 @@ export default function SellerProductsPage() {
                 {imagesOpen[p.id] && token && (
                   <ImageUploader token={token} productId={p.id} />
                 )}
-                {p.status === "active" && (
+                {p.status === "active" && p.admin_hidden_at === null && (
                   <p>
                     <Link href={`/seller/promotions?product=${p.id}`}>
                       প্রমোট করুন — Promote this product

@@ -57,6 +57,18 @@
 //!   while their store is suspended: a dark store's
 //!   publishes do not ping followers about pages they
 //!   cannot open, and nothing retro-fires on reactivation.
+//! - `product_taken_down` / `product_restored` (admin
+//!   products remake) — `admin::set_product_takedown`, to
+//!   the store owner, inside the transition's own
+//!   transaction. Both kinds share the one funnel
+//!   ([`enqueue_product_status_notice`]); a taken-down
+//!   notice carries the admin's required reason, a
+//!   restored notice carries none. The wording says
+//!   TEMPORARY — a takedown deletes nothing and leaves
+//!   the seller's own status untouched. The follower
+//!   funnel above (`store_new_product`) also enqueues
+//!   NOTHING for a taken-down product: followers must
+//!   not be pinged about a listing the platform removed.
 //! - `return_update` — `returns::decide_return_request`
 //!   (approved / rejected) and `returns::mark_return_received`
 //!   (received), to the buyer.
@@ -209,10 +221,12 @@ pub async fn enqueue_store_new_product_notices(
         store_name: String,
         store_status: String,
         product_title: String,
+        product_taken_down: bool,
     }
     let product: ProductNoticeRow = sqlx::query_as(
         "SELECT p.store_id, s.name AS store_name, s.status AS store_status, \
-         p.title AS product_title \
+         p.title AS product_title, \
+         (p.admin_hidden_at IS NOT NULL) AS product_taken_down \
          FROM products p JOIN stores s ON s.id = p.store_id \
          WHERE p.id = $1",
     )
@@ -229,6 +243,19 @@ pub async fn enqueue_store_new_product_notices(
     // dark. Nothing retro-fires on reactivation either:
     // the funnel runs at publish time only.
     if product.store_status != "active" {
+        return Ok(0);
+    }
+
+    // Admin products remake: a TAKEN-DOWN product's
+    // publishes enqueue nothing either. The seller may
+    // keep editing the listing — including flipping it
+    // back to `active` while the platform flag stands —
+    // but followers must not be pinged about a product
+    // the platform removed and they cannot open. This
+    // guard is the funnel-level backstop behind every
+    // publish path (create, status flip, bulk import,
+    // Facebook import): no caller can forget it.
+    if product.product_taken_down {
         return Ok(0);
     }
 
@@ -558,5 +585,54 @@ pub async fn enqueue_store_status_notice(
     notify::enqueue(&mut *conn, owner_user_id, &phone, kind, &payload)
         .await
         .map_err(|e| ApiError::internal("enqueue store-status notification", e))?;
+    Ok(())
+}
+
+/// Enqueue the ONE seller notification for an admin
+/// product takedown or restore (`product_taken_down`,
+/// `product_restored`), called from
+/// `admin::set_product_takedown` inside the transition's
+/// own transaction, so the notice commits or rolls back
+/// with the state change it announces.
+///
+/// The store name and product title are caller-supplied
+/// PARAMETERS, never re-read: the caller has just locked
+/// and written the product inside the same transaction,
+/// and the reason is copied into the payload at takedown
+/// time — a restore racing in later can never swap or
+/// empty the reason this notice carries (the store
+/// funnel's rule). The reason rides ONLY on the
+/// taken-down kind — restore takes a note too, but that
+/// note is an admin-to-admin record in the audit detail,
+/// not broadcast to the seller.
+pub async fn enqueue_product_status_notice(
+    conn: &mut PgConnection,
+    store_id: Uuid,
+    store_name: &str,
+    product_id: Uuid,
+    product_title: &str,
+    kind: &str,
+    note: Option<&str>,
+) -> Result<(), ApiError> {
+    let (owner_user_id, phone): (Uuid, String) = sqlx::query_as(
+        "SELECT s.owner_user_id, u.phone FROM stores s \
+         JOIN users u ON u.id = s.owner_user_id WHERE s.id = $1",
+    )
+    .bind(store_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| ApiError::internal("load product-status notice recipient", e))?;
+    let mut payload = json!({
+        "store_id": store_id.to_string(),
+        "store_name": store_name,
+        "product_id": product_id.to_string(),
+        "product_title": product_title,
+    });
+    if let Some(note) = note {
+        payload["note"] = serde_json::Value::String(note.to_string());
+    }
+    notify::enqueue(&mut *conn, owner_user_id, &phone, kind, &payload)
+        .await
+        .map_err(|e| ApiError::internal("enqueue product-status notification", e))?;
     Ok(())
 }

@@ -244,6 +244,10 @@ function kindLabel(kind: string): string {
       return "স্টোর স্থগিত — Store suspended";
     case "store_reactivated":
       return "স্টোর চালু — Store reactivated";
+    case "product_taken_down":
+      return "পণ্য সরানো হয়েছে — Product taken down";
+    case "product_restored":
+      return "পণ্য ফেরত দেওয়া হয়েছে — Product restored";
     default:
       return "আপডেট — Update";
   }

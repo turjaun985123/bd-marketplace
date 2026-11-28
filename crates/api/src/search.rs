@@ -224,7 +224,7 @@ fn push_browse_conditions(
     exclude: FacetExclusion,
     taxonomy_ids: Option<&[Uuid]>,
 ) {
-    qb.push(" WHERE p.status = 'active' AND s.status = 'active'");
+    qb.push(" WHERE p.status = 'active' AND s.status = 'active' AND p.admin_hidden_at IS NULL");
     if let Some(q) = &filters.q {
         let pattern = search_like_pattern(q);
         qb.push(" AND (p.title ILIKE ");
@@ -720,7 +720,7 @@ pub async fn search_suggestions(pool: &PgPool, q: &str) -> Result<SuggestResults
                      LIMIT 1) AS image_width, \
                    similarity(p.title || ' ' || COALESCE(p.title_bn, ''), $2) AS sim \
             FROM products p JOIN stores s ON s.id = p.store_id \
-            WHERE p.status = 'active' AND s.status = 'active' \
+            WHERE p.status = 'active' AND s.status = 'active' AND p.admin_hidden_at IS NULL \
               AND (p.title ILIKE $1 OR p.title_bn ILIKE $1) \
             ORDER BY lower(p.title), sim DESC\
          ) d ORDER BY d.sim DESC LIMIT 8",
@@ -762,7 +762,7 @@ pub async fn search_suggestions(pool: &PgPool, q: &str) -> Result<SuggestResults
     let categories: Vec<SuggestedCategory> = sqlx::query_as(
         "SELECT p.category AS category, COUNT(*)::bigint AS product_count \
          FROM products p JOIN stores s ON s.id = p.store_id \
-         WHERE p.status = 'active' AND s.status = 'active' \
+         WHERE p.status = 'active' AND s.status = 'active' AND p.admin_hidden_at IS NULL \
            AND p.category IS NOT NULL \
            AND (p.title ILIKE $1 OR p.title_bn ILIKE $1) \
          GROUP BY p.category \

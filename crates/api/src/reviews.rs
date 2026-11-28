@@ -330,7 +330,15 @@ pub async fn list_product_reviews(
     sort: Option<&str>,
 ) -> Result<ReviewList, ApiError> {
     let sort = domain::validate_review_sort(sort).map_err(ApiError::bad_request)?;
-    get_product_by_id(pool, product_id).await?;
+    let product = get_product_by_id(pool, product_id).await?;
+    // Admin products remake: a taken-down product's
+    // reviews leave the public surface with the product —
+    // the same uniform 404 as a missing product. (Draft
+    // and archived products keep today's behaviour: this
+    // seals the platform-removal case only.)
+    if product.admin_hidden_at.is_some() {
+        return Err(ApiError::not_found("product not found"));
+    }
     let (page, limit) = clamp_pagination(page, limit);
     let offset = (page - 1) * limit;
 
@@ -442,7 +450,12 @@ pub async fn get_product_rating_summary(
     pool: &PgPool,
     product_id: Uuid,
 ) -> Result<RatingSummary, ApiError> {
-    get_product_by_id(pool, product_id).await?;
+    let product = get_product_by_id(pool, product_id).await?;
+    // Admin products remake: same takedown seal as the
+    // review list above.
+    if product.admin_hidden_at.is_some() {
+        return Err(ApiError::not_found("product not found"));
+    }
     let row: RatingSummaryRow = sqlx::query_as(&format!(
         "SELECT {RATING_SUMMARY_COLUMNS} FROM reviews r WHERE r.product_id = $1"
     ))
@@ -464,7 +477,8 @@ pub async fn get_store_rating_summary(
     let store = crate::stores::get_store_by_slug(pool, slug).await?;
     let row: RatingSummaryRow = sqlx::query_as(&format!(
         "SELECT {RATING_SUMMARY_COLUMNS} FROM reviews r \
-         JOIN products p ON p.id = r.product_id WHERE p.store_id = $1"
+         JOIN products p ON p.id = r.product_id \
+         WHERE p.store_id = $1 AND p.admin_hidden_at IS NULL"
     ))
     .bind(store.id)
     .fetch_one(pool)
@@ -557,7 +571,10 @@ pub struct StoreReviewList {
 /// store is a 404. Reviews of DRAFT/archived products are
 /// included — they are real reviews buyers wrote; hiding
 /// them would rewrite the store's history when a product
-/// is retired.
+/// is retired. Reviews of products the PLATFORM has
+/// taken down (admin products remake) are the exception:
+/// a removal for cause takes the product's reviews and
+/// title off the public store page with it.
 pub async fn list_store_reviews(
     pool: &PgPool,
     slug: &str,
@@ -572,7 +589,8 @@ pub async fn list_store_reviews(
 
     let total: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM reviews r \
-         JOIN products p ON p.id = r.product_id WHERE p.store_id = $1",
+         JOIN products p ON p.id = r.product_id \
+         WHERE p.store_id = $1 AND p.admin_hidden_at IS NULL",
     )
     .bind(store.id)
     .fetch_one(pool)
@@ -582,7 +600,7 @@ pub async fn list_store_reviews(
     let rows: Vec<StoreReviewRow> = sqlx::query_as(&format!(
         "SELECT {REVIEW_COLUMNS}, p.title AS product_title {REVIEW_FROM} \
          JOIN products p ON p.id = r.product_id \
-         WHERE p.store_id = $1 {} LIMIT $2 OFFSET $3",
+         WHERE p.store_id = $1 AND p.admin_hidden_at IS NULL {} LIMIT $2 OFFSET $3",
         review_order_by(sort)
     ))
     .bind(store.id)

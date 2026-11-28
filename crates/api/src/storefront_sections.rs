@@ -536,14 +536,14 @@ async fn load_rail_products(
         domain::RAIL_SOURCE_BEST_SELLERS => format!(
             "SELECT {PRODUCT_COLUMNS} FROM products p \
              JOIN stores s ON s.id = p.store_id {PRODUCT_RATING_JOIN} {SOLD_UNITS_JOIN} \
-             WHERE p.store_id = $1 AND p.status = 'active' \
+             WHERE p.store_id = $1 AND p.status = 'active' AND p.admin_hidden_at IS NULL \
              AND COALESCE(sold.sold_units, 0) > 0 \
              ORDER BY sold.sold_units DESC, p.created_at DESC LIMIT $2"
         ),
         domain::RAIL_SOURCE_ON_SALE => format!(
             "SELECT {PRODUCT_COLUMNS} FROM products p \
              JOIN stores s ON s.id = p.store_id {PRODUCT_RATING_JOIN} {FLASH_PRICE_JOIN} \
-             WHERE p.store_id = $1 AND p.status = 'active' \
+             WHERE p.store_id = $1 AND p.status = 'active' AND p.admin_hidden_at IS NULL \
              AND (fx.flash_price_poisha IS NOT NULL \
                   OR (p.compare_at_poisha IS NOT NULL \
                       AND p.compare_at_poisha > p.price_poisha)) \
@@ -555,7 +555,7 @@ async fn load_rail_products(
         _ => format!(
             "SELECT {PRODUCT_COLUMNS} FROM products p \
              JOIN stores s ON s.id = p.store_id {PRODUCT_RATING_JOIN} \
-             WHERE p.store_id = $1 AND p.status = 'active' \
+             WHERE p.store_id = $1 AND p.status = 'active' AND p.admin_hidden_at IS NULL \
              ORDER BY p.created_at DESC, p.id DESC LIMIT $2"
         ),
     };
@@ -602,7 +602,7 @@ async fn load_manual_rail_products(
     let fetched: Vec<Product> = sqlx::query_as(&format!(
         "SELECT {PRODUCT_COLUMNS} FROM products p \
          JOIN stores s ON s.id = p.store_id {PRODUCT_RATING_JOIN} \
-         WHERE p.store_id = $1 AND p.status = 'active' AND p.id = ANY($2)"
+         WHERE p.store_id = $1 AND p.status = 'active' AND p.admin_hidden_at IS NULL AND p.id = ANY($2)"
     ))
     .bind(store_id)
     .bind(&ids)
@@ -636,7 +636,7 @@ async fn load_shelf_products(
         "SELECT {PRODUCT_COLUMNS} FROM store_collection_products cp \
          JOIN products p ON p.id = cp.product_id \
          JOIN stores s ON s.id = p.store_id {PRODUCT_RATING_JOIN} \
-         WHERE cp.collection_id = $1 AND p.status = 'active' \
+         WHERE cp.collection_id = $1 AND p.status = 'active' AND p.admin_hidden_at IS NULL \
          ORDER BY cp.position ASC, p.id ASC LIMIT $2"
     ))
     .bind(collection_id)
@@ -663,7 +663,7 @@ async fn load_label_category_tiles(
     let rows: Vec<(String, i64)> = sqlx::query_as(
         "SELECT p.category AS category, COUNT(*)::bigint AS count \
          FROM products p \
-         WHERE p.store_id = $1 AND p.status = 'active' \
+         WHERE p.store_id = $1 AND p.status = 'active' AND p.admin_hidden_at IS NULL \
          AND p.category IS NOT NULL AND btrim(p.category) <> '' \
          GROUP BY p.category ORDER BY count DESC, p.category ASC LIMIT $2",
     )
@@ -853,7 +853,7 @@ async fn resolve_section(
         }
         domain::SECTION_TYPE_PRODUCT_GRID => {
             let total: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM products WHERE store_id = $1 AND status = 'active'",
+                "SELECT COUNT(*) FROM products WHERE store_id = $1 AND status = 'active' AND admin_hidden_at IS NULL",
             )
             .bind(store.id)
             .fetch_one(pool)

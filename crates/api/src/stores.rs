@@ -369,7 +369,8 @@ async fn store_public_stats(pool: &PgPool, store_id: Uuid) -> Result<StorePublic
           JOIN products p ON p.id = oi.product_id \
           WHERE p.store_id = $1 AND so.status = 'delivered') AS total_sold, \
          (SELECT COUNT(*) FROM products p \
-          WHERE p.store_id = $1 AND p.status = 'active') AS product_count",
+          WHERE p.store_id = $1 AND p.status = 'active' \
+            AND p.admin_hidden_at IS NULL) AS product_count",
     )
     .bind(store_id)
     .fetch_one(pool)
