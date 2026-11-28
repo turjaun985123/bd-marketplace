@@ -2164,7 +2164,12 @@ pub fn build_app(state: AppState) -> Router {
         )
         .route(
             "/v1/admin/coupons/:id",
-            patch(coupons::set_admin_coupon_active_handler),
+            get(coupons::get_admin_coupon_handler)
+                .patch(coupons::set_admin_coupon_active_handler),
+        )
+        .route(
+            "/v1/admin/coupons/:id/terms",
+            patch(coupons::update_admin_coupon_terms_handler),
         )
         // Wave 17 — the seller's buyer-risk lookup (the fraud
         // shield's verdict for one phone number).

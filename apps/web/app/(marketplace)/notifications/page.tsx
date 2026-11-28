@@ -248,6 +248,10 @@ function kindLabel(kind: string): string {
       return "পণ্য সরানো হয়েছে — Product taken down";
     case "product_restored":
       return "পণ্য ফেরত দেওয়া হয়েছে — Product restored";
+    case "coupon_deactivated":
+      return "কুপন বন্ধ — Coupon deactivated";
+    case "coupon_reactivated":
+      return "কুপন চালু — Coupon reactivated";
     default:
       return "আপডেট — Update";
   }

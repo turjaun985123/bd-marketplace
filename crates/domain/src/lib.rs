@@ -2471,7 +2471,11 @@ pub const MIN_FIXED_COUPON_POISHA: i64 = 100;
 /// coupon's value is at least [`MIN_FIXED_COUPON_POISHA`]. The
 /// minimum order must be non-negative. The discount cap
 /// (`max_discount_poisha`) only takes effect on percent coupons;
-/// when present it must be non-negative for either kind.
+/// when present it must be positive for either kind — a zero
+/// cap would make a percent coupon mathematically dead (it
+/// could be created, listed and shared, yet never discount),
+/// and `None` already means "uncapped" (admin coupons
+/// remake; previously zero was admitted).
 /// Error strings are user-facing.
 pub fn validate_coupon_input(
     code: &str,
@@ -2506,8 +2510,8 @@ pub fn validate_coupon_input(
     if min_order_poisha < 0 {
         return Err("min_order_poisha must not be negative");
     }
-    if max_discount_poisha.is_some_and(|cap| cap < 0) {
-        return Err("max_discount_poisha must not be negative");
+    if max_discount_poisha.is_some_and(|cap| cap <= 0) {
+        return Err("max_discount_poisha must be positive when set");
     }
     Ok(())
 }
@@ -2588,6 +2592,68 @@ pub fn allocate_discount(subtotals: &[i64], discount: i64) -> Vec<i64> {
     }
     debug_assert_eq!(remainder, 0, "allocation must sum to the discount");
     shares
+}
+
+/// A coupon's derived lifecycle status (admin coupons
+/// remake): `inactive` when the stored flag is off.
+pub const COUPON_STATUS_INACTIVE: &str = "inactive";
+/// A coupon's derived lifecycle status: active, but its
+/// start is still in the future.
+pub const COUPON_STATUS_SCHEDULED: &str = "scheduled";
+/// A coupon's derived lifecycle status: active, but its
+/// end has passed.
+pub const COUPON_STATUS_EXPIRED: &str = "expired";
+/// A coupon's derived lifecycle status: active and in
+/// window, but the global usage limit is reached.
+pub const COUPON_STATUS_EXHAUSTED: &str = "exhausted";
+/// A coupon's derived lifecycle status: usable right now
+/// (subject to an order's eligible goods and minimum,
+/// which a list cannot know).
+pub const COUPON_STATUS_LIVE: &str = "live";
+
+/// Derive a coupon's lifecycle status from its stored
+/// facts and the current time (admin coupons remake).
+/// Nothing here is stored — the API derives it at read,
+/// so it can never drift from the rule.
+///
+/// The precedence mirrors the ORDER-INDEPENDENT prefix
+/// of the shared rejection rule the API enforces at
+/// preview and checkout (`coupon_rejection_reason`):
+/// state, then window, then usage. The rule's last two
+/// branches (eligible subtotal, order minimum) depend on
+/// an order the list does not have, so they are excluded
+/// by construction — a `live` coupon can still fail a
+/// particular order, but never for a state, window or
+/// usage reason.
+///
+/// Boundary semantics mirror the coupon rule exactly
+/// (and deliberately NOT the gift-card rule, whose
+/// expiry is inclusive): a coupon is live AT its start
+/// instant (scheduled only while `now < starts_at`) and
+/// still live AT its end instant (expired only once
+/// `now > ends_at`). Times are unix seconds, the domain
+/// clock convention (see [`gift_card_status`]).
+pub fn coupon_status(
+    active: bool,
+    starts_at_unix: Option<i64>,
+    ends_at_unix: Option<i64>,
+    usage_limit: Option<i64>,
+    used_count: i64,
+    now_unix: i64,
+) -> &'static str {
+    if !active {
+        return COUPON_STATUS_INACTIVE;
+    }
+    if starts_at_unix.is_some_and(|starts_at| now_unix < starts_at) {
+        return COUPON_STATUS_SCHEDULED;
+    }
+    if ends_at_unix.is_some_and(|ends_at| now_unix > ends_at) {
+        return COUPON_STATUS_EXPIRED;
+    }
+    if usage_limit.is_some_and(|limit| used_count >= limit) {
+        return COUPON_STATUS_EXHAUSTED;
+    }
+    COUPON_STATUS_LIVE
 }
 
 // ---------------------------------------------------------------------------
@@ -3650,6 +3716,40 @@ pub fn validate_admin_product_list_sort(
     }
 }
 
+/// The admin coupon queue's sort orders (admin coupons
+/// remake). `Newest` is the pre-remake behaviour and the
+/// default; `Oldest` surfaces the longest-standing
+/// coupons; `CodeAsc` is the lookup order (admins think
+/// in codes); `MostUsed` surfaces the campaigns carrying
+/// the most redemptions first (a deactivation there has
+/// the widest blast radius); `ValueDesc` triages by the
+/// face value of the discount. The API layer maps each
+/// variant to a fixed ORDER BY fragment — user input
+/// never reaches the SQL text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CouponSort {
+    Newest,
+    Oldest,
+    CodeAsc,
+    MostUsed,
+    ValueDesc,
+}
+
+/// Validate an admin coupon-list `sort` parameter (admin
+/// coupons remake): absent means [`CouponSort::Newest`];
+/// an unknown value is an error naming the allowed set,
+/// in the style of [`validate_store_list_sort`].
+pub fn validate_coupon_list_sort(sort: Option<&str>) -> Result<CouponSort, &'static str> {
+    match sort {
+        None | Some("newest") => Ok(CouponSort::Newest),
+        Some("oldest") => Ok(CouponSort::Oldest),
+        Some("code_asc") => Ok(CouponSort::CodeAsc),
+        Some("most_used") => Ok(CouponSort::MostUsed),
+        Some("value_desc") => Ok(CouponSort::ValueDesc),
+        Some(_) => Err("sort must be one of: newest, oldest, code_asc, most_used, value_desc"),
+    }
+}
+
 /// The admin shipment queue's sort orders (admin shipments
 /// remake). `Newest` is the default archive order;
 /// `StaleFirst` is the poller's own order (oldest
@@ -4312,6 +4412,37 @@ pub fn validate_reviewer_note(raw: &str) -> Result<String, &'static str> {
     Ok(trimmed.to_string())
 }
 
+/// Maximum length of an admin's coupon deactivation
+/// reason, in characters (admin coupons remake) — the
+/// same cap as the suspension note: one vocabulary of
+/// admin reasons.
+pub const MAX_COUPON_DEACTIVATION_REASON_CHARS: usize = 500;
+
+/// Validate an admin's reason for deactivating a coupon
+/// (admin coupons remake). The reason is REQUIRED on an
+/// admin deactivation: it is stored on the coupon row
+/// (migration 0081), written into the audit detail, and —
+/// for a store coupon — quoted in the notice to the
+/// store's owner, because a deactivated coupon kills a
+/// publicly advertised campaign whose code buyers are
+/// actively typing: the seller needs the reason to fix
+/// or replace it. Reactivation takes no reason (the
+/// store-suspension split). Blank is an error; the value
+/// is trimmed and may be at most
+/// [`MAX_COUPON_DEACTIVATION_REASON_CHARS`] characters,
+/// counted in Unicode characters. Mirrors
+/// [`validate_suspension_note`].
+pub fn validate_coupon_deactivation_reason(raw: &str) -> Result<String, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("বন্ধ করার কারণ আবশ্যক (a deactivation reason is required)");
+    }
+    if trimmed.chars().count() > MAX_COUPON_DEACTIVATION_REASON_CHARS {
+        return Err("বন্ধ করার কারণ সর্বোচ্চ ৫০০ অক্ষরের হতে হবে (deactivation reason must be at most 500 characters)");
+    }
+    Ok(trimmed.to_string())
+}
+
 /// Maximum length of an admin's store suspension note, in
 /// characters (admin stores remake) — the same cap as the
 /// reviewer note: one vocabulary of admin reasons.
@@ -4729,6 +4860,21 @@ pub const NOTIFICATION_PRODUCT_TAKEN_DOWN: &str = "product_taken_down";
 /// note itself does not ride along (it is recorded in
 /// the audit detail, not broadcast to the seller).
 pub const NOTIFICATION_PRODUCT_RESTORED: &str = "product_restored";
+/// Admin coupons remake: one of a store's coupons was
+/// deactivated by an admin. The body carries the admin's
+/// reason via [`NotificationVars::note`] (truncated for
+/// SMS — the full reason stands on the coupon row, shown
+/// on the seller's coupons page) and the code via
+/// [`NotificationVars::coupon_code`]. It must say the
+/// deactivation is the platform's act and is reversible:
+/// the coupon is not deleted, its redemption history
+/// stands, and an admin can reactivate it.
+pub const NOTIFICATION_COUPON_DEACTIVATED: &str = "coupon_deactivated";
+/// Admin coupons remake: a store coupon an admin had
+/// deactivated was reactivated by an admin and works at
+/// checkout again. No note rides along — reactivation
+/// takes none (the store-reactivation split).
+pub const NOTIFICATION_COUPON_REACTIVATED: &str = "coupon_reactivated";
 pub const NOTIFICATION_RETURN_UPDATE: &str = "return_update";
 /// Wave 54: a store a user follows published a new product;
 /// the notice goes to each follower (see the API's
@@ -4816,6 +4962,13 @@ pub struct NotificationVars {
     /// for the KYC tier specifically: it is NOT a
     /// subscription/plan tier.
     pub verification_tier: String,
+    /// The coupon's code (admin coupons remake) — read
+    /// only by the `coupon_deactivated` /
+    /// `coupon_reactivated` templates; empty for every
+    /// other kind. A code is a public marketing string,
+    /// not a secret: it is printed on banners and typed
+    /// by buyers at checkout.
+    pub coupon_code: String,
 }
 
 /// The short display form of an order id: its first 8
@@ -4974,6 +5127,31 @@ pub fn render_body(kind: &str, vars: &NotificationVars) -> String {
         }
         NOTIFICATION_STORE_REACTIVATED => format!(
             "BD Marketplace: আপনার স্টোর {store} আবার চালু করা হয়েছে। এখন আবার বিক্রি করতে পারবেন।"
+        ),
+        NOTIFICATION_COUPON_DEACTIVATED => {
+            // Same truncation rule as the store suspension:
+            // the SMS carries a shortened reason and points
+            // at the seller coupons page, where the full
+            // reason stands on the coupon row. The wording
+            // claims only what is true: the platform
+            // deactivated the code, buyers can no longer use
+            // it at checkout, nothing was deleted, and an
+            // admin can reactivate it.
+            let reason = if vars.note.is_empty() {
+                String::new()
+            } else {
+                let note: String = vars.note.chars().take(120).collect();
+                let ellipsis = if vars.note.chars().count() > 120 { "…" } else { "" };
+                format!(" কারণ: {note}{ellipsis}। বিস্তারিত আপনার কুপন পেজে দেখুন।")
+            };
+            format!(
+                "BD Marketplace: প্ল্যাটফর্ম আপনার স্টোর {store}-এর কুপন {code} বন্ধ করে দিয়েছে। ক্রেতারা আর এই কোড ব্যবহার করতে পারবেন না।{reason}",
+                code = vars.coupon_code
+            )
+        }
+        NOTIFICATION_COUPON_REACTIVATED => format!(
+            "BD Marketplace: আপনার স্টোর {store}-এর কুপন {code} আবার চালু করা হয়েছে। ক্রেতারা আবার এই কোড ব্যবহার করতে পারবেন।",
+            code = vars.coupon_code
         ),
         NOTIFICATION_PRODUCT_TAKEN_DOWN => {
             // The reason is the actionable content, and it
@@ -10714,6 +10892,80 @@ mod tests {
         assert!(validate_coupon_input("XYZ", "bogus", 10, 0, None).is_err());
         assert!(validate_coupon_input("XYZ", "percent", 10, -1, None).is_err());
         assert!(validate_coupon_input("XYZ", "percent", 10, 0, Some(-1)).is_err());
+
+        // Admin coupons remake: a zero cap is rejected too —
+        // it would make a percent coupon mathematically dead,
+        // and None already means "uncapped".
+        assert!(validate_coupon_input("XYZ", "percent", 10, 0, Some(0)).is_err());
+        assert!(validate_coupon_input("XYZ", "fixed", 1_000, 0, Some(0)).is_err());
+    }
+
+    #[test]
+    fn coupon_status_precedence_and_boundaries() {
+        // Inactive beats everything, including a future
+        // start and an exhausted limit.
+        assert_eq!(
+            coupon_status(false, Some(2_000), None, Some(1), 1, 1_000),
+            COUPON_STATUS_INACTIVE
+        );
+        // Scheduled beats exhausted (window before usage,
+        // the rejection rule's order).
+        assert_eq!(
+            coupon_status(true, Some(2_000), None, Some(1), 1, 1_000),
+            COUPON_STATUS_SCHEDULED
+        );
+        // Expired beats exhausted.
+        assert_eq!(
+            coupon_status(true, None, Some(500), Some(1), 1, 1_000),
+            COUPON_STATUS_EXPIRED
+        );
+        // Boundaries mirror the coupon rule, NOT the
+        // gift-card rule: live AT the start instant and
+        // still live AT the end instant.
+        assert_eq!(
+            coupon_status(true, Some(1_000), None, None, 0, 1_000),
+            COUPON_STATUS_LIVE
+        );
+        assert_eq!(
+            coupon_status(true, None, Some(1_000), None, 0, 1_000),
+            COUPON_STATUS_LIVE
+        );
+        assert_eq!(
+            coupon_status(true, None, Some(1_000), None, 0, 1_001),
+            COUPON_STATUS_EXPIRED
+        );
+        // Exhaustion is exact: used == limit is exhausted;
+        // one below is live; no limit never exhausts.
+        assert_eq!(
+            coupon_status(true, None, None, Some(5), 5, 1_000),
+            COUPON_STATUS_EXHAUSTED
+        );
+        assert_eq!(
+            coupon_status(true, None, None, Some(5), 4, 1_000),
+            COUPON_STATUS_LIVE
+        );
+        assert_eq!(
+            coupon_status(true, None, None, None, 999_999, 1_000),
+            COUPON_STATUS_LIVE
+        );
+        // The plain live case.
+        assert_eq!(
+            coupon_status(true, Some(500), Some(2_000), Some(10), 3, 1_000),
+            COUPON_STATUS_LIVE
+        );
+    }
+
+    #[test]
+    fn coupon_deactivation_reason_validation() {
+        // Required, trimmed, capped at 500 characters.
+        assert!(validate_coupon_deactivation_reason("").is_err());
+        assert!(validate_coupon_deactivation_reason("   ").is_err());
+        assert_eq!(
+            validate_coupon_deactivation_reason("  জাল কোড ছড়িয়ে পড়েছে  "),
+            Ok("জাল কোড ছড়িয়ে পড়েছে".to_string())
+        );
+        assert!(validate_coupon_deactivation_reason(&"x".repeat(500)).is_ok());
+        assert!(validate_coupon_deactivation_reason(&"x".repeat(501)).is_err());
     }
 
     #[test]
@@ -13193,6 +13445,38 @@ mod tests {
         let reactivated = render_body(NOTIFICATION_STORE_REACTIVATED, &vars);
         assert!(reactivated.contains("আবার চালু করা হয়েছে"), "{reactivated}");
         assert!(reactivated.contains("বিক্রি করতে পারবেন"), "{reactivated}");
+    }
+
+    #[test]
+    fn coupon_deactivation_notification_bodies_are_honest() {
+        let mut vars = NotificationVars {
+            store_name: "ঢাকা ফ্যাশন".to_string(),
+            coupon_code: "EID10".to_string(),
+            note: "কোডটি প্রকাশ্যে ছড়িয়ে পড়েছে".to_string(),
+            ..NotificationVars::default()
+        };
+        let deactivated = render_body(NOTIFICATION_COUPON_DEACTIVATED, &vars);
+        // The platform's act, the code, the consequence for
+        // buyers, and the reason — never a word implying
+        // the coupon was deleted.
+        assert!(deactivated.contains("প্ল্যাটফর্ম"), "{deactivated}");
+        assert!(deactivated.contains("EID10"), "{deactivated}");
+        assert!(deactivated.contains("ব্যবহার করতে পারবেন না"), "{deactivated}");
+        assert!(deactivated.contains("কোডটি প্রকাশ্যে ছড়িয়ে পড়েছে"), "{deactivated}");
+        assert!(!deactivated.contains("মুছে"), "{deactivated}");
+
+        // A long reason truncates at 120 chars with an
+        // ellipsis and points at the seller coupons page.
+        vars.note = "x".repeat(200);
+        let truncated = render_body(NOTIFICATION_COUPON_DEACTIVATED, &vars);
+        assert!(truncated.contains("…"), "{truncated}");
+        assert!(truncated.contains("কুপন পেজে"), "{truncated}");
+
+        // Reactivation announces the code works again; it
+        // takes no note.
+        let reactivated = render_body(NOTIFICATION_COUPON_REACTIVATED, &vars);
+        assert!(reactivated.contains("EID10"), "{reactivated}");
+        assert!(reactivated.contains("আবার চালু করা হয়েছে"), "{reactivated}");
     }
 
     #[test]

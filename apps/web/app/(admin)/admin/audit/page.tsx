@@ -23,6 +23,10 @@ const ACTION_OPTIONS = [
   "qna.hide",
   "qna.unhide",
   "return.refund_done",
+  "coupon.create",
+  "coupon.deactivate",
+  "coupon.reactivate",
+  "coupon.update_terms",
 ];
 
 /**

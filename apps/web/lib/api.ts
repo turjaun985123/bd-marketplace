@@ -5959,6 +5959,16 @@ export interface Coupon {
   used_count: number;
   active: boolean;
   created_at: string;
+  /**
+   * Admin-deactivation stamps (admin coupons remake, migration
+   * 0081): set only while the coupon sits deactivated BY AN
+   * ADMIN, so a seller can tell a platform deactivation (with
+   * its reason) from their own toggle. Any reactivation clears
+   * all three.
+   */
+  admin_deactivated_at: string | null;
+  admin_deactivated_by_user_id: string | null;
+  admin_deactivated_reason: string | null;
 }
 
 export interface CouponList {
@@ -6056,19 +6066,144 @@ export function deleteSellerCoupon(token: string, couponId: string): Promise<voi
   });
 }
 
-/** GET /v1/admin/coupons — every coupon on the platform, newest first. */
+/**
+ * One row of the ADMIN coupon queue (admin coupons remake):
+ * the coupon flattened with its store's identity (null pair
+ * for a platform coupon) and its DERIVED lifecycle status —
+ * `live | scheduled | expired | exhausted | inactive`. The
+ * status is derived server-side from the active flag, the
+ * window and the usage cap; it is never stored.
+ */
+export interface AdminCoupon extends Coupon {
+  store_name: string | null;
+  store_slug: string | null;
+  status: string;
+}
+
+/**
+ * Whole-queue coupon summary for the admin list. Deliberately
+ * UNFILTERED — it describes the platform, not the page.
+ * Redemption figures are all-time and GROSS: a redemption is
+ * never removed, even when its order is later cancelled (the
+ * per-coupon detail carries the labelled net).
+ */
+export interface AdminCouponSummary {
+  total: number;
+  platform_count: number;
+  store_count: number;
+  active_count: number;
+  inactive_count: number;
+  live_count: number;
+  scheduled_count: number;
+  expired_count: number;
+  exhausted_count: number;
+  redemptions_all_time: number;
+  gross_discount_poisha_all_time: number;
+}
+
+/** GET /v1/admin/coupons response: a page plus the whole-queue summary. */
+export interface AdminCouponList {
+  items: AdminCoupon[];
+  total: number;
+  page: number;
+  limit: number;
+  summary: AdminCouponSummary;
+}
+
+/**
+ * Per-coupon usage on the admin detail, computed ONLY from
+ * redemption/order snapshots — never recomputed from the
+ * coupon's current terms. Gross counts every redemption ever
+ * written; cancelled and returned shares are labelled
+ * separately; net = gross − cancelled − returned.
+ */
+export interface AdminCouponUsage {
+  gross_redemptions: number;
+  gross_discount_poisha: number;
+  cancelled_redemptions: number;
+  cancelled_discount_poisha: number;
+  returned_sub_orders: number;
+  returned_discount_poisha: number;
+  net_effective_discount_poisha: number;
+  distinct_buyers: number;
+  first_redeemed_at: string | null;
+  last_redeemed_at: string | null;
+}
+
+/** One recent redemption on the admin coupon detail (buyer phone masked). */
+export interface AdminCouponRedemption {
+  id: string;
+  order_id: string;
+  buyer_phone_masked: string;
+  discount_poisha: number;
+  order_status: string;
+  created_at: string;
+}
+
+/** GET /v1/admin/coupons/{id} — the queue row plus usage, recent redemptions and audit history. */
+export interface AdminCouponDetail extends AdminCoupon {
+  usage: AdminCouponUsage;
+  recent_redemptions: AdminCouponRedemption[];
+  audit_history: AdminAuditEntry[];
+}
+
+/** Terms-edit payload: the create payload minus code and scope (admin coupons remake). */
+export interface UpdateCouponTermsInput {
+  discount_type: string;
+  discount_value: number;
+  min_order_poisha?: number;
+  max_discount_poisha?: number | null;
+  starts_at?: string | null;
+  ends_at?: string | null;
+  usage_limit?: number | null;
+}
+
+/** Bangla label for a derived coupon lifecycle status (falls back to the raw value). */
+export function couponStatusLabel(status: string): string {
+  switch (status) {
+    case "live":
+      return "চলমান";
+    case "scheduled":
+      return "নির্ধারিত (এখনো শুরু হয়নি)";
+    case "expired":
+      return "মেয়াদ শেষ";
+    case "exhausted":
+      return "ব্যবহারের সীমা শেষ";
+    case "inactive":
+      return "বন্ধ";
+    default:
+      return status;
+  }
+}
+
+/** GET /v1/admin/coupons — the rebuilt admin queue (filters fail closed server-side). */
 export function listAdminCoupons(
   token: string,
-  params?: { page?: number; limit?: number }
-): Promise<CouponList> {
+  params?: {
+    q?: string;
+    scope?: string;
+    status?: string;
+    discount_type?: string;
+    store_id?: string;
+    sort?: string;
+    page?: number;
+    limit?: number;
+  }
+): Promise<AdminCouponList> {
   const search = new URLSearchParams();
+  if (params?.q) search.set("q", params.q);
+  if (params?.scope) search.set("scope", params.scope);
+  if (params?.status) search.set("status", params.status);
+  if (params?.discount_type) search.set("discount_type", params.discount_type);
+  if (params?.store_id) search.set("store_id", params.store_id);
+  if (params?.sort) search.set("sort", params.sort);
   if (params?.page) search.set("page", String(params.page));
   if (params?.limit) search.set("limit", String(params.limit));
   const qs = search.toString();
   return call(`/v1/admin/coupons${qs ? `?${qs}` : ""}`, { token });
 }
 
-/** POST /v1/admin/coupons — create a platform coupon (store_id null). */
+/** POST /v1/admin/coupons — create a platform coupon (store_id null). Audited server-side. */
 export function createAdminCoupon(
   token: string,
   input: CreateCouponInput
@@ -6076,16 +6211,46 @@ export function createAdminCoupon(
   return call("/v1/admin/coupons", { method: "POST", token, body: input });
 }
 
-/** PATCH /v1/admin/coupons/{id} — activate or deactivate any coupon. */
+/** GET /v1/admin/coupons/{id} — one coupon with usage, recent redemptions and audit history. */
+export function getAdminCoupon(
+  token: string,
+  couponId: string
+): Promise<AdminCouponDetail> {
+  return call(`/v1/admin/coupons/${encodeURIComponent(couponId)}`, { token });
+}
+
+/**
+ * PATCH /v1/admin/coupons/{id} — deactivate or reactivate any coupon.
+ * Deactivation REQUIRES a reason (the server 400s without one);
+ * setting the state the coupon is already in is a 409.
+ */
 export function setAdminCouponActive(
   token: string,
   couponId: string,
-  active: boolean
+  active: boolean,
+  reason?: string
 ): Promise<Coupon> {
   return call(`/v1/admin/coupons/${encodeURIComponent(couponId)}`, {
     method: "PATCH",
     token,
-    body: { active },
+    body: reason === undefined ? { active } : { active, reason },
+  });
+}
+
+/**
+ * PATCH /v1/admin/coupons/{id}/terms — edit a platform coupon's
+ * terms. Server-gated to coupons that have never been redeemed
+ * (409 once redeemed, and 409 for store coupons).
+ */
+export function updateAdminCouponTerms(
+  token: string,
+  couponId: string,
+  input: UpdateCouponTermsInput
+): Promise<Coupon> {
+  return call(`/v1/admin/coupons/${encodeURIComponent(couponId)}/terms`, {
+    method: "PATCH",
+    token,
+    body: input,
   });
 }
 

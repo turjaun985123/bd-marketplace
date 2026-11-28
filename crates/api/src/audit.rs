@@ -58,6 +58,23 @@
 //!   `{target_slug, products_moved, children_moved}`),
 //!   `category.import` (detail `{created, updated}`, no
 //!   target) — target `category` (Wave 56).
+//! - `coupon.create` — target `coupon`, detail `{code,
+//!   store_id, discount_type, discount_value}` (admin
+//!   coupons remake; admin creates are platform coupons,
+//!   so `store_id` is null). `coupon.deactivate` — detail
+//!   `{code, store_id, reason}` (the reason is REQUIRED
+//!   and also stands on the coupon row until
+//!   reactivation). `coupon.reactivate` — detail `{code,
+//!   store_id, previous_reason, previous_deactivated_by}`
+//!   (the outgoing deactivation's reason and actor,
+//!   preserved here because reactivation clears them from
+//!   the row — the product-restore rule).
+//!   `coupon.update_terms` — detail `{code, before,
+//!   after}` (full term snapshots; terms edits are gated
+//!   to never-redeemed platform coupons). Only the ADMIN
+//!   coupon endpoints are audited; a seller's own coupon
+//!   management is routine self-management, not a
+//!   platform action (the `qna.hide` rule).
 //!
 //! What is NEVER logged: secrets of any kind (passwords do not
 //! exist here, but JWT secrets, gateway credentials, OTP codes

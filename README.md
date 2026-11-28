@@ -4889,6 +4889,87 @@ the detail, and one action:
   decision — this surface invents neither an amount
   beyond the recorded advance nor an action.
 
+**Admin coupons remake (2026-11-28, the eighth surface
+of the admin remake program; 18 analysis agents):** the
+coupons surface was a W14-era thin page (create form +
+bare newest-50 list) over unaudited, unlocked mutations.
+The remake rebuilds the queue, adds a detail, and brings
+every admin mutation to the remake canon:
+
+- **Audit coverage closed.** Before this remake, coupons
+  were the only admin-mutable money-affecting entity
+  with ZERO audit rows: all three admin handlers
+  discarded the admin identity, and an admin could mint
+  platform-funded discounts or silently deactivate any
+  seller's coupon with no trace. Admin create,
+  deactivate, reactivate and terms edits now each write
+  exactly ONE `coupon.*` audit row in the mutation's own
+  transaction (`coupon.create`, `coupon.deactivate`,
+  `coupon.reactivate`, `coupon.update_terms` — target
+  `coupon`). Seller-side coupon management stays
+  unaudited by design (routine self-management).
+- **Lifecycle is derived, never stored.** One domain
+  function (`domain::coupon_status`) derives the status
+  from the active flag, the window and the usage cap,
+  with the rejection rule's precedence — inactive →
+  scheduled → expired → exhausted → live — and the
+  coupon rule's boundaries: a coupon is live AT
+  `starts_at` and AT `ends_at`, expired only after it
+  (deliberately not the gift-card inclusive-expiry
+  rule). The list filters and summary buckets mirror
+  the same function in SQL.
+- **Deactivation takes a reason and leaves a stamp.**
+  Deactivation requires a reason (migration 0081 stamps
+  `admin_deactivated_at/by/reason` on the row) — it is
+  how a seller tells a platform deactivation from their
+  own toggle, it rides the `coupon_deactivated` notice
+  to the store owner (store coupons only; a platform
+  coupon has no seller to notify), and reactivation
+  copies it into its audit detail before clearing the
+  stamps. Setting the state a coupon is already in is a
+  409 that writes nothing. There is still no admin
+  DELETE: deactivation is the reversible equivalent,
+  and a redeemed coupon's record is the only proof of
+  what it granted.
+- **Terms lock at first redemption.** A platform
+  coupon's terms are editable (PATCH
+  `/v1/admin/coupons/{id}/terms`, full before/after
+  snapshots in the audit detail) ONLY while
+  `used_count = 0` — orders snapshot discount amounts,
+  never terms, so an edit after a redemption could
+  never be reconstructed; the remedy is deactivate +
+  a new code. A store coupon's terms are the seller's
+  own: the admin lever there is deactivation, never
+  rewriting (409). Validation is the ONE shared terms
+  validation create uses; the remake's single
+  tightening is there too — `max_discount_poisha = 0`
+  is now rejected (a percent coupon that could never
+  discount), for seller and admin creates alike.
+- **Usage is gross, labelled, and snapshot-only.** A
+  redemption is never removed and `used_count` never
+  decremented — buyer cancels and returns restore
+  stock, loyalty and gift-card value, but NOT coupon
+  usage (pre-existing Wave 14 semantics, unchanged).
+  The detail therefore shows gross redemptions/discount
+  with the cancelled-order and returned-sub-order
+  shares labelled separately and a derived net; the
+  queue summary's all-time figures are gross and say
+  so. All aggregates read the redemption/order
+  snapshots, never current coupon terms.
+- **Honest limits.** There is deliberately NO per-buyer
+  redemption limit: the schema has no such column and
+  the external audit's HI-09 proposal is an owner
+  product decision (recorded in the audit doc), not
+  something this surface invents. The buyer-facing
+  preview endpoint remains an unthrottled validity
+  oracle for logged-in buyers (distinguishable
+  rejection reasons are the shared-rule design);
+  hardening it is a buyer-surface decision, out of
+  scope here. Carts do not snapshot coupons: checkout
+  re-validates the live row, so a deactivation fails an
+  in-flight checkout with the shared rejection reason —
+  the page's dialog copy says exactly that.
+
 **Settings override precedence:** a row in `platform_settings`
 (migration 0013) beats the startup value, which beats the
 built-in default — for commission: setting > `COMMISSION_RATE_BPS`

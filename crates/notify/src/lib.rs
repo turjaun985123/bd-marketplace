@@ -157,8 +157,9 @@ pub fn sender_from_env(dev_mode: bool) -> Box<dyn SmsSender> {
 /// the JSON the API funnels store: `order_id`, `store_name`,
 /// `amount_poisha`, `status`, (Wave 54) `product_title`,
 /// `sale_title`, `post_title`, (Wave 60) `card_last4`,
-/// (admin payouts remake) `note` + `payment_reference`, and
-/// (admin verifications remake) `verification_tier`.
+/// (admin payouts remake) `note` + `payment_reference`,
+/// (admin verifications remake) `verification_tier`, and
+/// (admin coupons remake) `coupon_code`.
 /// Missing fields render as the domain defaults (empty /
 /// none) — `render_body` has a defined output for every
 /// combination.
@@ -212,6 +213,11 @@ fn vars_from_payload(payload: &Value) -> NotificationVars {
             .to_string(),
         verification_tier: payload
             .get("verification_tier")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        coupon_code: payload
+            .get("coupon_code")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),

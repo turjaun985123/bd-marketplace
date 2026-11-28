@@ -69,6 +69,14 @@
 //!   funnel above (`store_new_product`) also enqueues
 //!   NOTHING for a taken-down product: followers must
 //!   not be pinged about a listing the platform removed.
+//! - `coupon_deactivated` / `coupon_reactivated` (admin
+//!   coupons remake) — `coupons::set_admin_coupon_active`,
+//!   to the store owner, inside the transition's own
+//!   transaction. Both kinds share the one funnel
+//!   ([`enqueue_coupon_status_notice`]); a deactivated
+//!   notice carries the admin's required reason, a
+//!   reactivated notice carries none. Store coupons only:
+//!   a platform coupon has no seller to notify.
 //! - `return_update` — `returns::decide_return_request`
 //!   (approved / rejected) and `returns::mark_return_received`
 //!   (received), to the buyer.
@@ -634,5 +642,55 @@ pub async fn enqueue_product_status_notice(
     notify::enqueue(&mut *conn, owner_user_id, &phone, kind, &payload)
         .await
         .map_err(|e| ApiError::internal("enqueue product-status notification", e))?;
+    Ok(())
+}
+
+/// Queue one coupon-status notice for a store's owner
+/// (admin coupons remake): the recipient is the seller
+/// at their ACCOUNT phone, exactly like the store and
+/// product funnels — an admin flipping a store coupon is
+/// an account-level event for that store. One funnel for
+/// both coupon kinds (`coupon_deactivated`,
+/// `coupon_reactivated`), called from the admin toggle
+/// in `coupons` inside the transition's own transaction,
+/// so the notice commits or rolls back with the state
+/// change it announces. Platform coupons have no store
+/// and no recipient — the caller invokes this funnel
+/// only for store coupons.
+///
+/// The store name and coupon code are caller-supplied
+/// PARAMETERS, never re-read from the database: the
+/// caller has just locked and written the coupon inside
+/// the same transaction. The reason (the admin's
+/// deactivation reason) rides ONLY on the deactivated
+/// kind — reactivation takes no reason, and its payload
+/// stays reason-free (the store funnel's rule).
+pub async fn enqueue_coupon_status_notice(
+    conn: &mut PgConnection,
+    store_id: Uuid,
+    store_name: &str,
+    coupon_code: &str,
+    kind: &str,
+    note: Option<&str>,
+) -> Result<(), ApiError> {
+    let (owner_user_id, phone): (Uuid, String) = sqlx::query_as(
+        "SELECT s.owner_user_id, u.phone FROM stores s \
+         JOIN users u ON u.id = s.owner_user_id WHERE s.id = $1",
+    )
+    .bind(store_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| ApiError::internal("load coupon-status notice recipient", e))?;
+    let mut payload = json!({
+        "store_id": store_id.to_string(),
+        "store_name": store_name,
+        "coupon_code": coupon_code,
+    });
+    if let Some(note) = note {
+        payload["note"] = serde_json::Value::String(note.to_string());
+    }
+    notify::enqueue(&mut *conn, owner_user_id, &phone, kind, &payload)
+        .await
+        .map_err(|e| ApiError::internal("enqueue coupon-status notification", e))?;
     Ok(())
 }

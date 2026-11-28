@@ -243,6 +243,11 @@ export default function CouponManager({ api }: { api: CouponManagerApi }) {
               {coupon.active ? "" : "(বন্ধ আছে — inactive)"}
               {coupon.store_id ? " · স্টোর কুপন (store coupon)" : " · প্ল্যাটফর্ম কুপন"}
             </h3>
+            {coupon.admin_deactivated_reason && (
+              <p>
+                প্ল্যাটফর্ম বন্ধ করেছে — কারণ: {coupon.admin_deactivated_reason}
+              </p>
+            )}
             <p>
               ছাড়:{" "}
               {coupon.discount_type === "percent" ? (
