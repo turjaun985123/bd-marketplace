@@ -542,7 +542,7 @@ pub async fn issue_gift_card_handler(
         .begin()
         .await
         .map_err(|e| ApiError::internal("begin gift card issue transaction", e))?;
-    let mut created: Vec<CreatedGiftCard> = Vec::with_capacity(count as usize);
+    let mut created: Vec<(Uuid, String)> = Vec::with_capacity(count as usize);
     for _ in 0..count {
         // Generate + insert, retrying on a hash collision.
         // With ≈124 bits of entropy a collision is a
