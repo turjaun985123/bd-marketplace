@@ -7,6 +7,7 @@
 //! - events backdated to 10 days ago count in the total
 //!   and the window, but not today;
 //! - a fresh event counts everywhere.
+//!
 //! (The events are inserted directly because the beacon
 //! can only ever write "now" — ageing is a database
 //! fact, staged here the way the analytics tests stage
