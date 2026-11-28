@@ -308,6 +308,16 @@
 //! 0041); the Facebook import attaches each post's photo
 //! URL best-effort; admin metrics report the library's
 //! footprint.
+//! Wave 60: gift cards (`gift_cards` module, migration
+//! 0070) — store-scoped bearer stored value: SHA-256-hashed
+//! codes shown once at issuance, an append-only ledger
+//! behind a cached balance, promotional (seller-funded)
+//! issuance with no purchase flow, checkout redemption
+//! ordered coupon → gift card → loyalty, full restore on
+//! cancel and proportional restore on return-received, a
+//! public balance check with a uniform unknown-code 404,
+//! and audited admin disable/adjust. The funding model and
+//! the bearer tradeoff are documented in the module.
 //! Wave 43: observability (`observability` and `metrics`
 //! modules) — the outermost middleware honours or mints an
 //! `X-Request-Id` per request (the pure validation rule is
@@ -350,6 +360,7 @@ pub mod exports;
 pub mod facebook;
 pub mod follows;
 pub mod fulfillment;
+pub mod gift_cards;
 pub mod inventory;
 pub mod invoices;
 pub mod loyalty;
@@ -1610,6 +1621,57 @@ pub fn build_app(state: AppState) -> Router {
         // Wave 35 — loyalty: the caller's points balance,
         // the programme rules and their recent ledger.
         .route("/v1/loyalty", get(loyalty::get_loyalty_handler))
+        // Wave 60 — gift cards: the public bearer balance
+        // check (uniform 404 for unknown codes), the seller
+        // issue/list/detail/stats/disable/enable surface
+        // (issue + freeze are owner-level manage_payouts;
+        // reads are view_finances) and the audited admin
+        // surface. Checkout spends a card through the
+        // optional `gift_card_code` on POST /v1/orders.
+        .route(
+            "/v1/gift-cards/balance",
+            post(gift_cards::check_gift_card_balance_handler),
+        )
+        .route(
+            "/v1/seller/gift-cards",
+            post(gift_cards::issue_gift_card_handler).get(gift_cards::list_gift_cards_handler),
+        )
+        .route(
+            "/v1/seller/gift-cards/:id",
+            get(gift_cards::get_gift_card_handler),
+        )
+        .route(
+            "/v1/seller/gift-cards/:id/disable",
+            post(gift_cards::disable_gift_card_handler),
+        )
+        .route(
+            "/v1/seller/gift-cards/:id/enable",
+            post(gift_cards::enable_gift_card_handler),
+        )
+        .route(
+            "/v1/seller/gift-card-stats",
+            get(gift_cards::gift_card_stats_handler),
+        )
+        .route(
+            "/v1/admin/gift-cards",
+            get(gift_cards::admin_list_gift_cards_handler),
+        )
+        .route(
+            "/v1/admin/gift-cards/:id",
+            get(gift_cards::admin_get_gift_card_handler),
+        )
+        .route(
+            "/v1/admin/gift-cards/:id/disable",
+            post(gift_cards::admin_disable_gift_card_handler),
+        )
+        .route(
+            "/v1/admin/gift-cards/:id/enable",
+            post(gift_cards::admin_enable_gift_card_handler),
+        )
+        .route(
+            "/v1/admin/gift-cards/:id/adjust",
+            post(gift_cards::admin_adjust_gift_card_handler),
+        )
         // Wave 5 — payments: availability, gateway webhook, retry,
         // and the dev simulator helper (404s when dev mode is off).
         .route("/v1/payments/methods", get(payments::list_methods))

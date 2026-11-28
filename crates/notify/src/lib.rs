@@ -192,6 +192,11 @@ fn vars_from_payload(payload: &Value) -> NotificationVars {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
+        card_last4: payload
+            .get("card_last4")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
     }
 }
 

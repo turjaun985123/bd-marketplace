@@ -58,6 +58,10 @@
 //!   saved addresses, buyers holding at least one, and
 //!   how many books currently have a default. Adoption
 //!   figures for the checkout shortcut, nothing more.
+//! - `gift_cards` (Wave 60): gift-card counts by derived
+//!   status plus the issued / outstanding / redeemed /
+//!   restored totals — the stored-value liability at a
+//!   glance.
 
 use std::collections::BTreeMap;
 
@@ -163,6 +167,13 @@ pub struct AdminMetrics {
     pub orders_by_zone: Vec<ZoneOrderCount>,
     /// Wave 55: the address book's adoption figures.
     pub address_book: AddressBookStats,
+    /// Wave 60: gift cards platform-wide — counts by
+    /// derived status, issued / outstanding / redeemed /
+    /// restored totals (see
+    /// [`crate::gift_cards::GiftCardStats`]). The
+    /// outstanding figure is the platform's live
+    /// stored-value liability.
+    pub gift_cards: crate::gift_cards::GiftCardStats,
 }
 
 /// One district's order count (Wave 55). Districts are the
@@ -376,6 +387,7 @@ pub async fn get_admin_metrics(pool: &PgPool) -> Result<AdminMetrics, ApiError> 
         .fetch_one(pool)
         .await
         .map_err(|e| ApiError::internal("address book stats", e))?,
+        gift_cards: crate::gift_cards::platform_gift_card_stats(pool).await?,
     })
 }
 

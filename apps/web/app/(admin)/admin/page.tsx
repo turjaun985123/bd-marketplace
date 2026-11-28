@@ -243,6 +243,8 @@ function SystemStatus() {
         <Link href="/admin/media">ছবি মডারেশন — Media moderation</Link>
         {" · "}
         <Link href="/admin/content">কনটেন্ট মডারেশন — Content moderation</Link>
+        {" · "}
+        <Link href="/admin/gift-cards">গিফট কার্ড — Gift cards</Link>
       </p>
       {message ? (
         <p>{message}</p>
@@ -307,6 +309,26 @@ function SystemStatus() {
                 </ul>
               </>
             )}
+          </div>
+          <div className="card">
+            <p>
+              <strong>গিফট কার্ড — Gift cards (Wave 60)</strong>
+            </p>
+            <p>
+              মোট কার্ড: <strong>{metrics.gift_cards.cards_total}</strong> ·
+              সক্রিয়: <strong>{metrics.gift_cards.active_cards}</strong> ·
+              বকেয়া ব্যালেন্স (দায়):{" "}
+              <PriceTag amountPoisha={metrics.gift_cards.outstanding_poisha} />{" "}
+              · মোট খরচ:{" "}
+              <PriceTag amountPoisha={metrics.gift_cards.redeemed_total_poisha} />{" "}
+              · ফেরত:{" "}
+              <PriceTag amountPoisha={metrics.gift_cards.restored_total_poisha} />
+            </p>
+            <p>
+              <Link href="/admin/gift-cards">
+                সব কার্ড দেখুন — Manage gift cards
+              </Link>
+            </p>
           </div>
           <div className="card">
             <p>

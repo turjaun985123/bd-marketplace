@@ -190,6 +190,11 @@ pub struct SubOrder {
     /// post-coupon goods. Platform-funded — it never reduces
     /// the seller payout below.
     pub loyalty_discount_poisha: i64,
+    /// Gift-card redemption applied to this sub-order
+    /// (Wave 60); non-zero on at most one sub-order of an
+    /// order (the card's own store). Seller-funded — it DOES
+    /// reduce the seller payout below.
+    pub gift_card_discount_poisha: i64,
     pub delivery_charge_poisha: i64,
     pub commission_poisha: i64,
     pub seller_payout_poisha: i64,
@@ -267,6 +272,13 @@ pub struct Order {
     /// The discount those points bought (Wave 35). The grand
     /// total below is already net of it.
     pub loyalty_discount_poisha: i64,
+    /// Gift-card redemption on this order (Wave 60); the
+    /// grand total below is already net of it. The card's
+    /// display tail rides along for the receipt — the full
+    /// code is a bearer credential and is never stored, so
+    /// it can never appear here.
+    pub gift_card_discount_poisha: i64,
+    pub gift_card_last4: Option<String>,
     pub delivery_total_poisha: i64,
     pub grand_total_poisha: i64,
     pub created_at: DateTime<Utc>,
@@ -294,6 +306,10 @@ pub struct SellerSubOrder {
     pub goods_subtotal_poisha: i64,
     /// Coupon discount allocated to this sub-order (Wave 14).
     pub discount_poisha: i64,
+    /// Gift-card redemption applied to this sub-order
+    /// (Wave 60) — the seller sees why the payout below is
+    /// reduced: their own card funded part of the goods.
+    pub gift_card_discount_poisha: i64,
     pub delivery_charge_poisha: i64,
     pub commission_poisha: i64,
     pub seller_payout_poisha: i64,
@@ -369,6 +385,8 @@ struct OrderRow {
     discount_total_poisha: i64,
     loyalty_points_used: i32,
     loyalty_discount_poisha: i64,
+    gift_card_last4: Option<String>,
+    gift_card_discount_poisha: i64,
     delivery_total_poisha: i64,
     grand_total_poisha: i64,
     created_at: DateTime<Utc>,
@@ -384,6 +402,7 @@ struct SubOrderRow {
     goods_subtotal_poisha: i64,
     discount_poisha: i64,
     loyalty_discount_poisha: i64,
+    gift_card_discount_poisha: i64,
     delivery_charge_poisha: i64,
     commission_poisha: i64,
     seller_payout_poisha: i64,
@@ -395,10 +414,12 @@ const ORDER_COLUMNS: &str = "id, buyer_user_id, status, payment_method, payment_
     delivery_name, delivery_phone, delivery_address, delivery_zone, delivery_district, \
     order_note, goods_total_poisha, \
     coupon_code, discount_total_poisha, loyalty_points_used, loyalty_discount_poisha, \
+    gift_card_last4, gift_card_discount_poisha, \
     delivery_total_poisha, grand_total_poisha, created_at";
 
 const SUB_ORDER_COLUMNS: &str = "so.id, so.order_id, so.store_id, s.slug AS store_slug, \
     so.status, so.goods_subtotal_poisha, so.discount_poisha, so.loyalty_discount_poisha, \
+    so.gift_card_discount_poisha, \
     so.delivery_charge_poisha, so.commission_poisha, \
     so.seller_payout_poisha, so.created_at";
 
@@ -451,6 +472,7 @@ async fn sub_order_from_row(pool: &PgPool, row: SubOrderRow) -> Result<SubOrder,
         goods_subtotal_poisha: row.goods_subtotal_poisha,
         discount_poisha: row.discount_poisha,
         loyalty_discount_poisha: row.loyalty_discount_poisha,
+        gift_card_discount_poisha: row.gift_card_discount_poisha,
         delivery_charge_poisha: row.delivery_charge_poisha,
         commission_poisha: row.commission_poisha,
         seller_payout_poisha: row.seller_payout_poisha,
@@ -526,6 +548,8 @@ pub async fn load_order(pool: &PgPool, order_id: Uuid) -> Result<Order, ApiError
         discount_total_poisha: row.discount_total_poisha,
         loyalty_points_used: i64::from(row.loyalty_points_used),
         loyalty_discount_poisha: row.loyalty_discount_poisha,
+        gift_card_discount_poisha: row.gift_card_discount_poisha,
+        gift_card_last4: row.gift_card_last4,
         delivery_total_poisha: row.delivery_total_poisha,
         grand_total_poisha: row.grand_total_poisha,
         created_at: row.created_at,
@@ -555,6 +579,17 @@ pub struct PlaceOrderInput {
     /// the cart stays intact.
     #[serde(default)]
     pub coupon_code: Option<String>,
+    /// Optional gift-card code (Wave 60). When present, the
+    /// card is loaded and locked FOR UPDATE inside the
+    /// checkout transaction and redeemed against ITS store's
+    /// sub-order, after the coupon and before loyalty (the
+    /// documented redemption ordering). An unusable card —
+    /// unknown, disabled, expired, depleted, or for a store
+    /// that is not in this order — fails the whole checkout
+    /// with a 400 and the cart stays intact; a card is never
+    /// silently ignored.
+    #[serde(default)]
+    pub gift_card_code: Option<String>,
     /// The online method the buyer will pay a COD ADVANCE with
     /// (Wave 17: bkash, nagad, sslcommerz or shurjopay). Used
     /// only when this COD order requires an advance — the
@@ -1052,6 +1087,7 @@ pub async fn place_order(
             store_id: sub.store_id.clone(),
             items: sub.items.clone(),
             discount_poisha: 0,
+            gift_card_discount_poisha: 0,
             commission_on_discounted: false,
             commission_rate_bps: None,
         })
@@ -1064,6 +1100,82 @@ pub async fn place_order(
     // Any rejection returns an error here: the transaction drops
     // uncommitted, nothing is written, and the cart stays intact.
     let applied_coupon = apply_coupon_to_groups(&mut tx, &mut groups, &input).await?;
+
+    // Wave 60: apply the gift card, if one was given, AFTER
+    // the coupon and BEFORE totals — the redemption must be
+    // inside the totals for the domain's commission/payout
+    // rules to net it out (it is seller-funded, like a store
+    // coupon). The card row is locked FOR UPDATE inside this
+    // transaction, so two concurrent checkouts presenting
+    // the same code serialize on it and can never spend one
+    // balance twice. Any rejection is a 400 here: the
+    // transaction drops uncommitted, nothing is written, and
+    // the cart stays intact.
+    let mut applied_gift_card: Option<crate::gift_cards::LockedGiftCard> = None;
+    if let Some(raw_code) = input
+        .gift_card_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+    {
+        // One uniform message for a code that cannot be a
+        // card this platform issued, or matches no card:
+        // checkout must not become an enumeration oracle
+        // (the balance check's tradeoff, applied here too).
+        // A card that EXISTS but cannot be spent names its
+        // reason class instead — its holder is the one
+        // asking, and the balance endpoint tells them the
+        // same state.
+        let normalised = domain::normalize_gift_card_code(raw_code).ok_or_else(|| {
+            ApiError::bad_request(
+                "গিফট কার্ডটি ব্যবহার করা যাচ্ছে না — this gift card cannot be used",
+            )
+        })?;
+        let card = crate::gift_cards::lock_card_by_code(&mut tx, &normalised)
+            .await?
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    "গিফট কার্ডটি ব্যবহার করা যাচ্ছে না — this gift card cannot be used",
+                )
+            })?;
+        if let Some(reason) = crate::gift_cards::checkout_block_reason(&card, tx_now) {
+            return Err(reason);
+        }
+        // The card's store must be one of this order's
+        // stores — a card for another store is an honest
+        // 400, never a silent ignore.
+        let group_idx = groups
+            .iter()
+            .position(|group| group.store_id == card.store_id.to_string())
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    "গিফট কার্ডটি এই অর্ডারের কোনো দোকানের নয় — this gift card belongs to a store that is not in this order",
+                )
+            })?;
+        // Eligible goods: the group's POST-COUPON goods,
+        // recomputed from the checked line totals exactly
+        // as the coupon pass computed its subtotal.
+        let mut goods_subtotal_poisha: i64 = 0;
+        for item in &groups[group_idx].items {
+            let line_total = item.line_total_poisha().map_err(ApiError::bad_request)?;
+            goods_subtotal_poisha = goods_subtotal_poisha
+                .checked_add(line_total)
+                .ok_or_else(|| {
+                    ApiError::bad_request(
+                        "কার্টের মোট হিসাব সীমা ছাড়িয়ে গেছে — cart goods total overflows the money range",
+                    )
+                })?;
+        }
+        let post_coupon_goods = goods_subtotal_poisha - groups[group_idx].discount_poisha;
+        let applied = crate::gift_cards::applicable_poisha(card.balance_poisha, post_coupon_goods);
+        if applied <= 0 {
+            return Err(ApiError::bad_request(
+                "গিফট কার্ডটি এই অর্ডারে ব্যবহার করা যাচ্ছে না — this gift card cannot be applied to this order",
+            ));
+        }
+        groups[group_idx].gift_card_discount_poisha = applied;
+        applied_gift_card = Some(card);
+    }
 
     // The commission rate is the EFFECTIVE one (Wave 10): an
     // admin-set platform setting wins over the startup value.
@@ -1090,6 +1202,8 @@ pub async fn place_order(
 
     // Wave 35: redeem loyalty points, AFTER the coupon (the
     // brief's order: points price against post-coupon goods).
+    // Wave 60: AFTER the gift card too — the full ordering
+    // is coupon → gift card → loyalty (see the base below).
     // The buyer's user row is locked FOR UPDATE first, so two
     // concurrent checkouts by the same buyer serialize here and
     // can never both read the same balance and spend it twice.
@@ -1112,11 +1226,18 @@ pub async fn place_order(
         let balance = crate::loyalty::loyalty_balance_on(&mut *tx, user.user_id).await?;
         // Each group's post-coupon goods: its subtotal minus
         // its (clamped) coupon share — the same figures
-        // `build_order_totals` just used.
+        // `build_order_totals` just used. Wave 60: the gift
+        // card redemption comes off TOO — the redemption
+        // ordering is coupon → gift card → loyalty, so
+        // points price against what the buyer still owes
+        // for the goods after BOTH discounts, and the
+        // shares allocate over the same reduced bases.
         let post_coupon_goods: Vec<i64> = totals
             .sub_orders
             .iter()
-            .map(|sub| sub.goods_subtotal_poisha - sub.discount_poisha)
+            .map(|sub| {
+                sub.goods_subtotal_poisha - sub.discount_poisha - sub.gift_card_discount_poisha
+            })
             .collect();
         let post_coupon_total: i64 = post_coupon_goods.iter().sum();
         let allowed = loyalty_max_redeemable_points(balance.available_points, post_coupon_total);
@@ -1209,8 +1330,10 @@ pub async fn place_order(
          delivery_name, delivery_phone, delivery_address, delivery_zone, \
          goods_total_poisha, delivery_total_poisha, grand_total_poisha, \
          coupon_code, discount_total_poisha, advance_required_poisha, \
-         loyalty_points_used, loyalty_discount_poisha, order_note, delivery_district) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
+         loyalty_points_used, loyalty_discount_poisha, order_note, delivery_district, \
+         gift_card_id, gift_card_last4, gift_card_discount_poisha) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, \
+         $18, $19, $20) \
          RETURNING id",
     )
     .bind(user.user_id)
@@ -1230,6 +1353,9 @@ pub async fn place_order(
     .bind(loyalty_discount_total)
     .bind(&order_note)
     .bind(&delivery_district)
+    .bind(applied_gift_card.as_ref().map(|card| card.id))
+    .bind(applied_gift_card.as_ref().map(|card| card.last4.clone()))
+    .bind(totals.gift_card_discount_total_poisha)
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| ApiError::internal("insert order", e))?;
@@ -1342,8 +1468,8 @@ pub async fn place_order(
         let sub_order_id: Uuid = sqlx::query_scalar(
             "INSERT INTO sub_orders (order_id, store_id, goods_subtotal_poisha, \
              discount_poisha, delivery_charge_poisha, commission_poisha, seller_payout_poisha, \
-             loyalty_discount_poisha) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+             loyalty_discount_poisha, gift_card_id, gift_card_discount_poisha) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id",
         )
         .bind(order_id)
         .bind(store_id)
@@ -1353,9 +1479,36 @@ pub async fn place_order(
         .bind(sub_totals.commission_poisha)
         .bind(sub_totals.seller_payout_poisha)
         .bind(loyalty_shares[group_idx])
+        .bind(
+            applied_gift_card
+                .as_ref()
+                .filter(|card| card.store_id == store_id)
+                .map(|card| card.id),
+        )
+        .bind(sub_totals.gift_card_discount_poisha)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| ApiError::internal("insert sub-order", e))?;
+
+        // Wave 60: the funded sub-order's redemption lands
+        // on the card NOW — balance update + redeem ledger
+        // row, inside this transaction, against the card row
+        // locked above. Exactly one group in the order is
+        // the card's store, so this fires at most once.
+        if let Some(card) = applied_gift_card
+            .as_ref()
+            .filter(|card| card.store_id == store_id)
+        {
+            crate::gift_cards::apply_redemption(
+                &mut tx,
+                card,
+                sub_totals.gift_card_discount_poisha,
+                order_id,
+                sub_order_id,
+                user.user_id,
+            )
+            .await?;
+        }
 
         for item in &group.items {
             let product_id = Uuid::parse_str(&item.product_id)
@@ -2180,6 +2333,12 @@ pub async fn cancel_order_for_buyer(
         // transaction — a whole-order cancel therefore refunds
         // the order's full redemption, share by share.
         crate::loyalty::refund_for_cancelled_sub_order(&mut tx, *sub_order_id).await?;
+        // Wave 60: and the gift-card redemption the
+        // sub-order spent comes back to the card in full,
+        // in this transaction (the gift_cards module's
+        // cancel hook — a no-op for sub-orders that used
+        // no card).
+        crate::gift_cards::restore_for_cancelled_sub_order(&mut tx, *sub_order_id).await?;
     }
 
     tx.commit()
@@ -2269,6 +2428,13 @@ pub struct Receipt {
     /// renders the discount as its own line when positive.
     pub loyalty_points_used: i64,
     pub loyalty_discount_poisha: i64,
+    /// Gift card redeemed at checkout (Wave 60): the
+    /// display tail of the card used (null when none) and
+    /// the redemption the grand total is already net of;
+    /// the receipt renders it as its own line when
+    /// positive, exactly like the coupon and loyalty lines.
+    pub gift_card_last4: Option<String>,
+    pub gift_card_discount_poisha: i64,
     pub delivery_total_poisha: i64,
     pub grand_total_poisha: i64,
 }
@@ -2326,6 +2492,8 @@ pub fn build_receipt(order: &Order, store_names: &HashMap<Uuid, String>) -> Rece
         discount_total_poisha: order.discount_total_poisha,
         loyalty_points_used: order.loyalty_points_used,
         loyalty_discount_poisha: order.loyalty_discount_poisha,
+        gift_card_last4: order.gift_card_last4.clone(),
+        gift_card_discount_poisha: order.gift_card_discount_poisha,
         delivery_total_poisha: order.delivery_total_poisha,
         grand_total_poisha: order.grand_total_poisha,
     }
@@ -2366,6 +2534,7 @@ struct SellerSubOrderRow {
     status: String,
     goods_subtotal_poisha: i64,
     discount_poisha: i64,
+    gift_card_discount_poisha: i64,
     delivery_charge_poisha: i64,
     commission_poisha: i64,
     seller_payout_poisha: i64,
@@ -2422,7 +2591,8 @@ pub(crate) async fn list_seller_sub_orders_scoped(
 
     let rows: Vec<SellerSubOrderRow> = sqlx::query_as(
         "SELECT so.id, so.order_id, so.store_id, s.slug AS store_slug, so.status, \
-         so.goods_subtotal_poisha, so.discount_poisha, so.delivery_charge_poisha, so.commission_poisha, \
+         so.goods_subtotal_poisha, so.discount_poisha, so.gift_card_discount_poisha, \
+         so.delivery_charge_poisha, so.commission_poisha, \
          so.seller_payout_poisha, so.created_at, \
          o.delivery_name, o.delivery_phone, o.delivery_address, o.delivery_zone, \
          o.order_note, o.delivery_district, \
@@ -2472,6 +2642,7 @@ pub(crate) async fn list_seller_sub_orders_scoped(
             status: row.status,
             goods_subtotal_poisha: row.goods_subtotal_poisha,
             discount_poisha: row.discount_poisha,
+            gift_card_discount_poisha: row.gift_card_discount_poisha,
             delivery_charge_poisha: row.delivery_charge_poisha,
             commission_poisha: row.commission_poisha,
             seller_payout_poisha: row.seller_payout_poisha,
@@ -2633,6 +2804,10 @@ pub async fn update_sub_order_status(
     }
     if new_status == "cancelled" {
         crate::loyalty::refund_for_cancelled_sub_order(&mut tx, sub_order_id).await?;
+        // Wave 60: a seller cancellation restores the
+        // sub-order's gift-card redemption in full, in this
+        // transaction — the same rule as the buyer cancel.
+        crate::gift_cards::restore_for_cancelled_sub_order(&mut tx, sub_order_id).await?;
     }
 
     tx.commit()

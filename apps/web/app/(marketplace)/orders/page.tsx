@@ -480,6 +480,12 @@ export default function BuyerOrdersPage() {
                 ({order.loyalty_points_used} পয়েন্ট ব্যবহৃত হয়েছে)
               </p>
             )}
+            {order.gift_card_discount_poisha > 0 && (
+              <p>
+                গিফট কার্ড ছাড় (••{order.gift_card_last4}): −
+                <PriceTag amountPoisha={order.gift_card_discount_poisha} />
+              </p>
+            )}
             {order.payment_status === "failed" && order.payment && (
               <p>
                 <button

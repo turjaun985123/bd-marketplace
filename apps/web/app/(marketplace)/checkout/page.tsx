@@ -6,6 +6,7 @@ import DistrictSelect from "@/components/DistrictSelect";
 import PriceTag from "@/components/PriceTag";
 import { formatBdt } from "@/lib/format";
 import {
+  checkGiftCardBalance,
   createAddress,
   devSimulateSuccess,
   getAdvancePolicy,
@@ -24,6 +25,7 @@ import {
   type CouponPreview,
   type DeliveryEstimate,
   type District,
+  type GiftCardBalance,
   type LoyaltyView,
   type Order,
   type PaymentMethodInfo,
@@ -120,6 +122,15 @@ function groupByStore(items: CartItem[]): SellerGroup[] {
  * rides along with the order; the server clamps it and the
  * placed order reports the points actually used.
  *
+ * Wave 60: a gift-card block mirrors the coupon flow — the
+ * code is checked through the public balance endpoint (which
+ * reports the card's store and balance), the applicable
+ * amount is previewed against that store's goods in the
+ * cart, and the code rides along with the order. Checkout
+ * re-validates and redeems it after the coupon and before
+ * loyalty; the placed order on the success screen is the
+ * authority, exactly like the coupon.
+ *
  * Wave 55: the delivery form gains the address book and the
  * district table. A saved address can be picked (radio cards)
  * — the order then sends only its id and the server takes the
@@ -163,6 +174,11 @@ export default function CheckoutPage() {
   const [couponCode, setCouponCode] = useState("");
   const [coupon, setCoupon] = useState<CouponPreview | null>(null);
   const [applyingCoupon, setApplyingCoupon] = useState(false);
+  // Gift card (Wave 60): the typed code, and the balance
+  // check's answer (the card's store, balance and status).
+  const [giftCardCode, setGiftCardCode] = useState("");
+  const [giftCard, setGiftCard] = useState<GiftCardBalance | null>(null);
+  const [applyingGiftCard, setApplyingGiftCard] = useState(false);
   // Advance (Wave 17): the public policy, the buyer's chosen
   // advance method, and whether checkout has told us an advance
   // method is required (its 400) so the picker must show even
@@ -418,6 +434,26 @@ export default function CheckoutPage() {
     setCoupon(null);
   }, [goodsTotalPoisha]);
 
+  // Gift card preview (Wave 60): the card applies to ITS
+  // store's goods in the cart, up to its balance. The exact
+  // figure is post-coupon, which only the server knows at
+  // place-order time — this preview is the balance against
+  // the store's raw goods, and the placed order is the
+  // authority (the same honesty the coupon preview uses).
+  const giftCardStoreGoods = giftCard
+    ? items
+        .filter((item) => item.store_id === giftCard.store_id)
+        .reduce((sum, item) => sum + item.line_total_poisha, 0)
+    : 0;
+  const giftCardPreviewAmount = giftCard
+    ? Math.min(giftCard.balance_poisha, giftCardStoreGoods)
+    : 0;
+  // A balance check is priced against the cart it was made
+  // on; a changed cart makes it stale, like the coupon's.
+  useEffect(() => {
+    setGiftCard(null);
+  }, [goodsTotalPoisha]);
+
   async function onApplyCoupon() {
     if (!token || !couponCode.trim()) return;
     setApplyingCoupon(true);
@@ -450,6 +486,29 @@ export default function CheckoutPage() {
     }
   }
 
+  // Gift card check (Wave 60): the public balance endpoint
+  // answers for any holder — no token needed. A card that is
+  // unknown gets the endpoint's uniform 404, surfaced as a
+  // plain "cannot be used" here; a found card shows its
+  // store, balance and status, and its code rides along at
+  // place-order (checkout re-validates everything).
+  async function onApplyGiftCard() {
+    if (!giftCardCode.trim()) return;
+    setApplyingGiftCard(true);
+    setError(null);
+    try {
+      const balance = await checkGiftCardBalance(giftCardCode.trim());
+      setGiftCard(balance);
+    } catch (err) {
+      setGiftCard(null);
+      setError(
+        err instanceof Error ? err.message : "গিফট কার্ড যাচাই করা যায়নি।"
+      );
+    } finally {
+      setApplyingGiftCard(false);
+    }
+  }
+
   async function onPlaceOrder(e: React.FormEvent) {
     e.preventDefault();
     if (!token) return;
@@ -477,6 +536,14 @@ export default function CheckoutPage() {
         // Only a preview-valid code is sent; checkout re-checks it
         // and its response is the final authority either way.
         coupon_code: coupon?.valid ? coupon.code : undefined,
+        // Gift card (Wave 60): sent only when a balance check
+        // found the card ACTIVE; checkout locks and
+        // re-validates it (store in cart, live, funded) and
+        // its redemption is what the placed order reports.
+        gift_card_code:
+          giftCard && giftCard.status === "active"
+            ? giftCardCode.trim()
+            : undefined,
         // Loyalty points (Wave 35): sent only when the buyer
         // opted in; the server clamps to the redeemable maximum
         // and the placed order reports what was actually used.
@@ -594,6 +661,13 @@ export default function CheckoutPage() {
               {" "}
               · লয়্যালটি ছাড় ({placed.loyalty_points_used} পয়েন্ট): −
               <PriceTag amountPoisha={placed.loyalty_discount_poisha} />
+            </>
+          )}
+          {placed.gift_card_discount_poisha > 0 && (
+            <>
+              {" "}
+              · গিফট কার্ড (••{placed.gift_card_last4}): −
+              <PriceTag amountPoisha={placed.gift_card_discount_poisha} />
             </>
           )}{" "}
           · ডেলিভারি: <PriceTag amountPoisha={placed.delivery_total_poisha} /> ·
@@ -843,6 +917,70 @@ export default function CheckoutPage() {
               <p role="alert">
                 কুপনটি ব্যবহার করা যাচ্ছে না
                 {coupon.reason ? `: ${coupon.reason}` : ""}
+              </p>
+            ))}
+
+          <h2>গিফট কার্ড — Gift card</h2>
+          <p>
+            <label>
+              গিফট কার্ডের কোড
+              <input
+                value={giftCardCode}
+                onChange={(e) => {
+                  setGiftCardCode(e.target.value);
+                  setGiftCard(null);
+                }}
+                placeholder="bdgc_…"
+              />
+            </label>{" "}
+            <button
+              type="button"
+              disabled={applyingGiftCard || !giftCardCode.trim()}
+              onClick={() => void onApplyGiftCard()}
+            >
+              {applyingGiftCard ? "যাচাই হচ্ছে…" : "কার্ড যাচাই করুন"}
+            </button>
+          </p>
+          {giftCard &&
+            (giftCard.status === "active" ? (
+              <p>
+                {giftCard.store_name} — ব্যালেন্স:{" "}
+                <PriceTag amountPoisha={giftCard.balance_poisha} />{" "}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setGiftCard(null);
+                    setGiftCardCode("");
+                  }}
+                >
+                  কার্ড সরান — Remove card
+                </button>
+                {giftCardStoreGoods > 0 ? (
+                  <>
+                    {" "}
+                    · এই অর্ডারে আনুমানিক প্রযোজ্য: −
+                    <PriceTag amountPoisha={giftCardPreviewAmount} />{" "}
+                    (চূড়ান্ত হিসাব অর্ডারের সময় সার্ভার দেবে — the
+                    server applies the exact post-coupon amount at
+                    order time)
+                  </>
+                ) : (
+                  <>
+                    {" "}
+                    · এই কার্ডটি {giftCard.store_name}-এর — কার্টে সেই
+                    দোকানের পণ্য নেই (this card's store is not in your
+                    cart)
+                  </>
+                )}
+              </p>
+            ) : (
+              <p role="alert">
+                {giftCard.status === "disabled" &&
+                  "কার্ডটি বন্ধ করা আছে — this gift card has been disabled."}
+                {giftCard.status === "expired" &&
+                  "কার্ডের মেয়াদ শেষ — this gift card has expired."}
+                {giftCard.status === "depleted" &&
+                  "কার্ডে কোনো ব্যালেন্স নেই — this gift card has no balance left."}
               </p>
             ))}
 

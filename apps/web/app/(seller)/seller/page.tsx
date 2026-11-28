@@ -345,6 +345,8 @@ export default function SellerDashboardPage() {
         {" · "}
         <Link href="/seller/coupons">কুপন — Coupons</Link>
         {" · "}
+        <Link href="/seller/gift-cards">গিফট কার্ড — Gift cards</Link>
+        {" · "}
         <Link href="/seller/promotions">প্রমোশন — Promotions</Link>
         {" · "}
         <Link href="/seller/flash-sale">ফ্ল্যাশ সেল — Flash sale</Link>

@@ -26,7 +26,9 @@
 //! The money block mirrors the receipt's definitions, scoped
 //! to the sub-order: the goods, discount and delivery figures
 //! are the sub-order's own stored snapshot columns; the
-//! sub-order grand is goods minus discount plus delivery. A
+//! sub-order grand is goods minus discount minus any
+//! gift-card redemption (Wave 60 — a sub-order snapshot like
+//! the discount, unlike order-level loyalty) plus delivery. A
 //! collected COD advance (Wave 17) lives on the parent order,
 //! so the invoice allocates it across the order's sub-orders
 //! in proportion to each sub-order's share of the order grand
@@ -95,9 +97,17 @@ pub struct InvoiceBuyer {
 pub struct InvoiceMoney {
     pub goods_subtotal_poisha: i64,
     pub discount_poisha: i64,
+    /// The gift-card redemption on this sub-order (Wave 60):
+    /// stored value the buyer paid with, so it comes off the
+    /// grand exactly like the coupon discount does. (Loyalty
+    /// stays off the invoice — it is an ORDER-level figure,
+    /// while the gift redemption is this sub-order's own
+    /// snapshot column.)
+    pub gift_card_discount_poisha: i64,
     pub delivery_charge_poisha: i64,
-    /// Goods minus discount plus delivery: what this slice of
-    /// the order costs the buyer in total.
+    /// Goods minus discount minus gift-card redemption plus
+    /// delivery: what this slice of the order costs the
+    /// buyer in total.
     pub grand_total_poisha: i64,
     /// This sub-order's allocated share of any advance the
     /// parent COD order collected online (Wave 17); 0 when no
@@ -360,8 +370,9 @@ async fn build_invoice_view(
         .ok_or_else(|| ApiError::internal("find invoiced sub-order", sqlx::Error::RowNotFound))?;
     let store = get_store_by_id(pool, row.store_id).await?;
 
-    let grand_total_poisha =
-        sub.goods_subtotal_poisha - sub.discount_poisha + sub.delivery_charge_poisha;
+    let grand_total_poisha = sub.goods_subtotal_poisha - sub.discount_poisha
+        - sub.gift_card_discount_poisha
+        + sub.delivery_charge_poisha;
     // The collected advance is an order-level figure; this
     // sub-order's share is proportional to its share of the
     // order grand total (exact for single-seller orders).
@@ -405,6 +416,7 @@ async fn build_invoice_view(
         money: InvoiceMoney {
             goods_subtotal_poisha: sub.goods_subtotal_poisha,
             discount_poisha: sub.discount_poisha,
+            gift_card_discount_poisha: sub.gift_card_discount_poisha,
             delivery_charge_poisha: sub.delivery_charge_poisha,
             grand_total_poisha,
             advance_paid_poisha: advance_share_poisha,

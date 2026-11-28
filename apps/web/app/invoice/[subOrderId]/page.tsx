@@ -214,6 +214,13 @@ export default function InvoicePage({
               <PriceTag amountPoisha={invoice.money.discount_poisha} />
             </>
           )}
+          {invoice.money.gift_card_discount_poisha > 0 && (
+            <>
+              <br />
+              গিফট কার্ড: −
+              <PriceTag amountPoisha={invoice.money.gift_card_discount_poisha} />
+            </>
+          )}
           <br />
           ডেলিভারি চার্জ:{" "}
           <PriceTag amountPoisha={invoice.money.delivery_charge_poisha} />

@@ -58,6 +58,16 @@
 //! ride the Wave 43 summary line (`reaped_pending` /
 //! `reaped_failed`, inside the notifications group).
 //!
+//! Wave 60 gives the worker a small fourth sweep:
+//! `api::gift_cards::sweep_gift_card_expiry_reminders`
+//! enqueues ONE outbox reminder to a gift card's issuing
+//! seller when the card still holds a balance and its
+//! expiry is a week or less away (the card row's
+//! `expiry_reminded_at` stamp, set in the same
+//! transaction as the enqueue, makes it exactly-once).
+//! Its count rides the summary line as
+//! `gift_card_reminders`.
+//!
 //! Wave 43 gives the worker an observability line: each
 //! cycle ends with ONE summary line carrying the three
 //! jobs' headline counts (notifications sent / retried /
@@ -373,6 +383,23 @@ async fn main() {
                 (0, 0, 0)
             }
         };
+        // Wave 60 extension: the gift-card expiry sweep —
+        // cards still holding a balance whose expiry is a
+        // week or less away earn their ISSUING seller one
+        // outbox reminder (the card row is stamped in the
+        // same transaction, so the reminder is exactly-once
+        // across cycles and across racing workers). The
+        // reminder rows it enqueues are drained by the NEXT
+        // cycle's process_pending, like every outbox row a
+        // sweep produces.
+        let gift_card_reminders =
+            match api::gift_cards::sweep_gift_card_expiry_reminders(&state).await {
+                Ok(report) => report.reminded,
+                Err(error) => {
+                    eprintln!("worker: gift card expiry sweep failed: {}", error.message);
+                    0
+                }
+            };
         // Wave 51 extension: the media orphan reaper —
         // objects no product_images / reviews / stores row
         // accounts for (left by uploads that died between
@@ -407,6 +434,7 @@ async fn main() {
              reaped_pending={} reaped_failed={} \
              shipments checked={} advanced={} unchanged={} failed={} \
              subscriptions checked={} renewed={} expired={} \
+             gift_card_reminders={} \
              media scanned={} orphans_deleted={} \
              media_library images={} bytes={}",
             notify_counts.0,
@@ -421,6 +449,7 @@ async fn main() {
             sub_counts.0,
             sub_counts.1,
             sub_counts.2,
+            gift_card_reminders,
             media_counts.0,
             media_counts.1,
             media_library.0,

@@ -20,7 +20,8 @@
 //!   the key lookup (revoked / expired → 401), the JWT-only
 //!   route exclusions ([`api_key_forbidden_route`] — admin,
 //!   payout account + payout requests, subscription
-//!   subscribe/cancel, key management itself, data exports),
+//!   subscribe/cancel, key management itself, data exports,
+//!   and — Wave 60 — gift-card issuance and freeze/unfreeze),
 //!   the scope rule (a read-only key gets 403 on any non-GET
 //!   call), and the per-key rate limit (429 past the cap).
 //!   No handler re-implements any of it.
@@ -153,6 +154,15 @@ pub fn api_key_forbidden_route(path: &str, method: &Method) -> bool {
     if method == Method::POST
         && (path == "/v1/seller/payouts" || path.starts_with("/v1/seller/subscription"))
     {
+        return true;
+    }
+    // Wave 60: gift-card ISSUANCE and freeze/unfreeze are
+    // JWT-only for the same reason payout requests are —
+    // issuing a card creates store liability and freezing
+    // one strands a holder's value; a leaked key must not
+    // be able to do either. READING cards with a key stays
+    // allowed (money reading is readable, the rule above).
+    if method == Method::POST && path.starts_with("/v1/seller/gift-cards") {
         return true;
     }
     false

@@ -95,6 +95,8 @@ struct ExportSubOrderRow {
     status: String,
     goods_subtotal_poisha: i64,
     discount_poisha: i64,
+    /// The sub-order's gift-card redemption (Wave 60).
+    gift_card_discount_poisha: i64,
     delivery_charge_poisha: i64,
     commission_poisha: i64,
     seller_payout_poisha: i64,
@@ -110,7 +112,8 @@ struct ExportSubOrder {
 }
 
 const EXPORT_SUB_ORDER_COLUMNS: &str = "id, order_id, store_id, status, goods_subtotal_poisha, \
-    discount_poisha, delivery_charge_poisha, commission_poisha, seller_payout_poisha, created_at";
+    discount_poisha, gift_card_discount_poisha, delivery_charge_poisha, commission_poisha, \
+    seller_payout_poisha, created_at";
 
 /// Group order items under their sub-orders. Items arrive in
 /// one query for the whole export; this is the only assembly
@@ -286,6 +289,10 @@ async fn build_seller_export(
     let (content_pages, content_posts) =
         crate::store_content::export_content(pool, store_ids).await?;
 
+    // Wave 60: the store's gift cards (display fragments
+    // and money only — codes and hashes are never exported).
+    let gift_cards = crate::gift_cards::export_gift_cards(pool, store_ids).await?;
+
     let now = Utc::now();
     let filename = export_filename("seller", &store.slug, &now.format("%Y%m%d").to_string());
     let document = json!({
@@ -300,6 +307,7 @@ async fn build_seller_export(
         "charges_total_poisha": charges_total_poisha,
         "pages": content_pages,
         "posts": content_posts,
+        "gift_cards": gift_cards,
     });
     Ok(ExportDownload { filename, document })
 }
@@ -335,6 +343,10 @@ struct ExportOrderRow {
     goods_total_poisha: i64,
     coupon_code: Option<String>,
     discount_total_poisha: i64,
+    /// The order's gift-card redemption and the card's
+    /// display tail (Wave 60) — never the code.
+    gift_card_last4: Option<String>,
+    gift_card_discount_poisha: i64,
     delivery_total_poisha: i64,
     grand_total_poisha: i64,
     created_at: DateTime<Utc>,
@@ -408,6 +420,7 @@ pub async fn buyer_export(pool: &PgPool, user: &AuthUser) -> Result<ExportDownlo
          advance_required_poisha, advance_paid_poisha, \
          delivery_name, delivery_phone, delivery_address, delivery_zone, \
          goods_total_poisha, coupon_code, discount_total_poisha, \
+         gift_card_last4, gift_card_discount_poisha, \
          delivery_total_poisha, grand_total_poisha, created_at \
          FROM orders WHERE buyer_user_id = $1 ORDER BY created_at DESC LIMIT $2",
     )

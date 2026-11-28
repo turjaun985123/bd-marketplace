@@ -553,6 +553,11 @@ export interface SubOrder {
   discount_poisha: number;
   /** Loyalty discount allocated to this sub-order (Wave 35). */
   loyalty_discount_poisha: number;
+  /**
+   * Gift-card redemption applied to this sub-order (Wave 60);
+   * non-zero on at most one sub-order of an order.
+   */
+  gift_card_discount_poisha: number;
   delivery_charge_poisha: number;
   commission_poisha: number;
   seller_payout_poisha: number;
@@ -672,6 +677,14 @@ export interface Order {
    * payouts never see it.
    */
   loyalty_discount_poisha: number;
+  /**
+   * Gift-card redemption on this order (Wave 60). The grand
+   * total is already net of it; the card was the seller's
+   * own money, so the funded sub-order's payout nets it too.
+   */
+  gift_card_discount_poisha: number;
+  /** The redeemed card's display tail (Wave 60); null when none. */
+  gift_card_last4: string | null;
   delivery_total_poisha: number;
   grand_total_poisha: number;
   created_at: string;
@@ -695,6 +708,11 @@ export interface SellerSubOrder {
   goods_subtotal_poisha: number;
   /** Coupon discount allocated to this sub-order (Wave 14). */
   discount_poisha: number;
+  /**
+   * Gift-card redemption applied to this sub-order (Wave 60) —
+   * seller-funded, so it explains a reduced payout below.
+   */
+  gift_card_discount_poisha: number;
   delivery_charge_poisha: number;
   commission_poisha: number;
   seller_payout_poisha: number;
@@ -744,6 +762,13 @@ export interface PlaceOrderInput {
   payment_method: string;
   /** Optional coupon code (Wave 14); checkout re-validates it. */
   coupon_code?: string;
+  /**
+   * Optional gift-card code (Wave 60). Checkout locks the
+   * card, validates it against the cart (its store must be
+   * in the order) and redeems it after the coupon, before
+   * loyalty; an unusable card fails the checkout with a 400.
+   */
+  gift_card_code?: string;
   /**
    * The online method for a COD advance (Wave 17). Needed only
    * when checkout decides this order requires an advance; when
@@ -806,6 +831,246 @@ export interface LoyaltyView {
 /** GET /v1/loyalty — my loyalty points (Wave 35). */
 export function getLoyalty(token: string): Promise<LoyaltyView> {
   return call("/v1/loyalty", { token });
+}
+
+// ---------------------------------------------------------------------
+// Gift cards (Wave 60)
+//
+// Store-scoped bearer stored value. A card view NEVER
+// carries the full code or its hash — only the display
+// prefix and last4. The full code exists in exactly one
+// response: the issue call that created the card.
+// ---------------------------------------------------------------------
+
+/** A gift card as clients see it (Wave 60), masked. */
+export interface GiftCard {
+  id: string;
+  store_id: string;
+  store_slug: string;
+  store_name: string;
+  /** First 12 characters of the issued code — display only. */
+  code_prefix: string;
+  /** Last 4 characters of the issued code — the "••1234" tail. */
+  last4: string;
+  initial_amount_poisha: number;
+  balance_poisha: number;
+  /** Initial − balance: redemptions net of restores/adjusts. */
+  redeemed_net_poisha: number;
+  /** Derived at read: active | disabled | expired | depleted. */
+  status: string;
+  note: string | null;
+  recipient_name: string | null;
+  /** Null = never expires. */
+  expires_at: string | null;
+  disabled: boolean;
+  created_at: string;
+}
+
+/** A freshly issued card WITH its full code (Wave 60) — shown once. */
+export interface CreatedGiftCard extends GiftCard {
+  code: string;
+}
+
+/** One ledger movement on a card (Wave 60). */
+export interface GiftCardLedgerEntry {
+  id: string;
+  /** issue | redeem | cancel_restore | return_restore | admin_adjust */
+  kind: string;
+  /** Signed: positive into the card, negative out. */
+  delta_poisha: number;
+  balance_after_poisha: number;
+  order_id: string | null;
+  sub_order_id: string | null;
+  note: string | null;
+  created_at: string;
+}
+
+/** A card plus its recent ledger (Wave 60). */
+export interface GiftCardDetail extends GiftCard {
+  ledger: GiftCardLedgerEntry[];
+}
+
+/** A page of cards (Wave 60). */
+export interface GiftCardList {
+  items: GiftCard[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+/** Card aggregates for one store, or the platform (Wave 60). */
+export interface GiftCardStats {
+  cards_total: number;
+  active_cards: number;
+  disabled_cards: number;
+  expired_cards: number;
+  depleted_cards: number;
+  initial_total_poisha: number;
+  /** Current balances summed — the outstanding liability. */
+  outstanding_poisha: number;
+  redeemed_total_poisha: number;
+  restored_total_poisha: number;
+}
+
+/** Issue input (Wave 60). `count` > 1 bulk-issues identical cards. */
+export interface IssueGiftCardInput {
+  amount_poisha: number;
+  note?: string;
+  recipient_name?: string;
+  /** Days until expiry; absent = the platform default. */
+  validity_days?: number;
+  /** Issue a card that never expires (cannot combine with validity_days). */
+  no_expiry?: boolean;
+  count?: number;
+}
+
+/**
+ * POST /v1/seller/gift-cards — issue card(s) for a store
+ * (owner-level). The response is the ONLY place the full
+ * codes ever appear.
+ */
+export function issueGiftCards(
+  token: string,
+  input: IssueGiftCardInput,
+  storeId?: string
+): Promise<{ cards: CreatedGiftCard[] }> {
+  const qs = storeId ? `?store_id=${encodeURIComponent(storeId)}` : "";
+  return call(`/v1/seller/gift-cards${qs}`, {
+    method: "POST",
+    token,
+    body: input,
+  });
+}
+
+/** GET /v1/seller/gift-cards — a store's cards, masked. */
+export function listGiftCards(
+  token: string,
+  params?: { storeId?: string; status?: string; page?: number; limit?: number }
+): Promise<GiftCardList> {
+  const search = new URLSearchParams();
+  if (params?.storeId) search.set("store_id", params.storeId);
+  if (params?.status) search.set("status", params.status);
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/seller/gift-cards${qs ? `?${qs}` : ""}`, { token });
+}
+
+/** GET /v1/seller/gift-cards/{id} — one card + its ledger. */
+export function getGiftCard(token: string, id: string): Promise<GiftCardDetail> {
+  return call(`/v1/seller/gift-cards/${encodeURIComponent(id)}`, { token });
+}
+
+/** POST /v1/seller/gift-cards/{id}/disable — freeze a card (owner-level). */
+export function disableGiftCard(token: string, id: string): Promise<GiftCard> {
+  return call(`/v1/seller/gift-cards/${encodeURIComponent(id)}/disable`, {
+    method: "POST",
+    token,
+  });
+}
+
+/** POST /v1/seller/gift-cards/{id}/enable — unfreeze a card (owner-level). */
+export function enableGiftCard(token: string, id: string): Promise<GiftCard> {
+  return call(`/v1/seller/gift-cards/${encodeURIComponent(id)}/enable`, {
+    method: "POST",
+    token,
+  });
+}
+
+/** GET /v1/seller/gift-card-stats — a store's card aggregates. */
+export function getGiftCardStats(
+  token: string,
+  storeId?: string
+): Promise<GiftCardStats> {
+  const qs = storeId ? `?store_id=${encodeURIComponent(storeId)}` : "";
+  return call(`/v1/seller/gift-card-stats${qs}`, { token });
+}
+
+/** The public balance-check answer (Wave 60). */
+export interface GiftCardBalance {
+  balance_poisha: number;
+  initial_amount_poisha: number;
+  /** active | disabled | expired | depleted */
+  status: string;
+  store_id: string;
+  store_slug: string;
+  store_name: string;
+  last4: string;
+  expires_at: string | null;
+}
+
+/**
+ * POST /v1/gift-cards/balance — the public, unauthenticated
+ * bearer balance check. Unknown or malformed codes reject
+ * with one uniform 404.
+ */
+export function checkGiftCardBalance(code: string): Promise<GiftCardBalance> {
+  return call("/v1/gift-cards/balance", { method: "POST", body: { code } });
+}
+
+/** GET /v1/admin/gift-cards — every store's cards, searchable. */
+export function listAdminGiftCards(
+  token: string,
+  params?: {
+    q?: string;
+    storeId?: string;
+    status?: string;
+    page?: number;
+    limit?: number;
+  }
+): Promise<GiftCardList> {
+  const search = new URLSearchParams();
+  if (params?.q) search.set("q", params.q);
+  if (params?.storeId) search.set("store_id", params.storeId);
+  if (params?.status) search.set("status", params.status);
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/admin/gift-cards${qs ? `?${qs}` : ""}`, { token });
+}
+
+/** GET /v1/admin/gift-cards/{id} — one card + ledger, for support. */
+export function getAdminGiftCard(
+  token: string,
+  id: string
+): Promise<GiftCardDetail> {
+  return call(`/v1/admin/gift-cards/${encodeURIComponent(id)}`, { token });
+}
+
+/** POST /v1/admin/gift-cards/{id}/disable — freeze any card (audited). */
+export function disableAdminGiftCard(
+  token: string,
+  id: string
+): Promise<GiftCard> {
+  return call(`/v1/admin/gift-cards/${encodeURIComponent(id)}/disable`, {
+    method: "POST",
+    token,
+  });
+}
+
+/** POST /v1/admin/gift-cards/{id}/enable — unfreeze any card (audited). */
+export function enableAdminGiftCard(
+  token: string,
+  id: string
+): Promise<GiftCard> {
+  return call(`/v1/admin/gift-cards/${encodeURIComponent(id)}/enable`, {
+    method: "POST",
+    token,
+  });
+}
+
+/** POST /v1/admin/gift-cards/{id}/adjust — correct a balance (audited). */
+export function adjustAdminGiftCard(
+  token: string,
+  id: string,
+  deltaPoisha: number,
+  note: string
+): Promise<GiftCard> {
+  return call(`/v1/admin/gift-cards/${encodeURIComponent(id)}/adjust`, {
+    method: "POST",
+    token,
+    body: { delta_poisha: deltaPoisha, note },
+  });
 }
 
 function apiBase(): string {
@@ -2527,6 +2792,10 @@ export interface Receipt {
   loyalty_points_used: number;
   /** The discount those points bought (Wave 35); shown as its own line. */
   loyalty_discount_poisha: number;
+  /** The redeemed gift card's display tail (Wave 60); null when none. */
+  gift_card_last4: string | null;
+  /** Gift-card redemption (Wave 60); shown as its own line. */
+  gift_card_discount_poisha: number;
   delivery_total_poisha: number;
   grand_total_poisha: number;
 }
@@ -2560,8 +2829,10 @@ export interface InvoiceStore {
 export interface InvoiceMoney {
   goods_subtotal_poisha: number;
   discount_poisha: number;
+  /** Gift-card redemption on this sub-order (Wave 60). */
+  gift_card_discount_poisha: number;
   delivery_charge_poisha: number;
-  /** Goods − discount + delivery: this slice's total. */
+  /** Goods − discount − gift card + delivery: this slice's total. */
   grand_total_poisha: number;
   /** This slice's share of any advance the COD order collected (Wave 17). */
   advance_paid_poisha: number;
@@ -5385,6 +5656,8 @@ export interface AdminMetrics {
     buyers_with_addresses: number;
     defaults_count: number;
   };
+  /** Gift cards platform-wide (Wave 60) — the stored-value liability. */
+  gift_cards: GiftCardStats;
 }
 
 /** GET /v1/admin/metrics — admin only (the API answers 403 otherwise). */

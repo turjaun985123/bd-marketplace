@@ -42,6 +42,13 @@
 //! transaction — goods that came back un-earn their points.
 //! (An RTO parcel was never delivered, so it never earned
 //! anything and needs no clawback.)
+//!
+//! Wave 60: the same receipt restores the sub-order's
+//! gift-card redemption to the card (proportional to the
+//! refund basis — the whole redemption for a whole-sub-order
+//! return) and the stored cash refund drops by the restored
+//! amount, so the buyer recovers the card-funded slice as
+//! card balance instead of cash and is never paid twice.
 
 use axum::{
     extract::{Path, Query, State},
@@ -549,6 +556,26 @@ pub async fn mark_return_received(
     }
 
     let refund_poisha = compute_refund_poisha(goods_poisha, discount_poisha);
+    // Wave 60: the gift-card-funded share of this refund is
+    // restored to the CARD, not owed in cash — the hook
+    // returns how much it restored (proportional to the
+    // refund basis; whole-sub-order returns restore the
+    // full redemption), and the stored refund drops by
+    // exactly that. The buyer's total recovery is
+    // unchanged — cash here plus card balance there — and
+    // the Wave 41 payment-refund settlement below folds in
+    // the cash figure only, which is all the gateway ever
+    // collected. Restoring never extends the card's life:
+    // an expired card's balance returns but stays expired
+    // (the `gift_cards` module doc).
+    let gift_card_restored = crate::gift_cards::restore_for_returned_sub_order(
+        &mut tx,
+        sub_order_id,
+        refund_poisha,
+        refund_poisha,
+    )
+    .await?;
+    let refund_poisha = refund_poisha - gift_card_restored;
     sqlx::query(
         "UPDATE return_requests SET status = 'received', refund_poisha = $2, \
          refund_status = 'pending' WHERE id = $1",

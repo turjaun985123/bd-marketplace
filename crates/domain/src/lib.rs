@@ -306,6 +306,15 @@ pub struct OrderGroupInput {
     /// [`allocate_discount`] over the in-scope groups, so the group
     /// discounts sum exactly to the order's discount.
     pub discount_poisha: i64,
+    /// Gift-card redemption applied to this group (Wave 60), in
+    /// poisha; zero when the order uses no gift card. A gift card
+    /// belongs to ONE store, so at most one group in an order
+    /// carries a non-zero value. The redemption is SELLER-funded
+    /// (see the Wave 60 section): it clamps to the group's
+    /// post-coupon goods, it always reduces the commission base,
+    /// and it reduces the seller payout — exactly like a store
+    /// coupon's discount, whatever coupon the order also used.
+    pub gift_card_discount_poisha: i64,
     /// Who bears this group's discount (Wave 14). True for a STORE
     /// coupon: the seller bears it, so commission is computed on
     /// goods minus discount. False for a PLATFORM coupon: the
@@ -330,6 +339,9 @@ pub struct SubOrderTotals {
     pub goods_subtotal_poisha: i64,
     /// Coupon discount allocated to this sub-order (Wave 14).
     pub discount_poisha: i64,
+    /// Gift-card redemption applied to this sub-order (Wave 60);
+    /// non-zero on at most one sub-order of an order.
+    pub gift_card_discount_poisha: i64,
     pub delivery_charge_poisha: i64,
     pub commission_poisha: i64,
     pub seller_payout_poisha: i64,
@@ -343,8 +355,12 @@ pub struct OrderTotals {
     pub goods_total_poisha: i64,
     /// Total coupon discount across all sub-orders (Wave 14).
     pub discount_total_poisha: i64,
+    /// Total gift-card redemption across all sub-orders
+    /// (Wave 60) — one card, one store, so this equals the
+    /// single carrying sub-order's redemption.
+    pub gift_card_discount_total_poisha: i64,
     pub delivery_total_poisha: i64,
-    /// What the buyer pays: goods − discount + delivery.
+    /// What the buyer pays: goods − discount − gift card + delivery.
     pub grand_total_poisha: i64,
 }
 
@@ -373,6 +389,16 @@ pub struct OrderTotals {
 /// goods − discount + delivery: the discount reduces the grand
 /// total no matter who bears it.
 ///
+/// Gift-card redemptions (Wave 60) are applied per group from
+/// the group's `gift_card_discount_poisha`, clamped to the
+/// group's POST-COUPON goods (goods − coupon discount) — a
+/// card can never discount delivery or eat into another
+/// discount. The redemption is seller-funded in BOTH coupon
+/// cases: the commission base is the coupon-adjusted base
+/// above MINUS the redemption, and the payout is goods −
+/// coupon discount − redemption − commission. The buyer pays
+/// goods − discount − redemption + delivery.
+///
 /// Commission rates (Wave 36): `commission_rate_bps` is the
 /// order-wide rate, and a group carrying its own
 /// `commission_rate_bps` (a subscription plan discount resolved
@@ -392,6 +418,7 @@ pub fn build_order_totals(
     let mut sub_orders = Vec::with_capacity(groups.len());
     let mut goods_total_poisha = 0i64;
     let mut discount_total_poisha = 0i64;
+    let mut gift_card_discount_total_poisha = 0i64;
     let mut delivery_total_poisha = 0i64;
 
     for group in groups {
@@ -452,10 +479,24 @@ pub fn build_order_totals(
             goods_subtotal_poisha,
         )?;
         let discount_poisha = group.discount_poisha.clamp(0, goods_subtotal_poisha);
+        // Wave 60: the gift-card redemption clamps to the
+        // POST-COUPON goods — the card prices against what
+        // the buyer still owes for this group's goods after
+        // the coupon, never against delivery or the coupon
+        // itself. A negative stored value clamps to zero.
+        let gift_card_discount_poisha = group
+            .gift_card_discount_poisha
+            .clamp(0, goods_subtotal_poisha - discount_poisha);
+        // The commission base: the coupon rule first (the
+        // group bears its coupon discount only for a store
+        // coupon), then the gift-card redemption comes off
+        // in BOTH cases — the card is the seller's own
+        // money, so the platform never takes commission on
+        // value the seller gave away.
         let commission_base_poisha = if group.commission_on_discounted {
-            goods_subtotal_poisha - discount_poisha
+            goods_subtotal_poisha - discount_poisha - gift_card_discount_poisha
         } else {
-            goods_subtotal_poisha
+            goods_subtotal_poisha - gift_card_discount_poisha
         };
         // Wave 36: a group may carry its own rate (a subscription
         // plan discount resolved per store by the API); without
@@ -475,6 +516,12 @@ pub fn build_order_totals(
                 "অর্ডারের মোট হিসাব সীমা ছাড়িয়ে গেছে — order discount total overflows the money range"
                     .to_string()
             })?;
+        gift_card_discount_total_poisha = gift_card_discount_total_poisha
+            .checked_add(gift_card_discount_poisha)
+            .ok_or_else(|| {
+                "অর্ডারের মোট হিসাব সীমা ছাড়িয়ে গেছে — order gift card total overflows the money range"
+                    .to_string()
+            })?;
         delivery_total_poisha = delivery_total_poisha
             .checked_add(delivery_charge_poisha)
             .ok_or_else(|| {
@@ -484,14 +531,19 @@ pub fn build_order_totals(
         sub_orders.push(SubOrderTotals {
             goods_subtotal_poisha,
             discount_poisha,
+            gift_card_discount_poisha,
             delivery_charge_poisha,
             commission_poisha,
-            seller_payout_poisha: goods_subtotal_poisha - discount_poisha - commission_poisha,
+            seller_payout_poisha: goods_subtotal_poisha
+                - discount_poisha
+                - gift_card_discount_poisha
+                - commission_poisha,
         });
     }
 
     let grand_total_poisha = goods_total_poisha
         .checked_sub(discount_total_poisha)
+        .and_then(|net| net.checked_sub(gift_card_discount_total_poisha))
         .and_then(|net| net.checked_add(delivery_total_poisha))
         .ok_or_else(|| {
             "অর্ডারের মোট হিসাব সীমা ছাড়িয়ে গেছে — order grand total overflows the money range"
@@ -502,6 +554,7 @@ pub fn build_order_totals(
         sub_orders,
         goods_total_poisha,
         discount_total_poisha,
+        gift_card_discount_total_poisha,
         delivery_total_poisha,
         grand_total_poisha,
     })
@@ -4122,6 +4175,14 @@ pub const NOTIFICATION_STORE_FLASH_SALE: &str = "store_flash_sale";
 /// in the Wave 59 README section).
 pub const NOTIFICATION_STORE_NEW_POST: &str = "store_new_post";
 
+/// Wave 60: a gift card a seller issued still holds a
+/// balance and its expiry is days away. Enqueued by the
+/// worker's gift-card expiry sweep (one reminder per
+/// card, stamped on the card row) to the ISSUING seller —
+/// the person who can still reach the recipient before
+/// the value lapses.
+pub const NOTIFICATION_GIFT_CARD_EXPIRING: &str = "gift_card_expiring";
+
 /// The values a notification template renders (Wave 29).
 /// Every field is optional in effect: a kind uses the fields
 /// it names and ignores the rest, so one struct serves all
@@ -4149,6 +4210,12 @@ pub struct NotificationVars {
     /// the `store_new_post` template; empty for every
     /// other kind.
     pub post_title: String,
+    /// The gift card's last four characters (Wave 60) —
+    /// read only by the `gift_card_expiring` template;
+    /// empty for every other kind. Never more than the
+    /// last4: a notification body is not a place for a
+    /// bearer credential.
+    pub card_last4: String,
 }
 
 /// The short display form of an order id: its first 8
@@ -4253,6 +4320,17 @@ pub fn render_body(kind: &str, vars: &NotificationVars) -> String {
                 )
             }
         }
+        NOTIFICATION_GIFT_CARD_EXPIRING => match vars.amount_poisha {
+            Some(amount) => format!(
+                "BD Marketplace: {store}-এর গিফট কার্ড ••{}-এর মেয়াদ শীঘ্রই শেষ হচ্ছে। বকেয়া ব্যালেন্স {}।",
+                vars.card_last4,
+                format_taka(amount)
+            ),
+            None => format!(
+                "BD Marketplace: {store}-এর গিফট কার্ড ••{}-এর মেয়াদ শীঘ্রই শেষ হচ্ছে।",
+                vars.card_last4
+            ),
+        },
         _ => format!("BD Marketplace: অর্ডার #{short} সম্পর্কে একটি আপডেট আছে।"),
     }
 }
@@ -8791,6 +8869,379 @@ pub fn xml_escape(text: &str) -> String {
     out
 }
 
+// =====================================================================
+// Wave 60 — gift cards: store-scoped stored value.
+//
+// A gift card is a BEARER instrument: the code is the
+// credential, exactly like a Wave 37 API key. The full code
+// is shown exactly once at issuance; only its SHA-256 hash
+// is stored. Anyone holding the code can check its balance
+// and spend it — that is what a gift card IS (Shopify's work
+// the same way); the protection is the code's entropy and
+// the hash-only storage, and the tradeoff is documented in
+// the README's Wave 60 section.
+//
+// Scope: STORE-scoped cards only. A card is issued by one
+// store and redeems only against that store's sub-order in
+// a checkout. Platform-wide cards are a documented future.
+//
+// Funding model — read this before touching the money:
+// issuance in this wave is PROMOTIONAL / MANUAL (a seller
+// or an admin creates cards; there is NO purchase flow and
+// NO money is collected at issuance). Redemption is
+// therefore SELLER-FUNDED: it behaves exactly like a store
+// coupon discount on that store's sub-order — the
+// commission base and the seller payout snapshot both net
+// it out (see `build_order_totals`). The platform never
+// funds a gift-card redemption.
+//
+// Redemption ordering at checkout (pinned by tests):
+// coupon first, then the gift card against the sub-order's
+// POST-COUPON goods, then loyalty — loyalty's 50% cap base
+// is the goods net of coupon AND gift card, and the COD
+// advance base is the grand total net of all three.
+// =====================================================================
+
+/// The display prefix of every gift-card code (Wave 60).
+/// Codes look like `bdgc_K7QX…`: the prefix says what the
+/// string is when a buyer pastes it into the wrong field,
+/// and it keeps gift-card codes visually distinct from
+/// Wave 37 API keys (`bdm_live_…`).
+pub const GIFT_CARD_CODE_PREFIX: &str = "bdgc_";
+
+/// Random characters after the prefix (Wave 60). Sampled
+/// from uppercase letters + digits (36 symbols), 24 chars
+/// carry ≈ 124 bits of entropy — comfortably beyond
+/// guessing, short enough to read off a printed card.
+pub const GIFT_CARD_CODE_RANDOM_CHARS: usize = 24;
+
+/// Total length of a full gift-card code, prefix included
+/// (Wave 60).
+pub const GIFT_CARD_CODE_LENGTH: usize = 29;
+
+/// Smallest issuable card value (Wave 60): ৳10. Below this
+/// a card is confetti, not stored value.
+pub const GIFT_CARD_MIN_ISSUE_POISHA: i64 = 1_000;
+
+/// Largest issuable card value (Wave 60): ৳50,000. A
+/// promotional instrument issued without payment should
+/// not be able to create an unbounded store liability in
+/// one click; bigger campaigns issue more cards.
+pub const GIFT_CARD_MAX_ISSUE_POISHA: i64 = 5_000_000;
+
+/// Most cards one bulk-issue call may create (Wave 60).
+pub const GIFT_CARD_MAX_BULK_ISSUE: i64 = 50;
+
+/// Default validity when neither the issuer nor the
+/// platform setting says otherwise (Wave 60): one year.
+pub const GIFT_CARD_DEFAULT_VALIDITY_DAYS: i64 = 365;
+
+/// Longest validity an issuer may pick (Wave 60): ten
+/// years. Zero or negative validity is rejected at issue —
+/// a card that is born expired is a support ticket, not a
+/// feature; a card with NO expiry is expressed by the
+/// issuer picking the no-expiry option, not by 0 days.
+pub const GIFT_CARD_MAX_VALIDITY_DAYS: i64 = 3_650;
+
+/// The platform_settings key for the default validity
+/// (Wave 60). DB value wins over
+/// [`GIFT_CARD_DEFAULT_VALIDITY_DAYS`] when it parses to a
+/// valid day count (the `platform_setting_i64` precedent).
+pub const GIFT_CARD_VALIDITY_SETTING_KEY: &str = "gift_card_default_validity_days";
+
+/// How far ahead the worker's expiry sweep looks (Wave 60
+/// extension): a card expiring within this many days, still
+/// holding a balance and not yet reminded about, earns its
+/// issuing seller ONE reminder (the card row is stamped so
+/// the sweep never repeats it). A week is long enough to
+/// reach the recipient and short enough that the balance
+/// figure in the message is still roughly true.
+pub const GIFT_CARD_EXPIRY_REMINDER_WINDOW_DAYS: i64 = 7;
+
+/// Longest issuer note on a card (Wave 60) — "ঈদ মোবারক"
+/// territory, not an essay.
+pub const GIFT_CARD_MAX_NOTE_CHARS: usize = 200;
+
+/// Longest recipient name on a card (Wave 60).
+pub const GIFT_CARD_MAX_RECIPIENT_CHARS: usize = 80;
+
+/// Ledger kind: the issuance movement (Wave 60). Delta is
+/// the card's full initial value, positive.
+pub const GIFT_CARD_LEDGER_ISSUE: &str = "issue";
+
+/// Ledger kind: a checkout redemption (Wave 60). Delta is
+/// negative; the row references the order + sub-order.
+pub const GIFT_CARD_LEDGER_REDEEM: &str = "redeem";
+
+/// Ledger kind: a redemption restored because the order or
+/// sub-order was cancelled before delivery (Wave 60).
+/// Delta is positive, exactly the redeemed amount.
+pub const GIFT_CARD_LEDGER_CANCEL_RESTORE: &str = "cancel_restore";
+
+/// Ledger kind: a redemption restored because a return on
+/// the funded sub-order was received (Wave 60). Delta is
+/// positive, proportional to the refund basis (see
+/// [`gift_card_restore_for_return`]).
+pub const GIFT_CARD_LEDGER_RETURN_RESTORE: &str = "return_restore";
+
+/// Ledger kind: an admin's manual balance correction
+/// (Wave 60). Delta is signed and never takes the balance
+/// below zero; every such row is written in the same
+/// transaction as an admin audit-log entry.
+pub const GIFT_CARD_LEDGER_ADMIN_ADJUST: &str = "admin_adjust";
+
+/// The whole ledger-kind vocabulary (Wave 60). The API
+/// writes only these; the database CHECK mirrors the list.
+///
+/// Expiry is deliberately NOT a ledger kind: expiry is
+/// time-derived (the loyalty precedent), never a stored
+/// flip, so there is no movement to record — the balance
+/// does not change when a card expires.
+pub const GIFT_CARD_LEDGER_KINDS: [&str; 5] = [
+    GIFT_CARD_LEDGER_ISSUE,
+    GIFT_CARD_LEDGER_REDEEM,
+    GIFT_CARD_LEDGER_CANCEL_RESTORE,
+    GIFT_CARD_LEDGER_RETURN_RESTORE,
+    GIFT_CARD_LEDGER_ADMIN_ADJUST,
+];
+
+/// Derived card status: live and spendable (Wave 60).
+pub const GIFT_CARD_STATUS_ACTIVE: &str = "active";
+
+/// Derived card status: frozen by the seller or an admin
+/// (Wave 60). A stored fact (`disabled_at`), reversible.
+pub const GIFT_CARD_STATUS_DISABLED: &str = "disabled";
+
+/// Derived card status: past its expiry moment (Wave 60).
+/// Time-derived at read; no stored flip.
+pub const GIFT_CARD_STATUS_EXPIRED: &str = "expired";
+
+/// Derived card status: fully redeemed, nothing left to
+/// spend (Wave 60). Distinct from expired — the card kept
+/// its promise completely.
+pub const GIFT_CARD_STATUS_DEPLETED: &str = "depleted";
+
+/// Normalise a gift-card code as typed or pasted by a
+/// holder (Wave 60): whitespace and hyphens are dropped
+/// (printed cards group the code for readability) and the
+/// rest is upper-cased, then the shape is checked. Returns
+/// the canonical form — the string that is hashed and
+/// looked up — or `None` when the input cannot be a code
+/// this platform issued. Generation samples from the same
+/// uppercase alphabet, so a genuinely issued code always
+/// normalises to itself (modulo the prefix's case).
+pub fn normalize_gift_card_code(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect::<String>()
+        .to_ascii_uppercase();
+    if gift_card_code_shape_ok(&cleaned) {
+        Some(cleaned)
+    } else {
+        None
+    }
+}
+
+/// The shape check on a NORMALISED code (Wave 60): the
+/// upper-cased prefix `BDGC_`, then exactly
+/// [`GIFT_CARD_CODE_RANDOM_CHARS`] uppercase-alphanumeric
+/// characters, nothing else.
+pub fn gift_card_code_shape_ok(normalised: &str) -> bool {
+    if normalised.len() != GIFT_CARD_CODE_LENGTH {
+        return false;
+    }
+    let Some(rest) = normalised.strip_prefix("BDGC_") else {
+        return false;
+    };
+    rest.len() == GIFT_CARD_CODE_RANDOM_CHARS
+        && rest.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
+/// The display prefix of an issued code (Wave 60): the
+/// first 12 characters — enough to recognise a card in a
+/// list or a support chat, never enough to spend it. The
+/// argument is the code AS ISSUED (prefix in its display
+/// case); shorter inputs return whole.
+pub fn gift_card_display_prefix(code: &str) -> String {
+    code.chars().take(12).collect()
+}
+
+/// The last four characters of an issued code (Wave 60):
+/// the "••1234" tail every card product shows. The
+/// argument is the code AS ISSUED; shorter inputs return
+/// whole.
+pub fn gift_card_last4(code: &str) -> String {
+    let chars: Vec<char> = code.chars().collect();
+    let start = chars.len().saturating_sub(4);
+    chars[start..].iter().collect()
+}
+
+/// Validate one issuance (Wave 60): the amount must sit
+/// inside the documented caps, the optional note and
+/// recipient inside their character caps, and an explicit
+/// validity inside 1..=[`GIFT_CARD_MAX_VALIDITY_DAYS`]
+/// days. `validity_days: None` means "the default" and is
+/// always valid here — the API resolves it against the
+/// platform setting before calling anything else.
+pub fn validate_gift_card_issue(
+    amount_poisha: i64,
+    note: Option<&str>,
+    recipient_name: Option<&str>,
+    validity_days: Option<i64>,
+) -> Result<(), &'static str> {
+    if amount_poisha < GIFT_CARD_MIN_ISSUE_POISHA {
+        return Err("gift card amount is below the minimum (10 taka)");
+    }
+    if amount_poisha > GIFT_CARD_MAX_ISSUE_POISHA {
+        return Err("gift card amount exceeds the maximum (50,000 taka)");
+    }
+    if let Some(note) = note {
+        if note.chars().count() > GIFT_CARD_MAX_NOTE_CHARS {
+            return Err("gift card note is too long");
+        }
+    }
+    if let Some(name) = recipient_name {
+        if name.chars().count() > GIFT_CARD_MAX_RECIPIENT_CHARS {
+            return Err("gift card recipient name is too long");
+        }
+    }
+    if let Some(days) = validity_days {
+        if !(1..=GIFT_CARD_MAX_VALIDITY_DAYS).contains(&days) {
+            return Err("gift card validity days out of range");
+        }
+    }
+    Ok(())
+}
+
+/// Validate a bulk-issue count (Wave 60): 1..=
+/// [`GIFT_CARD_MAX_BULK_ISSUE`].
+pub fn validate_gift_card_bulk_count(count: i64) -> Result<(), &'static str> {
+    if !(1..=GIFT_CARD_MAX_BULK_ISSUE).contains(&count) {
+        return Err("gift card bulk count out of range");
+    }
+    Ok(())
+}
+
+/// Validate an admin balance adjustment (Wave 60) and
+/// return the resulting balance: the delta must be
+/// non-zero (a zero adjust is a no-op wearing a costume)
+/// and the result must stay within [0, i64] — an adjust
+/// can zero a card but never drive it negative, and the
+/// addition is checked (the Wave 39 money canon).
+pub fn validate_gift_card_adjust(
+    balance_poisha: i64,
+    delta_poisha: i64,
+) -> Result<i64, &'static str> {
+    if delta_poisha == 0 {
+        return Err("gift card adjustment must be non-zero");
+    }
+    let next = balance_poisha
+        .checked_add(delta_poisha)
+        .ok_or("gift card adjustment overflows the money range")?;
+    if next < 0 {
+        return Err("gift card adjustment would take the balance below zero");
+    }
+    Ok(next)
+}
+
+/// How much of a card's balance a checkout may apply
+/// (Wave 60): the smaller of the balance and the eligible
+/// goods — the target sub-order's POST-COUPON goods (see
+/// the section header for the ordering). Either side at or
+/// below zero means nothing applies; the result is never
+/// negative and never exceeds either input.
+pub fn gift_card_applicable_poisha(balance_poisha: i64, eligible_goods_poisha: i64) -> i64 {
+    balance_poisha.min(eligible_goods_poisha).max(0)
+}
+
+/// The redemption restored to a card when a return on the
+/// funded sub-order is received (Wave 60):
+/// `floor(redemption × refund ÷ refundable_goods)`,
+/// clamped to [0, redemption]. Returns in this platform
+/// are whole-sub-order, so the refund normally EQUALS the
+/// refundable base (goods − coupon discount) and the FULL
+/// redemption comes back; the proportion keeps the rule
+/// exact if a partial-refund basis ever appears, and the
+/// floor means rounding never invents value. A
+/// non-positive basis or refund restores nothing. The
+/// multiplication runs in i128 so no realistic money
+/// figures overflow before the division.
+pub fn gift_card_restore_for_return(
+    redemption_poisha: i64,
+    refund_poisha: i64,
+    refundable_goods_poisha: i64,
+) -> i64 {
+    if redemption_poisha <= 0 || refund_poisha <= 0 || refundable_goods_poisha <= 0 {
+        return 0;
+    }
+    let restored = (redemption_poisha as i128 * refund_poisha as i128)
+        / refundable_goods_poisha as i128;
+    restored.clamp(0, redemption_poisha as i128) as i64
+}
+
+/// Whether a card is past its expiry at `now` (Wave 60):
+/// time-derived, the loyalty precedent — no stored status
+/// flip exists anywhere. A card with no expiry never
+/// expires. The boundary is inclusive: at the expiry
+/// moment itself the card is already dead, matching how a
+/// printed "valid until" date reads.
+pub fn gift_card_is_expired(expires_at_unix: Option<i64>, now_unix: i64) -> bool {
+    match expires_at_unix {
+        Some(at) => at <= now_unix,
+        None => false,
+    }
+}
+
+/// A card's derived status (Wave 60), in precedence
+/// order: disabled beats expired (the freeze is a human
+/// act the holder should see named), expired beats
+/// depleted (a dead card with money left is "expired",
+/// the actionable fact), depleted beats active. Nothing
+/// here is stored — the API derives it from
+/// `disabled_at`, `expires_at` and the balance at read.
+pub fn gift_card_status(
+    disabled: bool,
+    balance_poisha: i64,
+    expires_at_unix: Option<i64>,
+    now_unix: i64,
+) -> &'static str {
+    if disabled {
+        return GIFT_CARD_STATUS_DISABLED;
+    }
+    if gift_card_is_expired(expires_at_unix, now_unix) {
+        return GIFT_CARD_STATUS_EXPIRED;
+    }
+    if balance_poisha <= 0 {
+        return GIFT_CARD_STATUS_DEPLETED;
+    }
+    GIFT_CARD_STATUS_ACTIVE
+}
+
+/// Whether a card can be redeemed right now (Wave 60):
+/// its derived status is active, which by construction
+/// also means the balance is positive.
+pub fn gift_card_is_redeemable(
+    disabled: bool,
+    balance_poisha: i64,
+    expires_at_unix: Option<i64>,
+    now_unix: i64,
+) -> bool {
+    gift_card_status(disabled, balance_poisha, expires_at_unix, now_unix)
+        == GIFT_CARD_STATUS_ACTIVE
+}
+
+/// The expiry moment for a card issued at `now_unix` with
+/// a validity of `validity_days` (Wave 60). Validity is
+/// validated to 1..=3,650 days before this is called, so
+/// the multiplication cannot overflow; the final addition
+/// is still checked, saturating at the end of time rather
+/// than wrapping.
+pub fn gift_card_expiry_unix(now_unix: i64, validity_days: i64) -> i64 {
+    let span = validity_days.saturating_mul(86_400);
+    now_unix.checked_add(span).unwrap_or(i64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8991,6 +9442,7 @@ mod tests {
             store_id: "store-a".to_string(),
             items,
             discount_poisha: 0,
+            gift_card_discount_poisha: 0,
             commission_on_discounted: false,
             commission_rate_bps: None,
         }
@@ -9342,6 +9794,7 @@ mod tests {
             store_id: store.to_string(),
             items,
             discount_poisha: 0,
+            gift_card_discount_poisha: 0,
             commission_on_discounted: false,
             commission_rate_bps: None,
         }
@@ -9357,6 +9810,7 @@ mod tests {
             store_id: store.to_string(),
             items,
             discount_poisha,
+            gift_card_discount_poisha: 0,
             commission_on_discounted,
             commission_rate_bps: None,
         }
@@ -11805,6 +12259,7 @@ mod tests {
             product_title: String::new(),
             sale_title: String::new(),
             post_title: String::new(),
+            card_last4: String::new(),
         };
         // The short order id (first 8 chars) is what prints.
         let placed = render_body(NOTIFICATION_ORDER_PLACED, &vars);
@@ -15056,5 +15511,402 @@ mod tests {
         assert_eq!(xml_escape("&lt;"), "&amp;lt;");
         assert_eq!(xml_escape("সাধারণ লেখা"), "সাধারণ লেখা");
         assert_eq!(xml_escape(""), "");
+    }
+
+    // ---- Wave 60: gift cards ----
+
+    fn gift_group(
+        store: &str,
+        items: Vec<CartItem>,
+        discount_poisha: i64,
+        commission_on_discounted: bool,
+        gift_card_discount_poisha: i64,
+    ) -> OrderGroupInput {
+        OrderGroupInput {
+            store_id: store.to_string(),
+            items,
+            discount_poisha,
+            gift_card_discount_poisha,
+            commission_on_discounted,
+            commission_rate_bps: None,
+        }
+    }
+
+    #[test]
+    fn wave60_code_normalisation_accepts_printed_forms() {
+        // As issued: prefix in display case, uppercase body.
+        assert_eq!(
+            normalize_gift_card_code("bdgc_K7QX2M9P4RT8VW3ZA6BC5N1D"),
+            Some("BDGC_K7QX2M9P4RT8VW3ZA6BC5N1D".to_string())
+        );
+        // As typed off a printed card: grouped with spaces
+        // and hyphens, lowercase letters — same canonical
+        // form, so the same hash, so the same card.
+        assert_eq!(
+            normalize_gift_card_code(" bdgc_K7QX-2M9P 4RT8-VW3Z A6BC 5N1D "),
+            Some("BDGC_K7QX2M9P4RT8VW3ZA6BC5N1D".to_string())
+        );
+    }
+
+    #[test]
+    fn wave60_code_normalisation_rejects_non_codes() {
+        assert_eq!(normalize_gift_card_code(""), None);
+        // A Wave 37 API key is not a gift card.
+        assert_eq!(
+            normalize_gift_card_code("bdm_live_K7QX2M9P4RT8VW3ZA6BC5N1DK7QX2M9P4RT8VW3Z"),
+            None
+        );
+        // Too short, too long, bad characters, wrong prefix.
+        assert_eq!(normalize_gift_card_code("bdgc_K7QX"), None);
+        assert_eq!(
+            normalize_gift_card_code("bdgc_K7QX2M9P4RT8VW3ZA6BC5N1DEXTRA"),
+            None
+        );
+        assert_eq!(
+            normalize_gift_card_code("bdgc_K7QX2M9P4RT8VW3ZA6BC5N!D"),
+            None
+        );
+        assert_eq!(
+            normalize_gift_card_code("xxxx_K7QX2M9P4RT8VW3ZA6BC5N1D"),
+            None
+        );
+    }
+
+    #[test]
+    fn wave60_code_display_helpers() {
+        let code = "bdgc_K7QX2M9P4RT8VW3ZA6BC5N1D";
+        assert_eq!(gift_card_display_prefix(code), "bdgc_K7QX2M9");
+        assert_eq!(gift_card_last4(code), "5N1D");
+        // Short inputs return whole instead of panicking.
+        assert_eq!(gift_card_display_prefix("bdgc_"), "bdgc_");
+        assert_eq!(gift_card_last4("ab"), "ab");
+    }
+
+    #[test]
+    fn wave60_issue_validation_enforces_the_caps() {
+        assert!(validate_gift_card_issue(GIFT_CARD_MIN_ISSUE_POISHA, None, None, None).is_ok());
+        assert!(validate_gift_card_issue(GIFT_CARD_MAX_ISSUE_POISHA, None, None, None).is_ok());
+        assert!(validate_gift_card_issue(GIFT_CARD_MIN_ISSUE_POISHA - 1, None, None, None).is_err());
+        assert!(validate_gift_card_issue(GIFT_CARD_MAX_ISSUE_POISHA + 1, None, None, None).is_err());
+        assert!(validate_gift_card_issue(0, None, None, None).is_err());
+        assert!(validate_gift_card_issue(-100, None, None, None).is_err());
+    }
+
+    #[test]
+    fn wave60_issue_validation_checks_texts_and_validity() {
+        let note_ok = "x".repeat(GIFT_CARD_MAX_NOTE_CHARS);
+        let note_long = "x".repeat(GIFT_CARD_MAX_NOTE_CHARS + 1);
+        assert!(validate_gift_card_issue(10_000, Some(&note_ok), None, None).is_ok());
+        assert!(validate_gift_card_issue(10_000, Some(&note_long), None, None).is_err());
+        let name_long = "x".repeat(GIFT_CARD_MAX_RECIPIENT_CHARS + 1);
+        assert!(validate_gift_card_issue(10_000, None, Some(&name_long), None).is_err());
+        assert!(validate_gift_card_issue(10_000, None, None, Some(1)).is_ok());
+        assert!(validate_gift_card_issue(10_000, None, None, Some(GIFT_CARD_MAX_VALIDITY_DAYS)).is_ok());
+        // Zero validity is NOT "no expiry" — it is an error.
+        assert!(validate_gift_card_issue(10_000, None, None, Some(0)).is_err());
+        assert!(validate_gift_card_issue(10_000, None, None, Some(-5)).is_err());
+        assert!(
+            validate_gift_card_issue(10_000, None, None, Some(GIFT_CARD_MAX_VALIDITY_DAYS + 1))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn wave60_bulk_count_bounds() {
+        assert!(validate_gift_card_bulk_count(1).is_ok());
+        assert!(validate_gift_card_bulk_count(GIFT_CARD_MAX_BULK_ISSUE).is_ok());
+        assert!(validate_gift_card_bulk_count(0).is_err());
+        assert!(validate_gift_card_bulk_count(GIFT_CARD_MAX_BULK_ISSUE + 1).is_err());
+    }
+
+    #[test]
+    fn wave60_adjust_validation() {
+        assert_eq!(validate_gift_card_adjust(50_000, 10_000), Ok(60_000));
+        assert_eq!(validate_gift_card_adjust(50_000, -50_000), Ok(0));
+        assert!(validate_gift_card_adjust(50_000, 0).is_err());
+        // Never below zero, never wrapped.
+        assert!(validate_gift_card_adjust(50_000, -50_001).is_err());
+        assert!(validate_gift_card_adjust(i64::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn wave60_applicable_is_the_smaller_side_floored_at_zero() {
+        // Balance smaller: the whole balance applies.
+        assert_eq!(gift_card_applicable_poisha(30_000, 200_000), 30_000);
+        // Goods smaller: the card covers the goods exactly.
+        assert_eq!(gift_card_applicable_poisha(500_000, 200_000), 200_000);
+        // Equal sides apply fully.
+        assert_eq!(gift_card_applicable_poisha(200_000, 200_000), 200_000);
+        // Zero or negative on either side applies nothing.
+        assert_eq!(gift_card_applicable_poisha(0, 200_000), 0);
+        assert_eq!(gift_card_applicable_poisha(200_000, 0), 0);
+        assert_eq!(gift_card_applicable_poisha(-5, 200_000), 0);
+        assert_eq!(gift_card_applicable_poisha(200_000, -5), 0);
+    }
+
+    #[test]
+    fn wave60_restore_for_return_is_proportional_floored_and_capped() {
+        // Whole-sub-order return: refund == basis, so the
+        // FULL redemption comes back.
+        assert_eq!(gift_card_restore_for_return(40_000, 160_000, 160_000), 40_000);
+        // Half the basis refunded: half the redemption,
+        // floored (40_001 / 2 would be 20_000.5 → 20_000).
+        assert_eq!(gift_card_restore_for_return(40_001, 80_000, 160_000), 20_000);
+        // A refund above the basis (corrupt snapshot) can
+        // never restore more than was redeemed.
+        assert_eq!(gift_card_restore_for_return(40_000, 999_999, 160_000), 40_000);
+        // Degenerate inputs restore nothing.
+        assert_eq!(gift_card_restore_for_return(0, 160_000, 160_000), 0);
+        assert_eq!(gift_card_restore_for_return(40_000, 0, 160_000), 0);
+        assert_eq!(gift_card_restore_for_return(40_000, 160_000, 0), 0);
+        assert_eq!(gift_card_restore_for_return(40_000, -1, 160_000), 0);
+    }
+
+    #[test]
+    fn wave60_expiry_is_time_derived_with_an_inclusive_boundary() {
+        assert!(!gift_card_is_expired(None, 1_700_000_000));
+        assert!(!gift_card_is_expired(Some(1_700_000_100), 1_700_000_000));
+        // At the expiry moment itself the card is dead.
+        assert!(gift_card_is_expired(Some(1_700_000_000), 1_700_000_000));
+        assert!(gift_card_is_expired(Some(1_699_999_999), 1_700_000_000));
+    }
+
+    #[test]
+    fn wave60_status_precedence() {
+        let now = 1_700_000_000;
+        let future = Some(now + 86_400);
+        let past = Some(now - 1);
+        assert_eq!(gift_card_status(false, 50_000, future, now), GIFT_CARD_STATUS_ACTIVE);
+        assert_eq!(gift_card_status(false, 50_000, None, now), GIFT_CARD_STATUS_ACTIVE);
+        assert_eq!(gift_card_status(false, 0, future, now), GIFT_CARD_STATUS_DEPLETED);
+        assert_eq!(gift_card_status(false, 50_000, past, now), GIFT_CARD_STATUS_EXPIRED);
+        // Expired beats depleted: money remains but is dead.
+        assert_eq!(gift_card_status(false, 0, past, now), GIFT_CARD_STATUS_EXPIRED);
+        // Disabled beats everything.
+        assert_eq!(gift_card_status(true, 50_000, future, now), GIFT_CARD_STATUS_DISABLED);
+        assert_eq!(gift_card_status(true, 0, past, now), GIFT_CARD_STATUS_DISABLED);
+    }
+
+    #[test]
+    fn wave60_redeemable_only_when_active() {
+        let now = 1_700_000_000;
+        assert!(gift_card_is_redeemable(false, 1, None, now));
+        assert!(!gift_card_is_redeemable(false, 0, None, now));
+        assert!(!gift_card_is_redeemable(true, 50_000, None, now));
+        assert!(!gift_card_is_redeemable(false, 50_000, Some(now), now));
+    }
+
+    #[test]
+    fn wave60_expiry_unix_adds_days() {
+        let now = 1_700_000_000;
+        assert_eq!(gift_card_expiry_unix(now, 1), now + 86_400);
+        assert_eq!(gift_card_expiry_unix(now, 365), now + 365 * 86_400);
+        assert_eq!(gift_card_expiry_unix(now, GIFT_CARD_MAX_VALIDITY_DAYS), now + 3_650 * 86_400);
+    }
+
+    #[test]
+    fn wave60_totals_gift_card_is_seller_funded_with_a_platform_coupon() {
+        // Goods 2,000 BDT, platform coupon 200 BDT off
+        // (commission stays on the full goods BEFORE the
+        // gift card), gift card 500 BDT. Commission 8%:
+        // base = 200_000 − 50_000 = 150_000 → 12_000.
+        // Payout = 200_000 − 20_000 − 50_000 − 12_000.
+        let groups = vec![gift_group(
+            "store-a",
+            vec![item("store-a", "p1", 1, 2_000)],
+            20_000,
+            false,
+            50_000,
+        )];
+        let totals = build_order_totals(&groups, DeliveryZone::InsideDhaka, 800).expect("totals");
+        let sub = &totals.sub_orders[0];
+        assert_eq!(sub.gift_card_discount_poisha, 50_000);
+        assert_eq!(sub.commission_poisha, 12_000);
+        assert_eq!(sub.seller_payout_poisha, 118_000);
+        assert_eq!(totals.gift_card_discount_total_poisha, 50_000);
+        // Buyer pays goods − coupon − card + delivery.
+        assert_eq!(totals.grand_total_poisha, 200_000 - 20_000 - 50_000 + 6_000);
+    }
+
+    #[test]
+    fn wave60_totals_gift_card_with_a_store_coupon() {
+        // Store coupon: the commission base is the
+        // discounted goods, and the card comes off that:
+        // base = 200_000 − 20_000 − 50_000 = 130_000 →
+        // commission 10_400; payout identical either way.
+        let groups = vec![gift_group(
+            "store-a",
+            vec![item("store-a", "p1", 1, 2_000)],
+            20_000,
+            true,
+            50_000,
+        )];
+        let totals = build_order_totals(&groups, DeliveryZone::InsideDhaka, 800).expect("totals");
+        let sub = &totals.sub_orders[0];
+        assert_eq!(sub.commission_poisha, 10_400);
+        assert_eq!(sub.seller_payout_poisha, 200_000 - 20_000 - 50_000 - 10_400);
+    }
+
+    #[test]
+    fn wave60_totals_gift_card_clamps_to_post_coupon_goods() {
+        // A card bigger than the post-coupon goods clamps:
+        // it can never eat the coupon or the delivery.
+        let groups = vec![gift_group(
+            "store-a",
+            vec![item("store-a", "p1", 1, 2_000)],
+            20_000,
+            true,
+            999_999,
+        )];
+        let totals = build_order_totals(&groups, DeliveryZone::InsideDhaka, 800).expect("totals");
+        let sub = &totals.sub_orders[0];
+        assert_eq!(sub.gift_card_discount_poisha, 180_000);
+        assert_eq!(sub.commission_poisha, 0);
+        assert_eq!(sub.seller_payout_poisha, 0);
+        // The buyer still pays the delivery charge in full.
+        assert_eq!(totals.grand_total_poisha, 6_000);
+        // A negative stored redemption clamps to zero.
+        let groups = vec![gift_group(
+            "store-a",
+            vec![item("store-a", "p1", 1, 2_000)],
+            0,
+            false,
+            -500,
+        )];
+        let totals = build_order_totals(&groups, DeliveryZone::InsideDhaka, 800).expect("totals");
+        assert_eq!(totals.sub_orders[0].gift_card_discount_poisha, 0);
+        assert_eq!(totals.grand_total_poisha, 206_000);
+    }
+
+    #[test]
+    fn wave60_totals_without_a_card_are_unchanged() {
+        // The Wave 14 worked numbers still hold when no
+        // card is present — the extension is inert.
+        let groups = vec![discounted_group(
+            "store-a",
+            vec![item("store-a", "p1", 1, 2_000)],
+            20_000,
+            true,
+        )];
+        let totals = build_order_totals(&groups, DeliveryZone::InsideDhaka, 800).expect("totals");
+        assert_eq!(totals.gift_card_discount_total_poisha, 0);
+        assert_eq!(totals.sub_orders[0].gift_card_discount_poisha, 0);
+        assert_eq!(totals.sub_orders[0].commission_poisha, 14_400);
+        assert_eq!(totals.grand_total_poisha, 186_000);
+    }
+
+    #[test]
+    fn wave60_restore_for_return_rounding_table() {
+        // Whole-sub-order returns (refund == basis) restore
+        // the full redemption, at any scale.
+        assert_eq!(gift_card_restore_for_return(50_000, 180_000, 180_000), 50_000);
+        assert_eq!(gift_card_restore_for_return(1, 1, 1), 1);
+        // The proportion floors: a third of the basis
+        // refunds a third of the redemption, rounded DOWN —
+        // rounding never invents value.
+        assert_eq!(gift_card_restore_for_return(100, 1, 3), 33);
+        assert_eq!(gift_card_restore_for_return(100, 2, 3), 66);
+        assert_eq!(gift_card_restore_for_return(99, 1, 2), 49);
+        // A refund above the basis (a data anomaly, never a
+        // rule output) clamps to the redemption itself.
+        assert_eq!(gift_card_restore_for_return(100, 500, 300), 100);
+        // Degenerate inputs restore nothing.
+        assert_eq!(gift_card_restore_for_return(0, 100, 100), 0);
+        assert_eq!(gift_card_restore_for_return(100, 0, 100), 0);
+        assert_eq!(gift_card_restore_for_return(100, 100, 0), 0);
+        assert_eq!(gift_card_restore_for_return(-5, 100, 100), 0);
+        assert_eq!(gift_card_restore_for_return(100, -5, 100), 0);
+        // i128 headroom: the largest issuable redemption
+        // against the largest plausible basis cannot
+        // overflow on the way to the division.
+        assert_eq!(
+            gift_card_restore_for_return(5_000_000, i64::MAX / 2, i64::MAX / 2),
+            5_000_000
+        );
+    }
+
+    #[test]
+    fn wave60_status_precedence_matrix() {
+        let now = 1_800_000_000_i64;
+        let past = Some(now - 1);
+        let future = Some(now + 86_400);
+        // Disabled beats everything, even expired + empty.
+        assert_eq!(gift_card_status(true, 0, past, now), "disabled");
+        assert_eq!(gift_card_status(true, 5_000, future, now), "disabled");
+        // Expired beats depleted: a dead card with money
+        // left reports the actionable fact.
+        assert_eq!(gift_card_status(false, 0, past, now), "expired");
+        assert_eq!(gift_card_status(false, 5_000, past, now), "expired");
+        // The boundary is inclusive: expiring AT now is dead.
+        assert_eq!(gift_card_status(false, 5_000, Some(now), now), "expired");
+        assert!(gift_card_is_expired(Some(now), now));
+        assert!(!gift_card_is_expired(Some(now + 1), now));
+        // Depleted: live window, nothing left.
+        assert_eq!(gift_card_status(false, 0, future, now), "depleted");
+        assert_eq!(gift_card_status(false, 0, None, now), "depleted");
+        // Active: money left, no freeze, no expiry reached
+        // (or none at all — a no-expiry card never dies).
+        assert_eq!(gift_card_status(false, 1, future, now), "active");
+        assert_eq!(gift_card_status(false, 1, None, now), "active");
+        assert!(!gift_card_is_expired(None, i64::MAX - 1));
+        // Redeemable is exactly "derived status is active".
+        assert!(gift_card_is_redeemable(false, 1, None, now));
+        assert!(!gift_card_is_redeemable(false, 0, None, now));
+        assert!(!gift_card_is_redeemable(true, 1, None, now));
+        assert!(!gift_card_is_redeemable(false, 1, past, now));
+    }
+
+    #[test]
+    fn wave60_normalize_code_table() {
+        // The canonical form passes through untouched
+        // (bdgc_ + exactly 24 random characters = 29).
+        assert_eq!(
+            normalize_gift_card_code("BDGC_K7QX2M9P4T6W8Z3N5R1V0ABC").as_deref(),
+            Some("BDGC_K7QX2M9P4T6W8Z3N5R1V0ABC")
+        );
+        // Case, spaces and hyphen grouping all normalise.
+        assert_eq!(
+            normalize_gift_card_code("bdgc_k7qx2m9p4t6w8z3n5r1v0abc").as_deref(),
+            Some("BDGC_K7QX2M9P4T6W8Z3N5R1V0ABC")
+        );
+        assert_eq!(
+            normalize_gift_card_code(" bdgc_K7QX-2M9P 4T6W-8Z3N 5R1V0ABC ").as_deref(),
+            Some("BDGC_K7QX2M9P4T6W8Z3N5R1V0ABC")
+        );
+        // Wrong prefix, wrong length, foreign characters
+        // and empty input are not codes this platform made.
+        assert_eq!(normalize_gift_card_code("XXXX_K7QX2M9P4T6W8Z3N5R1V0ABC"), None);
+        assert_eq!(normalize_gift_card_code("BDGC_K7QX"), None);
+        assert_eq!(normalize_gift_card_code("BDGC_K7QX2M9P4T6W8Z3N5R1V0ABCD"), None);
+        assert_eq!(normalize_gift_card_code("BDGC_K7QX2M9P4T6W8Z3N5R1V0AB!"), None);
+        assert_eq!(normalize_gift_card_code(""), None);
+        assert_eq!(normalize_gift_card_code("   "), None);
+        assert_eq!(normalize_gift_card_code("bdgc_"), None);
+    }
+
+    #[test]
+    fn wave60_expiry_reminder_template_renders_last4_and_balance() {
+        // The reminder body names the store, the card's
+        // last4 (never more of the code) and the balance at
+        // risk — and renders sanely without an amount.
+        let vars = NotificationVars {
+            store_name: "ঢাকা ফ্যাশন হাউস".to_string(),
+            amount_poisha: Some(50_000),
+            card_last4: "5N1D".to_string(),
+            ..NotificationVars::default()
+        };
+        let body = render_body(NOTIFICATION_GIFT_CARD_EXPIRING, &vars);
+        assert!(body.contains("ঢাকা ফ্যাশন হাউস"), "{body}");
+        assert!(body.contains("••5N1D"), "{body}");
+        assert!(body.contains("৳500"), "{body}");
+        let bare = NotificationVars {
+            store_name: "ঢাকা ফ্যাশন হাউস".to_string(),
+            card_last4: "5N1D".to_string(),
+            ..NotificationVars::default()
+        };
+        let body = render_body(NOTIFICATION_GIFT_CARD_EXPIRING, &bare);
+        assert!(body.contains("••5N1D"), "{body}");
+        // The sweep window is a positive week.
+        assert_eq!(GIFT_CARD_EXPIRY_REMINDER_WINDOW_DAYS, 7);
     }
 }

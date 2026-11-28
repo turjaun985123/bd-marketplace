@@ -196,6 +196,13 @@ export default function OrderReceiptPage({
               <PriceTag amountPoisha={receipt.loyalty_discount_poisha} />
             </>
           )}
+          {receipt.gift_card_discount_poisha > 0 && (
+            <>
+              <br />
+              গিফট কার্ড ছাড় (••{receipt.gift_card_last4}): −
+              <PriceTag amountPoisha={receipt.gift_card_discount_poisha} />
+            </>
+          )}
           <br />
           ডেলিভারি মোট:{" "}
           <PriceTag amountPoisha={receipt.delivery_total_poisha} />

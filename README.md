@@ -5274,6 +5274,196 @@ configured public base URL (above); deleting a post
 deletes its view rows with it (the counts are the
 post's own, not a platform archive).
 
+## Wave 60 — gift cards: store-scoped stored value
+
+Shopify's stored-value instrument, in the shape this
+platform's money rules allow. A gift card
+(`crates/api/src/gift_cards.rs`, migrations
+0070–0071, domain rules in the Wave 60 section of
+`crates/domain`) is a **bearer instrument**: the code
+is the credential. Codes are `bdgc_` + 24
+uppercase-alphanumeric characters (≈124 bits of
+entropy, the Wave 37 API-key construction); only the
+SHA-256 hash of the normalised code is stored, and
+the full code is shown **exactly once**, in the issue
+response. Lists, details, exports and receipts carry
+the display prefix + last4, never the code and never
+the hash. A public balance check
+(`POST /v1/gift-cards/balance`) answers anyone holding
+a code — that is what a bearer instrument is for —
+with ONE uniform 404 for unknown or malformed codes
+so it cannot enumerate; a found card reports its true
+state, because its holder deserves a true answer. The
+tradeoff is deliberate and is the standard gift-card
+shape: the protection is the code's entropy plus
+hash-only storage, not secrecy of the endpoint.
+
+**Scope: store-scoped cards only.** A card is issued
+by one store and redeems only against that store's
+sub-order in a checkout. Platform-wide cards are a
+documented future — store scope is what keeps the
+money math exact: a redemption touches exactly one
+sub-order, one commission base, one payout snapshot.
+
+**The funding model — read this before the money.**
+Issuance in this wave is **promotional / manual**: a
+seller (or an admin) creates cards, and NO money is
+collected at issuance. There is no purchase flow (a
+buyable gift-card product is a documented future
+wave). Redemption is therefore **SELLER-FUNDED**: it
+behaves exactly like a store coupon on that sub-order
+— commission is computed on goods − redemption and
+the seller payout snapshot nets it out. The platform
+never funds a redemption and never pretends purchase
+money exists.
+
+**Issuance.** `POST /v1/seller/gift-cards` (one card,
+or a bulk batch with `count` 1–50 — each card its own
+code, one transaction), amounts ৳10–৳50,000 (domain
+caps), an optional note (≤ 200 chars) and recipient
+name (≤ 80), and an expiry: explicit validity days
+(1–3,650), a no-expiry flag, or the platform default —
+the `gift_card_default_validity_days` platform setting
+when valid, else 365 days (DB > const, the standing
+precedent). Issuing is gated on the owner-level
+`manage_payouts` capability: minting a card spends the
+store's future earnings exactly like requesting a
+payout, so managers cannot do it. Reads (list, detail
++ ledger, per-store stats at
+`GET /v1/seller/gift-card-stats`) are `view_finances`
+(owner + manager). Sellers disable/re-enable their own
+cards; the freeze is a stored, reversible fact.
+Wave 37 API keys may READ cards but issuance and
+freeze/unfreeze are JWT-only, like payout requests.
+
+**The ledger.** Every balance movement is an
+append-only `gift_card_ledger` row — `issue`,
+`redeem`, `cancel_restore`, `return_restore`,
+`admin_adjust` — written in the SAME transaction as
+the cached `balance_poisha` update (the Wave 35
+loyalty shape). Tests pin that the ledger sums to the
+cached balance at every step. Expiry is NOT a ledger
+kind and NOT a stored status: like loyalty expiry it
+is time-derived at read. The derived status vocabulary
+is `active | disabled | expired | depleted`, in that
+precedence (a disabled card reads disabled even past
+its expiry; an expired card with money left reads
+expired, not depleted).
+
+**Checkout.** The checkout body gains an optional
+`gift_card_code`. Inside the checkout transaction the
+card row is locked FOR UPDATE (two concurrent
+checkouts presenting the same code serialize and can
+never spend one balance twice) and validated: unknown
+code → the one uniform bilingual 400 (checkout is not
+an enumeration oracle either); disabled / expired /
+depleted → a 400 naming the reason class (the holder
+is the one asking; the balance endpoint tells them the
+same); a card whose store is not in the order → a
+bilingual 400, never a silent ignore. The redemption
+ordering is **coupon → gift card → loyalty**: the
+coupon allocates first, the card applies to its
+sub-order's POST-COUPON goods
+(`gift_card_applicable_poisha` = min of balance and
+eligible goods), and loyalty then prices against goods
+net of coupon AND card — its 50% cap base and the COD
+advance base both treat the card-reduced goods
+consistently (pinned exactly by the wave60i test: 170
+points usable where a post-coupon-only base would
+have allowed 270). The funded sub-order snapshots
+`gift_card_discount_poisha` (+ the card id), the order
+snapshots the total and the card's last4, the receipt
+shows the gift-card line, the per-seller invoice nets
+the redemption out of its money block the same way
+(it is a sub-order snapshot, unlike order-level
+loyalty), and the courier's booking COD computation
+subtracts the redemption — the courier never
+collects the card-funded slice in cash. The COD
+advance base is the payable net of the card too
+(pinned: a card that pulls an order under the
+advance threshold removes the advance entirely).
+
+**Restores.** Cancelling an unpaid order (buyer
+whole-order cancel or seller sub-order cancel)
+restores the FULL redemption to the card inside the
+cancel transaction, mirroring the loyalty cancel hook.
+A return received on the funded sub-order restores
+the proportional share —
+`gift_card_restore_for_return` =
+floor(redemption × refund ÷ refundable goods), never
+more than was redeemed; whole-sub-order returns
+restore the full redemption — and the stored CASH
+refund is reduced by the restored amount: the buyer
+recovers the card-funded slice as card balance, the
+total recovery is unchanged, and the Wave 41 payment
+settlement folds in the cash figure only, which is
+all any gateway ever collected. **Restoring never
+extends a card's life**: value restored to an expired
+card returns to its balance but the expiry stands and
+the card stays unredeemable; restoring to a disabled
+card likewise returns the balance under the freeze.
+Both rules are pinned by tests.
+
+**Admin.** `GET /v1/admin/gift-cards` searches every
+store's cards by code prefix, last4 or store slug;
+detail carries the ledger; disable/enable and a
+balance **adjust** endpoint (signed delta, never
+below zero, note REQUIRED) are each audited in the
+same transaction (`gift_card.disable` /
+`gift_card.enable` / `gift_card.adjust`). Admin
+metrics gain the platform gift-card block (counts by
+derived status; issued / outstanding / redeemed /
+restored totals — the outstanding figure is the live
+stored-value liability). Gift cards also ride the
+data exports: the seller export gains a masked
+`gift_cards` section, and buyer/seller order rows
+carry the redemption + last4.
+
+**Web.** A seller page at `/seller/gift-cards`
+(issue form in taka with one-time code reveal + copy,
+stats strip, status-filtered list, per-card ledger
+panel, disable/enable), an admin page at
+`/admin/gift-cards` (search, ledger, freeze/unfreeze,
+audited adjust form) plus a gift-card block on the
+admin overview, a gift-card field on the checkout
+page (checked through the public balance endpoint,
+mirroring the coupon flow; the placed order on the
+success screen shows the server's redemption), the
+gift-card line on the buyer orders list and receipt,
+and a public balance-check page at `/gift-cards`.
+
+**Expiry reminders.** The worker's fourth sweep
+(`sweep_gift_card_expiry_reminders`, migration 0071)
+watches for the moment a card's value is about to
+lapse: a card that is not disabled, still holds a
+balance, and expires within 7 days earns its ISSUING
+seller exactly one outbox reminder
+(`gift_card_expiring` — store, masked last4, balance
+at risk). The card row's `expiry_reminded_at` stamp
+is written in the same transaction as the enqueue,
+so the reminder is exactly-once across cycles and
+racing workers; already-expired cards are not
+reminded about (the moment to act has passed). The
+seller gift-cards page shows the same window as a
+warning strip over the unfiltered list.
+
+**Honest limits:** no purchase flow (a buyable
+gift-card product, with real money collected at
+issuance and platform-held liability, is a future
+wave — until then every card is seller-funded
+promotion); store-scoped only (no platform-wide
+cards, no cross-store redemption); one card per
+checkout (Shopify allows stacking; here a second
+card means a second order — the one-card shape is
+what keeps the snapshot columns singular and the
+restore rules exact); a lost code is unrecoverable
+by design (hash-only storage — the remedy is an
+audited admin adjustment onto a new card, never a
+reveal); reminders go to the issuing SELLER, not the
+card's holder — the platform usually does not know
+who holds a bearer card, and pretending otherwise
+would mean inventing a recipient.
+
 ## How to run
 
 With a database (Wave 2 features):
@@ -6928,6 +7118,38 @@ in the seller data export; the storefront store
 nav, the public page/blog surfaces with BlogPosting
 JSON-LD, and the /seller/pages + /seller/blog
 editors. See the Wave 59 section.
+
+**Real (Wave 60):** gift cards — store-scoped bearer
+stored value (migrations 0070–0071): `bdgc_` codes hashed
+with SHA-256 and shown exactly once at issuance,
+an append-only ledger behind a cached balance
+(pinned to sum at every step), promotional
+SELLER-FUNDED issuance with no purchase flow (the
+funding model is stated wherever it matters);
+seller issue (single + bulk) / list / detail /
+stats / disable / enable under the deliberate
+access split (issue + freeze are owner-level
+manage_payouts, reads are view_finances), a public
+balance check with a uniform unknown-code 404, and
+audited admin search / disable / enable / adjust;
+checkout redemption ordered coupon → gift card →
+loyalty with the card locked FOR UPDATE in the
+checkout transaction, the sub-order + order
+snapshots, the receipt line, the invoice money
+block, the courier COD and the COD advance base all
+netting the redemption out; full restore on cancel
+(both funnels) and proportional restore on
+return-received with the cash refund netted by the
+restored amount; restoring never extends a card's
+life; and a worker expiry-reminder sweep
+(exactly-once, stamped on the card row) warning the
+issuing seller a week before a balance lapses.
+Seller + admin gift-card pages, the checkout
+gift-card field, the public /gift-cards balance
+page, gift-card lines on buyer order views and the
+invoice page, the admin metrics gift-card block,
+and gift cards in the data exports. See the Wave 60
+section.
 
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
