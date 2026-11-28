@@ -324,7 +324,7 @@ async fn wave57b_dry_run_writes_nothing_and_reimport_updates_in_place() {
     // The stock move (10 -> 17) wrote its audit row
     // through the Wave 23 writer: delta +7, count_fix.
     let (delta, reason): (i64, String) = sqlx::query_as(
-        "SELECT delta, reason FROM stock_adjustments WHERE product_id = $1::uuid",
+        "SELECT delta::bigint, reason FROM stock_adjustments WHERE product_id = $1::uuid",
     )
     .bind(&widget_one)
     .fetch_one(&pool)

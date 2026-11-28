@@ -274,7 +274,7 @@ async fn wave57f_bulk_edit_price_stock_status_category_and_foreign_ids() {
     assert_eq!(status, StatusCode::OK, "stock set: {report}");
     assert_eq!(report["outcomes"][0]["changed"], json!(["stock"]));
     let (delta, reason, stock): (i64, String, i32) = sqlx::query_as(
-        "SELECT a.delta, a.reason, p.stock FROM stock_adjustments a \
+        "SELECT a.delta::bigint, a.reason, p.stock FROM stock_adjustments a \
          JOIN products p ON p.id = a.product_id WHERE a.product_id = $1::uuid",
     )
     .bind(&alpha)
