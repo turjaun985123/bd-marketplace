@@ -6610,3 +6610,230 @@ export function setFollowNotify(
 
 /** Question list sort orders (Wave 54 extension). */
 export type QuestionSort = "newest" | "answered";
+
+// ---------------------------------------------------------------------------
+// Wave 58 — storefront section layouts (the section editor)
+// ---------------------------------------------------------------------------
+
+/**
+ * One section of a storefront layout, as the seller's
+ * editor sends and receives it. `config` is the type's
+ * own object — its shape is per-type and validated by
+ * the API's domain rules; the editor builds it from the
+ * per-type forms. Scheduling windows are RFC 3339.
+ */
+export interface LayoutSection {
+  id: string;
+  type: string;
+  enabled: boolean;
+  config: Record<string, unknown>;
+  starts_at?: string | null;
+  ends_at?: string | null;
+}
+
+/**
+ * The seller's layout view: the effective document (the
+ * stored one, or the platform default), whether it is
+ * custom, and when the stored row was last written.
+ */
+export interface SellerLayout {
+  store_id: string;
+  store_slug: string;
+  version: number;
+  is_custom: boolean;
+  sections: LayoutSection[];
+  updated_at: string | null;
+}
+
+/** The PUT body for the layout: the whole document. */
+export interface LayoutInput {
+  version?: number;
+  sections: LayoutSection[];
+}
+
+/** One section type's editor metadata (the catalogue). */
+export interface SectionTypeMeta {
+  section_type: string;
+  label_en: string;
+  label_bn: string;
+  description_en: string;
+  description_bn: string;
+}
+
+/** One named layout preset in the catalogue. */
+export interface LayoutPreset {
+  key: string;
+  label_en: string;
+  label_bn: string;
+  sections: LayoutSection[];
+}
+
+/** GET /v1/seller/store/layout/catalogue — picker data. */
+export interface LayoutCatalogue {
+  version: number;
+  max_sections: number;
+  types: SectionTypeMeta[];
+  presets: LayoutPreset[];
+  /** The rail sources the config form offers (the API's closed list). */
+  rail_sources: string[];
+  /** The category-grid modes the config form offers. */
+  category_grid_modes: string[];
+}
+
+/** The hero's resolved data (branding fallbacks applied). */
+export interface HeroData {
+  headline: string | null;
+  subtext: string | null;
+  image_url: string | null;
+  announcement: string | null;
+  link_url: string | null;
+  link_label: string | null;
+  is_customised: boolean;
+}
+
+/** One category tile of a resolved category grid. */
+export interface LayoutCategoryTile {
+  name: string;
+  name_en: string | null;
+  name_bn: string | null;
+  slug: string | null;
+  category: string | null;
+  icon_key: string | null;
+  product_count: number;
+  path: CategoryPathEntry[];
+}
+
+/** The store info section's resolved data. */
+export interface LayoutStoreInfo {
+  about: string | null;
+  return_policy: string | null;
+  rating_avg: number | null;
+  rating_count: number;
+  total_sold: number;
+  product_count: number;
+  follower_count: number;
+}
+
+/** One FAQ pair of a resolved FAQ section. */
+export interface LayoutFaqItem {
+  question: string;
+  answer: string;
+}
+
+/**
+ * One RESOLVED section of the public render model:
+ * identity + config plus exactly one payload family,
+ * filled by type (products for rails and single shelves,
+ * collections for the all-collections shelf,
+ * total_products for the catalogue grid).
+ */
+export interface ResolvedSection {
+  id: string;
+  type: string;
+  config: Record<string, unknown>;
+  hero?: HeroData;
+  products?: Product[];
+  total_products?: number;
+  collections?: StoreCollection[];
+  collection?: StoreCollection;
+  categories?: LayoutCategoryTile[];
+  store_info?: LayoutStoreInfo;
+  faq_items?: LayoutFaqItem[];
+}
+
+/** GET /v1/stores/{slug}/layout — the public render model. */
+export interface PublicStoreLayout {
+  store_slug: string;
+  version: number;
+  is_custom: boolean;
+  sections: ResolvedSection[];
+}
+
+/** One section's analytics row in the seller stats view. */
+export interface SectionStats {
+  section_id: string;
+  type: string;
+  views_total: number;
+  clicks_total: number;
+  views_today: number;
+  clicks_today: number;
+  views_window: number;
+  clicks_window: number;
+}
+
+/** GET /v1/seller/store/layout/stats — per-section counts. */
+export interface LayoutStats {
+  store_id: string;
+  window_days: number;
+  sections: SectionStats[];
+}
+
+/** GET /v1/stores/{slug}/layout — the resolved render model. */
+export function getStoreLayout(slug: string): Promise<PublicStoreLayout> {
+  return call(`/v1/stores/${encodeURIComponent(slug)}/layout`);
+}
+
+/** GET /v1/seller/store/layout — the seller's effective document. */
+export function getSellerLayout(
+  token: string,
+  storeId?: string
+): Promise<SellerLayout> {
+  const query = storeId ? `?store_id=${encodeURIComponent(storeId)}` : "";
+  return call(`/v1/seller/store/layout${query}`, { token });
+}
+
+/** PUT /v1/seller/store/layout — replace the whole document. */
+export function saveSellerLayout(
+  token: string,
+  input: LayoutInput,
+  storeId?: string
+): Promise<SellerLayout> {
+  const query = storeId ? `?store_id=${encodeURIComponent(storeId)}` : "";
+  return call(`/v1/seller/store/layout${query}`, {
+    method: "PUT",
+    token,
+    body: input,
+  });
+}
+
+/** POST /v1/seller/store/layout/reset — back to the platform default. */
+export function resetSellerLayout(
+  token: string,
+  storeId?: string
+): Promise<SellerLayout> {
+  const query = storeId ? `?store_id=${encodeURIComponent(storeId)}` : "";
+  return call(`/v1/seller/store/layout/reset${query}`, {
+    method: "POST",
+    token,
+  });
+}
+
+/** GET /v1/seller/store/layout/catalogue — types, caps, presets. */
+export function getLayoutCatalogue(token: string): Promise<LayoutCatalogue> {
+  return call("/v1/seller/store/layout/catalogue", { token });
+}
+
+/** GET /v1/seller/store/layout/stats — per-section view/click counts. */
+export function getSellerLayoutStats(
+  token: string,
+  storeId?: string
+): Promise<LayoutStats> {
+  const query = storeId ? `?store_id=${encodeURIComponent(storeId)}` : "";
+  return call(`/v1/seller/store/layout/stats${query}`, { token });
+}
+
+/**
+ * POST /v1/stores/{slug}/section-events — the anonymous
+ * section beacon (aggregate-only; fire-and-forget, the
+ * caller ignores failures).
+ */
+export function recordSectionEvent(
+  slug: string,
+  sectionId: string,
+  kind: "section_view" | "section_click"
+): Promise<{ recorded: boolean }> {
+  return call(`/v1/stores/${encodeURIComponent(slug)}/section-events`, {
+    method: "POST",
+    body: { section_id: sectionId, kind },
+  });
+}

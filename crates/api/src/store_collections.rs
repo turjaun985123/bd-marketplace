@@ -145,7 +145,11 @@ fn is_unique_violation(err: &sqlx::Error) -> bool {
 }
 
 /// Load one collection of one store by id (seller reads).
-async fn load_collection(
+/// Wave 58: `pub(crate)` — the storefront section
+/// resolver loads a shelf's named collection through the
+/// same read, so its counts and cover match this
+/// module's surfaces exactly.
+pub(crate) async fn load_collection(
     pool: &PgPool,
     store_id: Uuid,
     collection_id: Uuid,
@@ -187,7 +191,10 @@ async fn load_collection_by_slug(
 }
 
 /// Every collection of one store, newest first.
-async fn list_collections(
+/// Wave 58: `pub(crate)` — the storefront section
+/// resolver renders the all-collections shelf from the
+/// same read the public collections route serves.
+pub(crate) async fn list_collections(
     pool: &PgPool,
     store_id: Uuid,
     active_only: bool,

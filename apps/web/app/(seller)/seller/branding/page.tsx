@@ -183,6 +183,15 @@ export default function SellerBrandingPage() {
           </>
         )}
       </p>
+      <p>
+        স্টোরফ্রন্টের অংশগুলো (হিরো, রেল, কালেকশন, FAQ) সাজাতে{" "}
+        <Link href="/seller/storefront">
+          স্টোরফ্রন্ট এডিটর — Storefront editor
+        </Link>{" "}
+        ব্যবহার করুন — থিম ও রঙ এখানেই থাকে, বিন্যাস ওখানে। (To compose the
+        storefront's sections — hero, rails, collections, FAQ — use the
+        storefront editor; theme and colour stay here, layout lives there.)
+      </p>
       {message && <p role="status">{message}</p>}
       {store === null ? (
         <p>লোড হচ্ছে…</p>

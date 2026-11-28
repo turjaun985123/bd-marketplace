@@ -4929,6 +4929,157 @@ created only behind the `DEMO_SEED=1` guard, and the
 seed's placeholder images are generated art, stated
 above.
 
+Wave 58 (storefront section editor — the Shopify-parity
+program continues): until now a seller picked one of
+three themes plus branding, and the storefront's layout
+was fixed code. This wave makes the layout itself the
+seller's: a real sections system — an ordered,
+configurable composition per store — with a domain
+catalogue, a resolved public render model, a full
+seller editor with live preview, per-section scheduling,
+and aggregate-only section analytics.
+
+**The catalogue** (domain crate; the caps are the
+domain's, enforced on every write): nine section types —
+`hero` (headline ≤120 chars, subtext ≤300, image, link +
+label ≤60; every field optional, unset fields fall back
+to the store's branding at resolution), `rich_text`
+(heading ≤120, body required ≤2,000), `product_rail`
+(source `newest` | `best_sellers` | `on_sale` |
+`manual`; title ≤80; limit 4–24, default 10; a manual
+rail holds 1–24 of the store's OWN product ids, in the
+seller's order, duplicates collapsed), `collection_shelf`
+(an optional Wave 54 collection id — absent means all
+collections as tiles; limit 4–24, default 8),
+`category_grid` (mode `taxonomy` | `labels`; limit 4–24,
+default 12), `product_grid` (the full catalogue; title
+≤80), `image_banner` (image required, optional link +
+caption ≤120), `store_info` (no config — its texts are
+the branding-owned about / return-policy, never copied
+into the layout), `faq` (1–10 pairs; question ≤200,
+answer ≤1,000). A layout holds at most **20 sections**;
+section ids are unique slug-shaped handles ≤40 chars
+(they key the analytics). Validation errors are
+bilingual and name the offending section's 1-based
+position ("section 2 (faq): …"), and a failed PUT
+changes nothing.
+
+**Versioning & tolerance:** the document is
+`{ "version": 1, "sections": [...] }` stored as one
+JSONB row per store (migration 0065, `store_layouts`).
+Reads are forward-tolerant (unknown fields ignored,
+missing `enabled` defaults to true). On WRITE the
+version must be current — a future document is refused,
+never silently rewritten. A section whose type is
+well-formed but UNKNOWN to this build is a future
+section: it is preserved verbatim (config, flags,
+window) on write, shown as a locked block in the
+editor, and skipped at render; a malformed type string
+is refused as garbage. (The brief's "unknown type
+rejected" and "unknown types skipped but preserved"
+read together this way: garbage is rejected, the
+future is preserved.)
+
+**The default layout** is CODE, not data:
+`domain::default_storefront_layout()` composes hero →
+on-sale rail → best-sellers rail → newest rail →
+collection shelf → taxonomy grid → label grid →
+catalogue grid → store info, with the rails' historical
+titles — exactly the pre-Wave-58 storefront. A store
+with no row renders it; **reset = DELETE the row**.
+Three presets (`default`, `minimal`, `merchandising`)
+ship in the catalogue as one-click starting points;
+every preset passes the same validation as a seller
+document.
+
+**Endpoints:**
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| GET | `/v1/stores/{slug}/layout` | Public. The RESOLVED render model: sections in order, each with its data loaded server-side (rails carry real product cards through the shared product view, flash prices attached; shelves carry collections/products; grids carry counts; the hero carries branding fallbacks + an `is_customised` flag). Non-active store → 404 |
+| GET | `/v1/seller/store/layout` | Bearer; the branding access rule (owner, or `manage_marketing` via `?store_id=` — manager yes, staff 403, stranger 404). The effective document (stored or default) with `is_custom`, windows as RFC 3339 |
+| PUT | `/v1/seller/store/layout` | Same access. Full replace: domain validation first, then reference checks (manual rails name only the store's own products; shelves only its own collections — a foreign id is a 400 naming the section). Last write wins — no conflict guard, by design; `updated_at`/`updated_by` keep provenance |
+| POST | `/v1/seller/store/layout/reset` | Same access. Deletes the row; answers the default document |
+| GET | `/v1/seller/store/layout/catalogue` | Bearer. Editor metadata from the domain: types with Bangla+English labels/descriptions, caps, rail sources, grid modes, presets |
+| POST | `/v1/stores/{slug}/section-events` | Public, anonymous. Body `{section_id, kind}` with kind `section_view` \| `section_click`; the section must exist in the store's current effective layout (404 otherwise). Aggregate-only: no user, session, IP or agent is recorded (migration 0066, `storefront_events`) |
+| GET | `/v1/seller/store/layout/stats` | Same access as the layout. One row per section of the current layout (zeros included): total views/clicks, today's (Asia/Dhaka), and the trailing 30 days |
+
+**Resolution rules** (the public GET): disabled
+sections, sections outside their scheduling window
+(per-section `starts_at`/`ends_at`, the Wave 52 banner
+rule — half-open [start, end), via the domain's one
+`storefront_section_is_live`), unknown types, and
+sections whose data resolves EMPTY are dropped
+server-side: an on-sale rail with nothing on sale, a
+best-sellers rail with no delivered units (the
+platform's one "sold"), a shelf whose collection was
+deleted or whose members all drafted, a category grid
+with no categories, store info with neither text
+written, an FAQ with no pairs. The ONE exception is
+`product_grid`, which always resolves (it carries the
+store's active-product total; an empty storefront must
+show its empty state where the seller placed it).
+Resolution always follows the CURRENT catalogue: a
+product drafted after the layout was saved drops out
+of its rail/shelf quietly; the stored document is
+never rewritten by reads. Taxonomy grids read through
+the Wave 56 specialties service (which caps at 8);
+label grids use the faceted browse's category facet
+scoped to the store, so the grid and the old tiles can
+never disagree.
+
+**Rendering (web):** the storefront page fetches the
+layout and renders one component per type
+(`StorefrontSectionViews`) reusing ProductRail /
+ProductGrid / the Wave 54–56 tile markup. Placement
+rule: hero sections render ABOVE the identity frame
+(header, trust line, follow/message/search — who the
+store IS, not layout), everything else below it in
+layout order; with the default layout the page is the
+pre-Wave-58 page. The theme still frames everything
+(accent, banner rule, grid card layout) — sections are
+layout, theme is skin. The shop / categories /
+collections / reviews routes are separate surfaces,
+untouched: sections compose the storefront HOME only.
+Each rendered section fires one `section_view` beacon
+per page load; hero/banner link clicks fire
+`section_click` (fire-and-forget). If the layout read
+fails, the page falls back to the legacy fixed
+composition (the Wave 52–56 components) — a storefront
+never blanks over a sections outage.
+
+**The editor** (`/seller/storefront`, linked from the
+dashboard and the branding page): section cards with
+bilingual type labels, id editing (the analytics
+handle), enable/disable, up/down reorder, duplicate,
+delete, per-type config forms (including a product
+multi-select for manual rails that shows the pick
+order, a collection select, an FAQ pair editor, and
+datetime scheduling), an add-section picker driven by
+the catalogue endpoint, preset loading, save + reset
+with confirm, a stats panel, and a LIVE PREVIEW through
+the same section components. **Preview fidelity
+limit:** the preview resolves the draft CLIENT-side
+from the seller's own reads (search/store products,
+collections, facets, the store view); the live page
+resolves server-side at request time, so edge cases
+can differ (a flash sale starting mid-edit, a
+collection changed in another tab) — the saved layout
+read back from the API is the truth.
+
+**Honest limits:** the editor acts on the seller's own
+store (a manager's `?store_id=` layout edit works at
+the API, like branding's, but the editor page itself
+does not yet offer a store switcher — the same limit
+the branding page has); section analytics count page
+loads that render a section, not viewability (no
+intersection observation — a view means "served in the
+layout", stated here so the numbers are never
+oversold); store_info's trust numbers render in the
+identity frame's stats line (the section carries the
+texts; the API payload includes the aggregates for
+clients that want them).
+
 ## How to run
 
 With a database (Wave 2 features):
@@ -6521,6 +6672,33 @@ building an 8-store / 161-product demo catalogue
 through the same services with generated placeholder
 images; and the /seller/bulk page. See the Wave 57
 section.
+
+**Real (Wave 58):** the storefront section editor —
+a nine-type section catalogue in the domain crate
+(hero, rich text, product rails incl. hand-picked,
+collection shelves, category grids, the catalogue
+grid, image banners, store info, FAQ) with per-type
+config caps and bilingual, position-naming validation;
+one JSONB layout document per store (migration 0065)
+with a code-level default layout equivalent to the
+pre-Wave-58 storefront (reset = delete the row);
+a public resolved-layout endpoint that loads every
+section's data server-side (flash-priced product
+cards, shelves, counts, hero branding fallbacks) and
+drops disabled / out-of-window / unknown / empty
+sections; seller layout GET/PUT/reset under the
+branding access rule with ownership checks on rail
+and shelf references; an editor catalogue endpoint
+(types, caps, presets); per-section scheduling on
+the banner window rule; aggregate-only section
+analytics (migration 0066) with a seller stats view
+(total / Dhaka-today / trailing-30-days); the
+storefront rendering sections in order through
+shared components with a legacy-composition fallback;
+and the /seller/storefront editor with catalogue-
+driven forms and a live preview (client-resolved —
+the fidelity limit is documented in the Wave 58
+section). See the Wave 58 section.
 
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real

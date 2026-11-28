@@ -7293,6 +7293,1088 @@ pub fn validate_bulk_stock_target(stock: i64) -> Result<i32, &'static str> {
     i32::try_from(stock).map_err(|_| "stock is out of range")
 }
 
+// ---------------------------------------------------------------------------
+// Wave 58 — storefront section layouts (the section editor)
+// ---------------------------------------------------------------------------
+
+/// The layout document version this build writes. The
+/// reader is forward-tolerant (unknown fields ignored,
+/// unknown section types preserved — see
+/// [`validate_storefront_layout`]), but a WRITE must name
+/// the current version: silently accepting a future
+/// document and re-serialising it with today's types could
+/// drop fields this build does not know it dropped.
+pub const STOREFRONT_LAYOUT_VERSION: i64 = 1;
+
+/// The most sections one storefront layout may hold. The
+/// editor composes a page, not a directory — twenty blocks
+/// is already a very long storefront, and the cap keeps the
+/// stored document (and its resolution) bounded.
+pub const MAX_STOREFRONT_SECTIONS: usize = 20;
+
+/// Section type: the storefront's crown — headline,
+/// subtext, image and an optional call-to-action link.
+/// Every field is optional; an unset field falls back to
+/// the store's branding at resolution time (the Wave 18
+/// banner / announcement / name), so an empty hero is
+/// exactly today's storefront header art.
+pub const SECTION_TYPE_HERO: &str = "hero";
+/// Section type: a heading plus a free-text body — the
+/// seller's own words (a story, a delivery note, a
+/// campaign explanation).
+pub const SECTION_TYPE_RICH_TEXT: &str = "rich_text";
+/// Section type: a horizontal rail of product cards fed
+/// from one source (newest / best sellers / on sale / a
+/// hand-picked list).
+pub const SECTION_TYPE_PRODUCT_RAIL: &str = "product_rail";
+/// Section type: the store's own collections (Wave 54) —
+/// tiles for every shelf, or one named shelf's products.
+pub const SECTION_TYPE_COLLECTION_SHELF: &str = "collection_shelf";
+/// Section type: the categories this store sells in, as
+/// tiles with counts — the taxonomy specialisations
+/// (Wave 56) or the free-text labels (Wave 54).
+pub const SECTION_TYPE_CATEGORY_GRID: &str = "category_grid";
+/// Section type: the store's full catalogue grid — the
+/// one section every storefront keeps, movable like the
+/// rest.
+pub const SECTION_TYPE_PRODUCT_GRID: &str = "product_grid";
+/// Section type: one wide image with an optional link
+/// and caption — a campaign banner of the seller's own.
+pub const SECTION_TYPE_IMAGE_BANNER: &str = "image_banner";
+/// Section type: the store's long profile blocks (Wave
+/// 54): the about text and the return policy, with the
+/// store's trust numbers riding the resolved payload.
+pub const SECTION_TYPE_STORE_INFO: &str = "store_info";
+/// Section type: question/answer pairs — delivery,
+/// payment and returns answers a buyer reads before
+/// asking.
+pub const SECTION_TYPE_FAQ: &str = "faq";
+
+/// Every section type this build knows, in the order the
+/// editor's add-section picker lists them.
+pub const STOREFRONT_SECTION_TYPES: [&str; 9] = [
+    SECTION_TYPE_HERO,
+    SECTION_TYPE_RICH_TEXT,
+    SECTION_TYPE_PRODUCT_RAIL,
+    SECTION_TYPE_COLLECTION_SHELF,
+    SECTION_TYPE_CATEGORY_GRID,
+    SECTION_TYPE_PRODUCT_GRID,
+    SECTION_TYPE_IMAGE_BANNER,
+    SECTION_TYPE_STORE_INFO,
+    SECTION_TYPE_FAQ,
+];
+
+/// Product-rail source: the store's newest products.
+pub const RAIL_SOURCE_NEWEST: &str = "newest";
+/// Product-rail source: the store's best sellers (real
+/// delivered units only — the platform's one "sold").
+pub const RAIL_SOURCE_BEST_SELLERS: &str = "best_sellers";
+/// Product-rail source: products on sale (a live flash
+/// price, or a compare-at above the price — the search
+/// module's one on-sale predicate).
+pub const RAIL_SOURCE_ON_SALE: &str = "on_sale";
+/// Product-rail source: the seller's hand-picked product
+/// ids, in the seller's order.
+pub const RAIL_SOURCE_MANUAL: &str = "manual";
+
+/// Every product-rail source.
+pub const RAIL_SOURCES: [&str; 4] = [
+    RAIL_SOURCE_NEWEST,
+    RAIL_SOURCE_BEST_SELLERS,
+    RAIL_SOURCE_ON_SALE,
+    RAIL_SOURCE_MANUAL,
+];
+
+/// Category-grid mode: the managed taxonomy (Wave 56).
+pub const CATEGORY_GRID_MODE_TAXONOMY: &str = "taxonomy";
+/// Category-grid mode: the free-text category labels
+/// (Wave 54).
+pub const CATEGORY_GRID_MODE_LABELS: &str = "labels";
+
+/// Every category-grid mode.
+pub const CATEGORY_GRID_MODES: [&str; 2] = [
+    CATEGORY_GRID_MODE_TAXONOMY,
+    CATEGORY_GRID_MODE_LABELS,
+];
+
+/// Longest hero headline, in Unicode characters.
+pub const MAX_SECTION_HEADLINE_CHARS: usize = 120;
+/// Longest hero subtext, in Unicode characters.
+pub const MAX_SECTION_SUBTEXT_CHARS: usize = 300;
+/// Longest rich-text heading, in Unicode characters.
+pub const MAX_SECTION_HEADING_CHARS: usize = 120;
+/// Longest rich-text body, in Unicode characters (the
+/// store about text's cap — the same reading length).
+pub const MAX_SECTION_BODY_CHARS: usize = 2_000;
+/// Longest section title (rails, shelves, grids), in
+/// Unicode characters.
+pub const MAX_SECTION_TITLE_CHARS: usize = 80;
+/// Longest call-to-action link label, in Unicode
+/// characters.
+pub const MAX_SECTION_LINK_LABEL_CHARS: usize = 60;
+/// Longest image-banner caption, in Unicode characters.
+pub const MAX_SECTION_CAPTION_CHARS: usize = 120;
+/// The fewest products a rail / shelf / grid may show.
+pub const MIN_SECTION_LIMIT: i64 = 4;
+/// The most products a rail may show.
+pub const MAX_RAIL_LIMIT: i64 = 24;
+/// The most products a single-collection shelf may show.
+pub const MAX_SHELF_LIMIT: i64 = 24;
+/// The most tiles a category grid may show.
+pub const MAX_CATEGORY_GRID_LIMIT: i64 = 24;
+/// A rail's product count when the seller does not say.
+pub const DEFAULT_RAIL_LIMIT: i64 = 10;
+/// A single-collection shelf's product count default.
+pub const DEFAULT_SHELF_LIMIT: i64 = 8;
+/// A category grid's tile count default.
+pub const DEFAULT_CATEGORY_GRID_LIMIT: i64 = 12;
+/// The most hand-picked products in one manual rail.
+pub const MAX_MANUAL_RAIL_PRODUCTS: usize = 24;
+/// The most question/answer pairs in one FAQ section.
+pub const MAX_FAQ_PAIRS: usize = 10;
+/// Longest FAQ question, in Unicode characters.
+pub const MAX_FAQ_QUESTION_CHARS: usize = 200;
+/// Longest FAQ answer, in Unicode characters.
+pub const MAX_FAQ_ANSWER_CHARS: usize = 1_000;
+/// Longest section id, in characters (ids are the
+/// seller-facing handle the analytics events key on).
+pub const MAX_SECTION_ID_CHARS: usize = 40;
+
+/// One question/answer pair of an FAQ section.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FaqItem {
+    pub question: String,
+    pub answer: String,
+}
+
+/// One section of a storefront layout. `config` is the
+/// type's own JSON object — validated and normalised by
+/// [`validate_storefront_layout`] for the types this
+/// build knows, and carried verbatim for types it does
+/// not (the forward-tolerance rule). `starts_at` /
+/// `ends_at` are unix seconds (the domain crate's time
+/// convention); the API translates to and from RFC 3339
+/// at its boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StorefrontSection {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub section_type: String,
+    #[serde(default = "default_section_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub config: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starts_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ends_at: Option<i64>,
+}
+
+fn default_section_enabled() -> bool {
+    true
+}
+
+/// A store's whole storefront layout: an ordered list of
+/// sections under a document version. Stored as JSONB
+/// (migration 0065); a store with no stored layout uses
+/// [`default_storefront_layout`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StorefrontLayout {
+    #[serde(default = "default_layout_version")]
+    pub version: i64,
+    #[serde(default)]
+    pub sections: Vec<StorefrontSection>,
+}
+
+fn default_layout_version() -> i64 {
+    STOREFRONT_LAYOUT_VERSION
+}
+
+/// Is this one of the section types this build knows?
+pub fn is_known_section_type(section_type: &str) -> bool {
+    STOREFRONT_SECTION_TYPES.contains(&section_type)
+}
+
+/// A section id: 1–40 characters of lowercase letters,
+/// digits and hyphens, not starting or ending with a
+/// hyphen (the slug shape, minus the length floor — a
+/// one-letter id is a fine handle). Ids key the section
+/// analytics, so they must stay URL- and JSON-safe.
+pub fn validate_section_id(id: &str) -> Result<(), &'static str> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > MAX_SECTION_ID_CHARS {
+        return Err("section id must be 1-40 characters");
+    }
+    if trimmed.starts_with('-') || trimmed.ends_with('-') {
+        return Err("section id must not start or end with a hyphen");
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err("section id must be lowercase letters, digits and hyphens");
+    }
+    Ok(())
+}
+
+/// Is a section type string at least well-formed (the
+/// catalogue's charset: lowercase letters, digits,
+/// underscores and hyphens)? A well-formed type this
+/// build does not know is a FUTURE type — tolerated and
+/// preserved. A malformed one is garbage and refused.
+fn is_well_formed_section_type(section_type: &str) -> bool {
+    !section_type.is_empty()
+        && section_type.chars().count() <= MAX_SECTION_ID_CHARS
+        && section_type
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+/// Read an optional string out of a section config: a
+/// missing key or an explicit null is `None`; a present
+/// non-string is an error (a number where text belongs is
+/// a broken document, not a default).
+fn section_config_str(
+    config: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Option<String>, String> {
+    match config.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(raw)) => Ok(Some(raw.clone())),
+        Some(_) => Err(format!("config key '{key}' must be a string")),
+    }
+}
+
+/// Read an optional integer out of a section config.
+fn section_config_i64(
+    config: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Option<i64>, String> {
+    match config.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| format!("config key '{key}' must be a whole number")),
+    }
+}
+
+/// Read an optional string list out of a section config.
+fn section_config_str_list(
+    config: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Vec<String>, String> {
+    match config.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item.as_str() {
+                    Some(raw) => out.push(raw.to_string()),
+                    None => {
+                        return Err(format!(
+                            "config key '{key}' must be a list of strings"
+                        ))
+                    }
+                }
+            }
+            Ok(out)
+        }
+        Some(_) => Err(format!("config key '{key}' must be a list of strings")),
+    }
+}
+
+/// Validate + normalise one optional config text: trim,
+/// blank becomes absent, over the cap is an error naming
+/// the key. `label` is the human name used in messages.
+fn section_config_text(
+    config: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    label: &str,
+    max_chars: usize,
+) -> Result<Option<String>, String> {
+    let Some(raw) = section_config_str(config, key)? else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().count() > max_chars {
+        return Err(format!(
+            "{label} must be at most {max_chars} characters — \
+             {label} সর্বোচ্চ {max_chars} অক্ষরের হতে পারবে"
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+/// Validate + normalise one optional config URL through
+/// the branding rule (Wave 18: http(s) or site-relative,
+/// blank clears): an image a storefront renders straight
+/// into an `<img>` gets exactly the branding defence.
+fn section_config_image_url(
+    config: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    label: &str,
+) -> Result<Option<String>, String> {
+    let Some(raw) = section_config_str(config, key)? else {
+        return Ok(None);
+    };
+    validate_branding_url(Some(&raw))
+        .map_err(|message| format!("{label}: {message}"))
+}
+
+/// Validate + normalise one optional config link through
+/// the banner link rule (Wave 52: a site path with a
+/// single leading `/`, or an absolute http(s) URL — the
+/// scheme whitelist is the whole defence for a value
+/// rendered straight into an anchor).
+fn section_config_link_url(
+    config: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Option<String>, String> {
+    let Some(raw) = section_config_str(config, key)? else {
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    validate_banner_link(&raw).map(Some).map_err(str::to_string)
+}
+
+/// Validate + normalise a rail/shelf/grid limit: absent
+/// takes the type's default; present must sit inside
+/// [MIN_SECTION_LIMIT, max].
+fn section_config_limit(
+    config: &serde_json::Map<String, serde_json::Value>,
+    default: i64,
+    max: i64,
+) -> Result<i64, String> {
+    let Some(value) = section_config_i64(config, "limit")? else {
+        return Ok(default);
+    };
+    if !(MIN_SECTION_LIMIT..=max).contains(&value) {
+        return Err(format!(
+            "limit must be between {MIN_SECTION_LIMIT} and {max} — \
+             limit {MIN_SECTION_LIMIT} থেকে {max}-এর মধ্যে হতে হবে"
+        ));
+    }
+    Ok(value)
+}
+
+/// Is this string shaped like a uuid (8-4-4-4-12 hex)?
+/// The domain has no uuid crate; the API re-parses every
+/// id it resolves, so this shape check only keeps obvious
+/// garbage out of a stored document.
+fn is_uuid_shaped(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    bytes.iter().enumerate().all(|(index, byte)| {
+        if matches!(index, 8 | 13 | 18 | 23) {
+            *byte == b'-'
+        } else {
+            byte.is_ascii_hexdigit()
+        }
+    })
+}
+
+/// Build one normalised config value from the keys a
+/// section type actually carries — the stored document
+/// keeps only its type's own keys, in a stable shape.
+fn normalised_config(
+    pairs: Vec<(&str, serde_json::Value)>,
+) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (key, value) in pairs {
+        if !value.is_null() {
+            map.insert(key.to_string(), value);
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
+fn json_text(value: Option<String>) -> serde_json::Value {
+    value.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null)
+}
+
+/// Validate + normalise ONE known section type's config.
+/// The returned value replaces the submitted config in
+/// the stored document. Unknown types never reach here
+/// (they are preserved verbatim by the caller).
+fn validate_section_config(
+    section_type: &str,
+    config: &serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    match section_type {
+        SECTION_TYPE_HERO => Ok(normalised_config(vec![
+            (
+                "headline",
+                json_text(section_config_text(
+                    config,
+                    "headline",
+                    "headline",
+                    MAX_SECTION_HEADLINE_CHARS,
+                )?),
+            ),
+            (
+                "subtext",
+                json_text(section_config_text(
+                    config,
+                    "subtext",
+                    "subtext",
+                    MAX_SECTION_SUBTEXT_CHARS,
+                )?),
+            ),
+            (
+                "image_url",
+                json_text(section_config_image_url(config, "image_url", "hero image")?),
+            ),
+            (
+                "link_url",
+                json_text(section_config_link_url(config, "link_url")?),
+            ),
+            (
+                "link_label",
+                json_text(section_config_text(
+                    config,
+                    "link_label",
+                    "link label",
+                    MAX_SECTION_LINK_LABEL_CHARS,
+                )?),
+            ),
+        ])),
+        SECTION_TYPE_RICH_TEXT => {
+            let heading = section_config_text(
+                config,
+                "heading",
+                "heading",
+                MAX_SECTION_HEADING_CHARS,
+            )?;
+            let body = section_config_text(config, "body", "body", MAX_SECTION_BODY_CHARS)?
+                .ok_or_else(|| {
+                    "a rich text section needs a body — \
+                     রিচ টেক্সট সেকশনে লেখা আবশ্যক"
+                        .to_string()
+                })?;
+            Ok(normalised_config(vec![
+                ("heading", json_text(heading)),
+                ("body", serde_json::Value::String(body)),
+            ]))
+        }
+        SECTION_TYPE_PRODUCT_RAIL => {
+            let source = section_config_str(config, "source")?
+                .map(|raw| raw.trim().to_string())
+                .filter(|raw| !raw.is_empty())
+                .ok_or_else(|| {
+                    "a product rail needs a source — \
+                     প্রোডাক্ট রেলের উৎস (source) আবশ্যক"
+                        .to_string()
+                })?;
+            if !RAIL_SOURCES.contains(&source.as_str()) {
+                return Err(format!(
+                    "rail source must be one of: {} — \
+                     রেলের উৎস হতে হবে: {}",
+                    RAIL_SOURCES.join(", "),
+                    RAIL_SOURCES.join(", ")
+                ));
+            }
+            let title = section_config_text(config, "title", "title", MAX_SECTION_TITLE_CHARS)?;
+            let limit = section_config_limit(config, DEFAULT_RAIL_LIMIT, MAX_RAIL_LIMIT)?;
+            let mut product_ids = section_config_str_list(config, "product_ids")?;
+            // Duplicates collapse, first occurrence keeps
+            // its place (the collection membership rule).
+            let mut deduped: Vec<String> = Vec::with_capacity(product_ids.len());
+            for id in product_ids.drain(..) {
+                let id = id.trim().to_string();
+                if !deduped.contains(&id) {
+                    deduped.push(id);
+                }
+            }
+            if source == RAIL_SOURCE_MANUAL {
+                if deduped.is_empty() {
+                    return Err(
+                        "a manual rail needs at least one product — \
+                         হাতে-বাছাই রেলে অন্তত একটি পণ্য আবশ্যক"
+                            .to_string(),
+                    );
+                }
+                if deduped.len() > MAX_MANUAL_RAIL_PRODUCTS {
+                    return Err(format!(
+                        "a manual rail holds at most {MAX_MANUAL_RAIL_PRODUCTS} products — \
+                         হাতে-বাছাই রেলে সর্বোচ্চ {MAX_MANUAL_RAIL_PRODUCTS}টি পণ্য রাখা যাবে"
+                    ));
+                }
+                for id in &deduped {
+                    if !is_uuid_shaped(id) {
+                        return Err(format!(
+                            "product id '{id}' is not a valid id — \
+                             '{id}' সঠিক পণ্য আইডি নয়"
+                        ));
+                    }
+                }
+            } else if !deduped.is_empty() {
+                return Err(
+                    "product_ids only applies to a manual rail — \
+                     product_ids শুধু হাতে-বাছাই রেলের জন্য"
+                        .to_string(),
+                );
+            }
+            let mut pairs = vec![
+                ("source", serde_json::Value::String(source.clone())),
+                ("title", json_text(title)),
+                ("limit", serde_json::Value::Number(limit.into())),
+            ];
+            if source == RAIL_SOURCE_MANUAL {
+                pairs.push((
+                    "product_ids",
+                    serde_json::Value::Array(
+                        deduped.into_iter().map(serde_json::Value::String).collect(),
+                    ),
+                ));
+            }
+            Ok(normalised_config(pairs))
+        }
+        SECTION_TYPE_COLLECTION_SHELF => {
+            let collection_id = match section_config_str(config, "collection_id")? {
+                Some(raw) => {
+                    let raw = raw.trim().to_string();
+                    if raw.is_empty() {
+                        None
+                    } else if is_uuid_shaped(&raw) {
+                        Some(raw)
+                    } else {
+                        return Err(format!(
+                            "collection id '{raw}' is not a valid id — \
+                             '{raw}' সঠিক কালেকশন আইডি নয়"
+                        ));
+                    }
+                }
+                None => None,
+            };
+            let title = section_config_text(config, "title", "title", MAX_SECTION_TITLE_CHARS)?;
+            let limit = section_config_limit(config, DEFAULT_SHELF_LIMIT, MAX_SHELF_LIMIT)?;
+            Ok(normalised_config(vec![
+                ("collection_id", json_text(collection_id)),
+                ("title", json_text(title)),
+                ("limit", serde_json::Value::Number(limit.into())),
+            ]))
+        }
+        SECTION_TYPE_CATEGORY_GRID => {
+            let mode = section_config_str(config, "mode")?
+                .map(|raw| raw.trim().to_string())
+                .filter(|raw| !raw.is_empty())
+                .unwrap_or_else(|| CATEGORY_GRID_MODE_TAXONOMY.to_string());
+            if mode != CATEGORY_GRID_MODE_TAXONOMY && mode != CATEGORY_GRID_MODE_LABELS {
+                return Err(format!(
+                    "category grid mode must be '{CATEGORY_GRID_MODE_TAXONOMY}' or \
+                     '{CATEGORY_GRID_MODE_LABELS}' — \
+                     মোড হতে হবে '{CATEGORY_GRID_MODE_TAXONOMY}' অথবা '{CATEGORY_GRID_MODE_LABELS}'"
+                ));
+            }
+            let title = section_config_text(config, "title", "title", MAX_SECTION_TITLE_CHARS)?;
+            let limit = section_config_limit(
+                config,
+                DEFAULT_CATEGORY_GRID_LIMIT,
+                MAX_CATEGORY_GRID_LIMIT,
+            )?;
+            Ok(normalised_config(vec![
+                ("mode", serde_json::Value::String(mode)),
+                ("title", json_text(title)),
+                ("limit", serde_json::Value::Number(limit.into())),
+            ]))
+        }
+        SECTION_TYPE_PRODUCT_GRID => {
+            let title = section_config_text(config, "title", "title", MAX_SECTION_TITLE_CHARS)?;
+            Ok(normalised_config(vec![("title", json_text(title))]))
+        }
+        SECTION_TYPE_IMAGE_BANNER => {
+            let image_url = section_config_image_url(config, "image_url", "banner image")?
+                .ok_or_else(|| {
+                    "an image banner needs an image — \
+                     ইমেজ ব্যানারে ছবি আবশ্যক"
+                        .to_string()
+                })?;
+            let link_url = section_config_link_url(config, "link_url")?;
+            let caption = section_config_text(
+                config,
+                "caption",
+                "caption",
+                MAX_SECTION_CAPTION_CHARS,
+            )?;
+            Ok(normalised_config(vec![
+                ("image_url", serde_json::Value::String(image_url)),
+                ("link_url", json_text(link_url)),
+                ("caption", json_text(caption)),
+            ]))
+        }
+        SECTION_TYPE_STORE_INFO => {
+            // The store info section carries no config of
+            // its own: its content is the store's profile
+            // (about / return policy), edited on the
+            // branding surface, never duplicated here.
+            Ok(normalised_config(Vec::new()))
+        }
+        SECTION_TYPE_FAQ => {
+            let Some(items_value) = config.get("items") else {
+                return Err(
+                    "an FAQ section needs its question list — \
+                     FAQ সেকশনে প্রশ্নের তালিকা আবশ্যক"
+                        .to_string(),
+                );
+            };
+            let Some(items) = items_value.as_array() else {
+                return Err("config key 'items' must be a list".to_string());
+            };
+            if items.is_empty() || items.len() > MAX_FAQ_PAIRS {
+                return Err(format!(
+                    "an FAQ section holds between 1 and {MAX_FAQ_PAIRS} questions — \
+                     FAQ সেকশনে ১ থেকে {MAX_FAQ_PAIRS}টি প্রশ্ন রাখা যাবে"
+                ));
+            }
+            let mut normalised_items = Vec::with_capacity(items.len());
+            for (position, item) in items.iter().enumerate() {
+                let Some(pair) = item.as_object() else {
+                    return Err(format!("FAQ item {} must be an object", position + 1));
+                };
+                let question = section_config_text(
+                    pair,
+                    "question",
+                    "question",
+                    MAX_FAQ_QUESTION_CHARS,
+                )?
+                .ok_or_else(|| format!("FAQ item {} needs a question", position + 1))?;
+                let answer = section_config_text(pair, "answer", "answer", MAX_FAQ_ANSWER_CHARS)?
+                    .ok_or_else(|| format!("FAQ item {} needs an answer", position + 1))?;
+                normalised_items.push(serde_json::json!({
+                    "question": question,
+                    "answer": answer,
+                }));
+            }
+            Ok(normalised_config(vec![(
+                "items",
+                serde_json::Value::Array(normalised_items),
+            )]))
+        }
+        _ => Ok(serde_json::Value::Object(config.clone())),
+    }
+}
+
+/// Validate a whole storefront layout for WRITING and
+/// return the normalised document to store. Rules, in
+/// check order:
+///
+/// - the version must be the current one (a future
+///   document is refused, never silently rewritten);
+/// - at most [`MAX_STOREFRONT_SECTIONS`] sections;
+/// - every section id is well-formed and unique — the
+///   error names the section's 1-based position, so the
+///   seller can find the offending block in the editor;
+/// - a scheduling window, when both bounds are present,
+///   must be non-empty (the shared window rule);
+/// - a KNOWN type's config passes its per-type
+///   validation and is normalised to the type's own keys;
+/// - an UNKNOWN type is a future section: tolerated and
+///   preserved verbatim (its config is not ours to judge)
+///   as long as its type string is well-formed — a
+///   malformed type string is refused as garbage. The
+///   public renderer skips unknown types; the editor
+///   shows them as locked blocks, so a seller on an older
+///   build can never destroy a newer layout by saving.
+pub fn validate_storefront_layout(
+    layout: &StorefrontLayout,
+) -> Result<StorefrontLayout, String> {
+    if layout.version != STOREFRONT_LAYOUT_VERSION {
+        return Err(format!(
+            "layout version must be {STOREFRONT_LAYOUT_VERSION} — \
+             লেআউটের সংস্করণ হতে হবে {STOREFRONT_LAYOUT_VERSION}"
+        ));
+    }
+    if layout.sections.len() > MAX_STOREFRONT_SECTIONS {
+        return Err(format!(
+            "a layout holds at most {MAX_STOREFRONT_SECTIONS} sections — \
+             একটি লেআউটে সর্বোচ্চ {MAX_STOREFRONT_SECTIONS}টি সেকশন রাখা যাবে"
+        ));
+    }
+    let mut seen_ids: Vec<&str> = Vec::with_capacity(layout.sections.len());
+    let mut normalised_sections = Vec::with_capacity(layout.sections.len());
+    for (index, section) in layout.sections.iter().enumerate() {
+        let position = index + 1;
+        let prefix = format!("section {position} ({})", section.section_type);
+        validate_section_id(&section.id)
+            .map_err(|message| format!("{prefix}: {message}"))?;
+        if seen_ids.contains(&section.id.as_str()) {
+            return Err(format!(
+                "{prefix}: section id '{}' is used more than once — \
+                 '{}' আইডিটি একাধিকবার ব্যবহৃত হয়েছে",
+                section.id, section.id
+            ));
+        }
+        seen_ids.push(section.id.as_str());
+        validate_optional_window(section.starts_at, section.ends_at)
+            .map_err(|message| format!("{prefix}: {message}"))?;
+        if !is_well_formed_section_type(&section.section_type) {
+            return Err(format!(
+                "{prefix}: section type '{}' is not a valid type name — \
+                 '{}' সঠিক সেকশন টাইপ নয়",
+                section.section_type, section.section_type
+            ));
+        }
+        let config_map = match &section.config {
+            serde_json::Value::Object(map) => map.clone(),
+            serde_json::Value::Null => serde_json::Map::new(),
+            _ => {
+                return Err(format!(
+                    "{prefix}: config must be an object — \
+                     config একটি অবজেক্ট হতে হবে"
+                ))
+            }
+        };
+        let config = if is_known_section_type(&section.section_type) {
+            validate_section_config(&section.section_type, &config_map)
+                .map_err(|message| format!("{prefix}: {message}"))?
+        } else {
+            // A future type: preserved verbatim.
+            section.config.clone()
+        };
+        normalised_sections.push(StorefrontSection {
+            id: section.id.trim().to_string(),
+            section_type: section.section_type.clone(),
+            enabled: section.enabled,
+            config,
+            starts_at: section.starts_at,
+            ends_at: section.ends_at,
+        });
+    }
+    Ok(StorefrontLayout {
+        version: layout.version,
+        sections: normalised_sections,
+    })
+}
+
+/// Is a section live at `now` (unix seconds)? The one
+/// visibility rule, shared with banners: switched on, and
+/// its optional window contains `now` — half-open
+/// [starts_at, ends_at), so a section appears exactly at
+/// its start second and disappears exactly at its end.
+pub fn storefront_section_is_live(section: &StorefrontSection, now_unix: i64) -> bool {
+    banner_is_visible(section.enabled, section.starts_at, section.ends_at, now_unix)
+}
+
+/// One section of the platform default layout, built by
+/// [`default_storefront_layout`] and the presets.
+fn default_section(
+    id: &str,
+    section_type: &str,
+    config: serde_json::Value,
+) -> StorefrontSection {
+    StorefrontSection {
+        id: id.to_string(),
+        section_type: section_type.to_string(),
+        enabled: true,
+        config,
+        starts_at: None,
+        ends_at: None,
+    }
+}
+
+/// The default layout's rail for one source, with the
+/// title the pre-Wave-58 storefront showed for it.
+fn default_rail(id: &str, source: &str, title: &str) -> StorefrontSection {
+    default_section(
+        id,
+        SECTION_TYPE_PRODUCT_RAIL,
+        serde_json::json!({
+            "source": source,
+            "title": title,
+            "limit": DEFAULT_RAIL_LIMIT,
+        }),
+    )
+}
+
+/// The platform default storefront layout — the
+/// composition a store renders when it has no stored
+/// layout, equivalent to the pre-Wave-58 storefront:
+/// the hero (resolved from the store's branding), the
+/// three merchandising rails in their historical order
+/// (on sale, best sellers, new arrivals), the collection
+/// shelf, the taxonomy specialties, the label categories,
+/// the full catalogue grid, and the store info blocks.
+/// This is CODE, never a seeded row: resetting a layout
+/// deletes the row and lands back here.
+pub fn default_storefront_layout() -> StorefrontLayout {
+    StorefrontLayout {
+        version: STOREFRONT_LAYOUT_VERSION,
+        sections: vec![
+            default_section("hero", SECTION_TYPE_HERO, serde_json::json!({})),
+            default_rail(
+                "rail-on-sale",
+                RAIL_SOURCE_ON_SALE,
+                "অফারে আছে — On sale at this store",
+            ),
+            default_rail(
+                "rail-best-sellers",
+                RAIL_SOURCE_BEST_SELLERS,
+                "এই স্টোরের সেরা বিক্রিত — This store's best sellers",
+            ),
+            default_rail(
+                "rail-new-arrivals",
+                RAIL_SOURCE_NEWEST,
+                "নতুন এসেছে — New at this store",
+            ),
+            default_section(
+                "collections",
+                SECTION_TYPE_COLLECTION_SHELF,
+                serde_json::json!({ "limit": DEFAULT_SHELF_LIMIT }),
+            ),
+            default_section(
+                "specialties",
+                SECTION_TYPE_CATEGORY_GRID,
+                serde_json::json!({
+                    "mode": CATEGORY_GRID_MODE_TAXONOMY,
+                    "title": "এই স্টোরের বিশেষত্ব — This store specialises in",
+                    "limit": 8,
+                }),
+            ),
+            default_section(
+                "categories",
+                SECTION_TYPE_CATEGORY_GRID,
+                serde_json::json!({
+                    "mode": CATEGORY_GRID_MODE_LABELS,
+                    "title": "ক্যাটাগরি অনুযায়ী কিনুন — Shop by category",
+                    "limit": DEFAULT_CATEGORY_GRID_LIMIT,
+                }),
+            ),
+            default_section(
+                "all-products",
+                SECTION_TYPE_PRODUCT_GRID,
+                serde_json::json!({}),
+            ),
+            default_section("store-info", SECTION_TYPE_STORE_INFO, serde_json::json!({})),
+        ],
+    }
+}
+
+/// Layout preset: the platform default composition.
+pub const LAYOUT_PRESET_DEFAULT: &str = "default";
+/// Layout preset: the quiet storefront — hero, catalogue,
+/// info; no merchandising blocks.
+pub const LAYOUT_PRESET_MINIMAL: &str = "minimal";
+/// Layout preset: the merchandising-forward storefront —
+/// rails and shelves ahead of the catalogue, an FAQ
+/// before the info blocks.
+pub const LAYOUT_PRESET_MERCHANDISING: &str = "merchandising";
+
+/// Every layout preset key, in picker order.
+pub const STOREFRONT_LAYOUT_PRESETS: [&str; 3] = [
+    LAYOUT_PRESET_DEFAULT,
+    LAYOUT_PRESET_MINIMAL,
+    LAYOUT_PRESET_MERCHANDISING,
+];
+
+/// Build one named layout preset (the editor's one-click
+/// starting points). `None` for an unknown key. Every
+/// preset passes [`validate_storefront_layout`] — they
+/// are starting points a seller then edits, never a
+/// separate storage path.
+pub fn storefront_layout_preset(key: &str) -> Option<StorefrontLayout> {
+    match key {
+        LAYOUT_PRESET_DEFAULT => Some(default_storefront_layout()),
+        LAYOUT_PRESET_MINIMAL => Some(StorefrontLayout {
+            version: STOREFRONT_LAYOUT_VERSION,
+            sections: vec![
+                default_section("hero", SECTION_TYPE_HERO, serde_json::json!({})),
+                default_section(
+                    "all-products",
+                    SECTION_TYPE_PRODUCT_GRID,
+                    serde_json::json!({}),
+                ),
+                default_section(
+                    "store-info",
+                    SECTION_TYPE_STORE_INFO,
+                    serde_json::json!({}),
+                ),
+            ],
+        }),
+        LAYOUT_PRESET_MERCHANDISING => Some(StorefrontLayout {
+            version: STOREFRONT_LAYOUT_VERSION,
+            sections: vec![
+                default_section("hero", SECTION_TYPE_HERO, serde_json::json!({})),
+                default_rail(
+                    "rail-on-sale",
+                    RAIL_SOURCE_ON_SALE,
+                    "অফারে আছে — On sale at this store",
+                ),
+                default_rail(
+                    "rail-best-sellers",
+                    RAIL_SOURCE_BEST_SELLERS,
+                    "এই স্টোরের সেরা বিক্রিত — This store's best sellers",
+                ),
+                default_section(
+                    "collections",
+                    SECTION_TYPE_COLLECTION_SHELF,
+                    serde_json::json!({ "limit": DEFAULT_SHELF_LIMIT }),
+                ),
+                default_rail(
+                    "rail-new-arrivals",
+                    RAIL_SOURCE_NEWEST,
+                    "নতুন এসেছে — New at this store",
+                ),
+                default_section(
+                    "categories",
+                    SECTION_TYPE_CATEGORY_GRID,
+                    serde_json::json!({
+                        "mode": CATEGORY_GRID_MODE_LABELS,
+                        "title": "ক্যাটাগরি অনুযায়ী কিনুন — Shop by category",
+                        "limit": DEFAULT_CATEGORY_GRID_LIMIT,
+                    }),
+                ),
+                default_section(
+                    "all-products",
+                    SECTION_TYPE_PRODUCT_GRID,
+                    serde_json::json!({}),
+                ),
+                default_section(
+                    "faq",
+                    SECTION_TYPE_FAQ,
+                    serde_json::json!({
+                        "items": [
+                            {
+                                "question": "ক্যাশ অন ডেলিভারি আছে কি?",
+                                "answer": "হ্যাঁ — পণ্য হাতে পেয়ে মূল্য পরিশোধ করুন।",
+                            },
+                            {
+                                "question": "ডেলিভারি পেতে কতদিন লাগবে?",
+                                "answer": "ঢাকার ভিতরে ১–২ দিন, ঢাকার বাইরে ৩–৫ দিন।",
+                            },
+                        ],
+                    }),
+                ),
+                default_section(
+                    "store-info",
+                    SECTION_TYPE_STORE_INFO,
+                    serde_json::json!({}),
+                ),
+            ],
+        }),
+        _ => None,
+    }
+}
+
+/// One section type's editor metadata: the names and the
+/// one-line description the add-section picker shows.
+/// The catalogue is data (not UI copy buried in the web
+/// app) so the picker and any future client describe the
+/// types identically.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SectionTypeMeta {
+    pub section_type: &'static str,
+    pub label_en: &'static str,
+    pub label_bn: &'static str,
+    pub description_en: &'static str,
+    pub description_bn: &'static str,
+}
+
+/// The section catalogue: every known type with its
+/// editor labels and descriptions, in picker order.
+pub fn storefront_section_catalogue() -> Vec<SectionTypeMeta> {
+    vec![
+        SectionTypeMeta {
+            section_type: SECTION_TYPE_HERO,
+            label_en: "Hero",
+            label_bn: "হিরো",
+            description_en: "Headline, subtext, image and a call-to-action — the storefront's crown. Empty fields fall back to your branding.",
+            description_bn: "শিরোনাম, উপ-লেখা, ছবি ও একটি বোতাম — স্টোরফ্রন্টের মুকুট। খালি ঘর ব্র্যান্ডিং থেকে পূরণ হয়।",
+        },
+        SectionTypeMeta {
+            section_type: SECTION_TYPE_RICH_TEXT,
+            label_en: "Rich text",
+            label_bn: "রিচ টেক্সট",
+            description_en: "A heading and a paragraph in your own words — your story, a delivery note, a campaign.",
+            description_bn: "আপনার নিজের কথায় একটি শিরোনাম ও অনুচ্ছেদ — আপনার গল্প, ডেলিভারির নোট, কোনো প্রচারণা।",
+        },
+        SectionTypeMeta {
+            section_type: SECTION_TYPE_PRODUCT_RAIL,
+            label_en: "Product rail",
+            label_bn: "পণ্যের রেল",
+            description_en: "A sliding row of product cards: newest, best sellers, on sale, or hand-picked by you.",
+            description_bn: "পণ্যের কার্ডের একটি স্লাইডিং সারি: নতুন, সেরা বিক্রিত, অফারের, অথবা আপনার হাতে-বাছাই।",
+        },
+        SectionTypeMeta {
+            section_type: SECTION_TYPE_COLLECTION_SHELF,
+            label_en: "Collection shelf",
+            label_bn: "কালেকশন শেলফ",
+            description_en: "Your collections as tiles, or one collection's products as a shelf.",
+            description_bn: "আপনার কালেকশনগুলো টাইল আকারে, অথবা একটি কালেকশনের পণ্য শেলফ আকারে।",
+        },
+        SectionTypeMeta {
+            section_type: SECTION_TYPE_CATEGORY_GRID,
+            label_en: "Category grid",
+            label_bn: "ক্যাটাগরি গ্রিড",
+            description_en: "The categories you sell in, as tiles with live counts.",
+            description_bn: "আপনি যেসব ক্যাটাগরিতে বিক্রি করেন, লাইভ সংখ্যাসহ টাইল আকারে।",
+        },
+        SectionTypeMeta {
+            section_type: SECTION_TYPE_PRODUCT_GRID,
+            label_en: "Product grid",
+            label_bn: "পণ্যের গ্রিড",
+            description_en: "Your full catalogue grid — every active product, paged.",
+            description_bn: "আপনার পুরো ক্যাটালগের গ্রিড — সব সক্রিয় পণ্য, পেজ আকারে।",
+        },
+        SectionTypeMeta {
+            section_type: SECTION_TYPE_IMAGE_BANNER,
+            label_en: "Image banner",
+            label_bn: "ইমেজ ব্যানার",
+            description_en: "One wide image with an optional link and caption — a campaign of your own.",
+            description_bn: "একটি চওড়া ছবি, চাইলে লিংক ও ক্যাপশনসহ — আপনার নিজের প্রচারণা।",
+        },
+        SectionTypeMeta {
+            section_type: SECTION_TYPE_STORE_INFO,
+            label_en: "Store info",
+            label_bn: "স্টোরের তথ্য",
+            description_en: "Your about text and return policy (written on the branding page), with your trust numbers.",
+            description_bn: "আপনার পরিচিতি ও রিটার্ন নীতি (ব্র্যান্ডিং পেজে লেখা), আস্থার সংখ্যাসহ।",
+        },
+        SectionTypeMeta {
+            section_type: SECTION_TYPE_FAQ,
+            label_en: "FAQ",
+            label_bn: "সাধারণ প্রশ্ন",
+            description_en: "Question and answer pairs — delivery, payment and returns, answered before buyers ask.",
+            description_bn: "প্রশ্ন-উত্তরের জোড়া — ডেলিভারি, পেমেন্ট ও রিটার্নের উত্তর, ক্রেতা জিজ্ঞেস করার আগেই।",
+        },
+    ]
+}
+
+/// Storefront section analytics: a section was seen.
+pub const STOREFRONT_EVENT_SECTION_VIEW: &str = "section_view";
+/// Storefront section analytics: a section's link or
+/// call-to-action was clicked.
+pub const STOREFRONT_EVENT_SECTION_CLICK: &str = "section_click";
+
+/// Every storefront event kind.
+pub const STOREFRONT_EVENT_KINDS: [&str; 2] = [
+    STOREFRONT_EVENT_SECTION_VIEW,
+    STOREFRONT_EVENT_SECTION_CLICK,
+];
+
+/// Validate a storefront section event kind (the public
+/// beacon's only vocabulary — anything else is refused,
+/// the merch-events rule).
+pub fn validate_storefront_event_kind(kind: &str) -> Result<&str, &'static str> {
+    match kind {
+        STOREFRONT_EVENT_SECTION_VIEW => Ok(STOREFRONT_EVENT_SECTION_VIEW),
+        STOREFRONT_EVENT_SECTION_CLICK => Ok(STOREFRONT_EVENT_SECTION_CLICK),
+        _ => Err("kind must be 'section_view' or 'section_click'"),
+    }
+}
+
+/// The seller section-stats window: counts are all-time
+/// plus the last this many days (Asia/Dhaka calendar days
+/// at the API, like every analytics surface).
+pub const STOREFRONT_STATS_WINDOW_DAYS: i64 = 30;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -12620,5 +13702,743 @@ mod tests {
             .errors
             .iter()
             .any(|e| e.field == "sku"));
+    }
+
+    // -- Wave 58: storefront section layouts --
+
+    fn w58_section(
+        id: &str,
+        section_type: &str,
+        config: serde_json::Value,
+    ) -> StorefrontSection {
+        StorefrontSection {
+            id: id.to_string(),
+            section_type: section_type.to_string(),
+            enabled: true,
+            config,
+            starts_at: None,
+            ends_at: None,
+        }
+    }
+
+    fn w58_layout(sections: Vec<StorefrontSection>) -> StorefrontLayout {
+        StorefrontLayout {
+            version: STOREFRONT_LAYOUT_VERSION,
+            sections,
+        }
+    }
+
+    #[test]
+    fn wave58_default_layout_is_valid_and_matches_the_historical_storefront() {
+        let layout = default_storefront_layout();
+        let validated = validate_storefront_layout(&layout).expect("default validates");
+        assert_eq!(validated.version, 1);
+        let types: Vec<&str> = validated
+            .sections
+            .iter()
+            .map(|section| section.section_type.as_str())
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                "hero",
+                "product_rail",
+                "product_rail",
+                "product_rail",
+                "collection_shelf",
+                "category_grid",
+                "category_grid",
+                "product_grid",
+                "store_info",
+            ]
+        );
+        let ids: Vec<&str> = validated
+            .sections
+            .iter()
+            .map(|section| section.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "hero",
+                "rail-on-sale",
+                "rail-best-sellers",
+                "rail-new-arrivals",
+                "collections",
+                "specialties",
+                "categories",
+                "all-products",
+                "store-info",
+            ]
+        );
+        // The rails keep the historical order and titles.
+        let sources: Vec<&str> = validated.sections[1..4]
+            .iter()
+            .map(|section| section.config["source"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(sources, vec!["on_sale", "best_sellers", "newest"]);
+        assert_eq!(
+            validated.sections[1].config["title"].as_str(),
+            Some("অফারে আছে — On sale at this store")
+        );
+        // Both category grids survive: taxonomy then labels.
+        assert_eq!(validated.sections[5].config["mode"].as_str(), Some("taxonomy"));
+        assert_eq!(validated.sections[6].config["mode"].as_str(), Some("labels"));
+        assert!(validated.sections.iter().all(|section| section.enabled));
+    }
+
+    #[test]
+    fn wave58_every_preset_validates_and_unknown_preset_is_none() {
+        for key in STOREFRONT_LAYOUT_PRESETS {
+            let preset = storefront_layout_preset(key).expect("preset exists");
+            validate_storefront_layout(&preset)
+                .unwrap_or_else(|error| panic!("preset {key} validates: {error}"));
+        }
+        assert!(storefront_layout_preset("nope").is_none());
+        let minimal = storefront_layout_preset(LAYOUT_PRESET_MINIMAL).expect("minimal");
+        assert_eq!(minimal.sections.len(), 3);
+        let merchandising =
+            storefront_layout_preset(LAYOUT_PRESET_MERCHANDISING).expect("merchandising");
+        assert_eq!(merchandising.sections.len(), 9);
+    }
+
+    #[test]
+    fn wave58_layout_version_and_section_caps() {
+        let future = StorefrontLayout {
+            version: 2,
+            sections: Vec::new(),
+        };
+        assert!(validate_storefront_layout(&future)
+            .unwrap_err()
+            .contains("version"));
+        let mut many = Vec::new();
+        for index in 0..=MAX_STOREFRONT_SECTIONS {
+            many.push(w58_section(
+                &format!("s-{index}"),
+                SECTION_TYPE_STORE_INFO,
+                serde_json::json!({}),
+            ));
+        }
+        assert!(validate_storefront_layout(&w58_layout(many))
+            .unwrap_err()
+            .contains("at most"));
+        let exact = (0..MAX_STOREFRONT_SECTIONS)
+            .map(|index| {
+                w58_section(
+                    &format!("s-{index}"),
+                    SECTION_TYPE_STORE_INFO,
+                    serde_json::json!({}),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(validate_storefront_layout(&w58_layout(exact)).is_ok());
+        // An empty layout is legal (a blank canvas).
+        assert!(validate_storefront_layout(&w58_layout(Vec::new())).is_ok());
+    }
+
+    #[test]
+    fn wave58_section_ids_unique_and_well_formed() {
+        let duplicate = w58_layout(vec![
+            w58_section("hero", SECTION_TYPE_HERO, serde_json::json!({})),
+            w58_section("hero", SECTION_TYPE_HERO, serde_json::json!({})),
+        ]);
+        let error = validate_storefront_layout(&duplicate).unwrap_err();
+        // The error names the 1-based position of the dupe.
+        assert!(error.contains("section 2"), "error: {error}");
+        assert!(error.contains("more than once"), "error: {error}");
+        for bad in ["", "Hero", "hero block", "-hero", "hero-", "héros", "a".repeat(41).as_str()] {
+            let layout = w58_layout(vec![w58_section(
+                bad,
+                SECTION_TYPE_HERO,
+                serde_json::json!({}),
+            )]);
+            assert!(
+                validate_storefront_layout(&layout).is_err(),
+                "id {bad:?} refused"
+            );
+        }
+        let good = w58_layout(vec![w58_section(
+            "eid-2026-hero",
+            SECTION_TYPE_HERO,
+            serde_json::json!({}),
+        )]);
+        assert!(validate_storefront_layout(&good).is_ok());
+    }
+
+    #[test]
+    fn wave58_unknown_types_preserved_and_malformed_types_rejected() {
+        let future = w58_section(
+            "ar-try-on",
+            "ar_try_on",
+            serde_json::json!({ "model": "v2", "depth": 3 }),
+        );
+        let validated = validate_storefront_layout(&w58_layout(vec![future]))
+            .expect("a future type validates");
+        // Config carried verbatim — nothing normalised away.
+        assert_eq!(validated.sections[0].config["model"].as_str(), Some("v2"));
+        assert_eq!(validated.sections[0].config["depth"].as_i64(), Some(3));
+        assert!(!is_known_section_type("ar_try_on"));
+        for bad_type in ["", "AR Try On", "hero!", "type with spaces"] {
+            let layout = w58_layout(vec![w58_section(
+                "block",
+                bad_type,
+                serde_json::json!({}),
+            )]);
+            assert!(
+                validate_storefront_layout(&layout).is_err(),
+                "type {bad_type:?} refused"
+            );
+        }
+        // A known type with a non-object config is refused.
+        let layout = w58_layout(vec![w58_section(
+            "hero",
+            SECTION_TYPE_HERO,
+            serde_json::json!([1, 2]),
+        )]);
+        assert!(validate_storefront_layout(&layout)
+            .unwrap_err()
+            .contains("config must be an object"));
+    }
+
+    #[test]
+    fn wave58_layout_read_is_forward_tolerant() {
+        // A stored document from a newer build: unknown
+        // top-level fields, unknown section fields, a
+        // missing `enabled`, a null config — all parse.
+        let raw = serde_json::json!({
+            "version": 1,
+            "future_field": { "x": 1 },
+            "sections": [
+                {
+                    "id": "hero",
+                    "type": "hero",
+                    "config": null,
+                    "future_section_field": true,
+                },
+                {
+                    "id": "mystery",
+                    "type": "future_widget",
+                    "enabled": false,
+                    "config": { "anything": [1, 2, 3] },
+                },
+            ],
+        });
+        let layout: StorefrontLayout =
+            serde_json::from_value(raw).expect("tolerant parse");
+        assert_eq!(layout.sections.len(), 2);
+        assert!(layout.sections[0].enabled, "enabled defaults to true");
+        assert_eq!(layout.sections[1].section_type, "future_widget");
+        assert!(!layout.sections[1].enabled);
+        // ... and the parsed document still validates.
+        assert!(validate_storefront_layout(&layout).is_ok());
+    }
+
+    #[test]
+    fn wave58_hero_config_caps_and_normalisation() {
+        let ok = w58_layout(vec![w58_section(
+            "hero",
+            SECTION_TYPE_HERO,
+            serde_json::json!({
+                "headline": "  Eid Collection  ",
+                "subtext": "Up to 50% off",
+                "image_url": "https://cdn.example.com/hero.png",
+                "link_url": "/shop?on_sale=1",
+                "link_label": "Shop now",
+            }),
+        )]);
+        let validated = validate_storefront_layout(&ok).expect("hero validates");
+        assert_eq!(
+            validated.sections[0].config["headline"].as_str(),
+            Some("Eid Collection"),
+            "text is trimmed on write"
+        );
+        // Blank headline clears to absent.
+        let blank = w58_layout(vec![w58_section(
+            "hero",
+            SECTION_TYPE_HERO,
+            serde_json::json!({ "headline": "   " }),
+        )]);
+        let validated = validate_storefront_layout(&blank).expect("blank hero validates");
+        assert!(validated.sections[0].config.get("headline").is_none());
+        // Caps bite at cap+1.
+        let long_headline = "h".repeat(MAX_SECTION_HEADLINE_CHARS + 1);
+        let layout = w58_layout(vec![w58_section(
+            "hero",
+            SECTION_TYPE_HERO,
+            serde_json::json!({ "headline": long_headline }),
+        )]);
+        assert!(validate_storefront_layout(&layout)
+            .unwrap_err()
+            .contains("section 1 (hero)"));
+        let long_subtext = "s".repeat(MAX_SECTION_SUBTEXT_CHARS + 1);
+        let layout = w58_layout(vec![w58_section(
+            "hero",
+            SECTION_TYPE_HERO,
+            serde_json::json!({ "subtext": long_subtext }),
+        )]);
+        assert!(validate_storefront_layout(&layout).is_err());
+        // A script-scheme link is refused by the link rule.
+        let layout = w58_layout(vec![w58_section(
+            "hero",
+            SECTION_TYPE_HERO,
+            serde_json::json!({ "link_url": "javascript:alert(1)" }),
+        )]);
+        assert!(validate_storefront_layout(&layout).is_err());
+        // A wrong JSON type in a known key is an error,
+        // never a silent default.
+        let layout = w58_layout(vec![w58_section(
+            "hero",
+            SECTION_TYPE_HERO,
+            serde_json::json!({ "headline": 42 }),
+        )]);
+        assert!(validate_storefront_layout(&layout)
+            .unwrap_err()
+            .contains("must be a string"));
+    }
+
+    #[test]
+    fn wave58_rich_text_requires_a_body_within_the_cap() {
+        let missing = w58_layout(vec![w58_section(
+            "story",
+            SECTION_TYPE_RICH_TEXT,
+            serde_json::json!({ "heading": "Our story" }),
+        )]);
+        assert!(validate_storefront_layout(&missing)
+            .unwrap_err()
+            .contains("needs a body"));
+        let long_body = "b".repeat(MAX_SECTION_BODY_CHARS + 1);
+        let too_long = w58_layout(vec![w58_section(
+            "story",
+            SECTION_TYPE_RICH_TEXT,
+            serde_json::json!({ "body": long_body }),
+        )]);
+        assert!(validate_storefront_layout(&too_long).is_err());
+        let at_cap = "b".repeat(MAX_SECTION_BODY_CHARS);
+        let ok = w58_layout(vec![w58_section(
+            "story",
+            SECTION_TYPE_RICH_TEXT,
+            serde_json::json!({ "body": at_cap }),
+        )]);
+        assert!(validate_storefront_layout(&ok).is_ok());
+    }
+
+    #[test]
+    fn wave58_product_rail_rules() {
+        // Source is required and must be in the catalogue.
+        let missing = w58_layout(vec![w58_section(
+            "rail",
+            SECTION_TYPE_PRODUCT_RAIL,
+            serde_json::json!({}),
+        )]);
+        assert!(validate_storefront_layout(&missing)
+            .unwrap_err()
+            .contains("needs a source"));
+        let bogus = w58_layout(vec![w58_section(
+            "rail",
+            SECTION_TYPE_PRODUCT_RAIL,
+            serde_json::json!({ "source": "trending" }),
+        )]);
+        assert!(validate_storefront_layout(&bogus).is_err());
+        // Limit: default fills in; 3 and 25 refuse; 4/24 pass.
+        let defaulted = validate_storefront_layout(&w58_layout(vec![w58_section(
+            "rail",
+            SECTION_TYPE_PRODUCT_RAIL,
+            serde_json::json!({ "source": "newest" }),
+        )]))
+        .expect("rail validates");
+        assert_eq!(
+            defaulted.sections[0].config["limit"].as_i64(),
+            Some(DEFAULT_RAIL_LIMIT)
+        );
+        for (limit, ok) in [(3_i64, false), (4, true), (24, true), (25, false)] {
+            let layout = w58_layout(vec![w58_section(
+                "rail",
+                SECTION_TYPE_PRODUCT_RAIL,
+                serde_json::json!({ "source": "newest", "limit": limit }),
+            )]);
+            assert_eq!(
+                validate_storefront_layout(&layout).is_ok(),
+                ok,
+                "limit {limit}"
+            );
+        }
+        // product_ids on an automatic rail is a seller
+        // mistake, refused loudly.
+        let stray = w58_layout(vec![w58_section(
+            "rail",
+            SECTION_TYPE_PRODUCT_RAIL,
+            serde_json::json!({
+                "source": "newest",
+                "product_ids": ["123e4567-e89b-12d3-a456-426614174000"],
+            }),
+        )]);
+        assert!(validate_storefront_layout(&stray)
+            .unwrap_err()
+            .contains("only applies to a manual rail"));
+    }
+
+    #[test]
+    fn wave58_manual_rail_rules() {
+        let first = "123e4567-e89b-12d3-a456-426614174000";
+        let second = "123e4567-e89b-12d3-a456-426614174001";
+        // Empty manual rail refused.
+        let empty = w58_layout(vec![w58_section(
+            "rail",
+            SECTION_TYPE_PRODUCT_RAIL,
+            serde_json::json!({ "source": "manual", "product_ids": [] }),
+        )]);
+        assert!(validate_storefront_layout(&empty)
+            .unwrap_err()
+            .contains("at least one product"));
+        // A garbage id refused, naming the id.
+        let garbage = w58_layout(vec![w58_section(
+            "rail",
+            SECTION_TYPE_PRODUCT_RAIL,
+            serde_json::json!({ "source": "manual", "product_ids": ["not-an-id"] }),
+        )]);
+        assert!(validate_storefront_layout(&garbage)
+            .unwrap_err()
+            .contains("not-an-id"));
+        // Duplicates collapse, order preserved.
+        let dupes = validate_storefront_layout(&w58_layout(vec![w58_section(
+            "rail",
+            SECTION_TYPE_PRODUCT_RAIL,
+            serde_json::json!({
+                "source": "manual",
+                "product_ids": [second, first, second],
+            }),
+        )]))
+        .expect("manual rail validates");
+        let ids: Vec<&str> = dupes.sections[0].config["product_ids"]
+            .as_array()
+            .expect("ids array")
+            .iter()
+            .map(|value| value.as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(ids, vec![second, first]);
+        // The cap: 24 pass, 25 refuse.
+        let make_ids = |count: usize| -> Vec<String> {
+            (0..count)
+                .map(|index| format!("123e4567-e89b-12d3-a456-42661417{index:04}"))
+                .collect()
+        };
+        let at_cap = w58_layout(vec![w58_section(
+            "rail",
+            SECTION_TYPE_PRODUCT_RAIL,
+            serde_json::json!({ "source": "manual", "product_ids": make_ids(24) }),
+        )]);
+        assert!(validate_storefront_layout(&at_cap).is_ok());
+        let over_cap = w58_layout(vec![w58_section(
+            "rail",
+            SECTION_TYPE_PRODUCT_RAIL,
+            serde_json::json!({ "source": "manual", "product_ids": make_ids(25) }),
+        )]);
+        assert!(validate_storefront_layout(&over_cap).is_err());
+    }
+
+    #[test]
+    fn wave58_shelf_grid_banner_and_info_rules() {
+        // Shelf: a bad collection id refused; null = all.
+        let bad = w58_layout(vec![w58_section(
+            "shelf",
+            SECTION_TYPE_COLLECTION_SHELF,
+            serde_json::json!({ "collection_id": "shelf-1" }),
+        )]);
+        assert!(validate_storefront_layout(&bad)
+            .unwrap_err()
+            .contains("not a valid id"));
+        let all = validate_storefront_layout(&w58_layout(vec![w58_section(
+            "shelf",
+            SECTION_TYPE_COLLECTION_SHELF,
+            serde_json::json!({}),
+        )]))
+        .expect("all-collections shelf validates");
+        assert_eq!(
+            all.sections[0].config["limit"].as_i64(),
+            Some(DEFAULT_SHELF_LIMIT)
+        );
+        // Grid: bad mode refused, default is taxonomy.
+        let bad_mode = w58_layout(vec![w58_section(
+            "grid",
+            SECTION_TYPE_CATEGORY_GRID,
+            serde_json::json!({ "mode": "brands" }),
+        )]);
+        assert!(validate_storefront_layout(&bad_mode).is_err());
+        let defaulted = validate_storefront_layout(&w58_layout(vec![w58_section(
+            "grid",
+            SECTION_TYPE_CATEGORY_GRID,
+            serde_json::json!({}),
+        )]))
+        .expect("grid validates");
+        assert_eq!(
+            defaulted.sections[0].config["mode"].as_str(),
+            Some("taxonomy")
+        );
+        // Banner: image required.
+        let no_image = w58_layout(vec![w58_section(
+            "banner",
+            SECTION_TYPE_IMAGE_BANNER,
+            serde_json::json!({ "caption": "Sale" }),
+        )]);
+        assert!(validate_storefront_layout(&no_image)
+            .unwrap_err()
+            .contains("needs an image"));
+        // Store info: any stray config keys normalise away.
+        let info = validate_storefront_layout(&w58_layout(vec![w58_section(
+            "info",
+            SECTION_TYPE_STORE_INFO,
+            serde_json::json!({ "about": "smuggled" }),
+        )]))
+        .expect("store info validates");
+        assert_eq!(info.sections[0].config, serde_json::json!({}));
+    }
+
+    #[test]
+    fn wave58_faq_rules() {
+        let pair = |question: &str, answer: &str| {
+            serde_json::json!({ "question": question, "answer": answer })
+        };
+        // Missing list, empty list, and 11 pairs refuse.
+        let missing = w58_layout(vec![w58_section(
+            "faq",
+            SECTION_TYPE_FAQ,
+            serde_json::json!({}),
+        )]);
+        assert!(validate_storefront_layout(&missing).is_err());
+        let empty = w58_layout(vec![w58_section(
+            "faq",
+            SECTION_TYPE_FAQ,
+            serde_json::json!({ "items": [] }),
+        )]);
+        assert!(validate_storefront_layout(&empty).is_err());
+        let eleven: Vec<serde_json::Value> = (0..11)
+            .map(|index| pair(&format!("Q{index}?"), "A"))
+            .collect();
+        let too_many = w58_layout(vec![w58_section(
+            "faq",
+            SECTION_TYPE_FAQ,
+            serde_json::json!({ "items": eleven }),
+        )]);
+        assert!(validate_storefront_layout(&too_many)
+            .unwrap_err()
+            .contains("between 1 and 10"));
+        // A pair missing its answer names its position.
+        let half = w58_layout(vec![w58_section(
+            "faq",
+            SECTION_TYPE_FAQ,
+            serde_json::json!({
+                "items": [pair("Q?", "A"), { "question": "Q2?" }],
+            }),
+        )]);
+        assert!(validate_storefront_layout(&half)
+            .unwrap_err()
+            .contains("FAQ item 2 needs an answer"));
+        // Over-long question refused; at-cap passes.
+        let long_q = "q".repeat(MAX_FAQ_QUESTION_CHARS + 1);
+        let too_long = w58_layout(vec![w58_section(
+            "faq",
+            SECTION_TYPE_FAQ,
+            serde_json::json!({ "items": [pair(&long_q, "A")] }),
+        )]);
+        assert!(validate_storefront_layout(&too_long).is_err());
+        let ok = w58_layout(vec![w58_section(
+            "faq",
+            SECTION_TYPE_FAQ,
+            serde_json::json!({ "items": [pair("Delivery?", "  2 days  ")] }),
+        )]);
+        let validated = validate_storefront_layout(&ok).expect("faq validates");
+        assert_eq!(
+            validated.sections[0].config["items"][0]["answer"].as_str(),
+            Some("2 days"),
+            "answers are trimmed on write"
+        );
+    }
+
+    #[test]
+    fn wave58_section_scheduling_window_and_liveness() {
+        // A backwards window is refused by the shared rule.
+        let mut backwards = w58_section("hero", SECTION_TYPE_HERO, serde_json::json!({}));
+        backwards.starts_at = Some(2_000);
+        backwards.ends_at = Some(1_000);
+        assert!(validate_storefront_layout(&w58_layout(vec![backwards])).is_err());
+        // Liveness: the half-open window, banner-identical.
+        let mut section = w58_section("hero", SECTION_TYPE_HERO, serde_json::json!({}));
+        assert!(storefront_section_is_live(&section, 500));
+        section.enabled = false;
+        assert!(!storefront_section_is_live(&section, 500));
+        section.enabled = true;
+        section.starts_at = Some(1_000);
+        section.ends_at = Some(2_000);
+        assert!(!storefront_section_is_live(&section, 999));
+        assert!(storefront_section_is_live(&section, 1_000), "live AT the start");
+        assert!(storefront_section_is_live(&section, 1_999));
+        assert!(!storefront_section_is_live(&section, 2_000), "gone AT the end");
+    }
+
+    #[test]
+    fn wave58_catalogue_covers_every_type_with_labels() {
+        let catalogue = storefront_section_catalogue();
+        assert_eq!(catalogue.len(), STOREFRONT_SECTION_TYPES.len());
+        for (meta, expected) in catalogue.iter().zip(STOREFRONT_SECTION_TYPES.iter()) {
+            assert_eq!(meta.section_type, *expected);
+            assert!(!meta.label_en.is_empty());
+            assert!(!meta.label_bn.is_empty());
+            assert!(!meta.description_en.is_empty());
+            assert!(!meta.description_bn.is_empty());
+        }
+    }
+
+    #[test]
+    fn wave58_remaining_per_type_caps() {
+        // Hero link label cap.
+        let long_label = "l".repeat(MAX_SECTION_LINK_LABEL_CHARS + 1);
+        let layout = w58_layout(vec![w58_section(
+            "hero",
+            SECTION_TYPE_HERO,
+            serde_json::json!({ "link_label": long_label }),
+        )]);
+        assert!(validate_storefront_layout(&layout).is_err());
+        // Banner caption cap.
+        let long_caption = "c".repeat(MAX_SECTION_CAPTION_CHARS + 1);
+        let layout = w58_layout(vec![w58_section(
+            "banner",
+            SECTION_TYPE_IMAGE_BANNER,
+            serde_json::json!({
+                "image_url": "https://cdn.example.com/b.png",
+                "caption": long_caption,
+            }),
+        )]);
+        assert!(validate_storefront_layout(&layout).is_err());
+        // Rail/shelf/grid title cap.
+        let long_title = "t".repeat(MAX_SECTION_TITLE_CHARS + 1);
+        let layout = w58_layout(vec![w58_section(
+            "rail",
+            SECTION_TYPE_PRODUCT_RAIL,
+            serde_json::json!({ "source": "newest", "title": long_title }),
+        )]);
+        assert!(validate_storefront_layout(&layout).is_err());
+        // Grid limit bounds: 3 and 25 refuse, 24 passes;
+        // the default fills in when absent.
+        for (limit, ok) in [(3_i64, false), (24, true), (25, false)] {
+            let layout = w58_layout(vec![w58_section(
+                "grid",
+                SECTION_TYPE_CATEGORY_GRID,
+                serde_json::json!({ "limit": limit }),
+            )]);
+            assert_eq!(validate_storefront_layout(&layout).is_ok(), ok, "limit {limit}");
+        }
+        let shelf = validate_storefront_layout(&w58_layout(vec![w58_section(
+            "shelf",
+            SECTION_TYPE_COLLECTION_SHELF,
+            serde_json::json!({
+                "collection_id": "123e4567-e89b-12d3-a456-426614174000",
+            }),
+        )]))
+        .expect("shelf validates");
+        assert_eq!(
+            shelf.sections[0].config["limit"].as_i64(),
+            Some(DEFAULT_SHELF_LIMIT)
+        );
+        assert_eq!(
+            shelf.sections[0].config["collection_id"].as_str(),
+            Some("123e4567-e89b-12d3-a456-426614174000")
+        );
+    }
+
+    #[test]
+    fn wave58_window_with_a_single_bound() {
+        // Only a start: valid, live from the start on.
+        let mut section = w58_section("hero", SECTION_TYPE_HERO, serde_json::json!({}));
+        section.starts_at = Some(1_000);
+        let validated = validate_storefront_layout(&w58_layout(vec![section.clone()]))
+            .expect("single-bound window validates");
+        assert_eq!(validated.sections[0].ends_at, None);
+        assert!(!storefront_section_is_live(&section, 999));
+        assert!(storefront_section_is_live(&section, 1_000));
+        assert!(storefront_section_is_live(&section, 9_999_999));
+        // Only an end: valid, live until the end.
+        let mut section = w58_section("hero", SECTION_TYPE_HERO, serde_json::json!({}));
+        section.ends_at = Some(2_000);
+        assert!(validate_storefront_layout(&w58_layout(vec![section.clone()])).is_ok());
+        assert!(storefront_section_is_live(&section, 0));
+        assert!(!storefront_section_is_live(&section, 2_000));
+    }
+
+    #[test]
+    fn wave58_layout_json_round_trip_is_stable() {
+        // The stored document serialises and parses back
+        // to the same value — the storage contract the API
+        // relies on (write the validated document, read it
+        // back whole).
+        let layout = validate_storefront_layout(&w58_layout(vec![
+            w58_section(
+                "hero",
+                SECTION_TYPE_HERO,
+                serde_json::json!({ "headline": "ঈদ মোবারক" }),
+            ),
+            w58_section(
+                "faq",
+                SECTION_TYPE_FAQ,
+                serde_json::json!({
+                    "items": [{ "question": "Q?", "answer": "A." }],
+                }),
+            ),
+        ]))
+        .expect("layout validates");
+        let text = serde_json::to_string(&layout).expect("serialise");
+        let parsed: StorefrontLayout = serde_json::from_str(&text).expect("parse back");
+        assert_eq!(parsed, layout);
+        // Scheduling survives the round trip as unix
+        // seconds in the domain shape.
+        let mut scheduled = layout.clone();
+        scheduled.sections[0].starts_at = Some(1_700_000_000);
+        let value = serde_json::to_value(&scheduled).expect("to value");
+        assert_eq!(value["sections"][0]["starts_at"].as_i64(), Some(1_700_000_000));
+        let parsed: StorefrontLayout = serde_json::from_value(value).expect("from value");
+        assert_eq!(parsed, scheduled);
+    }
+
+    #[test]
+    fn wave58_ids_trim_and_unknown_sections_keep_their_flags() {
+        // A padded id validates and is STORED trimmed —
+        // the id is an analytics key and must not fork on
+        // stray spaces.
+        let layout = w58_layout(vec![w58_section(
+            "  hero  ",
+            SECTION_TYPE_HERO,
+            serde_json::json!({}),
+        )]);
+        let validated = validate_storefront_layout(&layout).expect("padded id validates");
+        assert_eq!(validated.sections[0].id, "hero");
+        // An unknown section keeps its enabled flag and
+        // its scheduling window untouched — preservation
+        // is total, not just the config.
+        let mut future = w58_section(
+            "ar-block",
+            "ar_try_on",
+            serde_json::json!({ "model": "v2" }),
+        );
+        future.enabled = false;
+        future.starts_at = Some(1_800_000_000);
+        let validated = validate_storefront_layout(&w58_layout(vec![future]))
+            .expect("future section validates");
+        assert!(!validated.sections[0].enabled);
+        assert_eq!(validated.sections[0].starts_at, Some(1_800_000_000));
+        assert!(!storefront_section_is_live(&validated.sections[0], 1_800_000_000));
+    }
+
+    #[test]
+    fn wave58_event_kinds_are_a_closed_vocabulary() {
+        assert_eq!(
+            validate_storefront_event_kind("section_view"),
+            Ok(STOREFRONT_EVENT_SECTION_VIEW)
+        );
+        assert_eq!(
+            validate_storefront_event_kind("section_click"),
+            Ok(STOREFRONT_EVENT_SECTION_CLICK)
+        );
+        for bad in ["view", "click", "section_hover", ""] {
+            assert!(validate_storefront_event_kind(bad).is_err(), "{bad:?} refused");
+        }
     }
 }

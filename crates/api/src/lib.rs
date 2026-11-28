@@ -375,6 +375,7 @@ pub mod saved_searches;
 pub mod search;
 pub mod shipments;
 pub mod store_collections;
+pub mod storefront_sections;
 pub mod stores;
 pub mod subscriptions;
 pub mod timeline;
@@ -1765,6 +1766,36 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/v1/seller/store/branding",
             put(stores::update_store_branding),
+        )
+        // Wave 58 — the storefront section editor: the
+        // seller's layout document (the branding access
+        // rule), its reset, the editor catalogue, the
+        // section stats, the public resolved layout, and
+        // the anonymous section-event beacon.
+        .route(
+            "/v1/seller/store/layout",
+            get(storefront_sections::seller_get_layout_handler)
+                .put(storefront_sections::seller_put_layout_handler),
+        )
+        .route(
+            "/v1/seller/store/layout/reset",
+            post(storefront_sections::seller_reset_layout_handler),
+        )
+        .route(
+            "/v1/seller/store/layout/catalogue",
+            get(storefront_sections::seller_layout_catalogue_handler),
+        )
+        .route(
+            "/v1/seller/store/layout/stats",
+            get(storefront_sections::seller_layout_stats_handler),
+        )
+        .route(
+            "/v1/stores/:slug/layout",
+            get(storefront_sections::public_layout_handler),
+        )
+        .route(
+            "/v1/stores/:slug/section-events",
+            post(storefront_sections::record_section_event_handler),
         )
         .route("/v1/seller/facebook/status", get(facebook::facebook_status))
         .route(

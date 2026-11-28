@@ -361,6 +361,8 @@ export default function SellerDashboardPage() {
         {" · "}
         <Link href="/seller/branding">স্টোরের সাজসজ্জা — Branding</Link>
         {" · "}
+        <Link href="/seller/storefront">স্টোরফ্রন্ট এডিটর — Storefront editor</Link>
+        {" · "}
         <Link href="/seller/followers">ফলোয়ার — Followers</Link>
         {" · "}
         <Link href="/seller/collections">কালেকশন — Collections</Link>

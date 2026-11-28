@@ -685,3 +685,39 @@ a { color: var(--brand-600); }
 .saved-shelf { margin-top: var(--space-6); }
 .buy-again-rail { margin-top: var(--space-6); }
 .label-district { font-weight: 600; }
+
+/* Wave 58 — storefront sections + the section editor. The
+   section renderers reuse the Wave 52–56 classes (rails,
+   tiles, text blocks); these are the pieces that are new:
+   the hero copy block, the image banner, the FAQ, and the
+   editor's own chrome. */
+.storefront-hero-copy { margin: var(--space-4) 0; }
+.storefront-hero-title { font-size: var(--text-2xl); margin: 0 0 var(--space-2); }
+.storefront--bold .storefront-hero-title { font-size: var(--text-3xl); }
+.storefront-hero-subtext { color: var(--text-muted); margin: 0 0 var(--space-3); }
+.storefront-hero-cta { display: inline-block; padding: var(--space-2) var(--space-4); border: 1px solid var(--store-accent, var(--brand-700)); border-radius: var(--radius); font-weight: 600; }
+.storefront-banner-figure { margin: var(--space-4) 0; }
+.storefront-image-banner { width: 100%; max-height: 320px; object-fit: cover; border-radius: 8px; display: block; }
+.storefront-banner-figure figcaption { color: var(--text-muted); font-size: var(--text-sm); margin-top: var(--space-1); }
+.storefront-faq { margin-top: var(--space-6); }
+.storefront-faq-item { border: 1px solid var(--border); border-radius: var(--radius); padding: var(--space-2) var(--space-3); margin-bottom: var(--space-2); background: var(--surface); }
+.storefront-faq-item summary { cursor: pointer; font-weight: 600; }
+.layout-editor-columns { display: grid; grid-template-columns: minmax(320px, 1fr) minmax(320px, 1fr); gap: var(--space-5); align-items: start; }
+@media (max-width: 900px) { .layout-editor-columns { grid-template-columns: 1fr; } }
+.layout-editor-card { border: 1px solid var(--border); border-radius: var(--radius); padding: var(--space-3); margin-bottom: var(--space-3); background: var(--surface); }
+.layout-editor-card-head { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: center; margin-bottom: var(--space-2); }
+.layout-editor-card-id { color: var(--text-muted); font-size: var(--text-sm); font-family: monospace; }
+.layout-editor-fields { display: flex; flex-direction: column; gap: var(--space-2); }
+.layout-editor-fields label { display: flex; flex-direction: column; gap: var(--space-1); }
+.layout-editor-fields input[type="text"], .layout-editor-fields input[type="number"], .layout-editor-fields select, .layout-editor-fields textarea { width: 100%; }
+.layout-editor-products { display: flex; flex-direction: column; gap: var(--space-1); max-height: 240px; overflow-y: auto; }
+.layout-editor-products label { flex-direction: row; align-items: center; }
+.layout-editor-schedule { display: flex; flex-wrap: wrap; gap: var(--space-3); margin-top: var(--space-3); }
+.layout-editor-actions { display: flex; flex-wrap: wrap; gap: var(--space-3); align-items: center; margin: var(--space-3) 0; }
+.layout-editor-message { border: 1px solid var(--brand-700); border-radius: var(--radius); padding: var(--space-2) var(--space-3); }
+.layout-editor-error { border: 1px solid #b3261e; color: #b3261e; border-radius: var(--radius); padding: var(--space-2) var(--space-3); }
+.layout-editor-stats table { border-collapse: collapse; }
+.layout-editor-stats th, .layout-editor-stats td { border: 1px solid var(--border); padding: var(--space-1) var(--space-2); text-align: left; }
+.layout-editor-preview-frame { border: 1px dashed var(--border); border-radius: var(--radius); padding: var(--space-3); }
+.layout-editor-preview-note { color: var(--text-muted); font-size: var(--text-sm); }
+.layout-editor-faq-pair { display: flex; flex-direction: column; gap: var(--space-2); margin-bottom: var(--space-2); }
