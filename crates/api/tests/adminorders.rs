@@ -319,7 +319,7 @@ async fn adminorders_list_masks_and_detail_composes() {
     let (status, detail) = call(&app, Method::GET, &detail_uri, None, Some(&admin)).await;
     assert_eq!(status, StatusCode::OK, "admin detail: {detail}");
     assert_eq!(detail["id"], order_id);
-    assert_eq!(detail["delivery_phone"], "01888888888");
+    assert_eq!(detail["delivery_phone"], "+8801888888888");
     assert_eq!(detail["delivery_address"], "House 9, Road 3, Khulna");
     assert_eq!(detail["goods_total_poisha"], 445_000);
     assert_eq!(detail["grand_total_poisha"], 457_000);
