@@ -11,7 +11,7 @@
 //! layout is one JSONB document per store (migration
 //! 0065), validated and normalised by the domain crate on
 //! every write; the theme (Wave 18: classic/minimal/bold
-//! + brand colour) still frames the page — sections are
+//! and brand colour) still frames the page — sections are
 //! layout, theme is skin.
 //!
 //! Surfaces:
