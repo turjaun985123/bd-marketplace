@@ -363,6 +363,10 @@ export default function SellerDashboardPage() {
         {" · "}
         <Link href="/seller/storefront">স্টোরফ্রন্ট এডিটর — Storefront editor</Link>
         {" · "}
+        <Link href="/seller/pages">স্টোর পেজ — Store pages</Link>
+        {" · "}
+        <Link href="/seller/blog">স্টোর ব্লগ — Store blog</Link>
+        {" · "}
         <Link href="/seller/followers">ফলোয়ার — Followers</Link>
         {" · "}
         <Link href="/seller/collections">কালেকশন — Collections</Link>

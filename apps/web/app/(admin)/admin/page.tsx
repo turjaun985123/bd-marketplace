@@ -241,6 +241,8 @@ function SystemStatus() {
       <h2>সিস্টেম অবস্থা — System status</h2>
       <p>
         <Link href="/admin/media">ছবি মডারেশন — Media moderation</Link>
+        {" · "}
+        <Link href="/admin/content">কনটেন্ট মডারেশন — Content moderation</Link>
       </p>
       {message ? (
         <p>{message}</p>

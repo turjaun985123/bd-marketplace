@@ -281,6 +281,11 @@ async fn build_seller_export(
     .await
     .map_err(|e| ApiError::internal("export charges total", e))?;
 
+    // Wave 59: the store's content — pages and posts in
+    // full (the seller's own writing is their backup).
+    let (content_pages, content_posts) =
+        crate::store_content::export_content(pool, store_ids).await?;
+
     let now = Utc::now();
     let filename = export_filename("seller", &store.slug, &now.format("%Y%m%d").to_string());
     let document = json!({
@@ -293,6 +298,8 @@ async fn build_seller_export(
         "coupons": coupons,
         "promotions": promotions,
         "charges_total_poisha": charges_total_poisha,
+        "pages": content_pages,
+        "posts": content_posts,
     });
     Ok(ExportDownload { filename, document })
 }

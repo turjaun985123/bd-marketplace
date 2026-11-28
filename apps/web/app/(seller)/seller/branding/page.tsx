@@ -192,6 +192,13 @@ export default function SellerBrandingPage() {
         storefront's sections — hero, rails, collections, FAQ — use the
         storefront editor; theme and colour stay here, layout lives there.)
       </p>
+      <p>
+        স্টোরের স্থায়ী লেখা (ডেলিভারি তথ্য, সাইজ গাইড){" "}
+        <Link href="/seller/pages">স্টোর পেজ — Store pages</Link>-এ, আর
+        পাঠকদের জন্য লেখা <Link href="/seller/blog">স্টোর ব্লগ — Store blog</Link>
+        -এ সম্পাদনা করুন। (Standing documents live in store pages; writing
+        for readers lives in the store blog.)
+      </p>
       {message && <p role="status">{message}</p>}
       {store === null ? (
         <p>লোড হচ্ছে…</p>

@@ -4,6 +4,7 @@ import { useEffect, useState, type CSSProperties } from "react";
 import Link from "next/link";
 import FollowButton from "./FollowButton";
 import MessageStoreButton from "./MessageStoreButton";
+import StoreNav from "./StoreNav";
 import StoreStats from "./StoreStats";
 import StorefrontLayout from "./StorefrontLayout";
 import SearchBar from "./SearchBar";
@@ -131,6 +132,10 @@ export default function StorefrontView({ slug }: { slug: string }) {
             ফিল্টারসহ সব পণ্য দেখুন — Shop all products with filters
           </Link>
         </p>
+        {/* Wave 59: the store navigation — home, shop,
+            the store's published pages, and its blog
+            when the blog has a live post. */}
+        <StoreNav slug={slug} current="home" />
       </StorefrontLayout>
     </div>
   );

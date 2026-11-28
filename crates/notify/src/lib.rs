@@ -187,6 +187,11 @@ fn vars_from_payload(payload: &Value) -> NotificationVars {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
+        post_title: payload
+            .get("post_title")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
     }
 }
 

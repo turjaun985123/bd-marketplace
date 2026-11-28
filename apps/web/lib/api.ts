@@ -6837,3 +6837,542 @@ export function recordSectionEvent(
     body: { section_id: sectionId, kind },
   });
 }
+
+// ---------------------------------------------------------------------------
+// Wave 59 — store content: custom pages + the store blog
+// ---------------------------------------------------------------------------
+
+/** The content lifecycle vocabulary (domain-owned). */
+export type ContentStatus = "draft" | "published" | "archived";
+
+/**
+ * One store page: the seller's standing document
+ * (about, shipping, size guide, FAQ…). The body is
+ * PLAIN TEXT — the surfaces render paragraphs, never
+ * markup.
+ */
+export interface StorePage {
+  id: string;
+  store_id: string;
+  slug: string;
+  title: string;
+  body: string;
+  status: ContentStatus;
+  show_in_nav: boolean;
+  position: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StorePageInput {
+  slug?: string;
+  title?: string;
+  body?: string;
+  show_in_nav?: boolean;
+}
+
+function scopeQuery(storeId?: string): string {
+  return storeId ? `?store_id=${encodeURIComponent(storeId)}` : "";
+}
+
+/** GET /v1/seller/store/pages — the seller's pages, in their order. */
+export function listSellerPages(
+  token: string,
+  storeId?: string
+): Promise<StorePage[]> {
+  return call(`/v1/seller/store/pages${scopeQuery(storeId)}`, { token });
+}
+
+/** POST /v1/seller/store/pages — create a page (starts as a draft). */
+export function createStorePage(
+  token: string,
+  input: StorePageInput,
+  storeId?: string
+): Promise<StorePage> {
+  return call(`/v1/seller/store/pages${scopeQuery(storeId)}`, {
+    method: "POST",
+    token,
+    body: input,
+  });
+}
+
+/** GET /v1/seller/store/pages/{id} — one of the seller's pages. */
+export function getSellerPage(
+  token: string,
+  pageId: string,
+  storeId?: string
+): Promise<StorePage> {
+  return call(
+    `/v1/seller/store/pages/${encodeURIComponent(pageId)}${scopeQuery(storeId)}`,
+    { token }
+  );
+}
+
+/** PUT /v1/seller/store/pages/{id} — merge-update a page. */
+export function updateStorePage(
+  token: string,
+  pageId: string,
+  input: StorePageInput,
+  storeId?: string
+): Promise<StorePage> {
+  return call(
+    `/v1/seller/store/pages/${encodeURIComponent(pageId)}${scopeQuery(storeId)}`,
+    { method: "PUT", token, body: input }
+  );
+}
+
+/** DELETE /v1/seller/store/pages/{id} — remove a page. */
+export function deleteStorePage(
+  token: string,
+  pageId: string,
+  storeId?: string
+): Promise<{ deleted: boolean }> {
+  return call(
+    `/v1/seller/store/pages/${encodeURIComponent(pageId)}${scopeQuery(storeId)}`,
+    { method: "DELETE", token }
+  );
+}
+
+/** PUT /v1/seller/store/pages — rewrite the page order (the whole set). */
+export function reorderStorePages(
+  token: string,
+  pageIds: string[],
+  storeId?: string
+): Promise<StorePage[]> {
+  return call(`/v1/seller/store/pages${scopeQuery(storeId)}`, {
+    method: "PUT",
+    token,
+    body: { page_ids: pageIds },
+  });
+}
+
+/** POST /v1/seller/store/pages/{id}/status — move a page's lifecycle. */
+export function setStorePageStatus(
+  token: string,
+  pageId: string,
+  status: ContentStatus,
+  storeId?: string
+): Promise<StorePage> {
+  return call(
+    `/v1/seller/store/pages/${encodeURIComponent(pageId)}/status${scopeQuery(storeId)}`,
+    { method: "POST", token, body: { status } }
+  );
+}
+
+/** One nav entry of the public pages list. */
+export interface PublicPageSummary {
+  slug: string;
+  title: string;
+}
+
+/**
+ * The public pages list: nav entries plus the store's
+ * live blog-post count (the storefront frame shows its
+ * Blog link only when the count is positive).
+ */
+export interface PublicPageList {
+  items: PublicPageSummary[];
+  total: number;
+  blog_post_count: number;
+}
+
+/** GET /v1/stores/{slug}/pages — the store's public nav pages. */
+export function listStorePages(slug: string): Promise<PublicPageList> {
+  return call(`/v1/stores/${encodeURIComponent(slug)}/pages`);
+}
+
+/** GET /v1/stores/{slug}/pages/{page} — one published page, full body. */
+export function getStorePage(slug: string, pageSlug: string): Promise<StorePage> {
+  return call(
+    `/v1/stores/${encodeURIComponent(slug)}/pages/${encodeURIComponent(pageSlug)}`
+  );
+}
+
+/**
+ * One blog post as the seller's surfaces show it: the
+ * excerpt in effect (the seller's own, or derived from
+ * the body), the aggregate view count, no body.
+ */
+export interface SellerPost {
+  id: string;
+  store_id: string;
+  slug: string;
+  title: string;
+  excerpt: string;
+  has_custom_excerpt: boolean;
+  tags: string[];
+  cover_image_url: string | null;
+  status: ContentStatus;
+  published_at: string | null;
+  word_count: number;
+  reading_minutes: number;
+  view_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** The seller's post detail: the list shape plus the body and raw excerpt. */
+export interface SellerPostDetail extends SellerPost {
+  body: string;
+  custom_excerpt: string | null;
+}
+
+export interface StorePostInput {
+  slug?: string;
+  title?: string;
+  body?: string;
+  excerpt?: string;
+  tags?: string[];
+  cover_image_url?: string;
+  status?: ContentStatus;
+  published_at?: string;
+}
+
+export interface SellerPostList {
+  items: SellerPost[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+/** GET /v1/seller/store/posts — the seller's posts (status/search filters). */
+export function listSellerPosts(
+  token: string,
+  params?: {
+    status?: ContentStatus;
+    q?: string;
+    page?: number;
+    limit?: number;
+    storeId?: string;
+  }
+): Promise<SellerPostList> {
+  const search = new URLSearchParams();
+  if (params?.status) search.set("status", params.status);
+  if (params?.q) search.set("q", params.q);
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  if (params?.storeId) search.set("store_id", params.storeId);
+  const qs = search.toString();
+  return call(`/v1/seller/store/posts${qs ? `?${qs}` : ""}`, { token });
+}
+
+/** POST /v1/seller/store/posts — create a post (draft unless told otherwise). */
+export function createStorePost(
+  token: string,
+  input: StorePostInput,
+  storeId?: string
+): Promise<SellerPostDetail> {
+  return call(`/v1/seller/store/posts${scopeQuery(storeId)}`, {
+    method: "POST",
+    token,
+    body: input,
+  });
+}
+
+/** GET /v1/seller/store/posts/{id} — one post with its body. */
+export function getSellerPost(
+  token: string,
+  postId: string,
+  storeId?: string
+): Promise<SellerPostDetail> {
+  return call(
+    `/v1/seller/store/posts/${encodeURIComponent(postId)}${scopeQuery(storeId)}`,
+    { token }
+  );
+}
+
+/** PUT /v1/seller/store/posts/{id} — merge-update a post. */
+export function updateStorePost(
+  token: string,
+  postId: string,
+  input: StorePostInput,
+  storeId?: string
+): Promise<SellerPostDetail> {
+  return call(
+    `/v1/seller/store/posts/${encodeURIComponent(postId)}${scopeQuery(storeId)}`,
+    { method: "PUT", token, body: input }
+  );
+}
+
+/** DELETE /v1/seller/store/posts/{id} — remove a post and its view history. */
+export function deleteStorePost(
+  token: string,
+  postId: string,
+  storeId?: string
+): Promise<{ deleted: boolean }> {
+  return call(
+    `/v1/seller/store/posts/${encodeURIComponent(postId)}${scopeQuery(storeId)}`,
+    { method: "DELETE", token }
+  );
+}
+
+/**
+ * POST /v1/seller/store/posts/{id}/status — move a
+ * post's lifecycle; `publishedAt` (ISO) names the
+ * publish moment (a future moment schedules the post;
+ * re-publishing a live post with a new moment
+ * reschedules it).
+ */
+export function setStorePostStatus(
+  token: string,
+  postId: string,
+  status: ContentStatus,
+  publishedAt?: string,
+  storeId?: string
+): Promise<SellerPostDetail> {
+  return call(
+    `/v1/seller/store/posts/${encodeURIComponent(postId)}/status${scopeQuery(storeId)}`,
+    {
+      method: "POST",
+      token,
+      body: { status, published_at: publishedAt ?? null },
+    }
+  );
+}
+
+/** POST /v1/seller/store/posts/{id}/cover-image — upload a cover (Wave 51 pipeline). */
+export function uploadStorePostCover(
+  token: string,
+  postId: string,
+  file: File,
+  storeId?: string
+): Promise<SellerPostDetail> {
+  const form = new FormData();
+  form.append("file", file);
+  return callForm(
+    `/v1/seller/store/posts/${encodeURIComponent(postId)}/cover-image${scopeQuery(storeId)}`,
+    form,
+    { token }
+  );
+}
+
+/** DELETE /v1/seller/store/posts/{id}/cover-image — remove the cover. */
+export function deleteStorePostCover(
+  token: string,
+  postId: string,
+  storeId?: string
+): Promise<SellerPostDetail> {
+  return call(
+    `/v1/seller/store/posts/${encodeURIComponent(postId)}/cover-image${scopeQuery(storeId)}`,
+    { method: "DELETE", token }
+  );
+}
+
+/** One post's line in the seller blog statistics. */
+export interface PostStatLine {
+  post_id: string;
+  slug: string;
+  title: string;
+  status: ContentStatus;
+  total_views: number;
+  window_views: number;
+}
+
+/** The seller blog statistics: totals plus per-post view counts. */
+export interface PostStats {
+  total_views: number;
+  window_views: number;
+  window_days: number;
+  posts: PostStatLine[];
+}
+
+/** GET /v1/seller/store/post-stats — aggregate-only blog view counts. */
+export function getSellerPostStats(
+  token: string,
+  storeId?: string
+): Promise<PostStats> {
+  return call(`/v1/seller/store/post-stats${scopeQuery(storeId)}`, { token });
+}
+
+/**
+ * One blog post as public surfaces show it: excerpt in
+ * effect, tags, cover, publish moment, reading time —
+ * and the store identity the discovery surfaces need.
+ */
+export interface PublicPost {
+  id: string;
+  store_id: string;
+  store_slug: string;
+  store_name: string;
+  slug: string;
+  title: string;
+  excerpt: string;
+  tags: string[];
+  cover_image_url: string | null;
+  published_at: string | null;
+  reading_minutes: number;
+}
+
+export interface PublicPostList {
+  items: PublicPost[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+/** One end of a post's prev/next navigation. */
+export interface PostNavLink {
+  slug: string;
+  title: string;
+}
+
+/** The public post page: the post, its body, navigation and related posts. */
+export interface PublicPostDetail extends PublicPost {
+  body: string;
+  previous: PostNavLink | null;
+  next: PostNavLink | null;
+  related: PublicPost[];
+}
+
+/** GET /v1/stores/{slug}/posts — the store's live posts (optional tag filter). */
+export function listStorePosts(
+  slug: string,
+  params?: { tag?: string; page?: number; limit?: number }
+): Promise<PublicPostList> {
+  const search = new URLSearchParams();
+  if (params?.tag) search.set("tag", params.tag);
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(
+    `/v1/stores/${encodeURIComponent(slug)}/posts${qs ? `?${qs}` : ""}`
+  );
+}
+
+/** GET /v1/stores/{slug}/posts/{post} — one live post with body + relations. */
+export function getStorePost(
+  slug: string,
+  postSlug: string
+): Promise<PublicPostDetail> {
+  return call(
+    `/v1/stores/${encodeURIComponent(slug)}/posts/${encodeURIComponent(postSlug)}`
+  );
+}
+
+/**
+ * POST /v1/stores/{slug}/posts/{post}/view — the
+ * anonymous view beacon (aggregate-only; fire-and-forget,
+ * the caller ignores failures).
+ */
+export function recordStorePostView(
+  slug: string,
+  postSlug: string
+): Promise<{ recorded: boolean }> {
+  return call(
+    `/v1/stores/${encodeURIComponent(slug)}/posts/${encodeURIComponent(postSlug)}/view`,
+    { method: "POST" }
+  );
+}
+
+/** The store blog's Atom feed URL (the API serves the XML itself). */
+export function storePostFeedUrl(slug: string): string {
+  return `${apiBase()}/v1/stores/${encodeURIComponent(slug)}/feed`;
+}
+
+/** GET /v1/posts/recent — the newest live posts across every active store. */
+export function listRecentPosts(limit?: number): Promise<PublicPostList> {
+  const qs = limit ? `?limit=${limit}` : "";
+  return call(`/v1/posts/recent${qs}`);
+}
+
+/** GET /v1/follows/posts — the newest live posts from the stores the caller follows. */
+export function listFollowedPosts(
+  token: string,
+  params?: { page?: number; limit?: number }
+): Promise<PublicPostList> {
+  const search = new URLSearchParams();
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/follows/posts${qs ? `?${qs}` : ""}`, { token });
+}
+
+/** One post in the admin content-moderation list (Wave 59). */
+export interface AdminContentPost {
+  id: string;
+  store_id: string;
+  store_slug: string;
+  store_name: string;
+  slug: string;
+  title: string;
+  status: ContentStatus;
+  published_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** One page in the admin content-moderation list (Wave 59). */
+export interface AdminContentPage {
+  id: string;
+  store_id: string;
+  store_slug: string;
+  store_name: string;
+  slug: string;
+  title: string;
+  status: ContentStatus;
+  show_in_nav: boolean;
+  position: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AdminContentList<T> {
+  items: T[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+/** GET /v1/admin/content/posts — every store's posts, for moderation. */
+export function listAdminContentPosts(
+  token: string,
+  params?: { status?: ContentStatus; q?: string; page?: number; limit?: number }
+): Promise<AdminContentList<AdminContentPost>> {
+  const search = new URLSearchParams();
+  if (params?.status) search.set("status", params.status);
+  if (params?.q) search.set("q", params.q);
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/admin/content/posts${qs ? `?${qs}` : ""}`, { token });
+}
+
+/** GET /v1/admin/content/pages — every store's pages, for moderation. */
+export function listAdminContentPages(
+  token: string,
+  params?: { status?: ContentStatus; q?: string; page?: number; limit?: number }
+): Promise<AdminContentList<AdminContentPage>> {
+  const search = new URLSearchParams();
+  if (params?.status) search.set("status", params.status);
+  if (params?.q) search.set("q", params.q);
+  if (params?.page) search.set("page", String(params.page));
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return call(`/v1/admin/content/pages${qs ? `?${qs}` : ""}`, { token });
+}
+
+/** POST /v1/admin/content/posts/{id}/status — the audited moderation write. */
+export function setAdminPostStatus(
+  token: string,
+  postId: string,
+  status: ContentStatus
+): Promise<AdminContentPost> {
+  return call(`/v1/admin/content/posts/${postId}/status`, {
+    method: "POST",
+    token,
+    body: { status },
+  });
+}
+
+/** POST /v1/admin/content/pages/{id}/status — the audited moderation write. */
+export function setAdminPageStatus(
+  token: string,
+  pageId: string,
+  status: ContentStatus
+): Promise<AdminContentPage> {
+  return call(`/v1/admin/content/pages/${pageId}/status`, {
+    method: "POST",
+    token,
+    body: { status },
+  });
+}

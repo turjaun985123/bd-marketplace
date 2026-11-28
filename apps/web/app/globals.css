@@ -721,3 +721,23 @@ a { color: var(--brand-600); }
 .layout-editor-preview-frame { border: 1px dashed var(--border); border-radius: var(--radius); padding: var(--space-3); }
 .layout-editor-preview-note { color: var(--text-muted); font-size: var(--text-sm); }
 .layout-editor-faq-pair { display: flex; flex-direction: column; gap: var(--space-2); margin-bottom: var(--space-2); }
+
+/* Wave 59 — store content: the store navigation, page and
+   post bodies, blog cards, and the seller content lists. */
+.store-nav { display: flex; flex-wrap: wrap; gap: var(--space-3); padding: var(--space-2) 0; border-bottom: 1px solid var(--border); margin-bottom: var(--space-3); }
+.store-nav a { font-weight: 600; }
+.store-nav a[aria-current="page"] { color: var(--store-accent, var(--brand-700)); text-decoration: underline; }
+.post-body p { margin: 0 0 var(--space-3); white-space: pre-line; line-height: 1.65; }
+.post-meta { color: var(--text-muted); font-size: var(--text-sm); }
+.post-cover { width: 100%; max-height: 420px; object-fit: cover; border-radius: 8px; display: block; margin: var(--space-3) 0; }
+.post-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: var(--space-4); }
+.post-card { border: 1px solid var(--border); border-radius: var(--radius); padding: var(--space-3); background: var(--surface); }
+.post-card h3 { margin: 0 0 var(--space-2); }
+.post-card-cover { width: 100%; height: 160px; object-fit: cover; border-radius: 6px; display: block; margin-bottom: var(--space-2); }
+.post-card-store { font-weight: 600; margin: 0 0 var(--space-1); }
+.post-card-meta { color: var(--text-muted); font-size: var(--text-sm); }
+.post-card-tags { display: flex; flex-wrap: wrap; gap: var(--space-1); }
+.tag-chip { border: 1px solid var(--border); border-radius: 999px; padding: 0 var(--space-2); font-size: var(--text-sm); background: var(--surface-muted, var(--surface)); }
+.post-nav { border-top: 1px solid var(--border); margin-top: var(--space-5); padding-top: var(--space-3); }
+.content-list { list-style: none; padding: 0; }
+.content-list li { border: 1px solid var(--border); border-radius: var(--radius); padding: var(--space-3); margin-bottom: var(--space-2); background: var(--surface); }

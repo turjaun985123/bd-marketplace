@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import FollowButton from "./FollowButton";
+import StoreNav from "./StoreNav";
 import StoreStats from "./StoreStats";
 import VerificationBadge from "./VerificationBadge";
 import { useAuth } from "@/hooks/useAuth";
@@ -19,7 +20,15 @@ import { getStore, type PublicStore } from "@/lib/api";
  * header only says whose it is. A failed load renders
  * just the way back — the catalogue below still works.
  */
-export default function StoreShopHeader({ slug }: { slug: string }) {
+export default function StoreShopHeader({
+  slug,
+  navCurrent = "shop",
+}: {
+  slug: string;
+  /** Which nav entry is current (Wave 59): the shop
+   * page's own default; the content pages pass theirs. */
+  navCurrent?: string;
+}) {
   const { token } = useAuth();
   const [store, setStore] = useState<PublicStore | null>(null);
   const [failed, setFailed] = useState(false);
@@ -74,6 +83,11 @@ export default function StoreShopHeader({ slug }: { slug: string }) {
               initialCount={store.follower_count}
             />
           </p>
+          {/* Wave 59: the store navigation rides the
+              shop header too — the content pages render
+              this same header, so the nav is the frame
+              every store surface shares. */}
+          <StoreNav slug={slug} current={navCurrent} />
         </>
       )}
     </header>

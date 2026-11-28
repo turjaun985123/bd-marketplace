@@ -48,6 +48,18 @@
 //!   ([`enqueue_store_flash_sale_notices`]) fires from the
 //!   admin item-set write when a product NEWLY joins a
 //!   sale that is live at that moment.
+//! - `store_new_post` (Wave 59) — a followed store's blog
+//!   post becoming live: `store_content::create_post`
+//!   (born published with a live moment) and
+//!   `store_content::set_post_status` (a move INTO live
+//!   from draft, archived, or a future schedule). One row
+//!   per follower, enqueued by
+//!   [`enqueue_store_new_post_notices`] inside the publish
+//!   transaction. A post that was already live and stays
+//!   live never re-fires, and a scheduled post fires
+//!   nothing — when its moment passes there is no write
+//!   to hook (liveness is read-time), which the Wave 59
+//!   README section states plainly.
 
 use serde_json::json;
 use sqlx::{FromRow, PgConnection};
@@ -216,6 +228,79 @@ pub async fn enqueue_store_new_product_notices(
         )
         .await
         .map_err(|e| ApiError::internal("enqueue new-product notification", e))?;
+        queued += 1;
+    }
+    Ok(queued)
+}
+
+/// Queue the `store_new_post` notice (Wave 59) for the
+/// followers of a store whose blog post has JUST become
+/// live. One row per follower; a follow whose owner
+/// muted store news (`notify_new_products = false` —
+/// the one mute covers products, sales, and posts) is
+/// skipped. The caller (the content publish write)
+/// decides the post is live NOW: a scheduled post does
+/// not fire this, and nothing fires later when its
+/// moment passes — liveness is computed at read time,
+/// so there is no later transition to hook. Runs inside
+/// the caller's transaction, like every funnel here.
+/// Returns how many notices were queued.
+pub async fn enqueue_store_new_post_notices(
+    conn: &mut PgConnection,
+    post_id: Uuid,
+) -> Result<i64, ApiError> {
+    #[derive(FromRow)]
+    struct PostNoticeRow {
+        store_id: Uuid,
+        store_name: String,
+        post_slug: String,
+        post_title: String,
+    }
+    let post: PostNoticeRow = sqlx::query_as(
+        "SELECT p.store_id, s.name AS store_name, p.slug AS post_slug, \
+         p.title AS post_title \
+         FROM store_posts p JOIN stores s ON s.id = p.store_id \
+         WHERE p.id = $1",
+    )
+    .bind(post_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| ApiError::internal("load new-post notice subject", e))?;
+
+    #[derive(FromRow)]
+    struct FollowerRow {
+        user_id: Uuid,
+        phone: String,
+    }
+    let followers: Vec<FollowerRow> = sqlx::query_as(
+        "SELECT f.user_id, u.phone FROM store_follows f \
+         JOIN users u ON u.id = f.user_id \
+         WHERE f.store_id = $1 AND f.notify_new_products \
+         ORDER BY f.created_at ASC",
+    )
+    .bind(post.store_id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| ApiError::internal("load store followers for post notice", e))?;
+
+    let payload = json!({
+        "store_id": post.store_id.to_string(),
+        "store_name": post.store_name,
+        "post_id": post_id.to_string(),
+        "post_slug": post.post_slug,
+        "post_title": post.post_title,
+    });
+    let mut queued: i64 = 0;
+    for follower in &followers {
+        notify::enqueue(
+            &mut *conn,
+            follower.user_id,
+            &follower.phone,
+            domain::NOTIFICATION_STORE_NEW_POST,
+            &payload,
+        )
+        .await
+        .map_err(|e| ApiError::internal("enqueue new-post notification", e))?;
         queued += 1;
     }
     Ok(queued)

@@ -375,6 +375,7 @@ pub mod saved_searches;
 pub mod search;
 pub mod shipments;
 pub mod store_collections;
+pub mod store_content;
 pub mod storefront_sections;
 pub mod stores;
 pub mod subscriptions;
@@ -1797,6 +1798,92 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/stores/:slug/section-events",
             post(storefront_sections::record_section_event_handler),
         )
+        // Wave 59 — store content: custom pages + the
+        // store blog. Seller CRUD rides the branding
+        // access rule (resolve via ?store_id= under
+        // manage_marketing); the reorder is a PUT on the
+        // pages collection itself (a /reorder sibling
+        // would sit a static segment beside :id, which
+        // the router forbids — the notifications
+        // precedent). Public reads hang off the store
+        // slug; the feed is /v1/stores/:slug/feed for the
+        // same static-beside-param reason (a /posts/feed
+        // sibling of :post_slug is not allowed).
+        .route(
+            "/v1/seller/store/pages",
+            get(store_content::list_seller_pages_handler)
+                .post(store_content::create_page_handler)
+                .put(store_content::reorder_pages_handler),
+        )
+        .route(
+            "/v1/seller/store/pages/:id",
+            get(store_content::get_seller_page_handler)
+                .put(store_content::update_page_handler)
+                .delete(store_content::delete_page_handler),
+        )
+        .route(
+            "/v1/seller/store/pages/:id/status",
+            post(store_content::set_page_status_handler),
+        )
+        .route(
+            "/v1/seller/store/posts",
+            get(store_content::list_seller_posts_handler)
+                .post(store_content::create_post_handler),
+        )
+        .route(
+            "/v1/seller/store/post-stats",
+            get(store_content::seller_post_stats_handler),
+        )
+        .route(
+            "/v1/seller/store/posts/:id",
+            get(store_content::get_seller_post_handler)
+                .put(store_content::update_post_handler)
+                .delete(store_content::delete_post_handler),
+        )
+        .route(
+            "/v1/seller/store/posts/:id/status",
+            post(store_content::set_post_status_handler),
+        )
+        .route(
+            "/v1/seller/store/posts/:id/cover-image",
+            post(store_content::upload_post_cover_handler)
+                .layer(DefaultBodyLimit::max(
+                    product_images::IMAGE_UPLOAD_ROUTE_LIMIT_BYTES,
+                ))
+                .delete(store_content::delete_post_cover_handler),
+        )
+        .route(
+            "/v1/stores/:slug/pages",
+            get(store_content::list_public_pages_handler),
+        )
+        .route(
+            "/v1/stores/:slug/pages/:page_slug",
+            get(store_content::get_public_page_handler),
+        )
+        .route(
+            "/v1/stores/:slug/posts",
+            get(store_content::list_public_posts_handler),
+        )
+        .route(
+            "/v1/stores/:slug/posts/:post_slug",
+            get(store_content::get_public_post_handler),
+        )
+        .route(
+            "/v1/stores/:slug/posts/:post_slug/view",
+            post(store_content::record_post_view_handler),
+        )
+        .route(
+            "/v1/stores/:slug/feed",
+            get(store_content::post_feed_handler),
+        )
+        .route(
+            "/v1/posts/recent",
+            get(store_content::list_recent_posts_handler),
+        )
+        .route(
+            "/v1/follows/posts",
+            get(store_content::list_followed_posts_handler),
+        )
         .route("/v1/seller/facebook/status", get(facebook::facebook_status))
         .route(
             "/v1/seller/products/import-preview",
@@ -2148,6 +2235,26 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/v1/admin/media/:image_id",
             delete(product_images::delete_admin_media_handler),
+        )
+        // Wave 59 extension — admin content moderation:
+        // the cross-store page/post lists and the audited
+        // status writes (the same state machine the
+        // sellers use; see the store_content module).
+        .route(
+            "/v1/admin/content/posts",
+            get(store_content::list_admin_posts_handler),
+        )
+        .route(
+            "/v1/admin/content/pages",
+            get(store_content::list_admin_pages_handler),
+        )
+        .route(
+            "/v1/admin/content/posts/:id/status",
+            post(store_content::set_admin_post_status_handler),
+        )
+        .route(
+            "/v1/admin/content/pages/:id/status",
+            post(store_content::set_admin_page_status_handler),
         )
         .route(
             "/v1/seller/media",

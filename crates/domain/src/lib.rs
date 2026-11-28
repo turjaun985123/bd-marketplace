@@ -4110,6 +4110,18 @@ pub const NOTIFICATION_STORE_NEW_PRODUCT: &str = "store_new_product";
 /// new-product kind.
 pub const NOTIFICATION_STORE_FLASH_SALE: &str = "store_flash_sale";
 
+/// Wave 59: a store a user follows published a blog post
+/// that is live now. Enqueued by the one funnel in the
+/// API's notices module inside the publish write;
+/// muted follows are excluded there, exactly like the
+/// new-product kind (the follow's one news mute covers
+/// products, sales, and posts). A scheduled post does
+/// not fire it — the post is not live yet, and nothing
+/// fires later when the moment passes (the read-time
+/// liveness rule has no transition to hook; documented
+/// in the Wave 59 README section).
+pub const NOTIFICATION_STORE_NEW_POST: &str = "store_new_post";
+
 /// The values a notification template renders (Wave 29).
 /// Every field is optional in effect: a kind uses the fields
 /// it names and ignores the rest, so one struct serves all
@@ -4133,6 +4145,10 @@ pub struct NotificationVars {
     /// only by the `store_flash_sale` template; empty for
     /// every other kind.
     pub sale_title: String,
+    /// The blog post's title (Wave 59) — read only by
+    /// the `store_new_post` template; empty for every
+    /// other kind.
+    pub post_title: String,
 }
 
 /// The short display form of an order id: its first 8
@@ -4224,6 +4240,16 @@ pub fn render_body(kind: &str, vars: &NotificationVars) -> String {
                 format!(
                     "BD Marketplace: {store} স্টোরের পণ্যে ফ্ল্যাশ সেল চলছে: {}!",
                     vars.sale_title
+                )
+            }
+        }
+        NOTIFICATION_STORE_NEW_POST => {
+            if vars.post_title.is_empty() {
+                format!("BD Marketplace: {store} নতুন ব্লগ পোস্ট প্রকাশ করেছে। পড়ে দেখুন!")
+            } else {
+                format!(
+                    "BD Marketplace: {store} নতুন ব্লগ পোস্ট প্রকাশ করেছে: {}।",
+                    vars.post_title
                 )
             }
         }
@@ -8375,6 +8401,396 @@ pub fn validate_storefront_event_kind(kind: &str) -> Result<&str, &'static str> 
 /// at the API, like every analytics surface).
 pub const STOREFRONT_STATS_WINDOW_DAYS: i64 = 30;
 
+// ---------------------------------------------------------------------------
+// Store content: custom pages and the store blog (Wave 59)
+// ---------------------------------------------------------------------------
+
+/// Content lifecycle statuses (Wave 59), shared by store
+/// pages and store blog posts and mirrored by the CHECK
+/// constraints in migrations 0067/0068. A `draft` is the
+/// seller's private work; `published` is public subject
+/// to the post scheduling rule ([`content_is_live`]);
+/// `archived` is retired from every public surface but
+/// kept in the seller's list, restorable at any time.
+pub const CONTENT_STATUS_DRAFT: &str = "draft";
+pub const CONTENT_STATUS_PUBLISHED: &str = "published";
+pub const CONTENT_STATUS_ARCHIVED: &str = "archived";
+
+/// Every content status, for validators and the web's
+/// status pickers (one vocabulary, served by the API).
+pub const CONTENT_STATUSES: [&str; 3] = [
+    CONTENT_STATUS_DRAFT,
+    CONTENT_STATUS_PUBLISHED,
+    CONTENT_STATUS_ARCHIVED,
+];
+
+/// Is this one of the content lifecycle statuses?
+pub fn is_valid_content_status(status: &str) -> bool {
+    CONTENT_STATUSES.contains(&status)
+}
+
+/// May content move from `from` to `to` (Wave 59)? The
+/// state machine is deliberately small: any status may
+/// move to any OTHER status (draft publishes, published
+/// unpublishes back to draft or retires to archived, an
+/// archived piece restores to draft or republishes
+/// directly), and staying in place is not a transition —
+/// the API answers a no-op status write with a 400
+/// naming the current state rather than pretending a
+/// change happened. Unknown statuses never transition.
+pub fn can_transition_content_status(from: &str, to: &str) -> bool {
+    is_valid_content_status(from) && is_valid_content_status(to) && from != to
+}
+
+/// Is a piece of content visible to the public right
+/// now (Wave 59)? The one visibility rule every public
+/// content read applies: the status must be `published`
+/// and, for posts, the publish moment must have arrived.
+/// Pages carry no schedule (their `published_at` is
+/// `None` in this call and the status alone decides);
+/// a published post with a future `published_at` is
+/// SCHEDULED — written, committed, and not yet public.
+pub fn content_is_live(status: &str, published_at_unix: Option<i64>, now_unix: i64) -> bool {
+    if status != CONTENT_STATUS_PUBLISHED {
+        return false;
+    }
+    match published_at_unix {
+        Some(at) => at <= now_unix,
+        None => true,
+    }
+}
+
+/// How many custom pages one store may keep (Wave 59).
+/// Pages are the store's standing documents (about,
+/// shipping, size guide, FAQ); past this count the store
+/// is writing a wiki, not a storefront.
+pub const MAX_STORE_PAGES_PER_STORE: i64 = 25;
+
+/// How many blog posts one store may keep (Wave 59),
+/// across all statuses. A generous ceiling — a post a
+/// day for well over a year — that still bounds a runaway
+/// import or a script gone wrong.
+pub const MAX_STORE_POSTS_PER_STORE: i64 = 500;
+
+/// Longest custom-page title, in characters (Wave 59).
+pub const MAX_STORE_PAGE_TITLE_CHARS: usize = 120;
+
+/// Longest blog-post title, in characters (Wave 59).
+pub const MAX_STORE_POST_TITLE_CHARS: usize = 160;
+
+/// Longest custom-page body, in characters (Wave 59):
+/// twenty thousand characters is a long policy document
+/// or guide, far past what a storefront page should be.
+pub const MAX_STORE_PAGE_BODY_CHARS: usize = 20_000;
+
+/// Longest blog-post body, in characters (Wave 59):
+/// forty thousand characters is a substantial article.
+pub const MAX_STORE_POST_BODY_CHARS: usize = 40_000;
+
+/// Longest hand-written post excerpt, in characters
+/// (Wave 59). A blank excerpt is not an error — it means
+/// "derive one from the body" ([`derive_post_excerpt`]).
+pub const MAX_POST_EXCERPT_CHARS: usize = 300;
+
+/// The character budget a derived excerpt aims for
+/// (Wave 59): the teaser shown on blog cards and in the
+/// feed. The derivation cuts on a word boundary inside
+/// this budget, so a derived excerpt is usually a little
+/// shorter, never longer.
+pub const POST_EXCERPT_DERIVE_CHARS: usize = 240;
+
+/// How many tags one post may carry (Wave 59).
+pub const MAX_POST_TAGS: usize = 8;
+
+/// Longest single post tag, in characters (Wave 59).
+pub const MAX_POST_TAG_CHARS: usize = 30;
+
+/// Reading-speed assumption for the reading-time
+/// estimate (Wave 59), in words per minute: the usual
+/// adult silent-reading average used by blogging
+/// platforms. The estimate is a display hint, never a
+/// promise, and is labelled as approximate in the UI.
+pub const READING_WORDS_PER_MINUTE: i64 = 200;
+
+/// How many posts the store's Atom feed carries (Wave
+/// 59): the most recent published ones.
+pub const STORE_POST_FEED_ITEMS: i64 = 20;
+
+/// The seller post-stats window: counts are all-time
+/// plus the last this many days (Asia/Dhaka calendar
+/// days at the API, like every analytics surface).
+pub const STORE_POST_STATS_WINDOW_DAYS: i64 = 30;
+
+/// Validate a content slug (Wave 59) — the platform's
+/// one slug grammar ([`is_valid_slug`]: 3–40 chars of
+/// lowercase letters, digits and hyphens, starting and
+/// ending alphanumeric), with the refusal worded
+/// bilingually like the other storefront rules. Page
+/// slugs are unique within their store and post slugs
+/// within theirs; the DB constraints are the backstop
+/// and this is the shape rule. Returns the slug.
+pub fn validate_content_slug(slug: &str) -> Result<String, String> {
+    if is_valid_slug(slug) {
+        Ok(slug.to_string())
+    } else {
+        Err(
+            "স্লাগটি ৩-৪০ অক্ষরের হতে হবে (ছোট হাতের অক্ষর, সংখ্যা ও হাইফেন) — \
+             the slug must be 3-40 characters of lowercase letters, digits and \
+             hyphens"
+                .to_string(),
+        )
+    }
+}
+
+/// The shared shape behind the two content title
+/// validators: required, trimmed, char-capped, with the
+/// refusal naming the field in both languages.
+fn validate_content_title(
+    raw: &str,
+    max_chars: usize,
+    bn_label: &str,
+    en_label: &str,
+) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{bn_label} আবশ্যক — a {en_label} is required"));
+    }
+    if trimmed.chars().count() > max_chars {
+        return Err(format!(
+            "{bn_label} সর্বোচ্চ {max_chars} অক্ষরের হতে হবে — the {en_label} \
+             must be at most {max_chars} characters"
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Validate a custom page's title (Wave 59).
+pub fn validate_store_page_title(title: &str) -> Result<String, String> {
+    validate_content_title(title, MAX_STORE_PAGE_TITLE_CHARS, "পেজের শিরোনাম", "page title")
+}
+
+/// Validate a blog post's title (Wave 59).
+pub fn validate_store_post_title(title: &str) -> Result<String, String> {
+    validate_content_title(title, MAX_STORE_POST_TITLE_CHARS, "পোস্টের শিরোনাম", "post title")
+}
+
+/// The shared shape behind the two content body
+/// validators: required, edge-trimmed (the interior is
+/// the author's, untouched), char-capped. Bodies are
+/// PLAIN TEXT — the platform renders paragraphs, never
+/// seller markup (see the Wave 59 README section).
+fn validate_content_body(
+    raw: &str,
+    max_chars: usize,
+    bn_label: &str,
+    en_label: &str,
+) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{bn_label} আবশ্যক — the {en_label} is required"));
+    }
+    if trimmed.chars().count() > max_chars {
+        return Err(format!(
+            "{bn_label} সর্বোচ্চ {max_chars} অক্ষরের হতে হবে — the {en_label} \
+             must be at most {max_chars} characters"
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Validate a custom page's body (Wave 59): plain text,
+/// at most [`MAX_STORE_PAGE_BODY_CHARS`] characters.
+pub fn validate_store_page_body(body: &str) -> Result<String, String> {
+    validate_content_body(body, MAX_STORE_PAGE_BODY_CHARS, "পেজের লেখা", "page body")
+}
+
+/// Validate a blog post's body (Wave 59): plain text,
+/// at most [`MAX_STORE_POST_BODY_CHARS`] characters.
+pub fn validate_store_post_body(body: &str) -> Result<String, String> {
+    validate_content_body(body, MAX_STORE_POST_BODY_CHARS, "পোস্টের লেখা", "post body")
+}
+
+/// Validate a store's page count before creating one
+/// more (Wave 59): at [`MAX_STORE_PAGES_PER_STORE`] the
+/// store must retire a page first.
+pub fn validate_store_page_count(current: i64) -> Result<(), String> {
+    if !(0..MAX_STORE_PAGES_PER_STORE).contains(&current) {
+        return Err(format!(
+            "একটি স্টোর সর্বোচ্চ {}টি পেজ রাখতে পারে — a store may keep at \
+             most {} pages",
+            MAX_STORE_PAGES_PER_STORE, MAX_STORE_PAGES_PER_STORE
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a store's post count before creating one
+/// more (Wave 59): at [`MAX_STORE_POSTS_PER_STORE`] the
+/// store must retire a post first.
+pub fn validate_store_post_count(current: i64) -> Result<(), String> {
+    if !(0..MAX_STORE_POSTS_PER_STORE).contains(&current) {
+        return Err(format!(
+            "একটি স্টোর সর্বোচ্চ {}টি ব্লগ পোস্ট রাখতে পারে — a store may \
+             keep at most {} blog posts",
+            MAX_STORE_POSTS_PER_STORE, MAX_STORE_POSTS_PER_STORE
+        ));
+    }
+    Ok(())
+}
+
+/// Normalize a post's tag list (Wave 59): each tag is
+/// trimmed, lowercased (Unicode), and its interior
+/// whitespace runs collapse to single hyphens, so
+/// "Eid Collection", "eid-collection" and "  EID
+/// COLLECTION " are the same tag. Blank entries drop
+/// out silently (a trailing comma in the editor is not
+/// an error). The result is deduplicated in first-seen
+/// order and capped at [`MAX_POST_TAGS`]; a tag over
+/// [`MAX_POST_TAG_CHARS`] characters, or carrying any
+/// character that is not a letter, digit or hyphen, is
+/// refused by name.
+pub fn normalize_post_tags(tags: &[String]) -> Result<Vec<String>, String> {
+    let mut normalized: Vec<String> = Vec::with_capacity(tags.len());
+    for raw in tags {
+        let lowered = raw.trim().to_lowercase();
+        if lowered.is_empty() {
+            continue;
+        }
+        let mut tag = String::with_capacity(lowered.len());
+        let mut last_was_space = false;
+        for ch in lowered.chars() {
+            if ch.is_whitespace() {
+                last_was_space = true;
+                continue;
+            }
+            if last_was_space && !tag.is_empty() {
+                tag.push('-');
+            }
+            last_was_space = false;
+            tag.push(ch);
+        }
+        if tag.chars().count() > MAX_POST_TAG_CHARS {
+            return Err(format!(
+                "ট্যাগ '{tag}' সর্বোচ্চ {MAX_POST_TAG_CHARS} অক্ষরের হতে পারে — \
+                 the tag '{tag}' may be at most {MAX_POST_TAG_CHARS} characters"
+            ));
+        }
+        if !tag
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-')
+        {
+            return Err(format!(
+                "ট্যাগ '{tag}'-এ শুধু অক্ষর, সংখ্যা ও হাইফেন থাকতে পারে — \
+                 the tag '{tag}' may contain only letters, digits and hyphens"
+            ));
+        }
+        if !normalized.contains(&tag) {
+            normalized.push(tag);
+        }
+    }
+    if normalized.len() > MAX_POST_TAGS {
+        return Err(format!(
+            "একটি পোস্টে সর্বোচ্চ {}টি ট্যাগ থাকতে পারে — a post may carry \
+             at most {} tags",
+            MAX_POST_TAGS, MAX_POST_TAGS
+        ));
+    }
+    Ok(normalized)
+}
+
+/// Derive a post's excerpt from its body (Wave 59): the
+/// body's whitespace runs (newlines included) collapse
+/// to single spaces; a body that fits
+/// [`POST_EXCERPT_DERIVE_CHARS`] is its own excerpt.
+/// A longer body is cut at the last word boundary
+/// inside the budget, so the excerpt ends mid-article
+/// but never mid-word; a single unbroken word longer
+/// than the budget is hard-cut at the budget. No
+/// ellipsis is appended — the excerpt simply ends, and
+/// the surfaces showing it link to the full post; an
+/// ellipsis would claim a truncation style the text
+/// does not have.
+pub fn derive_post_excerpt(body: &str) -> String {
+    let collapsed = body.split_whitespace().collect::<Vec<&str>>().join(" ");
+    if collapsed.chars().count() <= POST_EXCERPT_DERIVE_CHARS {
+        return collapsed;
+    }
+    let head: String = collapsed.chars().take(POST_EXCERPT_DERIVE_CHARS).collect();
+    match head.rfind(' ') {
+        Some(idx) if idx > 0 => head[..idx].to_string(),
+        _ => head,
+    }
+}
+
+/// Validate a hand-written post excerpt (Wave 59):
+/// blank becomes `None` (the post then derives its
+/// excerpt from the body), a present value is trimmed
+/// and capped at [`MAX_POST_EXCERPT_CHARS`].
+pub fn validate_post_excerpt(text: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = text else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().count() > MAX_POST_EXCERPT_CHARS {
+        return Err(format!(
+            "সারাংশ সর্বোচ্চ {} অক্ষরের হতে হবে — the excerpt must be at \
+             most {} characters",
+            MAX_POST_EXCERPT_CHARS, MAX_POST_EXCERPT_CHARS
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+/// Count the words in a text (Wave 59): maximal runs
+/// separated by any whitespace. Bangla and English text
+/// both word-separate on spaces in practice, and the
+/// count only feeds the reading-time estimate.
+pub fn count_words(text: &str) -> i64 {
+    text.split_whitespace().count() as i64
+}
+
+/// The reading-time estimate for a word count (Wave
+/// 59): whole minutes at [`READING_WORDS_PER_MINUTE`],
+/// rounded up, never below one minute — a 30-word post
+/// still takes a moment to read, and "0 min read" would
+/// be a false claim about any real text.
+pub fn reading_minutes_for_words(words: i64) -> i64 {
+    if words <= 0 {
+        return 1;
+    }
+    (words + READING_WORDS_PER_MINUTE - 1) / READING_WORDS_PER_MINUTE
+}
+
+/// The reading-time estimate for a body of text (Wave
+/// 59): [`reading_minutes_for_words`] over
+/// [`count_words`].
+pub fn estimate_reading_minutes(body: &str) -> i64 {
+    reading_minutes_for_words(count_words(body))
+}
+
+/// Escape a text for XML content or attribute use
+/// (Wave 59): the five predefined entities. The store
+/// blog's Atom feed is hand-built with this at every
+/// interpolation — a post title carrying `&` or `<`
+/// reaches feed readers as text, never as markup.
+pub fn xml_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11388,6 +11804,7 @@ mod tests {
             status: String::new(),
             product_title: String::new(),
             sale_title: String::new(),
+            post_title: String::new(),
         };
         // The short order id (first 8 chars) is what prints.
         let placed = render_body(NOTIFICATION_ORDER_PLACED, &vars);
@@ -14440,5 +14857,204 @@ mod tests {
         for bad in ["view", "click", "section_hover", ""] {
             assert!(validate_storefront_event_kind(bad).is_err(), "{bad:?} refused");
         }
+    }
+
+    // -- Wave 59: store content (pages + blog) --
+
+    #[test]
+    fn wave59_content_status_machine_allows_any_real_change() {
+        // Every move between two distinct valid statuses
+        // is allowed; staying put and unknown statuses
+        // are not transitions.
+        for from in CONTENT_STATUSES {
+            for to in CONTENT_STATUSES {
+                assert_eq!(
+                    can_transition_content_status(from, to),
+                    from != to,
+                    "{from} -> {to}"
+                );
+            }
+        }
+        assert!(!can_transition_content_status("live", "draft"));
+        assert!(!can_transition_content_status("draft", "live"));
+        assert!(!can_transition_content_status("", ""));
+        assert!(is_valid_content_status("published"));
+        assert!(!is_valid_content_status("Published"));
+    }
+
+    #[test]
+    fn wave59_content_liveness_honours_status_and_schedule() {
+        let now = 1_700_000_000;
+        // Pages: no schedule — the status alone decides.
+        assert!(content_is_live("published", None, now));
+        assert!(!content_is_live("draft", None, now));
+        assert!(!content_is_live("archived", None, now));
+        // Posts: a published post whose moment has come
+        // is live; a future moment is scheduled, not live;
+        // the exact moment counts as live (the window is
+        // half-open at the start, like the banner rule).
+        assert!(content_is_live("published", Some(now - 1), now));
+        assert!(content_is_live("published", Some(now), now));
+        assert!(!content_is_live("published", Some(now + 60), now));
+        // A draft with a past date is still a draft.
+        assert!(!content_is_live("draft", Some(now - 1), now));
+    }
+
+    #[test]
+    fn wave59_content_slug_uses_the_platform_grammar() {
+        assert_eq!(
+            validate_content_slug("shipping-info"),
+            Ok("shipping-info".to_string())
+        );
+        assert_eq!(validate_content_slug("eid-2026"), Ok("eid-2026".to_string()));
+        for bad in ["ab", "Has-Caps", "-leading", "trailing-", "under_score", ""] {
+            assert!(validate_content_slug(bad).is_err(), "{bad:?} refused");
+        }
+        let err = validate_content_slug("NO").expect_err("caps refused");
+        assert!(err.contains("স্লাগ"), "bilingual refusal: {err}");
+    }
+
+    #[test]
+    fn wave59_content_titles_trim_and_cap() {
+        assert_eq!(
+            validate_store_page_title("  ডেলিভারি তথ্য  "),
+            Ok("ডেলিভারি তথ্য".to_string())
+        );
+        assert!(validate_store_page_title("   ").is_err());
+        assert!(validate_store_post_title("").is_err());
+        let at_cap = "a".repeat(MAX_STORE_PAGE_TITLE_CHARS);
+        assert!(validate_store_page_title(&at_cap).is_ok());
+        let over_cap = "a".repeat(MAX_STORE_PAGE_TITLE_CHARS + 1);
+        assert!(validate_store_page_title(&over_cap).is_err());
+        // The post title cap is its own, larger one.
+        let post_over_page_cap = "a".repeat(MAX_STORE_PAGE_TITLE_CHARS + 1);
+        assert!(validate_store_post_title(&post_over_page_cap).is_ok());
+        let post_over = "a".repeat(MAX_STORE_POST_TITLE_CHARS + 1);
+        assert!(validate_store_post_title(&post_over).is_err());
+    }
+
+    #[test]
+    fn wave59_content_bodies_require_text_and_cap_chars() {
+        assert_eq!(
+            validate_store_page_body("  প্রথম লাইন।\n\nদ্বিতীয় লাইন।  "),
+            Ok("প্রথম লাইন।\n\nদ্বিতীয় লাইন।".to_string())
+        );
+        assert!(validate_store_page_body(" \n ").is_err());
+        assert!(validate_store_post_body("").is_err());
+        let page_at_cap = "x".repeat(MAX_STORE_PAGE_BODY_CHARS);
+        assert!(validate_store_page_body(&page_at_cap).is_ok());
+        // A page-overflowing body still fits a post.
+        let big = "x".repeat(MAX_STORE_PAGE_BODY_CHARS + 1);
+        assert!(validate_store_page_body(&big).is_err());
+        assert!(validate_store_post_body(&big).is_ok());
+        let post_over = "x".repeat(MAX_STORE_POST_BODY_CHARS + 1);
+        assert!(validate_store_post_body(&post_over).is_err());
+        // Interior whitespace is the author's — untouched.
+        let body = validate_store_post_body("a\n\n\nb").expect("body validates");
+        assert_eq!(body, "a\n\n\nb");
+    }
+
+    #[test]
+    fn wave59_content_count_caps() {
+        assert!(validate_store_page_count(0).is_ok());
+        assert!(validate_store_page_count(MAX_STORE_PAGES_PER_STORE - 1).is_ok());
+        assert!(validate_store_page_count(MAX_STORE_PAGES_PER_STORE).is_err());
+        assert!(validate_store_page_count(-1).is_err());
+        assert!(validate_store_post_count(MAX_STORE_POSTS_PER_STORE - 1).is_ok());
+        assert!(validate_store_post_count(MAX_STORE_POSTS_PER_STORE).is_err());
+    }
+
+    #[test]
+    fn wave59_tags_normalise_case_space_and_duplicates() {
+        let tags = normalize_post_tags(&[
+            "Eid Collection".to_string(),
+            "eid-collection".to_string(),
+            "  নতুন  ".to_string(),
+            "".to_string(),
+            "   ".to_string(),
+            "Sale 2026".to_string(),
+        ])
+        .expect("tags normalise");
+        assert_eq!(tags, ["eid-collection", "নতুন", "sale-2026"]);
+        // Multi-space interiors collapse to one hyphen.
+        let tags = normalize_post_tags(&["a   b\tc".to_string()]).expect("collapse");
+        assert_eq!(tags, ["a-b-c"]);
+        // No tags at all is fine — a post need not carry any.
+        assert_eq!(normalize_post_tags(&[]), Ok(vec![]));
+    }
+
+    #[test]
+    fn wave59_tags_refuse_overflow_and_bad_characters() {
+        let too_many: Vec<String> = (0..=MAX_POST_TAGS).map(|i| format!("tag{i}")).collect();
+        assert!(normalize_post_tags(&too_many).is_err());
+        let at_cap: Vec<String> = (0..MAX_POST_TAGS).map(|i| format!("tag{i}")).collect();
+        assert!(normalize_post_tags(&at_cap).is_ok());
+        let long = "x".repeat(MAX_POST_TAG_CHARS + 1);
+        assert!(normalize_post_tags(&[long]).is_err());
+        for bad in ["tag!", "a,b", "tag@home", "under_score"] {
+            assert!(
+                normalize_post_tags(&[bad.to_string()]).is_err(),
+                "{bad:?} refused"
+            );
+        }
+    }
+
+    #[test]
+    fn wave59_excerpt_derivation_cuts_on_word_boundaries() {
+        // A short body is its own excerpt, whitespace
+        // collapsed.
+        assert_eq!(derive_post_excerpt("hello   world\n\nagain"), "hello world again");
+        assert_eq!(derive_post_excerpt(""), "");
+        // A long body ends at the last word boundary
+        // inside the budget — never mid-word, never with
+        // an ellipsis.
+        let word = "abcde";
+        let body = std::iter::repeat_n(word, 100).collect::<Vec<_>>().join(" ");
+        let excerpt = derive_post_excerpt(&body);
+        assert!(excerpt.chars().count() <= POST_EXCERPT_DERIVE_CHARS);
+        assert!(excerpt.ends_with(word), "ends on a whole word: {excerpt}");
+        assert!(!excerpt.contains('…'), "no ellipsis fakery");
+        assert!(body.starts_with(&excerpt));
+        // One unbroken word longer than the budget is
+        // hard-cut at the budget exactly.
+        let solid = "z".repeat(POST_EXCERPT_DERIVE_CHARS + 50);
+        let excerpt = derive_post_excerpt(&solid);
+        assert_eq!(excerpt.chars().count(), POST_EXCERPT_DERIVE_CHARS);
+    }
+
+    #[test]
+    fn wave59_manual_excerpt_blank_means_derive() {
+        assert_eq!(validate_post_excerpt(None), Ok(None));
+        assert_eq!(validate_post_excerpt(Some("   ")), Ok(None));
+        assert_eq!(
+            validate_post_excerpt(Some("  নিজের লেখা সারাংশ  ")),
+            Ok(Some("নিজের লেখা সারাংশ".to_string()))
+        );
+        let over = "x".repeat(MAX_POST_EXCERPT_CHARS + 1);
+        assert!(validate_post_excerpt(Some(&over)).is_err());
+    }
+
+    #[test]
+    fn wave59_reading_time_rounds_up_with_a_floor_of_one() {
+        assert_eq!(count_words("  one two\nthree\tfour "), 4);
+        assert_eq!(count_words(""), 0);
+        assert_eq!(reading_minutes_for_words(0), 1);
+        assert_eq!(reading_minutes_for_words(1), 1);
+        assert_eq!(reading_minutes_for_words(READING_WORDS_PER_MINUTE), 1);
+        assert_eq!(reading_minutes_for_words(READING_WORDS_PER_MINUTE + 1), 2);
+        assert_eq!(estimate_reading_minutes("word ".repeat(450).as_str()), 3);
+    }
+
+    #[test]
+    fn wave59_xml_escape_covers_the_five_entities() {
+        assert_eq!(
+            xml_escape("Fish & Chips <b>\"tasty\"</b> 'yes'"),
+            "Fish &amp; Chips &lt;b&gt;&quot;tasty&quot;&lt;/b&gt; &apos;yes&apos;"
+        );
+        // Ampersand escapes first — an existing entity in
+        // the text stays literal text, never live markup.
+        assert_eq!(xml_escape("&lt;"), "&amp;lt;");
+        assert_eq!(xml_escape("সাধারণ লেখা"), "সাধারণ লেখা");
+        assert_eq!(xml_escape(""), "");
     }
 }

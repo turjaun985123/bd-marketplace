@@ -5080,6 +5080,200 @@ identity frame's stats line (the section carries the
 texts; the API payload includes the aggregates for
 clients that want them).
 
+## Wave 59 — store content: custom pages + store blog
+
+Shopify stores have two kinds of writing the product
+catalogue is not: standing documents (About, Shipping
+policy, FAQ, Size guide) and a blog. This platform's
+stores had neither — Waves 18/54 gave a store an
+about text and a return policy rendered inside the
+storefront frame, but no standalone pages and no
+posts. Wave 59 builds the content system
+(`crates/api/src/store_content.rs`, migrations
+0067–0069, domain rules in the Wave 59 section of
+`crates/domain`).
+
+**The model.** `store_pages` (slug, title, body,
+status, `show_in_nav`, `position`) and `store_posts`
+(the same plus a hand-written excerpt, normalised
+tags, a cover image, a `published_at` moment, and a
+word count maintained at write time), each unique per
+(store, slug) — the same slug in another store is a
+different document, and a page and a post may share a
+slug inside one store. Both kinds share one status
+vocabulary — draft / published / archived — and one
+domain state machine: any move between distinct
+states is allowed, staying put is not a transition
+and is refused. Caps are domain constants, enforced
+at the API: 25 pages and 500 posts per store, page
+titles ≤ 120 chars, post titles ≤ 160, page bodies
+≤ 20,000 chars, post bodies ≤ 40,000, excerpts
+≤ 300 chars, at most 8 tags of ≤ 30 chars.
+
+**Plain text only — the XSS stance.** Bodies are
+stored and rendered as PLAIN TEXT with paragraph
+breaks (split on blank lines; single line breaks are
+preserved as line breaks). No HTML or Markdown is
+accepted, stored, or rendered anywhere in the
+content system, so seller input can never become
+markup on a public page — the exclusion is by
+design, and the editors say so next to the body
+field.
+
+**Scheduling.** A post is public only when it is
+published AND its moment has arrived
+(`published_at <= now`). Publishing names the
+moment: none supplied means now; a future moment
+schedules the post, and it goes live on its own when
+the moment passes — no job flips anything, liveness
+is computed at read time (the same discipline as the
+Wave 52 banner windows and Wave 58 section windows).
+The stamp rules are part of the contract: publishing
+sets the stamp (supplied, else the existing one, else
+now); unpublishing back to draft CLEARS it, so a
+later publish starts a fresh moment; archiving keeps
+it, so restoring an archived post restores its
+original moment; and re-publishing an
+already-published post WITH a new moment is the one
+same-status write the machine allows — a reschedule,
+which hides the post until the new moment arrives.
+Pages have no scheduling (their status is the whole
+story).
+
+**Seller surface.** Pages and posts are managed
+under `/v1/seller/store/pages` and
+`/v1/seller/store/posts`, behind the SAME access
+rule as store branding (Wave 34's manage-marketing
+capability: the owner and managers write, staff are
+refused 403, strangers get the scoped 404, anonymous
+callers 401). Page reordering is a PUT on the pages
+collection naming the store's EXACT current page set
+— a partial list, a duplicate, or another store's
+page id is refused and nothing moves (a `/reorder`
+sibling route is impossible under the router's
+static-beside-param rule, the Wave 54 notifications
+precedent). The post editor's list carries a status
+filter and a title/slug search. Post covers work two
+ways, both first-class: a hotlink field validated by
+the same external-image rule as product images, and
+an upload through the Wave 51 media pipeline under
+the post's own key (`stores/<store>/posts/<post>/
+cover`), with the derived sizes and object cleanup
+that pipeline provides.
+
+**Public surface.** `GET /v1/stores/:slug/pages`
+(the nav list — published + nav-flagged, in the
+seller's order — with the store's live `blog_post_count`
+riding along so the storefront frame can render its
+Blog link in one round trip), `GET
+/v1/stores/:slug/pages/:page_slug` (published only,
+else the uniform 404), `GET /v1/stores/:slug/posts`
+(live posts, newest first, paginated, with an
+optional tag filter — the filter value is normalised
+by the same domain rule that normalises tags at
+write time, and a tag that can never exist answers
+an honest empty list), and `GET
+/v1/stores/:slug/posts/:post_slug` with the previous
+(older) and next (newer) live neighbours and a
+related rail ranked by shared-tag count then
+newest — a tagless post gets NO related rail rather
+than unrelated filler. Tags are normalised at write
+time (Unicode-lowercased, interior whitespace runs
+become one hyphen, duplicates collapse first-seen;
+anything outside letters/digits/hyphens is refused
+by name). The excerpt on every card is the
+hand-written one when present, else DERIVED from the
+body at read time — whitespace collapsed, cut at the
+last word boundary inside 240 chars, NO ellipsis
+appended (a truncation that admits itself would be
+fakery of a small kind; the rule is a real cut).
+Reading time is the stored word count at 200 words
+per minute, ceiling, minimum one minute. Suspended
+stores answer the uniform 404 on every content
+surface, exactly like their products, while the
+seller keeps full editor access.
+
+**The feed.** `GET /v1/stores/:slug/feed` serves an
+Atom feed of the store's latest 20 live posts —
+hand-built XML, every seller-written string passed
+through the domain XML escaper, content type
+`application/atom+xml`. (The route is `/feed` on the
+store, not `/posts/feed`: the router cannot place a
+static segment beside `:post_slug` — the Wave 54
+rule.) Entry links are path-absolute (`/<slug>/blog/
+<post>`) and ids are URNs, because the platform has
+no configured public base URL anywhere — inventing
+one for the feed would put wrong absolute URLs into
+every reader; when a deployment gains a canonical
+base URL, the feed is where it lands.
+
+**Discovery + view counts.** `GET /v1/posts/recent`
+lists live posts across active stores newest-first
+(the platform blog page), and `GET /v1/follows/posts`
+the same for the signed-in buyer's followed stores
+(the Wave 54 follow graph). When a post becomes live
+— born published with a live moment, or moved into
+live by a status write — the store's followers get a
+`store_new_post` notice through the Wave 54 outbox
+(one funnel in `notices`, the follow's news mute
+honoured, fired inside the publish transaction);
+a scheduled post fires nothing, and nothing fires
+when its moment later passes, because liveness is
+computed at read time and there is no later write to
+hook — the one gap in the notice story, stated
+plainly. Post reads are counted
+the Wave 58 way — aggregate-only: the public detail
+page fires `POST /v1/stores/:slug/posts/:post_slug/
+view`, which records one timestamped row for a LIVE
+post only (anything else is the uniform 404 and
+records nothing; no reader, session, or address is
+ever stored), and the seller's stats
+(`GET /v1/seller/store/post-stats`) report all-time
+and trailing-30-day counts per post and in total.
+
+**Moderation + export.** Platform admins get the
+cross-store queue at `GET /v1/admin/content/posts`
+and `/pages` (status filter + search) and audited
+status writes that run the SAME state machine and
+stamp rules as the seller's own actions — a takedown
+is an archive, a restore is a draft, and the audit
+log records every move (`/admin/content` in the web
+admin). The Wave 31 seller data export now carries
+the store's pages and posts in full.
+
+**Web.** The storefront frame gains a store nav
+(Home / Shop / each nav page / Blog — the Blog link
+renders only when the store has at least one live
+post); public pages at `/[store]/pages/[pageSlug]`,
+`/[store]/blog` (tag-filterable cards with cover,
+excerpt, tags, reading time) and
+`/[store]/blog/[postSlug]` (full post, tag chips,
+prev/next, related rail, BlogPosting JSON-LD, the
+view beacon); a platform blog at `/blog` (recent
+across stores, with a followed-stores view when
+signed in); and the seller editors `/seller/pages`
+(create/edit, nav toggle, up/down reorder, status
+actions) and `/seller/blog` (editor with draft /
+publish / schedule, tag input, excerpt override,
+cover hotlink + upload, read statistics), linked
+from the seller dashboard and the branding page.
+
+**Honest limits:** no HTML/Markdown rich text (the
+plain-text rule above is the limit, deliberately);
+no comments on posts; no full-text post search on
+the public surfaces (the blog filters by tag; the
+seller editor searches their own titles/slugs);
+scheduled posts go live by read-time computation,
+so a post scheduled for later does not notify
+followers when its moment arrives (publishes that
+are live at write time do — see Discovery above);
+the stats window is
+a rolling 30 days, not a calendar month; feed entry
+links are path-absolute until the platform has a
+configured public base URL (above); deleting a post
+deletes its view rows with it (the counts are the
+post's own, not a platform archive).
+
 ## How to run
 
 With a database (Wave 2 features):
@@ -6699,6 +6893,41 @@ and the /seller/storefront editor with catalogue-
 driven forms and a live preview (client-resolved —
 the fidelity limit is documented in the Wave 58
 section). See the Wave 58 section.
+
+**Real (Wave 59):** store content — custom pages and
+a store blog (migrations 0067–0069): per-store pages
+(≤25) and posts (≤500) with slugs unique per store
+and kind, one draft/published/archived state machine
+for both, PLAIN-TEXT bodies only (no HTML rendering
+of seller input anywhere — the XSS stance is in the
+Wave 59 section); scheduled publishing computed at
+read time from the published_at stamp (publish sets
+it, unpublish clears it, archive keeps it, and a
+re-publish with a new moment is a reschedule);
+normalised post tags (lowercase, hyphenated,
+deduplicated, ≤8) with a public tag filter; excerpts
+hand-written or derived on a word boundary with no
+ellipsis appended; reading time from a write-time
+word count; post covers as a validated hotlink or a
+Wave 51 pipeline upload under the post's own key;
+seller CRUD + exact-set page reorder under the
+branding access rule (manage-marketing); public
+nav/page/post reads with the uniform 404 for
+anything not live, prev/next neighbours and a
+shared-tag related rail; an Atom feed at the store's
+/feed URL (hand-built escaped XML, path-absolute
+links — the honest limit is documented); platform
+blog discovery (recent across stores + followed
+stores); a store_new_post follower notice fired
+inside the publish transaction (scheduled posts
+fire nothing — documented); aggregate-only post
+view counts with a seller stats view; admin content
+moderation (cross-store lists + audited status
+writes on the same state machine) and pages/posts
+in the seller data export; the storefront store
+nav, the public page/blog surfaces with BlogPosting
+JSON-LD, and the /seller/pages + /seller/blog
+editors. See the Wave 59 section.
 
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real
