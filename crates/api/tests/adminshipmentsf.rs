@@ -267,6 +267,23 @@ async fn adminshipments_cod_rollup_and_stranded_advance() {
             ..PaymentsConfig::default()
         });
     let app = build_app(state);
+    // A second app over the same pool and JWT secret but
+    // WITHOUT payments dev mode: Flow 1's 206_000 COD
+    // order is over the advance threshold, and on the
+    // dev-mode app a checkout without an advance method
+    // is a 400 by design (Wave 17). On this app it
+    // degrades to plain COD, so the courier still
+    // collects the full 206_000.
+    let plain_state = AppState::new(
+        Some(pool.clone()),
+        "adminshipmentsf-test-secret".to_string(),
+        true,
+    )
+    .with_couriers_config(CouriersConfig {
+        dev_mode: true,
+        ..CouriersConfig::default()
+    });
+    let app_plain = build_app(plain_state);
 
     let admin = login(&app, "01711111116").await;
     sqlx::query("UPDATE users SET is_admin = true WHERE phone = '+8801711111116'")
@@ -287,7 +304,7 @@ async fn adminshipments_cod_rollup_and_stranded_advance() {
     // admin refreshes — its stored COD (200_000 goods +
     // 6_000 delivery) becomes delivered-held.
     let (_sub1, delivered_ship) =
-        buy_confirm_book(&app, &buyer, &seller_a, &pricey, json!({})).await;
+        buy_confirm_book(&app_plain, &buyer, &seller_a, &pricey, json!({})).await;
     for _ in 0..4 {
         admin_refresh(&app, &admin, &delivered_ship).await;
     }
