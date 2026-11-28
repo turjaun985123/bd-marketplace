@@ -72,6 +72,17 @@
 //! zeroes in that cycle's summary; the summary never
 //! claims work the error line contradicts.
 //!
+//! Wave 57 adds a one-shot subcommand: `worker seed-demo`
+//! builds the demo catalogue (eight demo stores, 160+
+//! products) through the API crate's own service
+//! functions — `api::demo_seed::run_demo_seed` — and
+//! exits. It refuses to run unless `DEMO_SEED=1` is set:
+//! the seed writes seller accounts, stores and a full
+//! catalogue, and must never fire from a stray argument
+//! in a production worker invocation. The subcommand is
+//! thin arg glue over the service function (the
+//! integration suite tests the function directly).
+//!
 //! The worker runs the same embedded migrations as the API
 //! at startup (idempotent — whichever process starts first
 //! applies them). Poll interval: `WORKER_POLL_SECONDS`
@@ -244,6 +255,57 @@ async fn main() {
     // performs no startup gate — the JWT-secret gate lives
     // in `api::run`, which this process never calls.
     let state = api::AppState::from_env(Some(pool.clone()));
+    // Wave 57: the one-shot demo seed subcommand. Checked
+    // after the pool, migrations and state exist (the seed
+    // runs through the service functions, which need all
+    // three) and before the poll loop starts; it exits
+    // rather than falling through into the loop.
+    if std::env::args().nth(1).as_deref() == Some("seed-demo") {
+        if std::env::var("DEMO_SEED").map(|v| v == "1").unwrap_or(false) {
+            match api::demo_seed::run_demo_seed(&state).await {
+                Ok(report) => {
+                    println!(
+                        "seed-demo complete: stores created {}, reused {}; \
+                         products created {}, updated {}, errored {}; \
+                         placeholder images attached {}",
+                        report.stores_created,
+                        report.stores_reused,
+                        report.products_created,
+                        report.products_updated,
+                        report.products_errored,
+                        report.images_attached
+                    );
+                    for store in &report.stores {
+                        match &store.error {
+                            Some(error) => {
+                                println!("  - {}: ERROR {error}", store.store_slug)
+                            }
+                            None => println!(
+                                "  - {}: created {}, updated {}, errored {}, images {}",
+                                store.store_slug,
+                                store.products_created,
+                                store.products_updated,
+                                store.products_errored,
+                                store.images_attached
+                            ),
+                        }
+                    }
+                    let failed = report.products_errored > 0
+                        || report.stores.iter().any(|store| store.error.is_some());
+                    std::process::exit(if failed { 1 } else { 0 });
+                }
+                Err(error) => {
+                    eprintln!("seed-demo failed: {}", error.message);
+                    std::process::exit(1);
+                }
+            }
+        }
+        eprintln!(
+            "seed-demo: refusing to run without DEMO_SEED=1 — the seed writes \
+             demo seller accounts, stores and a full catalogue"
+        );
+        std::process::exit(2);
+    }
     println!(
         "bd-marketplace worker starting: notification outbox every {seconds}s \
          (sms sender: {}, batch {}, reap 'sending' after {sending_stale_minutes} min)",

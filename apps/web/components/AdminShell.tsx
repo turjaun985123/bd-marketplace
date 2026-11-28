@@ -91,6 +91,8 @@ export default function AdminShell({
         {" · "}
         <Link href="/admin/search-analytics">খোঁজের হিসাব</Link>
         {" · "}
+        <Link href="/admin/bulk-imports">বাল্ক ইমপোর্ট</Link>
+        {" · "}
         <Link href="/admin/stores">স্টোর</Link>
         {" · "}
         <Link href="/admin/payouts">পে-আউট</Link>

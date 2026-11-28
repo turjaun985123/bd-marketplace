@@ -6561,6 +6561,722 @@ pub fn slugify_category_name(name: &str) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Wave 57: bulk catalogue CSV — parser, writer, row rules, batch math
+// ---------------------------------------------------------------------------
+//
+// The seller bulk import speaks ONE format: a CSV sheet whose
+// columns are [`BULK_IMPORT_COLUMNS`]. Everything about the
+// format that can be decided without the database lives here,
+// pure: the CSV grammar itself (a small dependency-free
+// RFC-4180-style parser/writer), the header contract, the
+// per-row field rules (which reuse the SAME product validators
+// the single-create path uses, so a row can never smuggle in a
+// product the form would refuse), and the batch price math for
+// bulk edits. The API layer adds the database facts on top:
+// which skus already exist, the plan cap, the taxonomy nodes a
+// slug or label resolves to.
+
+/// The most data rows one bulk import file may carry. A
+/// seller with more splits the sheet — the cap keeps one
+/// request's work (and its report) bounded, and 500 rows is
+/// far beyond a hand-maintained catalogue page.
+pub const MAX_BULK_IMPORT_ROWS: usize = 500;
+
+/// The most products one bulk-edit request may name. Bulk
+/// edits run per product through the audited single-product
+/// paths, so the cap bounds the request's transaction count.
+pub const MAX_BULK_EDIT_ITEMS: usize = 200;
+
+/// The bulk sheet's columns, in the export's canonical
+/// order. The import accepts any order (it maps by name);
+/// the export and the template always write this order.
+///
+/// - `sku` — the seller's own stock-keeping id; the
+///   idempotency key. Stored as the product's `source_ref`
+///   with `source = 'bulk'` (the Wave 12 shape).
+/// - `price_poisha` / `compare_at_poisha` — integer poisha,
+///   like every money field in the API (৳1 = 100).
+/// - `category_slug` — a Wave 56 taxonomy slug; wins over
+///   `category_label` when both are present.
+/// - `category_label` — a free-text label, linked on the
+///   taxonomy's exact-match rule and stored exactly as
+///   typed when it matches nothing.
+/// - `image_url` — one external image URL, attached as a
+///   hotlink through the Wave 51 media path.
+pub const BULK_IMPORT_COLUMNS: &[&str] = &[
+    "sku",
+    "title",
+    "title_bn",
+    "description",
+    "price_poisha",
+    "compare_at_poisha",
+    "stock",
+    "weight_grams",
+    "status",
+    "category_slug",
+    "category_label",
+    "image_url",
+];
+
+/// The longest sku a bulk row may carry. The sku lands in
+/// `products.source_ref` (a text column), so the cap is a
+/// sanity bound, not a storage limit: real seller skus are
+/// short codes, and a 121-character "sku" is a paste error.
+pub const MAX_BULK_SKU_CHARS: usize = 120;
+
+/// The longest image URL a bulk row may carry (the media
+/// module's own URL validation runs again at attach time;
+/// this is the row-level sanity bound).
+pub const MAX_BULK_IMAGE_URL_CHARS: usize = 2_048;
+
+// --- The CSV grammar -------------------------------------------------------
+
+/// Parse CSV text into rows of fields. The grammar is the
+/// common spreadsheet dialect: fields may be double-quoted,
+/// a quoted field may contain commas, CR/LF newlines and
+/// `""` as an escaped quote, rows end at CRLF, LF or a lone
+/// CR, and a leading UTF-8 BOM is stripped (Excel writes
+/// one). A trailing newline does NOT produce a phantom empty
+/// row. The one hard error is an unterminated quoted field —
+/// the file is malformed and no row boundary after it can be
+/// trusted, so the caller refuses the whole file.
+pub fn parse_csv(input: &str) -> Result<Vec<Vec<String>>, String> {
+    let input = input.strip_prefix('\u{feff}').unwrap_or(input);
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut row: Vec<String> = Vec::new();
+    let mut field = String::new();
+    // True once the current row has seen any content (a
+    // character, a quote or a comma) — how the trailing
+    // newline at end-of-file avoids a phantom row while a
+    // genuinely empty line mid-file still parses as a
+    // one-field row the caller may skip or reject.
+    let mut row_started = false;
+    let mut chars = input.chars().peekable();
+    let mut line: usize = 1;
+    let mut quote_start_line: usize = 1;
+    #[derive(PartialEq)]
+    enum State {
+        FieldStart,
+        InField,
+        InQuotes,
+        AfterQuote,
+    }
+    let mut state = State::FieldStart;
+    while let Some(ch) = chars.next() {
+        match state {
+            State::FieldStart => match ch {
+                '"' => {
+                    state = State::InQuotes;
+                    quote_start_line = line;
+                    row_started = true;
+                }
+                ',' => {
+                    row.push(std::mem::take(&mut field));
+                    row_started = true;
+                }
+                '\r' | '\n' => {
+                    if ch == '\r' && chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    line += 1;
+                    if row_started || !row.is_empty() {
+                        row.push(std::mem::take(&mut field));
+                        rows.push(std::mem::take(&mut row));
+                    }
+                    row_started = false;
+                }
+                _ => {
+                    field.push(ch);
+                    state = State::InField;
+                    row_started = true;
+                }
+            },
+            State::InField => match ch {
+                ',' => {
+                    row.push(std::mem::take(&mut field));
+                    state = State::FieldStart;
+                }
+                '\r' | '\n' => {
+                    if ch == '\r' && chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    line += 1;
+                    row.push(std::mem::take(&mut field));
+                    rows.push(std::mem::take(&mut row));
+                    row_started = false;
+                    state = State::FieldStart;
+                }
+                _ => field.push(ch),
+            },
+            State::InQuotes => match ch {
+                '"' => state = State::AfterQuote,
+                '\n' => {
+                    line += 1;
+                    field.push(ch);
+                }
+                _ => field.push(ch),
+            },
+            State::AfterQuote => match ch {
+                '"' => {
+                    field.push('"');
+                    state = State::InQuotes;
+                }
+                ',' => {
+                    row.push(std::mem::take(&mut field));
+                    state = State::FieldStart;
+                }
+                '\r' | '\n' => {
+                    if ch == '\r' && chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    line += 1;
+                    row.push(std::mem::take(&mut field));
+                    rows.push(std::mem::take(&mut row));
+                    row_started = false;
+                    state = State::FieldStart;
+                }
+                // A stray character right after a closing
+                // quote (spreadsheets occasionally emit
+                // `"abc" `) — kept as literal field content
+                // rather than failing the whole file.
+                _ => {
+                    field.push(ch);
+                    state = State::InField;
+                }
+            },
+        }
+    }
+    if state == State::InQuotes {
+        return Err(format!(
+            "unterminated quoted field starting at line {quote_start_line} — \
+             উদ্ধৃতি চিহ্ন বন্ধ হয়নি (লাইন {quote_start_line})"
+        ));
+    }
+    if row_started || !row.is_empty() {
+        row.push(field);
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+/// Escape one field for CSV output: quoted exactly when it
+/// contains a comma, a quote or a newline (the minimal
+/// quoting spreadsheets expect), inner quotes doubled.
+pub fn csv_escape_field(field: &str) -> String {
+    if field.contains(',') || field.contains('"') || field.contains('\n') || field.contains('\r')
+    {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
+}
+
+/// Serialise rows to CSV text: CRLF row endings (the
+/// spreadsheet-native form), every row terminated.
+pub fn write_csv(rows: &[Vec<String>]) -> String {
+    let mut out = String::new();
+    for row in rows {
+        let cells: Vec<String> = row.iter().map(|f| csv_escape_field(f)).collect();
+        out.push_str(&cells.join(","));
+        out.push_str("\r\n");
+    }
+    out
+}
+
+// --- Bulk row mapping ------------------------------------------------------
+
+/// One field-level problem with a bulk row. `message` is
+/// bilingual like every seller-facing string in the API.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BulkFieldError {
+    pub field: String,
+    pub message: String,
+}
+
+/// One validated bulk row, ready for the service layer to
+/// match against the store's existing skus.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BulkProductRow {
+    /// Spreadsheet row number: the header is row 1, so the
+    /// first data row is row 2 — the number the seller sees
+    /// in their sheet when the report names a problem.
+    pub row_number: usize,
+    pub sku: String,
+    pub title: String,
+    pub title_bn: Option<String>,
+    pub description: Option<String>,
+    pub price_poisha: i64,
+    pub compare_at_poisha: Option<i64>,
+    pub stock: i32,
+    pub weight_grams: i64,
+    pub status: String,
+    pub category_slug: Option<String>,
+    pub category_label: Option<String>,
+    pub image_url: Option<String>,
+}
+
+/// Every problem with one row, keyed by its spreadsheet row
+/// number. The sku rides along when the row had one (the
+/// report's rows are findable by either).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BulkRowErrors {
+    pub row_number: usize,
+    pub sku: Option<String>,
+    pub errors: Vec<BulkFieldError>,
+}
+
+/// The outcome of parsing a bulk sheet: the rows that
+/// validated, and the rows that did not (with every field
+/// problem found, not just the first — a seller fixing a
+/// sheet should not need one round-trip per mistake).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BulkCsvParse {
+    pub rows: Vec<BulkProductRow>,
+    pub row_errors: Vec<BulkRowErrors>,
+}
+
+fn bulk_field_error(field: &str, message: impl Into<String>) -> BulkFieldError {
+    BulkFieldError {
+        field: field.to_string(),
+        message: message.into(),
+    }
+}
+
+/// Parse one integer cell. Empty (after trimming) yields
+/// `None` from the caller's perspective via the `raw`
+/// check; this helper only judges non-empty text. Whole
+/// numbers only — a decimal point in a poisha cell is a
+/// taka/poisha mix-up and must be an error, not a rounding.
+fn parse_bulk_i64(raw: &str, field: &str) -> Result<i64, BulkFieldError> {
+    raw.parse::<i64>().map_err(|_| {
+        bulk_field_error(
+            field,
+            format!(
+                "'{raw}' is not a whole number — '{raw}' পূর্ণসংখ্যা নয় \
+                 (poisha amounts are whole numbers)"
+            ),
+        )
+    })
+}
+
+/// Parse and validate a whole bulk sheet. A `Err` is a
+/// FATAL problem with the file itself (unparseable CSV, a
+/// missing or unknown header column, too many rows) — the
+/// service refuses the request with it. Per-row problems
+/// come back inside the outcome and never abort the batch.
+///
+/// Header contract: the first row names the columns
+/// (trimmed, case-insensitive). `sku`, `title` and
+/// `price_poisha` are required; unknown or duplicated
+/// columns are fatal (a mistyped column name must not
+/// silently drop a seller's data). Blank rows (every cell
+/// empty) are skipped without a murmur — spreadsheets emit
+/// them freely.
+pub fn parse_bulk_product_csv(text: &str) -> Result<BulkCsvParse, String> {
+    let grid = parse_csv(text)?;
+    let Some((header, data_rows)) = grid.split_first() else {
+        return Err(
+            "the file is empty — a header row is required — ফাইলটি খালি, হেডার সারি আবশ্যক"
+                .to_string(),
+        );
+    };
+    let columns: Vec<String> = header
+        .iter()
+        .map(|cell| cell.trim().to_lowercase())
+        .collect();
+    for name in &columns {
+        if !BULK_IMPORT_COLUMNS.contains(&name.as_str()) {
+            return Err(format!(
+                "unknown column '{name}' — allowed columns: {} — অজানা কলাম '{name}'",
+                BULK_IMPORT_COLUMNS.join(", ")
+            ));
+        }
+    }
+    for required in ["sku", "title", "price_poisha"] {
+        if !columns.iter().any(|name| name == required) {
+            return Err(format!(
+                "the header is missing the required column '{required}' — \
+                 হেডারে আবশ্যক কলাম '{required}' নেই"
+            ));
+        }
+    }
+    let mut seen_columns: Vec<&str> = Vec::new();
+    for name in &columns {
+        if seen_columns.contains(&name.as_str()) {
+            return Err(format!(
+                "the column '{name}' appears twice in the header — \
+                 হেডারে '{name}' কলামটি দুইবার আছে"
+            ));
+        }
+        seen_columns.push(name.as_str());
+    }
+    let column_index = |name: &str| columns.iter().position(|c| c == name);
+
+    let data_count = data_rows
+        .iter()
+        .filter(|cells| cells.iter().any(|cell| !cell.trim().is_empty()))
+        .count();
+    if data_count > MAX_BULK_IMPORT_ROWS {
+        return Err(format!(
+            "the file carries {data_count} data rows — at most {MAX_BULK_IMPORT_ROWS} per import; \
+             split the sheet — ফাইলে {data_count}টি সারি আছে, একবারে সর্বোচ্চ {MAX_BULK_IMPORT_ROWS}টি"
+        ));
+    }
+
+    let mut rows: Vec<BulkProductRow> = Vec::new();
+    let mut row_errors: Vec<BulkRowErrors> = Vec::new();
+    let mut seen_skus: Vec<String> = Vec::new();
+
+    for (offset, cells) in data_rows.iter().enumerate() {
+        // +2: the header is spreadsheet row 1 and `offset`
+        // is 0-based over the data rows.
+        let row_number = offset + 2;
+        if cells.iter().all(|cell| cell.trim().is_empty()) {
+            continue;
+        }
+        let mut errors: Vec<BulkFieldError> = Vec::new();
+        if cells.len() != columns.len() {
+            errors.push(bulk_field_error(
+                "row",
+                format!(
+                    "expected {} columns, found {} — {}টি কলাম থাকা উচিত ছিল, পাওয়া গেছে {}টি",
+                    columns.len(),
+                    cells.len(),
+                    columns.len(),
+                    cells.len()
+                ),
+            ));
+            row_errors.push(BulkRowErrors {
+                row_number,
+                sku: None,
+                errors,
+            });
+            continue;
+        }
+        let get = |name: &str| -> &str {
+            column_index(name)
+                .map(|idx| cells[idx].trim())
+                .unwrap_or("")
+        };
+        let opt = |name: &str| -> Option<String> {
+            let value = get(name);
+            if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            }
+        };
+
+        // sku — the idempotency key, required and unique
+        // within the file (the first occurrence wins; a
+        // later duplicate is the row's error).
+        let sku = get("sku").to_string();
+        if sku.is_empty() {
+            errors.push(bulk_field_error(
+                "sku",
+                "sku is required — SKU আবশ্যক (এটি পণ্যের নিজস্ব কোড)",
+            ));
+        } else if sku.chars().count() > MAX_BULK_SKU_CHARS {
+            errors.push(bulk_field_error(
+                "sku",
+                format!(
+                    "sku must be at most {MAX_BULK_SKU_CHARS} characters — \
+                     SKU সর্বোচ্চ {MAX_BULK_SKU_CHARS} অক্ষরের হতে পারবে"
+                ),
+            ));
+        } else if sku.chars().any(|c| c.is_control()) {
+            errors.push(bulk_field_error(
+                "sku",
+                "sku must not contain control characters — SKU-তে নিয়ন্ত্রণ অক্ষর থাকতে পারবে না",
+            ));
+        } else if seen_skus.contains(&sku) {
+            errors.push(bulk_field_error(
+                "sku",
+                format!(
+                    "sku '{sku}' appears more than once in this file — \
+                     এই ফাইলে '{sku}' SKU একাধিকবার আছে"
+                ),
+            ));
+        } else {
+            seen_skus.push(sku.clone());
+        }
+
+        let title = get("title").to_string();
+
+        // price — required, a whole number of poisha.
+        let price_raw = get("price_poisha");
+        let price_poisha = if price_raw.is_empty() {
+            errors.push(bulk_field_error(
+                "price_poisha",
+                "price_poisha is required — মূল্য (পয়সায়) আবশ্যক",
+            ));
+            0
+        } else {
+            match parse_bulk_i64(price_raw, "price_poisha") {
+                Ok(value) => value,
+                Err(error) => {
+                    errors.push(error);
+                    0
+                }
+            }
+        };
+
+        let compare_at_poisha = match opt("compare_at_poisha") {
+            None => None,
+            Some(raw) => match parse_bulk_i64(&raw, "compare_at_poisha") {
+                Ok(value) if value >= 0 => Some(value),
+                Ok(_) => {
+                    errors.push(bulk_field_error(
+                        "compare_at_poisha",
+                        "compare_at_poisha must be >= 0 — তুলনামূলক মূল্য ঋণাত্মক হতে পারবে না",
+                    ));
+                    None
+                }
+                Err(error) => {
+                    errors.push(error);
+                    None
+                }
+            },
+        };
+
+        let stock = match opt("stock") {
+            None => 0,
+            Some(raw) => match parse_bulk_i64(&raw, "stock") {
+                Ok(value) => match i32::try_from(value) {
+                    Ok(stock) => stock,
+                    Err(_) => {
+                        errors.push(bulk_field_error(
+                            "stock",
+                            "stock is out of range — স্টকের পরিমাণ সীমার বাইরে",
+                        ));
+                        0
+                    }
+                },
+                Err(error) => {
+                    errors.push(error);
+                    0
+                }
+            },
+        };
+
+        let weight_grams = match opt("weight_grams") {
+            None => DEFAULT_WEIGHT_GRAMS,
+            Some(raw) => match parse_bulk_i64(&raw, "weight_grams") {
+                Ok(value) => value,
+                Err(error) => {
+                    errors.push(error);
+                    DEFAULT_WEIGHT_GRAMS
+                }
+            },
+        };
+
+        let status = opt("status").unwrap_or_else(|| "draft".to_string());
+
+        // Category cells: the slug must at least be
+        // slug-shaped (existence is the service's fact);
+        // the label runs the shared category validator.
+        let category_slug = match opt("category_slug") {
+            None => None,
+            Some(raw) => match validate_category_slug(&raw) {
+                Ok(slug) => Some(slug),
+                Err(message) => {
+                    errors.push(bulk_field_error("category_slug", message));
+                    None
+                }
+            },
+        };
+        let category_label = opt("category_label");
+        if let Some(label) = &category_label {
+            if let Err(message) = validate_category(Some(label)) {
+                errors.push(bulk_field_error("category_label", message));
+            }
+        }
+
+        let image_url = opt("image_url");
+        if let Some(url) = &image_url {
+            if url.chars().count() > MAX_BULK_IMAGE_URL_CHARS {
+                errors.push(bulk_field_error(
+                    "image_url",
+                    format!(
+                        "image_url must be at most {MAX_BULK_IMAGE_URL_CHARS} characters — \
+                         ছবির লিংক সর্বোচ্চ {MAX_BULK_IMAGE_URL_CHARS} অক্ষরের হতে পারবে"
+                    ),
+                ));
+            }
+        }
+
+        // The shared product validator — the same gate the
+        // single-create form passes — judges the mapped
+        // row as a whole; its message is attributed to the
+        // field its wording names.
+        let candidate = ProductInput {
+            title: title.clone(),
+            price_poisha,
+            stock,
+            status: status.clone(),
+            weight_grams,
+        };
+        if let Err(message) = validate_product_input(&candidate) {
+            let field = if message.starts_with("title") {
+                "title"
+            } else if message.starts_with("price") {
+                "price_poisha"
+            } else if message.starts_with("stock") {
+                "stock"
+            } else if message.starts_with("status") {
+                "status"
+            } else {
+                "weight_grams"
+            };
+            errors.push(bulk_field_error(field, message));
+        }
+        // The import-only price rule (the Facebook import's
+        // precedent): a product going on sale needs a real
+        // price — a zero price on an ACTIVE row means the
+        // sheet did not name one the seller has confirmed.
+        if status == "active"
+            && price_poisha == 0
+            && !errors.iter().any(|e| e.field == "price_poisha")
+        {
+            errors.push(bulk_field_error(
+                "price_poisha",
+                "an active product needs a price greater than zero — \
+                     সক্রিয় পণ্যের মূল্য শূন্যের বেশি হতে হবে",
+            ));
+        }
+
+        if errors.is_empty() {
+            rows.push(BulkProductRow {
+                row_number,
+                sku,
+                title,
+                title_bn: opt("title_bn"),
+                description: opt("description"),
+                price_poisha,
+                compare_at_poisha,
+                stock,
+                weight_grams,
+                status,
+                category_slug,
+                category_label,
+                image_url,
+            });
+        } else {
+            row_errors.push(BulkRowErrors {
+                row_number,
+                sku: if sku.is_empty() { None } else { Some(sku) },
+                errors,
+            });
+        }
+    }
+
+    Ok(BulkCsvParse { rows, row_errors })
+}
+
+/// The downloadable example sheet: the canonical header
+/// plus two fully-worked example rows (a live panjabi and
+/// a draft grocery staple), generated from
+/// [`BULK_IMPORT_COLUMNS`] so the template can never drift
+/// from the parser's contract.
+pub fn bulk_template_csv() -> String {
+    let header: Vec<String> = BULK_IMPORT_COLUMNS
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+    let example_one: Vec<String> = [
+        "PANJABI-001",
+        "Premium Cotton Panjabi",
+        "প্রিমিয়াম সুতি পাঞ্জাবি",
+        "Soft combed cotton, festive fit",
+        "185000",
+        "220000",
+        "25",
+        "400",
+        "active",
+        "panjabi",
+        "",
+        "",
+    ]
+    .iter()
+    .map(|cell| cell.to_string())
+    .collect();
+    let example_two: Vec<String> = [
+        "RICE-NAZIR-5KG",
+        "Nazirshail Rice 5kg",
+        "নাজিরশাইল চাল ৫ কেজি",
+        "Aromatic fine rice, Dinajpur",
+        "62000",
+        "",
+        "120",
+        "5000",
+        "draft",
+        "rice-grains",
+        "",
+        "",
+    ]
+    .iter()
+    .map(|cell| cell.to_string())
+    .collect();
+    write_csv(&[header, example_one, example_two])
+}
+
+// --- Bulk price math -------------------------------------------------------
+
+/// The valid range for a bulk-edit percent: a cut may not
+/// exceed 99% (the price must stay real), and an increase
+/// beyond +500% is treated as a typo, not an intention.
+pub const BULK_PERCENT_MIN: i64 = -99;
+pub const BULK_PERCENT_MAX: i64 = 500;
+
+/// Validate a bulk-edit percent (whole percent points).
+pub fn validate_bulk_percent(percent: i64) -> Result<i64, &'static str> {
+    if (BULK_PERCENT_MIN..=BULK_PERCENT_MAX).contains(&percent) {
+        Ok(percent)
+    } else {
+        Err("percent must be between -99 and 500")
+    }
+}
+
+/// A price after a percent change, in poisha: computed in
+/// i128 so no catalogue price can overflow, rounded half
+/// up to the nearest poisha, and floored at 1 poisha — a
+/// bulk percent cut may make a product cheap, never free
+/// (a free product is a promotion decision, not a bulk
+/// edit). `None` for an out-of-range percent or a
+/// non-positive starting price.
+pub fn bulk_price_after_percent(price_poisha: i64, percent: i64) -> Option<i64> {
+    if price_poisha < 1 || validate_bulk_percent(percent).is_err() {
+        return None;
+    }
+    let scaled = i128::from(price_poisha) * i128::from(100 + percent);
+    let rounded = (scaled + 50) / 100;
+    let result = i64::try_from(rounded).ok()?;
+    Some(result.max(1))
+}
+
+/// A price after a fixed poisha delta, checked: the
+/// result must stay at or above 1 poisha (same floor as
+/// the percent rule) and inside i64. `None` otherwise.
+pub fn bulk_price_after_delta(price_poisha: i64, delta_poisha: i64) -> Option<i64> {
+    let result = price_poisha.checked_add(delta_poisha)?;
+    if result < 1 {
+        None
+    } else {
+        Some(result)
+    }
+}
+
+/// A bulk stock SET target: the products table stores
+/// stock as i32 and the domain validator already requires
+/// non-negative, so the target must fit both.
+pub fn validate_bulk_stock_target(stock: i64) -> Result<i32, &'static str> {
+    if stock < 0 {
+        return Err("stock must be >= 0");
+    }
+    i32::try_from(stock).map_err(|_| "stock is out of range")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11534,5 +12250,359 @@ mod tests {
         assert_eq!(mens.children[0].slug, "panjabi");
         assert_eq!(mens.children[0].depth, 3);
         assert!(mens.children[0].children.is_empty());
+    }
+
+    // -- Wave 57: bulk CSV -------------------------------------------
+
+    #[test]
+    fn csv_parser_handles_quotes_commas_and_embedded_newlines() {
+        let parsed = parse_csv("a,b,c\n\"x,y\",\"he said \"\"hi\"\"\",\"line1\nline2\"\n")
+            .expect("parse");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0], vec!["a", "b", "c"]);
+        assert_eq!(parsed[1], vec!["x,y", "he said \"hi\"", "line1\nline2"]);
+    }
+
+    #[test]
+    fn csv_parser_handles_crlf_cr_and_bom() {
+        let parsed = parse_csv("\u{feff}a,b\r\nc,d\re,f").expect("parse");
+        assert_eq!(
+            parsed,
+            vec![
+                vec!["a".to_string(), "b".to_string()],
+                vec!["c".to_string(), "d".to_string()],
+                vec!["e".to_string(), "f".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn csv_parser_trailing_newline_makes_no_phantom_row() {
+        assert_eq!(parse_csv("a,b\n").expect("parse").len(), 1);
+        assert_eq!(parse_csv("a,b").expect("parse").len(), 1);
+        assert!(parse_csv("").expect("parse").is_empty());
+    }
+
+    #[test]
+    fn csv_parser_rejects_an_unterminated_quote() {
+        let err = parse_csv("a,\"never closed\nnext").expect_err("must fail");
+        assert!(err.contains("unterminated"), "got: {err}");
+    }
+
+    #[test]
+    fn csv_writer_round_trips_through_the_parser() {
+        let rows = vec![
+            vec!["sku".to_string(), "title".to_string()],
+            vec![
+                "A-1".to_string(),
+                "Comma, quote \"and\" newline\ninside".to_string(),
+            ],
+            vec!["B-2".to_string(), "পাঞ্জাবি".to_string()],
+        ];
+        let text = write_csv(&rows);
+        assert_eq!(parse_csv(&text).expect("reparse"), rows);
+    }
+
+    #[test]
+    fn csv_escape_quotes_only_when_needed() {
+        assert_eq!(csv_escape_field("plain"), "plain");
+        assert_eq!(csv_escape_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_escape_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv_escape_field(""), "");
+    }
+
+    fn bulk_sheet(rows: &[&str]) -> String {
+        let mut text = String::from(
+            "sku,title,title_bn,description,price_poisha,compare_at_poisha,stock,\
+             weight_grams,status,category_slug,category_label,image_url\n",
+        );
+        for row in rows {
+            text.push_str(row);
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn bulk_rows_parse_with_defaults_and_trimming() {
+        // Columns: sku,title,title_bn,description,
+        // price_poisha,compare_at_poisha,stock,
+        // weight_grams,status,category_slug,
+        // category_label,image_url
+        let parsed = parse_bulk_product_csv(&bulk_sheet(&[
+            " SKU-1 , Cotton Panjabi ,,সুতির পাঞ্জাবি,185000,,25,,active,panjabi,,",
+            "SKU-2,Draft Thing,,,5000,,,,,,,",
+        ]))
+        .expect("parse");
+        assert!(parsed.row_errors.is_empty(), "{:?}", parsed.row_errors);
+        assert_eq!(parsed.rows.len(), 2);
+        let row = &parsed.rows[0];
+        assert_eq!(row.row_number, 2);
+        assert_eq!(row.sku, "SKU-1");
+        assert_eq!(row.title, "Cotton Panjabi");
+        assert_eq!(row.price_poisha, 185_000);
+        assert_eq!(row.stock, 25);
+        assert_eq!(row.weight_grams, DEFAULT_WEIGHT_GRAMS);
+        assert_eq!(row.status, "active");
+        assert_eq!(row.category_slug.as_deref(), Some("panjabi"));
+        assert_eq!(row.title_bn, None);
+        // Blank status defaults to draft (a sheet that does
+        // not say otherwise never publishes by accident).
+        assert_eq!(parsed.rows[1].status, "draft");
+        assert_eq!(parsed.rows[1].row_number, 3);
+    }
+
+    #[test]
+    fn bulk_rows_accumulate_every_field_error() {
+        let parsed = parse_bulk_product_csv(&bulk_sheet(&[
+            // Empty sku, empty title, non-numeric price,
+            // negative stock, bad status, bad slug.
+            ",,,,\"not-a-number\",,-5,,bogus,Bad Slug,,",
+            "OK-1,Good Row,,,1000,,,,active,,,",
+        ]))
+        .expect("parse");
+        assert_eq!(parsed.rows.len(), 1, "the good row survives");
+        assert_eq!(parsed.row_errors.len(), 1);
+        let bad = &parsed.row_errors[0];
+        assert_eq!(bad.row_number, 2);
+        let fields: Vec<&str> = bad.errors.iter().map(|e| e.field.as_str()).collect();
+        assert!(fields.contains(&"sku"), "{fields:?}");
+        assert!(fields.contains(&"title"), "{fields:?}");
+        assert!(fields.contains(&"price_poisha"), "{fields:?}");
+        assert!(fields.contains(&"stock"), "{fields:?}");
+        assert!(fields.contains(&"status"), "{fields:?}");
+        assert!(fields.contains(&"category_slug"), "{fields:?}");
+    }
+
+    #[test]
+    fn bulk_rows_reject_a_decimal_price_and_a_zero_active_price() {
+        let parsed = parse_bulk_product_csv(&bulk_sheet(&[
+            "D-1,Decimal Price,,,1850.50,,,,active,,,",
+            "Z-1,Zero Price,,,0,,,,active,,,",
+            "Z-2,Zero Draft,,,0,,,,draft,,,",
+        ]))
+        .expect("parse");
+        // The decimal is not a whole number of poisha; the
+        // zero price is refused only for the ACTIVE row —
+        // a draft may sit priceless until it is priced.
+        assert_eq!(parsed.rows.len(), 1);
+        assert_eq!(parsed.rows[0].sku, "Z-2");
+        assert_eq!(parsed.row_errors.len(), 2);
+        assert!(parsed.row_errors[0]
+            .errors
+            .iter()
+            .any(|e| e.field == "price_poisha"));
+        assert!(parsed.row_errors[1]
+            .errors
+            .iter()
+            .any(|e| e.field == "price_poisha"));
+    }
+
+    #[test]
+    fn bulk_rows_flag_duplicate_skus_and_skip_blank_rows() {
+        let parsed = parse_bulk_product_csv(&bulk_sheet(&[
+            "DUP-1,First,,,1000,,,,draft,,,",
+            "",
+            "DUP-1,Second,,,2000,,,,draft,,,",
+        ]))
+        .expect("parse");
+        assert_eq!(parsed.rows.len(), 1);
+        assert_eq!(parsed.rows[0].title, "First");
+        assert_eq!(parsed.row_errors.len(), 1);
+        assert_eq!(parsed.row_errors[0].row_number, 4);
+        assert_eq!(parsed.row_errors[0].sku.as_deref(), Some("DUP-1"));
+        assert!(parsed.row_errors[0]
+            .errors
+            .iter()
+            .any(|e| e.field == "sku"));
+    }
+
+    #[test]
+    fn bulk_sheet_header_contract_is_fatal_when_broken() {
+        // Missing a required column.
+        assert!(parse_bulk_product_csv("sku,title\nA,Thing\n").is_err());
+        // Unknown column.
+        assert!(parse_bulk_product_csv("sku,title,price_poisha,colour\nA,T,1,red\n").is_err());
+        // Duplicated column.
+        assert!(parse_bulk_product_csv("sku,sku,title,price_poisha\nA,A,T,1\n").is_err());
+        // Empty file.
+        assert!(parse_bulk_product_csv("").is_err());
+        // Header case and padding are forgiving.
+        let parsed =
+            parse_bulk_product_csv(" SKU , Title , PRICE_POISHA \nA,Thing,100\n").expect("parse");
+        assert_eq!(parsed.rows.len(), 1);
+    }
+
+    #[test]
+    fn bulk_sheet_row_limit_is_fatal() {
+        let mut text = String::from("sku,title,price_poisha\n");
+        for index in 0..=MAX_BULK_IMPORT_ROWS {
+            text.push_str(&format!("S-{index},Thing,100\n"));
+        }
+        let err = parse_bulk_product_csv(&text).expect_err("over the cap");
+        assert!(err.contains("500"), "got: {err}");
+    }
+
+    #[test]
+    fn bulk_template_parses_and_its_rows_validate() {
+        let template = bulk_template_csv();
+        let parsed = parse_bulk_product_csv(&template).expect("template parses");
+        assert!(parsed.row_errors.is_empty(), "{:?}", parsed.row_errors);
+        assert_eq!(parsed.rows.len(), 2);
+        assert_eq!(parsed.rows[0].status, "active");
+        assert_eq!(parsed.rows[1].status, "draft");
+    }
+
+    #[test]
+    fn bulk_percent_math_rounds_half_up_and_floors_at_one() {
+        assert_eq!(bulk_price_after_percent(100_000, -10), Some(90_000));
+        assert_eq!(bulk_price_after_percent(100_000, 10), Some(110_000));
+        // 105 * 1.10 = 115.5 -> 116 (half up).
+        assert_eq!(bulk_price_after_percent(105, 10), Some(116));
+        // 150 * 0.99 = 148.5 -> 149.
+        assert_eq!(bulk_price_after_percent(150, -1), Some(149));
+        // A 99% cut on 100 poisha leaves exactly 1.
+        assert_eq!(bulk_price_after_percent(100, -99), Some(1));
+        // A 99% cut on 50 poisha would leave 0.5 -> the
+        // floor keeps the product at 1 poisha, never free.
+        assert_eq!(bulk_price_after_percent(50, -99), Some(1));
+        assert_eq!(bulk_price_after_percent(0, 10), None);
+        assert_eq!(bulk_price_after_percent(100, -100), None);
+        assert_eq!(bulk_price_after_percent(100, 501), None);
+        assert_eq!(validate_bulk_percent(-99), Ok(-99));
+        assert!(validate_bulk_percent(-100).is_err());
+    }
+
+    #[test]
+    fn bulk_delta_math_is_checked_and_floored() {
+        assert_eq!(bulk_price_after_delta(1_000, -250), Some(750));
+        assert_eq!(bulk_price_after_delta(1_000, -999), Some(1));
+        assert_eq!(bulk_price_after_delta(1_000, -1_000), None);
+        assert_eq!(bulk_price_after_delta(i64::MAX, 1), None);
+        assert_eq!(validate_bulk_stock_target(0), Ok(0));
+        assert!(validate_bulk_stock_target(-1).is_err());
+        assert!(validate_bulk_stock_target(i64::from(i32::MAX) + 1).is_err());
+    }
+
+    #[test]
+    fn csv_parser_quoted_crlf_and_empty_trailing_fields() {
+        // A quoted field may carry a full CRLF pair, and a
+        // row may end in empty unquoted fields.
+        let parsed = parse_csv("\"a\r\nb\",c,\r\n").expect("parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0], vec!["a\r\nb", "c", ""]);
+        // A file that is only a header line plus its
+        // newline is one row.
+        assert_eq!(parse_csv("h1,h2\n").expect("parse").len(), 1);
+        // An empty quoted field is a real empty field.
+        let parsed = parse_csv("\"\",x").expect("parse");
+        assert_eq!(parsed[0], vec!["", "x"]);
+    }
+
+    #[test]
+    fn csv_writer_quotes_bangla_commas_and_quotes_minimally() {
+        let rows = vec![vec![
+            "ঢাকা, বাংলাদেশ".to_string(),
+            "plain".to_string(),
+            "with \"quote\"".to_string(),
+        ]];
+        let text = write_csv(&rows);
+        assert!(text.contains("\"ঢাকা, বাংলাদেশ\""), "{text}");
+        assert!(text.contains(",plain,"), "{text}");
+        assert!(text.ends_with("\r\n"), "CRLF terminated: {text:?}");
+        assert_eq!(parse_csv(&text).expect("reparse"), rows);
+    }
+
+    #[test]
+    fn bulk_row_maps_every_column() {
+        let parsed = parse_bulk_product_csv(&bulk_sheet(&[concat!(
+            "FULL-1,Full Title,পূর্ণ শিরোনাম,A description,123456,150000,42,750,",
+            "archived,electronics,Gadgets,https://example.com/x.jpg"
+        )]))
+        .expect("parse");
+        assert!(parsed.row_errors.is_empty(), "{:?}", parsed.row_errors);
+        let row = &parsed.rows[0];
+        assert_eq!(row.sku, "FULL-1");
+        assert_eq!(row.title, "Full Title");
+        assert_eq!(row.title_bn.as_deref(), Some("পূর্ণ শিরোনাম"));
+        assert_eq!(row.description.as_deref(), Some("A description"));
+        assert_eq!(row.price_poisha, 123_456);
+        assert_eq!(row.compare_at_poisha, Some(150_000));
+        assert_eq!(row.stock, 42);
+        assert_eq!(row.weight_grams, 750);
+        assert_eq!(row.status, "archived");
+        assert_eq!(row.category_slug.as_deref(), Some("electronics"));
+        assert_eq!(row.category_label.as_deref(), Some("Gadgets"));
+        assert_eq!(row.image_url.as_deref(), Some("https://example.com/x.jpg"));
+    }
+
+    #[test]
+    fn bulk_row_column_order_is_free() {
+        // The header maps by name: a sheet with its
+        // columns shuffled parses identically.
+        let text = "price_poisha,sku,title\n500,SHUF-1,Shuffled\n";
+        let parsed = parse_bulk_product_csv(text).expect("parse");
+        assert_eq!(parsed.rows.len(), 1);
+        assert_eq!(parsed.rows[0].sku, "SHUF-1");
+        assert_eq!(parsed.rows[0].price_poisha, 500);
+        // Only the three required columns are mandatory;
+        // the rest take their defaults.
+        assert_eq!(parsed.rows[0].status, "draft");
+        assert_eq!(parsed.rows[0].stock, 0);
+    }
+
+    #[test]
+    fn bulk_row_wrong_cell_count_is_a_row_error() {
+        let parsed = parse_bulk_product_csv(&bulk_sheet(&[
+            "SHORT-1,Only Two",
+            "OK-9,Fine,,,100,,,,draft,,,",
+        ]))
+        .expect("parse");
+        assert_eq!(parsed.rows.len(), 1);
+        assert_eq!(parsed.row_errors.len(), 1);
+        assert_eq!(parsed.row_errors[0].row_number, 2);
+        assert_eq!(parsed.row_errors[0].errors[0].field, "row");
+        assert_eq!(parsed.row_errors[0].sku, None);
+    }
+
+    #[test]
+    fn bulk_row_rejects_negative_compare_and_huge_stock() {
+        let parsed = parse_bulk_product_csv(&bulk_sheet(&[
+            "NEG-1,Neg Compare,,,100,-5,,,,draft,,,",
+            "HUGE-1,Huge Stock,,,100,,9999999999999,,,draft,,,",
+            "W-1,Bad Weight,,,100,,,0,draft,,,",
+        ]))
+        .expect("parse");
+        assert!(parsed.rows.is_empty(), "{:?}", parsed.rows);
+        assert_eq!(parsed.row_errors.len(), 3);
+        assert!(parsed.row_errors[0]
+            .errors
+            .iter()
+            .any(|e| e.field == "compare_at_poisha"));
+        assert!(parsed.row_errors[1]
+            .errors
+            .iter()
+            .any(|e| e.field == "stock"));
+        // Weight 0 is below the domain minimum (1 gram).
+        assert!(parsed.row_errors[2]
+            .errors
+            .iter()
+            .any(|e| e.field == "weight_grams"));
+    }
+
+    #[test]
+    fn bulk_row_sku_rules() {
+        let long_sku = "X".repeat(MAX_BULK_SKU_CHARS + 1);
+        let sheet = bulk_sheet(&[
+            &format!("{long_sku},Too Long,,,100,,,,draft,,,"),
+            "OK-2,Fine,,,100,,,,draft,,,",
+        ]);
+        let parsed = parse_bulk_product_csv(&sheet).expect("parse");
+        assert_eq!(parsed.rows.len(), 1);
+        assert_eq!(parsed.row_errors.len(), 1);
+        assert!(parsed.row_errors[0]
+            .errors
+            .iter()
+            .any(|e| e.field == "sku"));
     }
 }

@@ -337,6 +337,8 @@ export default function SellerDashboardPage() {
         {" · "}
         <Link href="/seller/import">Facebook থেকে ইমপোর্ট — Import</Link>
         {" · "}
+        <Link href="/seller/bulk">বাল্ক ক্যাটালগ — Bulk catalogue</Link>
+        {" · "}
         <Link href="/seller/inbox">ইনবক্স — Inbox</Link>
         {" · "}
         <Link href="/seller/questions">প্রশ্নোত্তর — Q&amp;A</Link>

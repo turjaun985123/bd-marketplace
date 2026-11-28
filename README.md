@@ -4791,6 +4791,144 @@ glyphs, not category images (a node borrows its cover
 from its best-selling imaged product, the Wave 53
 pattern).
 
+Wave 57 (seller bulk catalogue + demo catalogue seed —
+the Shopify-parity program continues):
+
+**The spreadsheet door.** Real sellers keep catalogues
+in sheets, not forms. The domain gains a
+dependency-free CSV parser/writer (quoted fields,
+embedded commas/quotes/newlines, CRLF, BOM) and the
+bulk row rules: one column contract (`sku`, `title`,
+`title_bn`, `description`, `price_poisha`,
+`compare_at_poisha`, `stock`, `weight_grams`, `status`,
+`category_slug`, `category_label`, `image_url` — prices
+in poisha, like everywhere), per-row validation reusing
+the SAME product validators the single-create form
+passes, per-row error accumulation (spreadsheet row
+number + field + bilingual message), and the batch caps
+(500 rows per import, 200 products per bulk edit). A
+blank `status` cell defaults to `draft` — a sheet that
+does not say otherwise never publishes by accident —
+and an ACTIVE row requires a price above zero.
+
+**Bulk import** (`POST /v1/seller/products/bulk-import?store_id=&dry_run=`,
+raw CSV body, route body limit 4 MiB; the Wave 12
+Facebook import keeps its own `/import` route). Store
+scoping is the Wave 34 rule (`manage_catalog` — owners,
+managers and staff may import; strangers get the access
+module's 404). Idempotency mirrors Wave 12: the sheet's
+`sku` is stored as the product's `source_ref` with
+`source = 'bulk'`, so re-importing a sheet UPDATES
+price/stock instead of duplicating; a sku already
+claimed by another source is a per-row error, never a
+hijack. The three invariants the wave was built around:
+the **plan-cap gate** is the shared
+`product_cap_for_store` — the batch spends the store's
+remaining budget on net-new rows in file order, rows
+past the budget fail individually and the rest still
+applies (partial apply), and updates never consume
+budget; the **follower-notice funnel** is the shared
+`enqueue_store_new_product_notices`, fired only for
+rows born active AND newly created, inside the row's
+own transaction (updates never notify — a re-import is
+a sync, not a publish); the **single stock path** holds
+— a re-import that changes stock writes the new value
+and its `stock_adjustments` row in the same transaction
+through the Wave 23 writer (reason `count_fix`), and a
+product whose stock lives on its variants keeps that
+stock with a note on its outcome instead of an error.
+Category resolution is per row through the Wave 56
+taxonomy (slug wins over label; a label links on the
+exact-match rule and is stored as typed; a non-matching
+label stays free-text with a note). A row's `image_url`
+attaches afterwards through the Wave 51 from-url
+service — best-effort, its failure rides the outcome's
+`image_error` and never fails the row. Dry runs compute
+the identical report (`would_create` / `would_update`)
+and write no products — but they ARE recorded, like
+every completed run, in the import history (migration
+0063, `bulk_imports`): `GET …/import-history` lists a
+store's runs with counts, `GET …/import-history/{id}`
+re-opens the full stored report. Fatally malformed
+files (unparseable CSV, unknown/missing/duplicated
+header column, over the row cap) refuse the whole
+request with a 400, write nothing and record nothing.
+`GET …/import-template.csv` downloads an example sheet
+generated from the domain column spec, so it cannot
+drift from the parser's contract.
+
+**Bulk edit** (`POST /v1/seller/products/bulk-edit`):
+price (set / percent / fixed poisha delta — the
+domain's checked math: percent rounds half up to the
+poisha and floors at 1 poisha, so a bulk cut can never
+make a product free), stock (set / adjust — computed as
+a delta and applied ONLY through the Wave 23 audited
+adjust-stock service), status flips and category
+assignment (slug / id / label, resolved once per
+request). Price, status and category ride the shared
+single-product update path, so its merged validation,
+variant-stranding guard and draft→active follower
+notice all apply unchanged. Per-item outcomes: a
+foreign or missing product id is an error entry, never
+silently skipped; request-shape problems (no ids, no
+action, bad percent) are whole-request 400s. The batch
+is deliberately not one transaction (the Wave 40
+bulk-book precedent) — the report names exactly what
+landed.
+
+**Catalogue export** (`GET /v1/seller/products/export.csv?store_id=`):
+the store's whole catalogue in the import's own column
+format — export, edit, re-import is the round-trip
+(pinned by test, including the category links). Base
+product rows only: variants are managed in their own
+module and are deliberately not flattened into the
+sheet. The `sku` column is the product's `source_ref`;
+products created outside an import carry none and
+export with a blank sku — assign one in the sheet
+before re-importing those rows (the import requires a
+sku and will say so per row, never silently duplicate).
+The exported stock is the product's stored pool; for a
+variant product the live stock is its variants' sum and
+a re-import reports stock changes as variant-managed.
+
+**The demo catalogue seed.** `worker seed-demo` (a
+one-shot subcommand of the worker binary) refuses to
+run unless `DEMO_SEED=1` is set, then builds the demo
+catalogue THROUGH the same service functions — eight
+demo stores across the taxonomy (fashion, electronics,
+grocery, home, beauty, agriculture, sports, baby &
+kids) with 161 products defined as compact data tables in
+`crates/api/src/demo_catalogue.rs` (realistic BD
+products with Bangla + English titles, poisha prices,
+weights, Wave 56 category slugs). Each store's sheet
+runs through the bulk import itself, so re-running the
+seed updates in place (keyed on sku) instead of
+duplicating. Each newly created product receives ONE
+generated placeholder image through the real Wave 51
+upload pipeline — a deterministic gradient rendered
+in-process from the product's sku by the `image` crate,
+no network — honestly labelled as a placeholder in its
+alt text; it demonstrates the media system, it is not
+product photography. The seller web gains a
+`/seller/bulk` page: CSV upload with dry-run preview
+(the report as a table), the template + export
+downloads, the import history with re-openable reports,
+and a bulk-edit panel over the store's product list.
+
+Honest limits: the import is CSV only (no XLSX — a
+seller saves-as CSV, the universal exchange format);
+import updates never fire follower notices and never
+touch variants (variant stock and variant prices stay
+in their own module); a blank optional cell on an
+update row leaves the stored value standing (title_bn,
+description, compare_at), while data columns
+(title, price, stock, weight, status, category) always
+overwrite — the sheet is the truth for those; the seed's
+demo seller accounts use sequential 0171-range numbers
+created only behind the `DEMO_SEED=1` guard, and the
+seed's placeholder images are generated art, stated
+above.
+
 ## How to run
 
 With a database (Wave 2 features):
@@ -6359,6 +6497,30 @@ taxonomy-first /categories, the subtree product list
 endpoint, the marketplace category nav bar with its
 mega panel, and in-store category landings. See the
 Wave 56 section.
+
+**Real (Wave 57):** seller bulk catalogue tools —
+a dependency-free domain CSV parser/writer plus the
+bulk row rules (one column contract, the shared product
+validators, per-row error accumulation, caps 500/200);
+the bulk import (`POST /v1/seller/products/bulk-import`,
+dry-run mode, sku→source_ref idempotency with
+update-on-reimport, the shared plan-cap gate in
+partial-apply form, the shared follower-notice funnel
+for born-active creations only, stock moves through
+the Wave 23 writer, per-row Wave 56 category
+resolution, best-effort Wave 51 image-URL attach);
+import history (migration 0063) with re-openable
+reports and a generated example template; the bulk
+edit (price set/percent/delta with checked poisha
+math floored at 1, stock only through the audited
+adjust path, status + category through the shared
+update path, per-item outcomes); the round-trip
+catalogue export in the import's own format; the
+`worker seed-demo` subcommand (DEMO_SEED=1-guarded)
+building an 8-store / 161-product demo catalogue
+through the same services with generated placeholder
+images; and the /seller/bulk page. See the Wave 57
+section.
 
 **Stubbed (typed errors — never fake success, no network calls):**
 none among the couriers — all five API couriers have real

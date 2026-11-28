@@ -338,10 +338,14 @@ pub mod analytics;
 pub mod api_keys;
 pub mod audit;
 pub mod auth;
+pub mod bulk_edit;
+pub mod bulk_import;
 pub mod cart;
 pub mod categories;
 pub mod coupons;
 pub mod delivery_estimates;
+pub mod demo_catalogue;
+pub mod demo_seed;
 pub mod exports;
 pub mod facebook;
 pub mod follows;
@@ -1775,6 +1779,41 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/seller/products/import-from-page",
             post(facebook::import_from_page),
         )
+        // Wave 57 — bulk catalogue: CSV import (raw sheet
+        // body, dry-run via query), bulk edit, the
+        // round-trip export, the generated template and the
+        // import history. `/import` above stays the
+        // Facebook import's route; the bulk sheet door is
+        // `bulk-import`. The literal segments sit beside
+        // the `:id` subroutes below, which axum 0.7
+        // accepts (a static segment wins over `:id`).
+        .route(
+            "/v1/seller/products/bulk-import",
+            post(bulk_import::bulk_import_handler)
+                .layer(DefaultBodyLimit::max(
+                    bulk_import::BULK_IMPORT_BODY_LIMIT_BYTES,
+                )),
+        )
+        .route(
+            "/v1/seller/products/bulk-edit",
+            post(bulk_edit::bulk_edit_handler),
+        )
+        .route(
+            "/v1/seller/products/export.csv",
+            get(bulk_import::bulk_export_handler),
+        )
+        .route(
+            "/v1/seller/products/import-template.csv",
+            get(bulk_import::bulk_import_template_handler),
+        )
+        .route(
+            "/v1/seller/products/import-history",
+            get(bulk_import::bulk_import_history_handler),
+        )
+        .route(
+            "/v1/seller/products/import-history/:id",
+            get(bulk_import::bulk_import_detail_handler),
+        )
         // Wave 13 — messaging: buyer <-> store conversations
         // (find-or-create, thread with read markers, close), the
         // SIDRA reply callback, and the seller's SIDRA controls
@@ -1822,6 +1861,12 @@ pub fn build_app(state: AppState) -> Router {
         // Wave 43 — the observability snapshot: point-in-time
         // platform health (orders today, backlogs, stale work).
         .route("/v1/admin/metrics", get(metrics::admin_metrics_handler))
+        // Wave 57 — the operator's cross-store bulk-import
+        // activity view (the seller history, platform-wide).
+        .route(
+            "/v1/admin/bulk-imports",
+            get(bulk_import::admin_bulk_imports_handler),
+        )
         .route(
             "/v1/admin/analytics",
             get(analytics::admin_analytics_handler),

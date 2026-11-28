@@ -861,6 +861,227 @@ async function callForm<T>(
   return data;
 }
 
+/**
+ * The raw-text sibling of `call` (Wave 57): sends a plain-text
+ * body (the bulk-import sheet) and parses a JSON response, or —
+ * with `responseType: "text"` — returns the response text
+ * itself (the CSV template and catalogue export downloads).
+ * Same error convention as `call`.
+ */
+async function callText<T>(
+  path: string,
+  options: {
+    method?: string;
+    token?: string | null;
+    body?: string;
+    contentType?: string;
+    responseType?: "json" | "text";
+  } = {}
+): Promise<T> {
+  const headers: Record<string, string> = {};
+  if (options.body !== undefined)
+    headers["Content-Type"] = options.contentType ?? "text/plain; charset=utf-8";
+  if (options.token) headers["Authorization"] = `Bearer ${options.token}`;
+  const res = await fetch(`${apiBase()}${path}`, {
+    method: options.method ?? "GET",
+    headers,
+    body: options.body,
+  });
+  if (options.responseType === "text") {
+    const text = await res.text();
+    if (!res.ok) throw new Error(text || `API returned ${res.status}`);
+    return text as T;
+  }
+  const data = (await res.json().catch(() => ({}))) as { error?: string } & T;
+  if (!res.ok) {
+    throw new Error(data.error ?? `API returned ${res.status}`);
+  }
+  return data;
+}
+
+// ---- Bulk catalogue (Wave 57) ----
+
+/** One field-level problem with a bulk-import row. */
+export interface BulkFieldError {
+  field: string;
+  message: string;
+}
+
+/** One row's outcome in a bulk-import report. */
+export interface BulkRowOutcome {
+  row_number: number;
+  sku: string | null;
+  action: "created" | "updated" | "error" | "would_create" | "would_update";
+  product_id: string | null;
+  errors: BulkFieldError[];
+  notes: string[];
+  image_error: string | null;
+}
+
+/** POST /v1/seller/products/bulk-import — the run's full report. */
+export interface BulkImportReport {
+  import_id: string | null;
+  store_id: string;
+  dry_run: boolean;
+  total_rows: number;
+  created: number;
+  updated: number;
+  skipped: number;
+  outcomes: BulkRowOutcome[];
+}
+
+/** One entry of GET /v1/seller/products/import-history. */
+export interface BulkImportSummary {
+  id: string;
+  store_id: string;
+  dry_run: boolean;
+  total_rows: number;
+  created_count: number;
+  updated_count: number;
+  error_count: number;
+  created_at: string;
+}
+
+/**
+ * POST /v1/seller/products/bulk-import?store_id=&dry_run= —
+ * run one CSV sheet (the raw sheet text is the body). A dry
+ * run validates and reports without writing anything.
+ */
+export function importBulkCsv(
+  token: string,
+  storeId: string,
+  csvText: string,
+  dryRun: boolean
+): Promise<BulkImportReport> {
+  const query = `store_id=${encodeURIComponent(storeId)}&dry_run=${dryRun ? "true" : "false"}`;
+  return callText(`/v1/seller/products/bulk-import?${query}`, {
+    method: "POST",
+    token,
+    body: csvText,
+    contentType: "text/csv; charset=utf-8",
+  });
+}
+
+/** GET /v1/seller/products/import-template.csv — the example sheet. */
+export function getBulkImportTemplate(token: string): Promise<string> {
+  return callText("/v1/seller/products/import-template.csv", {
+    token,
+    responseType: "text",
+  });
+}
+
+/**
+ * GET /v1/seller/products/export.csv?store_id= — the store's
+ * catalogue in the import's own column format (the
+ * export → edit → re-import round-trip).
+ */
+export function exportCatalogueCsv(
+  token: string,
+  storeId: string
+): Promise<string> {
+  return callText(
+    `/v1/seller/products/export.csv?store_id=${encodeURIComponent(storeId)}`,
+    { token, responseType: "text" }
+  );
+}
+
+/** GET /v1/seller/products/import-history?store_id= — past runs. */
+export function listBulkImportHistory(
+  token: string,
+  storeId: string
+): Promise<BulkImportSummary[]> {
+  return call(
+    `/v1/seller/products/import-history?store_id=${encodeURIComponent(storeId)}`,
+    { token }
+  );
+}
+
+/** GET /v1/seller/products/import-history/{id} — one run's stored report. */
+export function getBulkImportDetail(
+  token: string,
+  importId: string
+): Promise<BulkImportReport> {
+  return call(
+    `/v1/seller/products/import-history/${encodeURIComponent(importId)}`,
+    { token }
+  );
+}
+
+/** A bulk-edit price action (set / percent / fixed poisha delta). */
+export type BulkPriceAction =
+  | { mode: "set"; price_poisha: number }
+  | { mode: "percent"; percent: number }
+  | { mode: "adjust"; delta_poisha: number };
+
+/** A bulk-edit stock action (set the count / adjust by a delta). */
+export type BulkStockAction =
+  | { mode: "set"; stock: number }
+  | { mode: "adjust"; delta: number };
+
+/** POST /v1/seller/products/bulk-edit request body. */
+export interface BulkEditRequestBody {
+  product_ids: string[];
+  price?: BulkPriceAction;
+  stock?: BulkStockAction;
+  status?: string;
+  category?: {
+    category_id?: string;
+    category_slug?: string;
+    category_label?: string;
+  };
+}
+
+/** One product's outcome in a bulk-edit report. */
+export interface BulkEditOutcome {
+  product_id: string;
+  ok: boolean;
+  error: string | null;
+  changed: string[];
+}
+
+/** POST /v1/seller/products/bulk-edit — the batch report. */
+export interface BulkEditReport {
+  total: number;
+  succeeded: number;
+  failed: number;
+  outcomes: BulkEditOutcome[];
+}
+
+/** POST /v1/seller/products/bulk-edit — apply actions to up to 200 products. */
+export function bulkEditProducts(
+  token: string,
+  body: BulkEditRequestBody
+): Promise<BulkEditReport> {
+  return call("/v1/seller/products/bulk-edit", {
+    method: "POST",
+    token,
+    body,
+  });
+}
+
+/** One row of GET /v1/admin/bulk-imports (Wave 57). */
+export interface AdminBulkImportEntry {
+  id: string;
+  store_id: string;
+  store_slug: string;
+  store_name: string;
+  actor_phone_masked: string;
+  dry_run: boolean;
+  total_rows: number;
+  created_count: number;
+  updated_count: number;
+  error_count: number;
+  created_at: string;
+}
+
+/** GET /v1/admin/bulk-imports — recent bulk-import runs across all stores. */
+export function listAdminBulkImports(
+  token: string,
+  limit = 50
+): Promise<AdminBulkImportEntry[]> {
+  return call(`/v1/admin/bulk-imports?limit=${limit}`, { token });
+}
+
 // ---- Product media (Wave 51) ----
 
 /** GET /v1/seller/products/{id}/images — the owner's full image list. */
