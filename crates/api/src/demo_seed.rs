@@ -238,13 +238,13 @@ fn placeholder_png(product: &DemoProductDef) -> Vec<u8> {
         let dy = i64::from(y) - i64::from(size) / 2;
         let in_disc = dx * dx + dy * dy < i64::from(size / 4) * i64::from(size / 4);
         if in_disc {
-            image::Rgb(
+            image::Rgb([
                 blend(accent.0, 255),
                 blend(accent.1, 255),
                 blend(accent.2, 255),
-            )
+            ])
         } else {
-            image::Rgb(blend(base.0, accent.0), blend(base.1, accent.1), blend(base.2, accent.2))
+            image::Rgb([blend(base.0, accent.0), blend(base.1, accent.1), blend(base.2, accent.2)])
         }
     });
     let mut bytes: Vec<u8> = Vec::new();

@@ -50,7 +50,7 @@ export function parseCsvPreview(text: string): string[][] | null {
   let field = "";
   let rowStarted = false;
   let state: "start" | "field" | "quotes" | "afterQuote" = "start";
-  const chars = [...input];
+  const chars = Array.from(input);
   for (let i = 0; i < chars.length; i += 1) {
     const ch = chars[i];
     if (state === "start") {

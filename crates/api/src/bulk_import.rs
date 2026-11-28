@@ -163,8 +163,8 @@ fn resolve_bulk_category(
     }
     if let Some(label) = &row.category_label {
         return match domain::resolve_category_link(label, flats) {
-            Some(node) => {
-                let id = Uuid::parse_str(&node.id).map_err(|_| BulkFieldError {
+            Some(node_id) => {
+                let id = Uuid::parse_str(&node_id).map_err(|_| BulkFieldError {
                     field: "category_label".to_string(),
                     message: "category id is malformed".to_string(),
                 })?;
@@ -522,7 +522,7 @@ async fn update_bulk_product(
                     .to_string(),
             );
         } else {
-            let delta = i64::from(row.stock) - i64::from(existing.stock);
+            let delta = row.stock - existing.stock;
             sqlx::query("UPDATE products SET stock = $2 WHERE id = $1")
                 .bind(product_id)
                 .bind(row.stock)
@@ -535,12 +535,12 @@ async fn update_bulk_product(
                     product_id,
                     variant_id: None,
                     store_id: existing.store_id,
-                    actor: "seller".to_string(),
+                    actor: "seller",
                     actor_user_id: Some(user.user_id),
                     delta,
-                    new_stock: i64::from(row.stock),
-                    reason: "count_fix".to_string(),
-                    note: Some("bulk import (wave 57)".to_string()),
+                    new_stock: row.stock,
+                    reason: "count_fix",
+                    note: Some("bulk import (wave 57)"),
                 },
             )
             .await?;
