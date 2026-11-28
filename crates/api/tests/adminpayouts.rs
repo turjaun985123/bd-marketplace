@@ -348,7 +348,11 @@ async fn admin_payouts_mark_paid_coverage_reference_and_escape_hatch() {
     assert_eq!(body["details"]["kind"], "payout_coverage", "details: {body}");
     assert_eq!(body["details"]["shortfall_poisha"], 50_000, "details: {body}");
     assert_eq!(body["details"]["earned_poisha"], 50_000, "details: {body}");
-    assert_eq!(body["details"]["pending_poisha"], 100_000, "details: {body}");
+    // Canon (payouts.rs seller_earnings_on): an APPROVED payout counts in
+    // paid_out_poisha (status IN ('approved','paid')); pending_poisha is
+    // 'requested' only — so this approved subject sits in paid_out, not pending.
+    assert_eq!(body["details"]["paid_out_poisha"], 100_000, "details: {body}");
+    assert_eq!(body["details"]["pending_poisha"], 0, "details: {body}");
     assert_eq!(
         body["details"]["available_unclamped_poisha"], -50_000,
         "details: {body}"
