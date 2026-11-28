@@ -211,6 +211,22 @@ async fn adminorders_filters_and_summary_match_metrics() {
             ..CouriersConfig::default()
         });
     let app = build_app(state);
+    // A second app over the same pool and JWT secret but
+    // WITHOUT payments dev mode: no gateway can collect
+    // there, so over-threshold COD orders degrade there
+    // (advance recorded, plain COD proceeds). On the
+    // dev-mode app above, the same checkout without an
+    // advance method is a 400 by design (Wave 17).
+    let plain_state = AppState::new(
+        Some(pool.clone()),
+        "adminordersb-test-secret".to_string(),
+        true,
+    )
+    .with_couriers_config(CouriersConfig {
+        dev_mode: true,
+        ..CouriersConfig::default()
+    });
+    let app_plain = build_app(plain_state);
 
     let admin = login(&app, "01711111111").await;
     sqlx::query("UPDATE users SET is_admin = true WHERE phone = '+8801711111111'")
@@ -225,10 +241,11 @@ async fn adminorders_filters_and_summary_match_metrics() {
     // 61_200.
     let product = create_product(&app, &seller, &store, "OrdersB Product", 300_000, 10).await;
 
-    // Fixture 1: plain COD, no advance method — degraded.
-    let buyer1 = login(&app, "01911111111").await;
-    add_to_cart(&app, &buyer1, &product, 1).await;
-    let degraded = checkout_cod(&app, &buyer1, None).await;
+    // Fixture 1: plain COD, no advance method — degraded
+    // (checked out on the no-gateway app).
+    let buyer1 = login(&app_plain, "01911111111").await;
+    add_to_cart(&app_plain, &buyer1, &product, 1).await;
+    let degraded = checkout_cod(&app_plain, &buyer1, None).await;
     let degraded_id = degraded["id"].as_str().expect("order id").to_string();
     assert_eq!(degraded["payment_status"], "pay_on_delivery");
     assert_eq!(degraded["advance_required_poisha"], 61_200);
@@ -241,13 +258,14 @@ async fn adminorders_filters_and_summary_match_metrics() {
     assert_eq!(pending["payment_status"], "advance_pending");
     assert_eq!(pending["advance_required_poisha"], 61_200);
 
-    // Fixture 3: placed then cancelled by its buyer.
-    let buyer3 = login(&app, "01933333333").await;
-    add_to_cart(&app, &buyer3, &product, 1).await;
-    let placed = checkout_cod(&app, &buyer3, None).await;
+    // Fixture 3: placed then cancelled by its buyer
+    // (also degraded, on the no-gateway app).
+    let buyer3 = login(&app_plain, "01933333333").await;
+    add_to_cart(&app_plain, &buyer3, &product, 1).await;
+    let placed = checkout_cod(&app_plain, &buyer3, None).await;
     let cancelled_id = placed["id"].as_str().expect("order id").to_string();
     let cancel_uri = format!("/v1/orders/{cancelled_id}/cancel");
-    let (status, body) = call(&app, Method::POST, &cancel_uri, None, Some(&buyer3)).await;
+    let (status, body) = call(&app_plain, Method::POST, &cancel_uri, None, Some(&buyer3)).await;
     assert_eq!(status, StatusCode::OK, "buyer cancel: {body}");
     assert_eq!(body["status"], "cancelled");
 
