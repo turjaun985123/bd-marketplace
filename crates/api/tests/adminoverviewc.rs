@@ -197,7 +197,7 @@ async fn adminoverview_gift_card_stats_reconcile() {
 
     // Clean slate so the test is re-runnable against the same database.
     sqlx::query(
-        "TRUNCATE gift_card_ledger, gift_cards, products, stores, \
+        "TRUNCATE otp_request_log, gift_card_ledger, gift_cards, products, stores, \
          otp_codes, users CASCADE",
     )
     .execute(&pool)

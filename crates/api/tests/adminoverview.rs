@@ -196,7 +196,7 @@ async fn adminoverview_canonical_money_and_payout_consistency() {
 
     // Clean slate so the test is re-runnable against the same database.
     sqlx::query(
-        "TRUNCATE payouts, payout_accounts, review_replies, reviews, \
+        "TRUNCATE otp_request_log, payouts, payout_accounts, review_replies, reviews, \
          shipment_events, shipments, payment_events, payments, \
          order_items, sub_orders, orders, cart_items, carts, products, \
          stores, otp_codes, users CASCADE",

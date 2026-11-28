@@ -150,7 +150,7 @@ async fn adminstores_filters_sorts_and_validation() {
         .expect("connect to test database");
     run_migrations(&pool).await.expect("migrations run");
     sqlx::query(
-        "TRUNCATE notifications, admin_audit_log, return_requests, store_follows, \
+        "TRUNCATE notifications, admin_audit_log, otp_request_log, return_requests, store_follows, \
          store_verification_events, store_verifications, platform_settings, \
          payouts, payout_accounts, review_replies, reviews, shipment_events, \
          shipments, payment_events, payments, order_items, sub_orders, orders, \

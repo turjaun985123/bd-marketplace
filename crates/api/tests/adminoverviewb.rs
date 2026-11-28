@@ -187,7 +187,7 @@ async fn adminoverview_metrics_operator_blocks() {
 
     // Clean slate so the test is re-runnable against the same database.
     sqlx::query(
-        "TRUNCATE payouts, payout_accounts, review_replies, reviews, \
+        "TRUNCATE otp_request_log, payouts, payout_accounts, review_replies, reviews, \
          shipment_events, shipments, payment_events, payments, \
          return_requests, store_verifications, notifications, \
          gift_card_ledger, gift_cards, promotions, flash_sale_items, \

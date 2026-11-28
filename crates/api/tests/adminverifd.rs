@@ -113,7 +113,7 @@ async fn adminverif_kyc_is_owner_only_and_jwt_only() {
         .expect("connect to test database");
     run_migrations(&pool).await.expect("migrations run");
     sqlx::query(
-        "TRUNCATE notifications, admin_audit_log, store_verification_events, \
+        "TRUNCATE notifications, admin_audit_log, otp_request_log, store_verification_events, \
          store_verifications, platform_settings, payouts, payout_accounts, \
          review_replies, reviews, shipment_events, shipments, payment_events, \
          payments, order_items, sub_orders, orders, cart_items, carts, \
