@@ -270,7 +270,6 @@ pub struct AdminVerificationFull {
 /// `mask_nid_parts` needs.
 #[derive(Debug, FromRow)]
 struct VerificationRow {
-    store_id: Uuid,
     status: String,
     nid_last4: String,
     nid_length: i64,
@@ -281,14 +280,12 @@ struct VerificationRow {
     reviewed_at: Option<DateTime<Utc>>,
     version: i64,
     applicant_name: Option<String>,
-    submitted_by_user_id: Option<Uuid>,
-    reviewed_by_user_id: Option<Uuid>,
 }
 
-const VERIFICATION_COLUMNS: &str = "store_id, status, nid_last4, \
+const VERIFICATION_COLUMNS: &str = "status, nid_last4, \
     char_length(nid_number)::bigint AS nid_length, trade_license_number, \
     document_url, reviewer_note, submitted_at, reviewed_at, version, \
-    applicant_name, submitted_by_user_id, reviewed_by_user_id";
+    applicant_name";
 
 /// Load a store's application row (masked projection), if it
 /// has ever applied.
@@ -870,7 +867,8 @@ pub async fn get_admin_verification_detail(
             reason: None,
         });
     }
-    let audit_rows: Vec<(String, DateTime<Utc>, Option<String>, Option<serde_json::Value>)> =
+    type AuditHistoryRow = (String, DateTime<Utc>, Option<String>, Option<serde_json::Value>);
+    let audit_rows: Vec<AuditHistoryRow> =
         sqlx::query_as(
             "SELECT a.action, a.created_at, u.phone, a.detail \
              FROM admin_audit_log a \
@@ -926,7 +924,7 @@ pub async fn get_admin_verification_detail(
             reason,
         });
     }
-    history.sort_by(|a, b| b.at.cmp(&a.at));
+    history.sort_by_key(|a| std::cmp::Reverse(a.at));
     history.truncate(50);
 
     let owner_stores: Vec<OwnerStoreSummary> = sqlx::query_as::<_, (Uuid, String, String, String, Option<String>)>(
