@@ -4047,15 +4047,13 @@ impl ShipmentAgedThresholds {
     /// The seven thresholds in [`SHIPMENT_NON_TERMINAL`]
     /// order, for binding into the aged-queue predicates.
     fn ordered(&self) -> [i64; 7] {
-        [
-            self.created,
-            self.picked_up,
-            self.in_transit,
-            self.out_for_delivery,
-            self.partial_delivered,
-            self.return_in_transit,
-            self.unknown,
-        ]
+        let mut out = [0; 7];
+        for (index, status) in SHIPMENT_NON_TERMINAL.iter().enumerate() {
+            out[index] = self
+                .hours_for(status)
+                .expect("non-terminal status has a threshold");
+        }
+        out
     }
 }
 
