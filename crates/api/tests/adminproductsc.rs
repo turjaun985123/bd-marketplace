@@ -322,7 +322,7 @@ async fn adminproducts_takedown_blast_radius() {
     );
     let (status, body) = call(&app, Method::GET, "/v1/follows/feed", None, Some(&buyer)).await;
     assert_eq!(status, StatusCode::OK, "follows feed before: {body}");
-    assert!(contains_product(&body, &target), "follows feed before: {body}");
+    assert!(contains_product(&body["items"], &target), "follows feed before: {body}");
     let (status, body) = call(&app, Method::GET, "/v1/wishlist", None, Some(&buyer)).await;
     assert_eq!(status, StatusCode::OK, "wishlist before: {body}");
     assert!(contains_product(&body["items"], &target), "wishlist before: {body}");
@@ -402,8 +402,8 @@ async fn adminproducts_takedown_blast_radius() {
     );
     let (status, body) = call(&app, Method::GET, "/v1/follows/feed", None, Some(&buyer)).await;
     assert_eq!(status, StatusCode::OK, "follows feed after: {body}");
-    assert!(!contains_product(&body, &target), "follows feed after: {body}");
-    assert!(contains_product(&body, &control), "control stays in feed: {body}");
+    assert!(!contains_product(&body["items"], &target), "follows feed after: {body}");
+    assert!(contains_product(&body["items"], &control), "control stays in feed: {body}");
 
     // The wishlist: the saved row is filtered out of the
     // list, and re-adding is a 404 through the public gate.
