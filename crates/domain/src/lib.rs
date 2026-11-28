@@ -11502,7 +11502,7 @@ mod tests {
 
     #[test]
     fn category_display_order_breaks_ties_by_name_then_slug() {
-        let mut rows = vec![
+        let mut rows = [
             cat("c", None, "zeta", "Same", 10),
             cat("a", None, "alpha", "Same", 10),
             cat("b", None, "beta", "Another", 10),
