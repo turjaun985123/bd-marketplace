@@ -270,7 +270,7 @@ async fn wave57b_dry_run_writes_nothing_and_reimport_updates_in_place() {
             .fetch_one(&pool)
             .await
             .expect("follower row");
-    let notice_count = |pool: &PgPool| async move {
+    async fn notice_count(pool: &PgPool, follower_id: uuid::Uuid) -> i64 {
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM notifications WHERE user_id = $1 AND kind = 'store_new_product'",
         )
@@ -278,8 +278,8 @@ async fn wave57b_dry_run_writes_nothing_and_reimport_updates_in_place() {
         .fetch_one(pool)
         .await
         .expect("count notices")
-    };
-    assert_eq!(notice_count(&pool).await, 1);
+    }
+    assert_eq!(notice_count(&pool, follower_id).await, 1);
 
     // --- Re-import with a new price and stock: updates.
     let sheet_v2 = [
@@ -334,7 +334,7 @@ async fn wave57b_dry_run_writes_nothing_and_reimport_updates_in_place() {
     assert_eq!(reason, "count_fix");
 
     // The update did NOT re-notify the follower.
-    assert_eq!(notice_count(&pool).await, 1, "updates never notify");
+    assert_eq!(notice_count(&pool, follower_id).await, 1, "updates never notify");
 
     // --- A sku claimed by another source errors per-row.
     // Seed a facebook-source product directly (the

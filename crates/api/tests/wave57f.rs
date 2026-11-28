@@ -205,13 +205,13 @@ async fn wave57f_bulk_edit_price_stock_status_category_and_foreign_ids() {
     let foreign_store_id = foreign_store["id"].as_str().expect("store id").to_string();
     let foreign = create_product(&app, &stranger, &foreign_store_id, "Foreign", 77_000, 2, "active").await;
 
-    let price_of = |pool: &PgPool, id: String| async move {
+    async fn price_of(pool: &PgPool, id: String) -> i64 {
         sqlx::query_scalar::<_, i64>("SELECT price_poisha FROM products WHERE id = $1::uuid")
             .bind(&id)
             .fetch_one(pool)
             .await
             .expect("price")
-    };
+    }
 
     // Percent: -10% of 100000 = 90000.
     let (status, report) = bulk_edit(
