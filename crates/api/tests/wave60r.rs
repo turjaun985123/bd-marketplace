@@ -267,7 +267,7 @@ async fn wave60_card_value_never_spills_across_stores() {
     assert_eq!(status, StatusCode::CREATED, "two-store checkout: {order}");
     // The order total carries ONLY B's 30_000 of redemption.
     assert_eq!(order["gift_card_discount_poisha"], 30_000);
-    assert_eq!(order["goods_subtotal_poisha"], 130_000);
+    assert_eq!(order["goods_total_poisha"], 130_000);
     assert_eq!(order["grand_total_poisha"], 112_000, "130_000 − 30_000 + 12_000 delivery");
 
     // Per-sub-order truth: A untouched, B fully card-funded.
