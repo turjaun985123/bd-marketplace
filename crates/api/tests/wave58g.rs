@@ -243,8 +243,8 @@ async fn wave58_shelves_grids_and_the_empty_drop_rule() {
         .await
         .expect("link product to panjabi");
 
-    let keep = create_collection(&app, &seller, "eid-picks", &[labelled.clone()]).await;
-    let ghost = create_collection(&app, &seller, "ghost-picks", &[linked.clone()]).await;
+    let keep = create_collection(&app, &seller, "eid-picks", std::slice::from_ref(&labelled)).await;
+    let ghost = create_collection(&app, &seller, "ghost-picks", std::slice::from_ref(&linked)).await;
 
     let (status, saved) = call(
         &app,
