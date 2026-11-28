@@ -150,6 +150,7 @@ async fn admin_payouts_list_search_sort_summary() {
         Some(&admin),
     )
     .await;
+    assert_eq!(status, StatusCode::OK, "amount_asc list: {list}");
     assert_eq!(list["items"][0]["id"], payout_a2, "smallest first: {list}");
     let (status, list) = call(
         &app,
@@ -159,6 +160,7 @@ async fn admin_payouts_list_search_sort_summary() {
         Some(&admin),
     )
     .await;
+    assert_eq!(status, StatusCode::OK, "oldest list: {list}");
     assert_eq!(list["items"][0]["id"], payout_a1, "oldest first: {list}");
     let (status, list) = call(
         &app,
@@ -168,6 +170,7 @@ async fn admin_payouts_list_search_sort_summary() {
         Some(&admin),
     )
     .await;
+    assert_eq!(status, StatusCode::OK, "newest list: {list}");
     assert_eq!(list["items"][0]["id"], payout_b1, "newest first: {list}");
 
     // Validation: unknown status and sort are 400s, never a
@@ -215,6 +218,7 @@ async fn admin_payouts_list_search_sort_summary() {
         Some(&admin),
     )
     .await;
+    assert_eq!(status, StatusCode::OK, "q phone list: {list}");
     assert_eq!(list["total"], 2, "q local phone finds store A: {list}");
 
     let (status, list) = call(
@@ -225,6 +229,7 @@ async fn admin_payouts_list_search_sort_summary() {
         Some(&admin),
     )
     .await;
+    assert_eq!(status, StatusCode::OK, "q account list: {list}");
     assert_eq!(list["total"], 1, "q account substring finds store B: {list}");
     assert_eq!(list["items"][0]["id"], payout_b1, "q account: {list}");
 
