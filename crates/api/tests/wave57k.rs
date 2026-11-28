@@ -197,7 +197,7 @@ async fn wave57k_bulk_edit_notice_dedupe_and_variant_rules() {
             .fetch_one(&pool)
             .await
             .expect("follower row");
-    let notice_count = |pool: &PgPool| async move {
+    async fn notice_count(pool: &PgPool, follower_id: uuid::Uuid) -> i64 {
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM notifications WHERE user_id = $1 AND kind = 'store_new_product'",
         )
@@ -205,12 +205,12 @@ async fn wave57k_bulk_edit_notice_dedupe_and_variant_rules() {
         .fetch_one(pool)
         .await
         .expect("count notices")
-    };
+    }
 
     // A draft product, flipped active by bulk edit: the
     // follower notice fires exactly once.
     let draft = create_product(&app, &seller, &store_id, "Drafty", 10_000, 5, "draft").await;
-    assert_eq!(notice_count(&pool).await, 0, "a draft creation notifies nobody");
+    assert_eq!(notice_count(&pool, follower_id).await, 0, "a draft creation notifies nobody");
     let (status, report) = call(
         &app,
         Method::POST,
@@ -221,7 +221,7 @@ async fn wave57k_bulk_edit_notice_dedupe_and_variant_rules() {
     .await;
     assert_eq!(status, StatusCode::OK, "flip: {report}");
     assert_eq!(report["outcomes"][0]["changed"], json!(["status"]));
-    assert_eq!(notice_count(&pool).await, 1, "the flip notified the follower");
+    assert_eq!(notice_count(&pool, follower_id).await, 1, "the flip notified the follower");
 
     // Flipping to the SAME status again: no change, no
     // second notice, still a success.
@@ -240,7 +240,7 @@ async fn wave57k_bulk_edit_notice_dedupe_and_variant_rules() {
         json!([]),
         "no change is reported honestly"
     );
-    assert_eq!(notice_count(&pool).await, 1, "no duplicate notice");
+    assert_eq!(notice_count(&pool, follower_id).await, 1, "no duplicate notice");
 
     // Setting the price the product already has: ok,
     // changed empty.
