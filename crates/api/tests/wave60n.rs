@@ -259,7 +259,7 @@ async fn wave60_full_lifecycle_saga_with_ledger_audit() {
     // Admin: login FIRST (creates the user row), then the
     // SQL promotion — the standing convention.
     let admin = login(&app, "01766666667").await;
-    sqlx::query("UPDATE users SET is_admin = true WHERE phone = '01766666667'")
+    sqlx::query("UPDATE users SET is_admin = true WHERE phone = '+8801766666667'")
         .execute(&pool)
         .await
         .expect("promote admin");
