@@ -274,9 +274,9 @@ async fn wave21_seller_kyc_verification_flow() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "admin queue: {queue}");
-    let row_a = queue
+    let row_a = queue["items"]
         .as_array()
-        .expect("queue is a list")
+        .expect("queue envelope carries items")
         .iter()
         .find(|row| row["store_id"] == store_a)
         .expect("A is in the pending queue")
@@ -291,12 +291,28 @@ async fn wave21_seller_kyc_verification_flow() {
     );
 
     // 6. The full view is the ONE place the number comes back —
-    // and only for the admin.
+    // and only for the admin. Since the admin verifications
+    // remake it is an audited POST: the admin states a reason,
+    // the read writes an audit row, then the number is served.
     let uri = format!("/v1/admin/verifications/{store_a}/full");
-    let (status, full) = call(&app, Method::GET, &uri, None, Some(&admin)).await;
+    let (status, full) = call(
+        &app,
+        Method::POST,
+        &uri,
+        Some(json!({ "reason": "queue review of wave21-alpha" })),
+        Some(&admin),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "admin full view: {full}");
     assert_eq!(full["nid_number"], nid_a);
-    let (status, body) = call(&app, Method::GET, &uri, None, Some(&seller_a)).await;
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        &uri,
+        Some(json!({ "reason": "seller trying to self-serve" })),
+        Some(&seller_a),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "seller full view: {body}");
 
     // 7. `verified` without a trade license: 400.
@@ -305,7 +321,7 @@ async fn wave21_seller_kyc_verification_flow() {
         &app,
         Method::POST,
         &uri,
-        Some(json!({ "tier": "verified" })),
+        Some(json!({ "tier": "verified", "expected_version": 1 })),
         Some(&admin),
     )
     .await;
@@ -314,11 +330,17 @@ async fn wave21_seller_kyc_verification_flow() {
 
     // 8. Approve basic: the application is approved, the store
     // tier is basic — and the PUBLIC store view carries it.
+    // A submitted no document image, so the approval uses the
+    // remake's explicit no-document override (audited).
     let (status, view) = call(
         &app,
         Method::POST,
         &uri,
-        Some(json!({ "tier": "basic" })),
+        Some(json!({
+            "tier": "basic",
+            "expected_version": 1,
+            "no_document_override": true
+        })),
         Some(&admin),
     )
     .await;
@@ -335,7 +357,7 @@ async fn wave21_seller_kyc_verification_flow() {
         &app,
         Method::POST,
         &uri,
-        Some(json!({ "tier": "basic" })),
+        Some(json!({ "tier": "basic", "expected_version": 2 })),
         Some(&admin),
     )
     .await;
@@ -364,7 +386,7 @@ async fn wave21_seller_kyc_verification_flow() {
         &app,
         Method::POST,
         &uri,
-        Some(json!({ "tier": "verified" })),
+        Some(json!({ "tier": "verified", "expected_version": 1 })),
         Some(&admin),
     )
     .await;
@@ -406,7 +428,7 @@ async fn wave21_seller_kyc_verification_flow() {
         &app,
         Method::POST,
         &uri,
-        Some(json!({ "note": note })),
+        Some(json!({ "note": note, "expected_version": 1 })),
         Some(&admin),
     )
     .await;

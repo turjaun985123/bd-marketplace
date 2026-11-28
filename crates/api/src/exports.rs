@@ -184,7 +184,7 @@ pub async fn seller_export(pool: &PgPool, user: &AuthUser) -> Result<ExportDownl
             .await
             .map_err(|e| ApiError::internal("export seller stores", e))?;
 
-    build_seller_export(pool, store, &store_ids, None).await
+    build_seller_export(pool, store, &store_ids, None, true).await
 }
 
 /// The Wave 34 store-scoped export: ONE store's document,
@@ -199,18 +199,29 @@ pub async fn seller_export_scoped(
 ) -> Result<ExportDownload, ApiError> {
     let store_ids = vec![store.id];
     let charges_store = store.id;
-    build_seller_export(pool, store, &store_ids, Some(charges_store)).await
+    build_seller_export(pool, store, &store_ids, Some(charges_store), false).await
 }
 
 /// The export assembly shared by both scopes: `store` is
 /// the document's primary store, `store_ids` the section
 /// scope, and `charges_store` — when set — narrows the
 /// charges total to that store's promotions.
+/// `include_verification` (admin verifications remake) gates
+/// the KYC section with an explicit flag, set ONLY by the
+/// unscoped owner export: the section carries the owner's
+/// own verification views (masked NID; the license number
+/// and document URL are the owner's own data in their own
+/// backup), and a `view_finances` manager pulling the scoped
+/// export must never receive a bulk copy of it. The flag is
+/// deliberately NOT derived from `charges_store` — coupling
+/// a privacy boundary to a money-scoping parameter would
+/// flip it silently in some future refactor.
 async fn build_seller_export(
     pool: &PgPool,
     store: Store,
     store_ids: &[Uuid],
     charges_store: Option<Uuid>,
+    include_verification: bool,
 ) -> Result<ExportDownload, ApiError> {
 
     let mut products: Vec<Product> = sqlx::query_as(&format!(
@@ -294,9 +305,39 @@ async fn build_seller_export(
     // and money only — codes and hashes are never exported).
     let gift_cards = crate::gift_cards::export_gift_cards(pool, store_ids).await?;
 
+    // Admin verifications remake: the owner's KYC section —
+    // one masked verification view per store the export spans
+    // (the export's completeness rule: a section scoped to
+    // the primary store alone would silently drop the other
+    // stores' KYC state). Owner export only; see the
+    // `include_verification` note on this function.
+    let verification_section = if include_verification {
+        let store_rows: Vec<(Uuid, String, String)> = sqlx::query_as(
+            "SELECT id, slug, verified_tier FROM stores \
+             WHERE id = ANY($1) ORDER BY created_at ASC",
+        )
+        .bind(store_ids)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| ApiError::internal("export verification stores", e))?;
+        let mut entries = Vec::new();
+        for (store_id, slug, tier) in store_rows {
+            let view = crate::verification::admin_verification_summary(pool, store_id, &tier)
+                .await?;
+            entries.push(json!({
+                "store_id": store_id,
+                "store_slug": slug,
+                "verification": view,
+            }));
+        }
+        Some(serde_json::Value::Array(entries))
+    } else {
+        None
+    };
+
     let now = Utc::now();
     let filename = export_filename("seller", &store.slug, &now.format("%Y%m%d").to_string());
-    let document = json!({
+    let mut document = json!({
         "exported_at": now,
         "kind": "seller",
         "store": store,
@@ -310,6 +351,9 @@ async fn build_seller_export(
         "posts": content_posts,
         "gift_cards": gift_cards,
     });
+    if let Some(section) = verification_section {
+        document["verification"] = section;
+    }
     Ok(ExportDownload { filename, document })
 }
 

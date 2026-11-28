@@ -165,6 +165,15 @@ pub fn api_key_forbidden_route(path: &str, method: &Method) -> bool {
     if method == Method::POST && path.starts_with("/v1/seller/gift-cards") {
         return true;
     }
+    // Admin verifications remake: KYC submission is JWT-only.
+    // The route is a PUT (not POST — the clause above would
+    // miss it), and a write-scoped key acts as the owner: it
+    // must not be able to file or replace an application
+    // carrying the owner's NID. Reading the seller's own
+    // verification state with a key stays allowed.
+    if method_is_write(method) && path == "/v1/seller/store/verification" {
+        return true;
+    }
     false
 }
 
@@ -642,6 +651,17 @@ mod tests {
         // Exports.
         assert!(api_key_forbidden_route("/v1/seller/export", &Method::GET));
         assert!(api_key_forbidden_route("/v1/buyer/export", &Method::GET));
+        // KYC submission (admin verifications remake): the
+        // route is a PUT — a POST-only clause would protect
+        // nothing. The read stays open.
+        assert!(api_key_forbidden_route(
+            "/v1/seller/store/verification",
+            &Method::PUT
+        ));
+        assert!(!api_key_forbidden_route(
+            "/v1/seller/store/verification",
+            &Method::GET
+        ));
         // Ordinary traffic stays open.
         assert!(!api_key_forbidden_route("/v1/auth/me", &Method::GET));
         assert!(!api_key_forbidden_route("/v1/cart/items", &Method::POST));

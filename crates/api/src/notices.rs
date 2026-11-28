@@ -36,6 +36,14 @@
 //!   ([`enqueue_payout_notice`]); a rejected notice carries
 //!   the admin's reason, a paid notice the recorded payment
 //!   reference.
+//! - `verification_approved` / `verification_rejected`
+//!   (admin verifications remake) —
+//!   `verification::approve_verification` /
+//!   `reject_verification`, to the store owner. Both kinds
+//!   share the one funnel ([`enqueue_verification_notice`]);
+//!   an approved notice carries the granted tier, a rejected
+//!   notice the reviewer's note. The wording claims manual
+//!   platform review only — no government NID check exists.
 //! - `return_update` — `returns::decide_return_request`
 //!   (approved / rejected) and `returns::mark_return_received`
 //!   (received), to the buyer.
@@ -423,5 +431,52 @@ pub async fn enqueue_payout_notice(
     notify::enqueue(&mut *conn, owner_user_id, &phone, kind, &payload)
         .await
         .map_err(|e| ApiError::internal("enqueue payout notification", e))?;
+    Ok(())
+}
+
+/// Queue one verification-decision notice for a store's
+/// owner (admin verifications remake): the recipient is the
+/// seller at their ACCOUNT phone, exactly like the payout
+/// funnel — a KYC decision belongs to the account. One
+/// funnel for both verification kinds
+/// (`verification_approved`, `verification_rejected`),
+/// called from `verification::approve_verification` /
+/// `reject_verification` inside the decision's own
+/// transaction, so the notice commits or rolls back with
+/// the decision it announces.
+///
+/// The tier is a caller-supplied PARAMETER, never re-read
+/// from the store: the caller has just set it inside the
+/// same transaction, and a re-read could observe the
+/// pre-decision value depending on statement order. The
+/// rejected kind ignores the tier (a rejected application
+/// grants none) and carries the reviewer's note instead.
+/// The payload NEVER carries the NID number or its last4 —
+/// a notification row is not a place for identity data.
+pub async fn enqueue_verification_notice(
+    conn: &mut PgConnection,
+    store_id: Uuid,
+    kind: &str,
+    verification_tier: Option<&str>,
+    note: Option<&str>,
+) -> Result<(), ApiError> {
+    let (owner_user_id, phone): (Uuid, String) = sqlx::query_as(
+        "SELECT s.owner_user_id, u.phone FROM stores s \
+         JOIN users u ON u.id = s.owner_user_id WHERE s.id = $1",
+    )
+    .bind(store_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| ApiError::internal("load verification notice recipient", e))?;
+    let mut payload = json!({});
+    if let Some(tier) = verification_tier {
+        payload["verification_tier"] = serde_json::Value::String(tier.to_string());
+    }
+    if let Some(note) = note {
+        payload["note"] = serde_json::Value::String(note.to_string());
+    }
+    notify::enqueue(&mut *conn, owner_user_id, &phone, kind, &payload)
+        .await
+        .map_err(|e| ApiError::internal("enqueue verification notification", e))?;
     Ok(())
 }

@@ -2195,8 +2195,12 @@ pub fn build_app(state: AppState) -> Router {
             get(verification::list_admin_verifications_handler),
         )
         .route(
+            "/v1/admin/verifications/:store_id",
+            get(verification::get_admin_verification_detail_handler),
+        )
+        .route(
             "/v1/admin/verifications/:store_id/full",
-            get(verification::get_admin_verification_full_handler),
+            post(verification::get_admin_verification_full_handler),
         )
         .route(
             "/v1/admin/verifications/:store_id/approve",

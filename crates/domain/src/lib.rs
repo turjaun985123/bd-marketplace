@@ -1421,13 +1421,19 @@ pub const STORE_ACTION_MANAGE_MARKETING: &str = "manage_marketing";
 /// Answering product questions (and review replies stay
 /// owner-only this wave — see the API's access module).
 pub const STORE_ACTION_ANSWER_QUESTIONS: &str = "answer_questions";
-/// Verification submission and the SIDRA auto-reply toggle.
+/// The SIDRA auto-reply toggle.
 pub const STORE_ACTION_MANAGE_STORE_SETTINGS: &str = "manage_store_settings";
+/// Reading and submitting the store's KYC verification
+/// application (admin verifications remake). Owner-only: the
+/// application carries the owner's national ID number, trade
+/// license and document image, so unlike day-to-day settings
+/// it is never delegated to a manager or staff member.
+pub const STORE_ACTION_MANAGE_VERIFICATION: &str = "manage_verification";
 
 /// Every store action, in the order the README's matrix table
 /// lists them. Tests iterate this so a new action can never
 /// silently miss a matrix row.
-pub const STORE_ACTIONS: [&str; 8] = [
+pub const STORE_ACTIONS: [&str; 9] = [
     STORE_ACTION_MANAGE_MEMBERS,
     STORE_ACTION_MANAGE_PAYOUTS,
     STORE_ACTION_VIEW_FINANCES,
@@ -1436,6 +1442,7 @@ pub const STORE_ACTIONS: [&str; 8] = [
     STORE_ACTION_MANAGE_MARKETING,
     STORE_ACTION_ANSWER_QUESTIONS,
     STORE_ACTION_MANAGE_STORE_SETTINGS,
+    STORE_ACTION_MANAGE_VERIFICATION,
 ];
 
 /// The store role permission matrix (Wave 34) — THE one place
@@ -1443,9 +1450,10 @@ pub const STORE_ACTIONS: [&str; 8] = [
 ///
 /// - `owner` (the store's `owner_user_id`; never a member row)
 ///   may do everything.
-/// - `manager` may do everything EXCEPT `manage_members` and
-///   `manage_payouts` — a manager runs the shop day to day but
-///   cannot add people or move money out.
+/// - `manager` may do everything EXCEPT `manage_members`,
+///   `manage_payouts` and `manage_verification` — a manager
+///   runs the shop day to day but cannot add people, move
+///   money out, or touch the owner's identity documents.
 /// - `staff` may only work the floor: `manage_catalog`,
 ///   `manage_orders` and `answer_questions`.
 ///
@@ -3837,7 +3845,7 @@ pub fn validate_tier(tier: &str) -> Result<&str, &'static str> {
     if VERIFICATION_TIERS.contains(&tier) {
         Ok(tier)
     } else {
-        Err("tier must be one of: unverified, basic, verified")
+        Err("স্তরটি সঠিক নয় (tier must be one of: unverified, basic, verified)")
     }
 }
 
@@ -3846,17 +3854,30 @@ pub fn validate_tier(tier: &str) -> Result<&str, &'static str> {
 /// routinely type them with spaces between groups, so spaces
 /// are removed before the check; everything else must be an
 /// ASCII digit. Returns the bare digit string for storage.
+///
+/// Bengali digits (০-৯) are transliterated to ASCII first
+/// (admin verifications remake — a deliberate policy change
+/// from the original "reject, never guess" rule, recorded in
+/// the README): sellers type NIDs on Bengali keyboards, the
+/// [`bn_to_en_digits`] map is a deterministic 1:1
+/// transliteration, and the returned — therefore stored —
+/// form is always the canonical ASCII string, so masking,
+/// duplicate matching and the reviewer's full view all work
+/// on one representation. Other digit scripts are not
+/// converted and still fail the ASCII check.
+///
 /// This checks the SHAPE only: no checksum exists for NIDs
 /// that a platform could verify offline, and authenticity is
 /// established by the human document review, never by this
 /// function (the README says so plainly).
 pub fn validate_nid_number(raw: &str) -> Result<String, &'static str> {
-    let digits: String = raw.trim().chars().filter(|c| *c != ' ').collect();
+    let converted = bn_to_en_digits(raw);
+    let digits: String = converted.trim().chars().filter(|c| *c != ' ').collect();
     if !digits.chars().all(|c| c.is_ascii_digit()) {
-        return Err("NID number must contain digits only");
+        return Err("NID নম্বরে শুধু সংখ্যা থাকতে হবে (NID number must contain digits only)");
     }
     if !matches!(digits.len(), 10 | 13 | 17) {
-        return Err("NID number must be 10, 13 or 17 digits");
+        return Err("NID নম্বর ১০, ১৩ বা ১৭ সংখ্যার হতে হবে (NID number must be 10, 13 or 17 digits)");
     }
     Ok(digits)
 }
@@ -3877,6 +3898,96 @@ pub fn mask_nid(nid: &str) -> String {
     let masked: String = chars[..chars.len() - 4].iter().map(|_| '*').collect();
     let tail: String = chars[chars.len() - 4..].iter().collect();
     format!("{masked}{tail}")
+}
+
+/// Rebuild [`mask_nid`]'s output from the two facts a masked
+/// read path is allowed to hold: the number's length and its
+/// stored last four (`store_verifications.nid_last4`, whose
+/// match against the full number migration 0074 enforces).
+/// Byte-for-byte identical to `mask_nid` for every input the
+/// mask is defined on — including the short-input rule: a
+/// length of four or fewer masks EVERYTHING and `last4` is
+/// ignored, so a malformed short row can never leak itself
+/// through this helper. The point of the split is that masked
+/// surfaces (admin queue, seller view, payout summary) never
+/// need to SELECT the full number at all.
+pub fn mask_nid_parts(length: usize, last4: &str) -> String {
+    if length <= 4 {
+        return "*".repeat(length);
+    }
+    format!("{}{}", "*".repeat(length - 4), last4)
+}
+
+/// Maximum length of the applicant name on a verification
+/// application, in characters (matches the migration 0074
+/// CHECK on `store_verifications.applicant_name`).
+pub const MAX_APPLICANT_NAME_CHARS: usize = 80;
+
+/// Validate the applicant name a seller supplies with a
+/// verification application: the name as it appears on the
+/// NID, so the reviewer can compare name, number and document
+/// image. Optional at the API (the seller page predates the
+/// field) — `None` and blank input normalise to `None`; a
+/// present value is trimmed and length-capped. The name is
+/// self-asserted: nothing can check it against the NID
+/// itself, which is exactly why the reviewer sees it next to
+/// the document rather than the platform trusting it.
+pub fn validate_applicant_name(text: Option<&str>) -> Result<Option<String>, &'static str> {
+    let Some(raw) = text else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().count() > MAX_APPLICANT_NAME_CHARS {
+        return Err("আবেদনকারীর নাম সর্বোচ্চ ৮০ অক্ষরের হতে হবে (applicant name must be at most 80 characters)");
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+/// Maximum length of an admin's stated reason for viewing a
+/// full NID, in characters.
+pub const MAX_VIEW_REASON_CHARS: usize = 500;
+
+/// Minimum length of that reason, in characters — a reason
+/// shorter than this cannot say anything auditable.
+pub const MIN_VIEW_REASON_CHARS: usize = 4;
+
+/// Validate the reason an admin must state before the full
+/// NID endpoint releases a number (admin verifications
+/// remake). The reason is written to the admin audit log, so
+/// it is held to two rules beyond shape: it must be long
+/// enough to mean something, and it must never contain a run
+/// of ten or more digits (ASCII or Bengali) — a reason is a
+/// place admins paste things, and a pasted NID in the audit
+/// detail would quietly create a second, unaudited copy of
+/// the very number the endpoint exists to protect.
+pub fn validate_view_reason(raw: &str) -> Result<String, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("NID দেখার কারণ আবশ্যক (a reason for viewing the full NID is required)");
+    }
+    let len = trimmed.chars().count();
+    if len < MIN_VIEW_REASON_CHARS {
+        return Err("কারণটি খুবই ছোট — আরেকটু বিস্তারিত লিখুন (the reason is too short to be auditable)");
+    }
+    if len > MAX_VIEW_REASON_CHARS {
+        return Err("কারণ সর্বোচ্চ ৫০০ অক্ষরের হতে হবে (reason must be at most 500 characters)");
+    }
+    let converted = bn_to_en_digits(trimmed);
+    let mut run = 0usize;
+    for c in converted.chars() {
+        if c.is_ascii_digit() {
+            run += 1;
+            if run >= 10 {
+                return Err("কারণে কোনো NID বা দীর্ঘ নম্বর লেখা যাবে না (the reason must not contain an NID or other long number)");
+            }
+        } else if c != ' ' && c != '-' {
+            run = 0;
+        }
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Maximum length of a trade license number, in characters.
@@ -3903,7 +4014,7 @@ pub fn validate_trade_license(text: Option<&str>) -> Result<Option<String>, &'st
     }
     let len = trimmed.chars().count();
     if !(MIN_TRADE_LICENSE_CHARS..=MAX_TRADE_LICENSE_CHARS).contains(&len) {
-        return Err("trade license number must be 4 to 40 characters");
+        return Err("ট্রেড লাইসেন্স নম্বর ৪ থেকে ৪০ অক্ষরের হতে হবে (trade license number must be 4 to 40 characters)");
     }
     Ok(Some(trimmed.to_string()))
 }
@@ -3951,10 +4062,10 @@ pub const MAX_REVIEWER_NOTE_CHARS: usize = 500;
 pub fn validate_reviewer_note(raw: &str) -> Result<String, &'static str> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err("a rejection note is required");
+        return Err("প্রত্যাখ্যানের কারণ আবশ্যক (a rejection note is required)");
     }
     if trimmed.chars().count() > MAX_REVIEWER_NOTE_CHARS {
-        return Err("reviewer note must be at most 500 characters");
+        return Err("পর্যালোচকের নোট সর্বোচ্চ ৫০০ অক্ষরের হতে হবে (reviewer note must be at most 500 characters)");
     }
     Ok(trimmed.to_string())
 }
@@ -4256,6 +4367,19 @@ pub const NOTIFICATION_PAYOUT_APPROVED: &str = "payout_approved";
 /// reason via [`NotificationVars::note`], and the amount
 /// returns to the seller's available balance.
 pub const NOTIFICATION_PAYOUT_REJECTED: &str = "payout_rejected";
+/// Admin verifications remake: a store's KYC verification
+/// application was approved after MANUAL platform review.
+/// The wording must never claim a government or database
+/// NID check — no such check exists; a human compared the
+/// submitted documents. The granted tier rides in
+/// [`NotificationVars::verification_tier`].
+pub const NOTIFICATION_VERIFICATION_APPROVED: &str = "verification_approved";
+/// Admin verifications remake: a store's KYC verification
+/// application was rejected. The body carries the reviewer's
+/// note via [`NotificationVars::note`] (truncated for SMS —
+/// the full note is on the seller's verification page), so
+/// the seller knows what to fix before resubmitting.
+pub const NOTIFICATION_VERIFICATION_REJECTED: &str = "verification_rejected";
 pub const NOTIFICATION_RETURN_UPDATE: &str = "return_update";
 /// Wave 54: a store a user follows published a new product;
 /// the notice goes to each follower (see the API's
@@ -4335,6 +4459,14 @@ pub struct NotificationVars {
     /// statement; empty when no reference was recorded
     /// (every payout paid before the remake).
     pub payment_reference: String,
+    /// The verification tier granted by an approval
+    /// (admin verifications remake) — read only by the
+    /// `verification_approved` template, which maps it to
+    /// the same Bangla tier label the VerificationBadge
+    /// component prints; empty for every other kind. Named
+    /// for the KYC tier specifically: it is NOT a
+    /// subscription/plan tier.
+    pub verification_tier: String,
 }
 
 /// The short display form of an order id: its first 8
@@ -4427,6 +4559,49 @@ pub fn render_body(kind: &str, vars: &NotificationVars) -> String {
                     "BD Marketplace: আপনার পে-আউট অনুরোধটি গৃহীত হয়নি।{reason} টাকাটি আপনার উপলব্ধ ব্যালেন্সে ফেরত গেছে।"
                 ),
             }
+        }
+        NOTIFICATION_VERIFICATION_APPROVED => {
+            // The tier label is the VerificationBadge's own
+            // wording (basic = যাচাইকৃত বিক্রেতা, verified =
+            // যাচাইকৃত ব্যবসা) so the SMS and the storefront
+            // badge can never drift apart. An unknown or empty
+            // tier omits the tier phrase entirely — printing
+            // the unverified label on an approval would lie.
+            // The claim is approval of the APPLICATION after
+            // the platform team's manual document review —
+            // never that the NID itself was authenticated
+            // against any government database (no such check
+            // exists).
+            let tier_phrase = match vars.verification_tier.as_str() {
+                "basic" => " আপনার স্টোর এখন যাচাইকৃত বিক্রেতা।",
+                "verified" => " আপনার স্টোর এখন যাচাইকৃত ব্যবসা।",
+                _ => "",
+            };
+            format!(
+                "BD Marketplace: প্ল্যাটফর্ম দলের পর্যালোচনায় আপনার যাচাইকরণ আবেদন অনুমোদিত হয়েছে।{tier_phrase}"
+            )
+        }
+        NOTIFICATION_VERIFICATION_REJECTED => {
+            // The reviewer note is the actionable content, but
+            // it can run to 500 characters — at UCS-2 widths
+            // that is many SMS segments, and a gateway may cut
+            // it mid-sentence. The SMS therefore carries a
+            // truncated note and points at the seller page,
+            // where the full note always stands. This
+            // deliberately diverges from `payout_rejected`
+            // (whose reasons are short operational text):
+            // KYC notes are about identity documents and are
+            // long by nature.
+            let reason = if vars.note.is_empty() {
+                String::new()
+            } else {
+                let note: String = vars.note.chars().take(120).collect();
+                let ellipsis = if vars.note.chars().count() > 120 { "…" } else { "" };
+                format!(" কারণ: {note}{ellipsis}। বিস্তারিত আপনার যাচাইকরণ পেজে দেখুন।")
+            };
+            format!(
+                "BD Marketplace: আপনার যাচাইকরণ আবেদনটি গৃহীত হয়নি।{reason} সংশোধন করে আবার আবেদন করুন।"
+            )
         }
         NOTIFICATION_RETURN_UPDATE => match vars.status.as_str() {
             "approved" => format!(
@@ -9438,7 +9613,9 @@ mod tests {
         for action in STORE_ACTIONS {
             let expected = !matches!(
                 action,
-                STORE_ACTION_MANAGE_MEMBERS | STORE_ACTION_MANAGE_PAYOUTS
+                STORE_ACTION_MANAGE_MEMBERS
+                    | STORE_ACTION_MANAGE_PAYOUTS
+                    | STORE_ACTION_MANAGE_VERIFICATION
             );
             assert_eq!(
                 store_role_can("manager", action),
@@ -9446,10 +9623,11 @@ mod tests {
                 "manager / {action}"
             );
         }
-        // The two denials, named explicitly so the rule reads
+        // The denials, named explicitly so the rule reads
         // as policy, not as a table accident.
         assert!(!store_role_can("manager", "manage_members"));
         assert!(!store_role_can("manager", "manage_payouts"));
+        assert!(!store_role_can("manager", "manage_verification"));
     }
 
     #[test]
@@ -12177,9 +12355,16 @@ mod tests {
         assert!(validate_nid_number("   ").is_err());
         assert!(validate_nid_number("123456789A").is_err()); // letter
         assert!(validate_nid_number("1234-5678-90").is_err()); // hyphens are not spaces
-        // Bengali digits are digits to a human, but the stored
-        // form is the ASCII digit string — reject, never guess.
-        assert!(validate_nid_number("১২৩৪৫৬৭৮৯০").is_err());
+        // Bengali digits are transliterated to ASCII before
+        // the check (admin verifications remake — a policy
+        // change from the original reject-never-guess rule):
+        // the conversion is a deterministic 1:1 map, and the
+        // RETURNED (stored) form is always the ASCII string.
+        assert_eq!(validate_nid_number("১২৩৪৫৬৭৮৯০").unwrap(), "1234567890");
+        // Mixed ASCII/Bengali input canonicalises the same way.
+        assert_eq!(validate_nid_number("১২৩৪567890").unwrap(), "1234567890");
+        // Other digit scripts are NOT converted and still fail.
+        assert!(validate_nid_number("١٢٣٤٥٦٧٨٩٠").is_err());
     }
 
     #[test]
@@ -12192,6 +12377,89 @@ mod tests {
         assert_eq!(mask_nid("123"), "***");
         assert_eq!(mask_nid(""), "");
         assert_eq!(mask_nid("12345"), "*2345");
+    }
+
+    #[test]
+    fn mask_nid_parts_matches_mask_nid() {
+        // The parts form must reproduce mask_nid exactly for
+        // every length the mask is defined on — the masked
+        // read paths now hold only (length, last4).
+        assert_eq!(mask_nid_parts(13, "0123"), mask_nid("1234567890123"));
+        assert_eq!(mask_nid_parts(10, "7890"), mask_nid("1234567890"));
+        assert_eq!(mask_nid_parts(17, "4567"), mask_nid("12345678901234567"));
+        assert_eq!(mask_nid_parts(5, "2345"), "*2345");
+        // Short inputs mask everything and ignore last4 — a
+        // malformed short row must not leak itself.
+        assert_eq!(mask_nid_parts(4, "1234"), "****");
+        assert_eq!(mask_nid_parts(3, "123"), "***");
+        assert_eq!(mask_nid_parts(0, ""), "");
+    }
+
+    #[test]
+    fn view_reason_must_be_meaningful_and_number_free() {
+        assert_eq!(
+            validate_view_reason("  buyer dispute check  ").unwrap(),
+            "buyer dispute check"
+        );
+        assert!(validate_view_reason("").is_err());
+        assert!(validate_view_reason("   ").is_err());
+        assert!(validate_view_reason("ok").is_err()); // too short to audit
+        // A pasted NID (ASCII or Bengali digits) is refused:
+        // the audit detail must never become a second copy.
+        assert!(validate_view_reason("checking 1234567890 against doc").is_err());
+        assert!(validate_view_reason("checking ১২৩৪৫৬৭৮৯০ against doc").is_err());
+        // Short digit runs (an order number fragment) are fine.
+        assert!(validate_view_reason("dispute 4521 re-check").is_ok());
+    }
+
+    #[test]
+    fn applicant_name_is_optional_and_capped() {
+        assert_eq!(validate_applicant_name(None).unwrap(), None);
+        assert_eq!(validate_applicant_name(Some("   ")).unwrap(), None);
+        assert_eq!(
+            validate_applicant_name(Some("  মোঃ রফিকুল ইসলাম ")).unwrap(),
+            Some("মোঃ রফিকুল ইসলাম".to_string())
+        );
+        let too_long = "a".repeat(MAX_APPLICANT_NAME_CHARS + 1);
+        assert!(validate_applicant_name(Some(&too_long)).is_err());
+    }
+
+    #[test]
+    fn verification_notification_bodies_are_honest() {
+        let mut vars = NotificationVars {
+            verification_tier: "basic".to_string(),
+            ..NotificationVars::default()
+        };
+        let approved = render_body(NOTIFICATION_VERIFICATION_APPROVED, &vars);
+        assert!(approved.contains("অনুমোদিত হয়েছে"), "{approved}");
+        assert!(approved.contains("যাচাইকৃত বিক্রেতা"), "{approved}");
+        // The body must never claim a government/database
+        // check — review is manual, by the platform team.
+        assert!(approved.contains("প্ল্যাটফর্ম দলের পর্যালোচনায়"), "{approved}");
+        assert!(!approved.contains("সরকার"), "{approved}");
+
+        vars.verification_tier = "verified".to_string();
+        let approved_verified = render_body(NOTIFICATION_VERIFICATION_APPROVED, &vars);
+        assert!(approved_verified.contains("যাচাইকৃত ব্যবসা"), "{approved_verified}");
+
+        // An unknown tier omits the tier phrase rather than
+        // printing a label the seller does not hold.
+        vars.verification_tier = String::new();
+        let approved_bare = render_body(NOTIFICATION_VERIFICATION_APPROVED, &vars);
+        assert!(!approved_bare.contains("যাচাইকৃত বিক্রেতা"), "{approved_bare}");
+        assert!(!approved_bare.contains("যাচাইকৃত ব্যবসা"), "{approved_bare}");
+
+        // Rejection carries the note (truncated past 120
+        // chars) and the fix-and-resubmit path.
+        vars.note = "ছবি ঝাপসা".to_string();
+        let rejected = render_body(NOTIFICATION_VERIFICATION_REJECTED, &vars);
+        assert!(rejected.contains("গৃহীত হয়নি"), "{rejected}");
+        assert!(rejected.contains("ছবি ঝাপসা"), "{rejected}");
+        assert!(rejected.contains("আবার আবেদন করুন"), "{rejected}");
+        vars.note = "x".repeat(300);
+        let rejected_long = render_body(NOTIFICATION_VERIFICATION_REJECTED, &vars);
+        assert!(rejected_long.contains("…"), "{rejected_long}");
+        assert!(rejected_long.chars().count() < 300, "{rejected_long}");
     }
 
     #[test]
@@ -12494,6 +12762,7 @@ mod tests {
             card_last4: String::new(),
             note: String::new(),
             payment_reference: String::new(),
+            verification_tier: String::new(),
         };
         // The short order id (first 8 chars) is what prints.
         let placed = render_body(NOTIFICATION_ORDER_PLACED, &vars);

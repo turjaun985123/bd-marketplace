@@ -393,7 +393,7 @@ function AttentionQueue({ metrics }: { metrics: AdminMetrics }) {
       label: "দোকান যাচাইয়ের আবেদন — Verification reviews",
       count: metrics.verifications_pending.count,
       tone: "accent",
-      href: "/admin/verifications",
+      href: "/admin/verifications?status=pending",
       meta:
         metrics.verifications_pending.oldest_age_secs !== null
           ? `সবচেয়ে পুরনো আবেদন ${formatAgeSeconds(metrics.verifications_pending.oldest_age_secs)} ধরে`

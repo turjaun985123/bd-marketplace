@@ -1044,8 +1044,12 @@ rejected seller sees the note on their verification page,
 fixes the problem, and resubmits — resubmission from
 `rejected` is a normal transition, and the old note is
 cleared. `approved` is terminal for applications: changing
-an approved store's tier is a fresh admin action, not a new
-application.
+an approved store's tier would be a fresh admin action, not
+a new application — and, honestly, that action does NOT
+exist yet (there is no revoke/demote endpoint; it is an
+owner policy decision still owed, recorded in the admin
+verifications remake note below). A mistaken approval
+currently stands until that ruling lands.
 
 **NID handling (the sensitive rule of this wave):** the full
 NID number is stored exactly once, in
@@ -1558,7 +1562,8 @@ miss one that committed:
 | `payout.approve` / `payout.reject` / `payout.mark_paid` | payout id | the payout transition (detail: `{from, to}`, plus `note` on a rejection — required since the admin payouts remake — and `payment_reference` on a mark-paid; account numbers and phones are never written to the log) |
 | `store.suspend` / `store.reactivate` | store id | the store status change |
 | `settings.update` | — | the settings patch (detail: `{changed_keys}` — key NAMES only, never values; a no-op patch writes no row) |
-| `verification.approve` / `verification.reject` | store id | the KYC decision (detail: the granted tier, resp. the reviewer note the seller reads) |
+| `verification.approve` / `verification.reject` | store id | the KYC decision (detail: the granted tier, resp. the reviewer note the seller reads; since the admin verifications remake also `document_present`, `no_document_override` and the decided `version`) |
+| `verification.view_full_nid` | store id | the audited full-NID reveal (detail: `{reason, nid_last4, status}` — the admin's stated reason; the full number is NEVER a detail value) |
 | `qna.hide` / `qna.unhide` | question id | the ADMIN Q&A moderation endpoints only — a seller hiding a question on their own product is not audited |
 | `return.refund_done` | return request id | marking an off-platform refund done |
 
@@ -4385,6 +4390,86 @@ changed, beyond the endpoint table above —
   the rejection reason, the recorded reference, or the
   per-stage stamps (the API record and the notices carry
   them — a seller-surface follow-up).
+
+**Admin verifications remake (2026-11-28, the third surface
+of the admin remake program; 94 analysis agents):** the KYC
+review queue was rebuilt around one fact the audit had
+already flagged (HI-82): the full-NID reveal was NOT
+audited, despite the page claiming it was. What changed —
+
+- **The reveal is now an audited POST.** `POST
+  /v1/admin/verifications/:store_id/full` takes a mandatory
+  `reason` (domain-validated: meaningful length, and it may
+  not contain a long digit run — a pasted NID in the audit
+  detail would defeat the design), locks the application
+  row, writes `verification.view_full_nid` (detail:
+  `{reason, nid_last4, status}`) and commits BEFORE the
+  number is served, with `Cache-Control: no-store`. The web
+  reveal lives only inside a dialog, beside the document,
+  for 30 seconds, and is then deleted from state.
+- **Decisions are locked and version-bound** (migration
+  0074): store-then-application `FOR UPDATE`, the transition
+  re-checked under the lock, approval on a suspended store
+  is a 409, and approve/reject must present the
+  `expected_version` they reviewed — a seller edit after the
+  review makes the decision a 409 instead of landing on
+  unseen documents. Submissions take the same locks: a
+  payload-changing pending edit bumps the version but keeps
+  the original `submitted_at`; an identical resubmit is a
+  no-op. Approving with no document image is a 400 unless
+  the reviewer passes the explicit, audited
+  `no_document_override`.
+- **History exists now.** `store_verification_events`
+  records submissions only (decisions and reveals live in
+  the audit log — one canonical record, not two); events
+  carry `nid_last4`, never the number and never a hash of
+  it (a hash of a 10/13/17-digit number is a brute-forceable
+  second copy). Masked read paths no longer SELECT the full
+  number at all — they rebuild the mask from `nid_last4` +
+  length, and 0074 enforces `nid_last4 = right(nid_number,
+  4)` in the database.
+- **Sellers hear the outcome.** `verification_approved` /
+  `verification_rejected` notices (owner's account phone,
+  inside the decision transaction): approval names the
+  granted tier, rejection carries the reviewer's note
+  (truncated in the SMS body; the full note stands on the
+  seller's page). The wording claims manual platform review
+  only — no government NID check exists.
+- **KYC is owner-only.** Submission AND reading moved from
+  the shared store-settings action to a new
+  `manage_verification` domain action (owners only — a
+  manager can no longer file or open the owner's identity
+  file), the seller now supplies the applicant name as on
+  the NID, and the verification PUT joined the API-key
+  JWT-only denylist. Bengali-digit NIDs are transliterated
+  and stored as canonical ASCII (a deliberate reversal of
+  Wave 21's reject-never-guess rule: the map is a
+  deterministic 1:1 transliteration and the stored form is
+  always ASCII).
+- **The queue is decision-ready:** envelope
+  `{items, total, page, limit, summary}` (whole-queue
+  summary, payouts rule), search over store/applicant/phone
+  (NEVER the NID or license — no probing oracle), a detail
+  endpoint with store context (canonical aggregates),
+  different-owner duplicate flags (counts only), prior
+  rejections, and the owner's other stores. The unscoped
+  owner export gained a masked per-store `verification`
+  section; the manager-scoped export never carries it.
+- **Honest limits:** review remains MANUAL (restated —
+  nothing here authenticates an NID); there is still NO
+  tier revoke/demote action (an owner policy decision is
+  owed — a mistaken approval stands until then); the full
+  NID of a REJECTED application is retained indefinitely
+  (a rejected-NID scrub window is a second owed ruling;
+  approved NIDs are the evidence behind a live badge and
+  are not scrub candidates); `nid_number` is not encrypted
+  at rest (no KMS exists in the stack — database backups
+  are the compensating control and a named launch concern);
+  prior-rejection counts and decision history reach back
+  only to the Wave 28 audit log; the seller's document is
+  still a seller-hosted hotlink, so the reviewed evidence
+  can change after approval (the URL at decision time is
+  preserved in the submission events and audit trail).
 
 **Settings override precedence:** a row in `platform_settings`
 (migration 0013) beats the startup value, which beats the

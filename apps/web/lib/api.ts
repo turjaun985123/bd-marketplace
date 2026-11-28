@@ -4723,6 +4723,10 @@ export interface SellerVerification {
   reviewer_note: string | null;
   submitted_at: string | null;
   reviewed_at: string | null;
+  /** Applicant name as on the NID (admin verifications remake). */
+  applicant_name: string | null;
+  /** Application version; decisions must present it back. */
+  version: number | null;
 }
 
 /** What a seller submits to apply for verification. */
@@ -4730,12 +4734,15 @@ export interface SubmitVerificationInput {
   nid_number: string;
   trade_license_number?: string;
   document_url?: string;
+  applicant_name?: string;
 }
 
 /**
  * One row of the admin review queue (GET /v1/admin/
  * verifications). Owner phone and NID are masked here too;
- * the full NID lives behind the separate full-view call.
+ * the full NID lives behind the separate audited full-view
+ * call, and the trade license NUMBER rides that call as
+ * well — the queue carries only its presence.
  */
 export interface AdminVerification {
   store_id: string;
@@ -4751,16 +4758,80 @@ export interface AdminVerification {
   reviewer_note: string | null;
   submitted_at: string;
   reviewed_at: string | null;
+  /** Application version — pass back as expected_version. */
+  version: number;
+  applicant_name: string | null;
+  /** active | suspended */
+  store_status: string;
+  store_created_at: string;
+  product_count: number;
+  delivered_orders: number;
+  delivered_gmv_poisha: number;
+  returns_received: number;
+  pending_payout_count: number;
+  pending_payout_poisha: number;
+  /** Other stores of a DIFFERENT owner with the same NID. */
+  duplicate_nid_stores: number;
+  duplicate_license_stores: number;
+  prior_rejections: number;
+}
+
+/** Whole-queue per-status counts (never filter-shaped). */
+export interface AdminVerificationSummary {
+  pending: number;
+  approved: number;
+  rejected: number;
+}
+
+/** The queue envelope (admin verifications remake). */
+export interface AdminVerificationList {
+  items: AdminVerification[];
+  total: number;
+  page: number;
+  limit: number;
+  summary: AdminVerificationSummary;
+}
+
+/** One history entry on the admin detail view. */
+export interface VerificationHistoryEntry {
+  at: string;
+  /** submitted | resubmitted | approved | rejected | viewed_full_nid */
+  kind: string;
+  actor_phone_masked: string | null;
+  note: string | null;
+  tier: string | null;
+  reason: string | null;
+}
+
+/** One of the application owner's stores, on the detail view. */
+export interface OwnerStoreSummary {
+  store_id: string;
+  store_slug: string;
+  store_name: string;
+  tier: VerificationTier;
+  verification_status: string;
+}
+
+/** GET /v1/admin/verifications/{storeId} — detail (masked). */
+export interface AdminVerificationDetail extends AdminVerification {
+  history: VerificationHistoryEntry[];
+  owner_stores: OwnerStoreSummary[];
 }
 
 /**
- * The admin full view (GET /v1/admin/verifications/{storeId}/
+ * The admin full view (POST /v1/admin/verifications/{storeId}/
  * full): the ONLY API response carrying a complete NID
  * number, so a reviewer can check it against the document.
+ * Audited: the stated reason is written to the admin audit
+ * log before the number is served.
  */
 export interface AdminVerificationFull {
   store_id: string;
   nid_number: string;
+  trade_license_number: string | null;
+  applicant_name: string | null;
+  version: number;
+  status: string;
 }
 
 /** GET /v1/seller/store/verification — the caller's own KYC state. */
@@ -4786,39 +4857,78 @@ export function submitSellerVerification(
   });
 }
 
-/** GET /v1/admin/verifications — the review queue (default: pending). */
+/** GET /v1/admin/verifications — the review queue envelope. */
 export function listAdminVerifications(
   token: string,
-  status?: string
-): Promise<AdminVerification[]> {
-  const qs = status ? `?status=${encodeURIComponent(status)}` : "";
-  return call(`/v1/admin/verifications${qs}`, { token });
+  params?: {
+    status?: string;
+    q?: string;
+    page?: number;
+    limit?: number;
+  }
+): Promise<AdminVerificationList> {
+  const qs = new URLSearchParams();
+  if (params?.status) qs.set("status", params.status);
+  if (params?.q) qs.set("q", params.q);
+  if (params?.page) qs.set("page", String(params.page));
+  if (params?.limit) qs.set("limit", String(params.limit));
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  return call(`/v1/admin/verifications${suffix}`, { token });
 }
 
-/**
- * GET /v1/admin/verifications/{storeId}/full — reveal the full
- * NID for one application. Reviewer-only; call it only on an
- * explicit reveal action, never while listing the queue.
- */
-export function getAdminVerificationFull(
+/** GET /v1/admin/verifications/{storeId} — one application's detail. */
+export function getAdminVerificationDetail(
   token: string,
   storeId: string
-): Promise<AdminVerificationFull> {
+): Promise<AdminVerificationDetail> {
   return call(
-    `/v1/admin/verifications/${encodeURIComponent(storeId)}/full`,
+    `/v1/admin/verifications/${encodeURIComponent(storeId)}`,
     { token }
   );
 }
 
-/** POST /v1/admin/verifications/{storeId}/approve — grant a tier. */
+/**
+ * POST /v1/admin/verifications/{storeId}/full — reveal the
+ * full NID for one application. Reviewer-only and audited:
+ * the reason is recorded in the admin audit log. Call it
+ * only on an explicit reveal action inside the reveal
+ * dialog, never while listing the queue or opening a detail.
+ */
+export function getAdminVerificationFull(
+  token: string,
+  storeId: string,
+  reason: string
+): Promise<AdminVerificationFull> {
+  return call(
+    `/v1/admin/verifications/${encodeURIComponent(storeId)}/full`,
+    { method: "POST", token, body: { reason } }
+  );
+}
+
+/**
+ * POST /v1/admin/verifications/{storeId}/approve — grant a
+ * tier at the reviewed application version.
+ * `noDocumentOverride` is the explicit, audited override for
+ * an application with no document image.
+ */
 export function approveVerification(
   token: string,
   storeId: string,
-  tier: "basic" | "verified"
+  tier: "basic" | "verified",
+  expectedVersion: number,
+  noDocumentOverride?: boolean
 ): Promise<SellerVerification> {
   return call(
     `/v1/admin/verifications/${encodeURIComponent(storeId)}/approve`,
-    { method: "POST", token, body: { tier } }
+    {
+      method: "POST",
+      token,
+      body: {
+        tier,
+        expected_version: expectedVersion,
+        no_document_override: noDocumentOverride ?? false,
+      },
+    }
   );
 }
 
@@ -4826,11 +4936,16 @@ export function approveVerification(
 export function rejectVerification(
   token: string,
   storeId: string,
-  note: string
+  note: string,
+  expectedVersion: number
 ): Promise<SellerVerification> {
   return call(
     `/v1/admin/verifications/${encodeURIComponent(storeId)}/reject`,
-    { method: "POST", token, body: { note } }
+    {
+      method: "POST",
+      token,
+      body: { note, expected_version: expectedVersion },
+    }
   );
 }
 

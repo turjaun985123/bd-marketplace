@@ -18,9 +18,15 @@
 //! - `settings.update` — target `platform_settings`, detail
 //!   `{changed_keys}`: the NAMES of the settings the patch
 //!   changed, never their values.
-//! - `verification.approve` (detail `{tier}`),
+//! - `verification.approve` (detail `{tier}` plus, since the
+//!   admin verifications remake, `document_present`,
+//!   `no_document_override` and the `version` decided at),
 //!   `verification.reject` (detail `{note}` — the reviewer note
-//!   the seller themselves will read) — target `store`.
+//!   the seller themselves will read — plus `version`),
+//!   `verification.view_full_nid` (detail `{reason, nid_last4,
+//!   status}` — the stated reason for the reveal and the
+//!   number's last four; the full number itself is NEVER a
+//!   detail value) — target `store`.
 //! - `qna.hide`, `qna.unhide` — target `question`, no detail.
 //!   Only the ADMIN moderation endpoints are audited; a seller
 //!   hiding a question on their own product is routine

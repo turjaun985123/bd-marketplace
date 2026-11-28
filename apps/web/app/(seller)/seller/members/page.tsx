@@ -25,7 +25,8 @@ import { useAuth } from "@/hooks/useAuth";
  *
  * What each role may do is decided by the API's permission
  * matrix, never here: manager = everything except seating
- * members and payouts; staff = catalogue, orders and Q&A
+ * members, payouts and the owner's verification (KYC) file;
+ * staff = catalogue, orders and Q&A
  * only. This page only renders what the API returns and
  * surfaces its (bilingual) refusals verbatim.
  */

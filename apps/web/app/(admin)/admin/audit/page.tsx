@@ -19,6 +19,7 @@ const ACTION_OPTIONS = [
   "settings.update",
   "verification.approve",
   "verification.reject",
+  "verification.view_full_nid",
   "qna.hide",
   "qna.unhide",
   "return.refund_done",

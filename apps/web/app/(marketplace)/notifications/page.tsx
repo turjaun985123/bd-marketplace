@@ -226,6 +226,10 @@ function kindLabel(kind: string): string {
       return "পে-আউট অনুমোদিত — Payout approved";
     case "payout_rejected":
       return "পে-আউট প্রত্যাখ্যাত — Payout rejected";
+    case "verification_approved":
+      return "যাচাইকরণ অনুমোদিত — Verification approved";
+    case "verification_rejected":
+      return "যাচাইকরণ প্রত্যাখ্যাত — Verification rejected";
     case "return_update":
       return "রিটার্ন আপডেট — Return update";
     case "store_new_product":
