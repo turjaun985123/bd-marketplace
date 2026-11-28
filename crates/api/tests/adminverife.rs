@@ -115,7 +115,7 @@ async fn submit(app: &Router, token: &str, body: Value) -> (StatusCode, Value) {
 async fn event_kinds(pool: &PgPool, store_id: &str) -> Vec<String> {
     sqlx::query_scalar(
         "SELECT kind FROM store_verification_events \
-         WHERE store_id = $1 ORDER BY id ASC",
+         WHERE store_id = $1::uuid ORDER BY id ASC",
     )
     .bind(store_id)
     .fetch_all(pool)
