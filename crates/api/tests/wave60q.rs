@@ -217,7 +217,7 @@ async fn wave60_list_status_filters_mirror_the_derived_status() {
     let buyer = login(&app, "01966666671").await;
     // Admin: login FIRST, then the SQL promotion.
     let admin = login(&app, "01766666672").await;
-    sqlx::query("UPDATE users SET is_admin = true WHERE phone = '01766666672'")
+    sqlx::query("UPDATE users SET is_admin = true WHERE phone = '+8801766666672'")
         .execute(&pool)
         .await
         .expect("promote admin");
