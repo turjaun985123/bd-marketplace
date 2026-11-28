@@ -263,7 +263,7 @@ async fn adminshipments_cod_rollup_and_stranded_advance() {
         })
         .with_payments_config(PaymentsConfig {
             dev_mode: true,
-            dev_secret: "<redacted>",
+            dev_secret: "<redacted>".to_string(),
             ..PaymentsConfig::default()
         });
     let app = build_app(state);
